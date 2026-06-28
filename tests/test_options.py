@@ -158,6 +158,17 @@ def test_push_single_file_dryrun_uploads_nothing(ws):
     assert ws.keys() == set()
 
 
+def test_push_single_file_dryrun_prints_upload_once(ws):
+    # Regression: the single-file dryrun path printed the upload line twice -
+    # once directly and once via the shared results writer.
+    f = ws.write("solo.txt", "x")
+    ws.config({"solo.txt": {"path": str(f)}})
+
+    res = ws.run("push", "--dryrun", "solo.txt", expect_rc=0)
+    uploads = [ln for ln in res.out.splitlines() if ln.startswith("(dryrun) upload:")]
+    assert len(uploads) == 1
+
+
 def test_push_git_entry_meta_only_skips_manifest(ws):
     ws.write("repo.git/HEAD", "ref")
     ws.config({"repo.git": {"path": str(ws.root / "repo.git")}})

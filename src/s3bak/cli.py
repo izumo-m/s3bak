@@ -1633,9 +1633,10 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
 
         if local_mtime != s3_local_mtime:
             if opts.dryrun:
-                msg = f"(dryrun) upload: {target} -> {cfg.prefix}/{entry}"
-                print(msg)
-                results = msg
+                # Set results only; the shared writer below emits it (and the
+                # truthy results drives the dryrun manifest line). Printing here
+                # too would double the line.
+                results = f"(dryrun) upload: {target} -> {cfg.prefix}/{entry}"
             else:
                 result = cfg.store.put_object(
                     entry,
