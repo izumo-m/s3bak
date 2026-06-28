@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import os
+
+from s3bak import cli
+
 
 def test_push_uploads_objects_and_manifest(ws):
     ws.write("data/a.txt", "alpha")
@@ -35,6 +39,35 @@ def test_pull_restores_content(ws):
     ws.run("pull", "data", "-o", str(dest), expect_rc=0)
     assert (dest / "a.txt").read_text() == "alpha"
     assert (dest / "sub" / "b.txt").read_text() == "beta"
+
+
+def test_single_file_download_is_reported_as_changed(ws):
+    # download_from_s3 must report a single-file download as changed, so pull
+    # runs apply_manifest (and restores mode/mtime) - on Windows it is skipped
+    # when nothing changed, and a single-file download used to always look
+    # unchanged.
+    f = ws.write("solo.txt", "v1")
+    ws.config({"solo.txt": {"path": str(f)}})
+    ws.run("push", "solo.txt", expect_rc=0)
+
+    cfg = cli.load_config()
+    dest = ws.root / "out.txt"
+    rc, changed = cli.download_from_s3(cfg, "solo.txt", str(dest), is_dir=False, verbose=False)
+    assert rc == 0
+    assert changed is True
+    assert dest.read_text() == "v1"
+
+
+def test_single_file_pull_restores_original_mtime(ws):
+    f = ws.write("solo.txt", "data")
+    old = 1_600_000_000
+    os.utime(f, (old, old))
+    ws.config({"solo.txt": {"path": str(f)}})
+    ws.run("push", "solo.txt", expect_rc=0)
+
+    dest = ws.root / "out.txt"
+    ws.run("pull", "solo.txt", "-o", str(dest), expect_rc=0)
+    assert int(dest.stat().st_mtime) == old
 
 
 def test_push_after_delete_removes_remote_and_reports_it(ws):

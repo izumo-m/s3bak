@@ -1188,30 +1188,25 @@ def download_from_s3(
 ) -> tuple[int, bool]:
     assert cfg.store is not None
     rel = f"{entry}/{sub}" if sub else entry
+
     if is_dir:
         result = cfg.store.sync_down(rel, outpath, verbose=verbose)
-    else:
-        parent = os.path.dirname(outpath)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        try:
-            ok = cfg.store.get_object(
-                rel,
-                outpath,
-                verbose=verbose,
-                check=True,
-            )
-            result = TransferResult(returncode=0 if ok else 1)
-        except subprocess.CalledProcessError as e:
-            result = TransferResult(returncode=e.returncode, stderr=e.stderr or "")
+        if result.returncode != 0:
+            if result.stderr:
+                write_stderr(result.stderr)
+            return result.returncode, False
+        return 0, _print_transfer_lines(result.stdout)
 
-    if result.returncode != 0:
-        if result.stderr:
-            write_stderr(result.stderr)
-        return result.returncode, False
-
-    changed = _print_transfer_lines(result.stdout)
-    return 0, changed
+    # Single file: cp always transfers (we only reach here on a manifest
+    # mismatch), so a successful download counts as changed -> apply_manifest
+    # runs and restores mode/mtime. Matters on Windows, where apply_manifest is
+    # skipped when nothing changed.
+    parent = os.path.dirname(outpath)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    if not cfg.store.get_object(rel, outpath, verbose=verbose):
+        return 1, False
+    return 0, True
 
 
 # =============================================================================
