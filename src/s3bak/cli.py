@@ -1518,6 +1518,14 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
     if results:
         write_output(f"{results}\n")
 
+    # Refresh the manifest only when file data was actually transferred. A change
+    # to mode/owner/group alone is not re-uploaded by sync (it compares size and
+    # mtime, which such a change leaves untouched), so a plain push does not
+    # refresh the manifest and `status` keeps showing that diff until you run
+    # `push --meta-only` (handled above). Note: a content or mtime change does
+    # refresh it; only mode/owner/group-only changes are affected. This is the
+    # deliberate current behavior (not a bug), but a spec choice that may be
+    # revisited later - not an invariant.
     if results and not opts.data_only:
         st = upload_manifest(cfg, entry, target, excludes, opts)
         if st != 0:
