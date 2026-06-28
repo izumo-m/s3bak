@@ -22,7 +22,7 @@ classifiers = [
 # boto3-s3 provides the in-process S3 transfer/listing API; boto3 is used
 # directly for head-object / list-objects-v2.
 dependencies = [
-    "boto3-s3>=0.3",
+    "boto3-s3>=0.3,<0.4",
     "boto3>=1.28",
 ]
 
