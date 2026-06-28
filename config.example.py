@@ -17,6 +17,19 @@ profile = "default"
 # Destination root on S3 (required). Must start with "s3://".
 prefix = "s3://my-bucket/backup"
 
+# Parallelism (both optional, both independent positive integers). s3bak does
+# not read aws-cli's [s3] settings, so set these here if the defaults don't fit.
+#
+#   max_concurrency  parallel S3 transfer threads for cp / sync (default 10),
+#                    like aws-cli's s3.max_concurrent_requests.
+#   compare_workers  parallel ETag content comparisons during sync. sync hashes
+#                    each candidate file locally to compare it by content; raise
+#                    this to speed up a sync bottlenecked on that hashing, lower
+#                    it to cap CPU/IO. Defaults to max_concurrency, else 10.
+#
+# max_concurrency = 10
+# compare_workers = 10
+
 # Directories / files to back up (required), keyed by entry name.
 #
 # Per-entry keys:

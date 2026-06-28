@@ -77,12 +77,15 @@ class Workspace:
         p.write_text(content)
         return p
 
-    def config(self, entries: dict[str, dict[str, Any]]) -> None:
+    def config(self, entries: dict[str, dict[str, Any]], **settings: Any) -> None:
         body = (
             f'profile = "{PROFILE}"\n'
             f'prefix = "s3://{self.bucket}/{self.prefix}"\n'
             f"entries = {entries!r}\n"
         )
+        # Optional extra top-level settings (e.g. max_concurrency=7).
+        for key, value in settings.items():
+            body += f"{key} = {value!r}\n"
         self._config.write_text(body)
         self._monkeypatch.setenv("S3BAK_CONFIG", str(self._config))
 

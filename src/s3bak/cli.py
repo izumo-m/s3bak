@@ -444,6 +444,20 @@ class Opts:
     color: str = "auto"
 
 
+def _config_positive_int(ns: dict[str, Any], name: str, config_path: str) -> int | None:
+    """Read an optional positive-integer setting from the config namespace.
+
+    Returns None when unset; dies with a clear message on a non-int (bool
+    included, since `True` is an int in Python) or a value below 1.
+    """
+    value = ns.get(name)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        die(f"{name} must be a positive integer in {config_path} (got {value!r})")
+    return value
+
+
 def load_config() -> Config:
     config_path = os.environ.get("S3BAK_CONFIG")
     if not config_path:
@@ -494,6 +508,12 @@ def load_config() -> Config:
     if not bucket:
         die(f"could not parse bucket from prefix='{prefix}'")
 
+    # Optional, independent concurrency knobs (see config.example.py):
+    #   max_concurrency - parallel S3 transfer threads for cp / sync
+    #   compare_workers - parallel ETag content comparisons during sync
+    max_concurrency = _config_positive_int(ns, "max_concurrency", config_path)
+    compare_workers = _config_positive_int(ns, "compare_workers", config_path)
+
     cfg = Config(
         profile=profile,
         prefix=prefix,
@@ -501,7 +521,14 @@ def load_config() -> Config:
         path_prefix=path_prefix,
         entries=entries,
     )
-    cfg.store = Boto3S3Store(profile, prefix, bucket, path_prefix)
+    cfg.store = Boto3S3Store(
+        profile,
+        prefix,
+        bucket,
+        path_prefix,
+        max_concurrency=max_concurrency,
+        compare_workers=compare_workers,
+    )
     return cfg
 
 
@@ -541,28 +568,78 @@ class Boto3S3Store:
     `path_prefix` for boto3 calls and `prefix` (the s3:// URL) for cp / sync.
     """
 
-    def __init__(self, profile: str, prefix: str, bucket: str, path_prefix: str):
+    def __init__(
+        self,
+        profile: str,
+        prefix: str,
+        bucket: str,
+        path_prefix: str,
+        *,
+        max_concurrency: int | None = None,
+        compare_workers: int | None = None,
+    ):
         self.profile = profile
         self.prefix = prefix  # full s3:// URL
         self.bucket = bucket
         self.path_prefix = path_prefix
+        # Concurrency knobs (None = library default). max_concurrency tunes the
+        # transfer thread pool (cp / sync); compare_workers tunes the parallel
+        # ETag comparison; they are independent (see _s3 / _content_compare).
+        self.max_concurrency = max_concurrency
+        self.compare_workers = compare_workers
         self._s3_cache: Any = None
         self._client_cache: Any = None
 
     # --- internal ----------------------------------------------------------
     def _s3(self) -> Any:
-        """Lazily build the boto3-s3 S3 orchestrator for the configured profile."""
+        """Lazily build the boto3-s3 S3 orchestrator for the configured profile.
+
+        A configured `max_concurrency` becomes the default `TransferConfig` for
+        every cp / sync (the library otherwise uses boto3's default of 10 and
+        never reads `~/.aws/config` for it).
+        """
         if self._s3_cache is None:
             import boto3
             from boto3_s3 import S3
 
-            self._s3_cache = S3(session=boto3.Session(profile_name=self.profile))
+            transfer_config = None
+            if self.max_concurrency is not None:
+                from boto3_s3 import TransferConfig
+
+                transfer_config = TransferConfig(max_concurrency=self.max_concurrency)
+            self._s3_cache = S3(
+                session=boto3.Session(profile_name=self.profile),
+                transfer_config=transfer_config,
+            )
         return self._s3_cache
 
     def _client(self) -> Any:
         if self._client_cache is None:
             self._client_cache = self._s3().client()
         return self._client_cache
+
+    def _content_compare(self) -> Any:
+        """The `compare=` strategy for sync: ETag content comparison, parallelized.
+
+        Copies a pair only when the S3 ETag differs from the local file's
+        reconstructed ETag, instead of the default size + last-modified test -
+        so a metadata-only change (mode/owner/group, or an mtime change that
+        leaves the bytes identical) is not re-transferred, and a same-size,
+        same-mtime content change still is. `part_size` is read from the same
+        profile the uploads use, so multipart ETags reconstruct to a matching
+        value.
+
+        Wrapped in `ParallelCompare` so the per-pair local read + hash runs on
+        the sync's thread pool instead of serially on its main thread; the copy
+        decision is identical, only faster. `EtagComparison` is thread-safe, as
+        `ParallelCompare` requires. The worker count is the configured
+        `compare_workers`; when unset (None) the library defaults it to the
+        transfer `max_concurrency`, else 10.
+        """
+        from boto3_s3 import ParallelCompare
+        from boto3_s3.etagcompare import EtagComparison
+
+        return ParallelCompare(EtagComparison(self._s3()), workers=self.compare_workers)
 
     def _api_key(self, rel_key: str) -> str:
         return f"{self.path_prefix}/{rel_key}" if self.path_prefix else rel_key
@@ -702,7 +779,13 @@ class Boto3S3Store:
         return self._transfer(
             verbose,
             f"sync {src} {dest_dir}/",
-            lambda cb: self._s3().sync(src, f"{dest_dir}/", follow_symlinks=False, on_result=cb),
+            lambda cb: self._s3().sync(
+                src,
+                f"{dest_dir}/",
+                compare=self._content_compare(),
+                follow_symlinks=False,
+                on_result=cb,
+            ),
         )
 
     def put_text(self, rel_key: str, text: str, *, verbose: bool = False) -> None:
@@ -764,6 +847,7 @@ class Boto3S3Store:
                 delete=delete,
                 dryrun=dryrun,
                 filter=filt,
+                compare=self._content_compare(),
                 follow_symlinks=False,
                 on_result=cb,
             ),
@@ -1563,12 +1647,12 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
     if results:
         write_output(f"{results}\n")
 
-    # Refresh the manifest only when file data was actually transferred. A change
-    # to mode/owner/group alone is not re-uploaded by sync (it compares size and
-    # mtime, which such a change leaves untouched), so a plain push does not
-    # refresh the manifest and `status` keeps showing that diff until you run
-    # `push --meta-only` (handled above). Note: a content or mtime change does
-    # refresh it; only mode/owner/group-only changes are affected. This is the
+    # Refresh the manifest only when file data was actually transferred. sync
+    # compares by content (ETag, see Boto3S3Store._content_compare), so a
+    # metadata-only change - mode/owner/group, or an mtime change that leaves the
+    # bytes identical - is not re-uploaded and so does not refresh the manifest;
+    # `status` keeps showing that diff until you run `push --meta-only` (handled
+    # above). Only a content change refreshes the manifest here. This is the
     # deliberate current behavior (not a bug), but a spec choice that may be
     # revisited later - not an invariant.
     if results and not opts.data_only:
