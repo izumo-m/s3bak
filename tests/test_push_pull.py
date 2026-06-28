@@ -90,6 +90,32 @@ def test_single_file_pull_restores_original_mtime(ws):
     assert int(dest.stat().st_mtime) == old
 
 
+def test_push_with_unreadable_file_warns_and_exits_2(ws, monkeypatch):
+    # A skipped (unreadable) file is a WARNED outcome: the readable files still
+    # upload and the manifest still updates, but the run exits 2 so an incomplete
+    # backup is detectable. Exercised via run() (which maps warnings to exit 2).
+    import signal
+
+    from s3bak import cli
+
+    ws.write("data/good.txt", "good")
+    bad = ws.write("data/bad.txt", "secret")
+    os.chmod(bad, 0)
+    ws.config({"data": {"path": str(ws.root / "data")}})
+
+    monkeypatch.setattr("sys.argv", ["s3bak", "push", "data"])
+    saved = signal.getsignal(signal.SIGINT)
+    try:
+        rc = cli.run()
+    finally:
+        signal.signal(signal.SIGINT, saved)
+        os.chmod(bad, 0o644)
+
+    assert rc == 2
+    assert "data/good.txt" in ws.keys()
+    assert "data/bad.txt" not in ws.keys()
+
+
 def test_push_after_delete_removes_remote_and_reports_it(ws):
     ws.write("data/a.txt", "a")
     ws.write("data/b.txt", "b")

@@ -43,6 +43,11 @@ IS_WINDOWS = sys.platform == "win32"
 
 _output_lock = threading.Lock()
 
+# Transfer warnings (WARNED outcomes) are printed as they occur and counted;
+# run() turns a warning-only run into exit code 2.
+_warning_lock = threading.Lock()
+_warning_count = 0
+
 
 def err(msg: str) -> None:
     sys.stderr.write(f"{PROG}: {msg}\n")
@@ -64,6 +69,14 @@ def write_stderr(text: str) -> None:
     with _output_lock:
         sys.stderr.write(text)
         sys.stderr.flush()
+
+
+def _note_warning(msg: str) -> None:
+    """Print a transfer warning and count it; run() maps any warning to exit 2."""
+    global _warning_count
+    write_stderr(f"{msg}\n")
+    with _warning_lock:
+        _warning_count += 1
 
 
 def echo_command(verbose: bool, args: list[str]) -> None:
@@ -550,6 +563,11 @@ class Boto3S3Store:
             elif r.outcome is OpOutcome.FAILED:
                 with lock:
                     errs.append(f"{r.key}: {r.error}")
+            elif r.outcome is OpOutcome.WARNED:
+                _note_warning(f"warning: {r.error}" if r.error else f"warning: skipped {r.key}")
+            elif r.outcome is OpOutcome.NOTICE:
+                if r.error:
+                    write_stderr(f"{r.error}\n")
 
         try:
             op(on_result)
@@ -2324,9 +2342,11 @@ def _sdk_errors() -> tuple[type[BaseException], ...]:
 def run() -> int:
     """Console entry point: install signal handling and translate exceptions
     into exit codes. This is what the ``s3bak`` command invokes."""
+    global _warning_count
+    _warning_count = 0
     signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
     try:
-        return main() or 0
+        rc = main() or 0
     except subprocess.CalledProcessError as e:
         cmd_str = shlex.join(e.cmd) if isinstance(e.cmd, list) else str(e.cmd)
         err(f"command failed: {cmd_str}")
@@ -2336,6 +2356,11 @@ def run() -> int:
     except _sdk_errors() as e:
         err(str(e))
         return 1
+    # A run that only warned (skipped files etc.) but hit no hard error exits 2
+    # (aws-style), after the manifest update has completed.
+    if rc == 0 and _warning_count > 0:
+        return 2
+    return rc
 
 
 if __name__ == "__main__":
