@@ -43,6 +43,35 @@ def test_push_skips_reupload_on_mtime_only_change(ws):
     assert "upload:" not in res.out  # nothing re-uploaded
 
 
+def test_single_file_push_reuploads_same_size_same_mtime_content_change(ws):
+    # Single-file entry: same length, mtime restored, only content differs. The
+    # old mtime gate would skip; needs_upload's ETag check re-uploads.
+    f = ws.write("solo.txt", "hello")
+    ws.config({"solo.txt": {"path": str(f)}})
+    ws.run("push", "solo.txt", expect_rc=0)
+    mtime = f.stat().st_mtime
+
+    f.write_text("world")
+    os.utime(f, (mtime, mtime))
+    res = ws.run("push", "solo.txt", expect_rc=0)
+    assert "upload:" in res.out
+
+    body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/solo.txt")["Body"].read()
+    assert body == b"world"
+
+
+def test_single_file_push_skips_reupload_on_mtime_only_change(ws):
+    # Single-file entry: identical content, far-future mtime. The old mtime gate
+    # would re-upload; the ETag check skips.
+    f = ws.write("solo.txt", "hello")
+    ws.config({"solo.txt": {"path": str(f)}})
+    ws.run("push", "solo.txt", expect_rc=0)
+
+    os.utime(f, (2_000_000_000, 2_000_000_000))
+    res = ws.run("push", "solo.txt", expect_rc=0)
+    assert "upload:" not in res.out
+
+
 def test_pull_skips_download_when_content_matches(ws):
     # The destination already holds the right bytes but the wrong mode. The mode
     # mismatch defeats the "manifest already matches" short-circuit, so pull

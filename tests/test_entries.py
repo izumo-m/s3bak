@@ -7,15 +7,12 @@ import os
 import pytest
 
 
-def test_single_file_entry_roundtrip_with_metadata(ws, s3):
+def test_single_file_entry_roundtrip(ws):
     f = ws.write("solo.txt", "content\n")
     ws.config({"solo.txt": {"path": str(f)}})
 
     ws.run("push", "solo.txt", expect_rc=0)
-
     assert "solo.txt" in ws.keys()
-    head = s3.head_object(Bucket=ws.bucket, Key=f"{ws.prefix}/solo.txt")
-    assert "local-mtime" in head["Metadata"]
 
     res = ws.run("status", "solo.txt", expect_rc=0)
     assert res.out.strip() == ""

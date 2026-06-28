@@ -31,7 +31,7 @@ try:
 except ModuleNotFoundError:
     pwd = None  # type: ignore[assignment]
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, NoReturn
 
 PROG = "s3bak"
@@ -549,7 +549,7 @@ class ObjectMeta:
 
     key: str
     size: int = 0
-    metadata: dict[str, str] = field(default_factory=dict)
+    etag: str | None = None  # dequoted S3 ETag
 
 
 @dataclass
@@ -714,8 +714,33 @@ class Boto3S3Store:
         return ObjectMeta(
             key=rel_key,
             size=int(data.get("ContentLength", 0)),
-            metadata=dict(data.get("Metadata") or {}),
+            etag=(data.get("ETag") or "").strip('"') or None,
         )
+
+    def needs_upload(self, rel_key: str, local_path: str, *, verbose: bool = False) -> bool:
+        """True when local_path should be (re)uploaded to rel_key.
+
+        The single-object counterpart of sync's content comparison: no stored
+        object (or no ETag) means upload; otherwise reuse EtagComparison so a
+        cp-style entry decides by content (ETag), exactly like a dir entry's
+        sync - an unchanged file is skipped, a same-size/same-mtime content
+        change is not. part_size comes from the same profile the upload uses.
+        """
+        head = self.head_object(rel_key, verbose=verbose)
+        if head is None or not head.etag:
+            return True
+        from boto3_s3 import LocalFileInfo, OpKind, S3FileInfo, SyncPair
+        from boto3_s3.etagcompare import EtagComparison
+
+        # to_native_path(key) == local_path on POSIX (identity) and on Windows
+        # (a native path carries no '/'), so the local side resolves to the file.
+        pair = SyncPair(
+            key=rel_key,
+            kind=OpKind.UPLOAD,
+            src=LocalFileInfo(key=local_path, size=os.path.getsize(local_path)),
+            dst=S3FileInfo(key=rel_key, size=head.size, etag=head.etag),
+        )
+        return EtagComparison(self._s3())(pair)
 
     def list_keys_under(self, rel_prefix: str, *, verbose: bool = False) -> set[str]:
         norm = rel_prefix if rel_prefix.endswith("/") else f"{rel_prefix}/"
@@ -803,20 +828,12 @@ class Boto3S3Store:
             write_stderr(f"+ (boto3-s3) cp - {self._s3_url(rel_key)}\n")
         self._s3().cp(IOStorage(io.BytesIO(text.encode("utf-8"))), self._s3_url(rel_key))
 
-    def put_object(
-        self,
-        rel_key: str,
-        src_path: str,
-        *,
-        verbose: bool = False,
-        metadata: dict[str, str] | None = None,
-    ) -> TransferResult:
+    def put_object(self, rel_key: str, src_path: str, *, verbose: bool = False) -> TransferResult:
         dst = self._s3_url(rel_key)
-        options: dict[str, Any] = {"metadata": metadata} if metadata else {}
         return self._transfer(
             verbose,
             f"cp {src_path} {dst}",
-            lambda cb: self._s3().cp(src_path, dst, on_result=cb, **options),
+            lambda cb: self._s3().cp(src_path, dst, on_result=cb),
         )
 
     def sync_up(
@@ -1524,18 +1541,11 @@ def _push_sub(
         if filtered:
             write_output(f"{filtered}\n")
     else:
-        # Regular file.
-        local_mtime = str(int(os.path.getmtime(local_sub)))
+        # Regular file: an explicit sub-path push always uploads.
         if opts.dryrun:
-            msg = f"(dryrun) upload: {local_sub} -> {s3_sub_path}"
-            print(msg)
+            print(f"(dryrun) upload: {local_sub} -> {s3_sub_path}")
         else:
-            result = cfg.store.put_object(
-                sub_rel,
-                local_sub,
-                verbose=opts.verbose,
-                metadata={"local-mtime": local_mtime},
-            )
+            result = cfg.store.put_object(sub_rel, local_sub, verbose=opts.verbose)
             if result.returncode != 0:
                 write_output(result.stdout)
                 if result.stderr:
@@ -1626,30 +1636,22 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 write_stderr(result.stderr)
             return result.returncode
         results = _filter_aws_output(result.stdout)
-    else:
-        local_mtime = str(int(os.path.getmtime(target)))
-        head = cfg.store.head_object(entry, verbose=opts.verbose)
-        s3_local_mtime = head.metadata.get("local-mtime", "") if head else ""
-
-        if local_mtime != s3_local_mtime:
-            if opts.dryrun:
-                # Set results only; the shared writer below emits it (and the
-                # truthy results drives the dryrun manifest line). Printing here
-                # too would double the line.
-                results = f"(dryrun) upload: {target} -> {cfg.prefix}/{entry}"
-            else:
-                result = cfg.store.put_object(
-                    entry,
-                    target,
-                    verbose=opts.verbose,
-                    metadata={"local-mtime": local_mtime},
-                )
-                if result.returncode != 0:
-                    write_output(result.stdout)
-                    if result.stderr:
-                        write_stderr(result.stderr)
-                    return result.returncode
-                results = _filter_aws_output(result.stdout)
+    elif cfg.store.needs_upload(entry, target, verbose=opts.verbose):
+        # Single-file entry, content differs from the stored object (or it is
+        # absent): upload it. Decided by ETag, like a dir entry's sync.
+        if opts.dryrun:
+            # Set results only; the shared writer below emits it (and the truthy
+            # results drives the dryrun manifest line). Printing here too would
+            # double the line.
+            results = f"(dryrun) upload: {target} -> {cfg.prefix}/{entry}"
+        else:
+            result = cfg.store.put_object(entry, target, verbose=opts.verbose)
+            if result.returncode != 0:
+                write_output(result.stdout)
+                if result.stderr:
+                    write_stderr(result.stderr)
+                return result.returncode
+            results = _filter_aws_output(result.stdout)
 
     if results:
         write_output(f"{results}\n")
