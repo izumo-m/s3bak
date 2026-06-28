@@ -703,11 +703,18 @@ class Boto3S3Store:
         verbose: bool = False,
     ) -> TransferResult:
         dst = f"{self._s3_url(rel_prefix)}/" if rel_prefix else f"{self.prefix}/"
-        filt = None
-        if excludes:
-            from boto3_s3 import GlobFilter
+        from boto3_s3 import GlobFilter
 
-            filt = GlobFilter().exclude(*excludes).compile()
+        glob = GlobFilter().exclude(*excludes).compile() if excludes else None
+
+        def filt(info: Any) -> bool:
+            # Drop names the manifest cannot represent (newline/CR); this skip is
+            # silent because the manifest pass (format_stat_line) warns. Then
+            # apply the configured excludes.
+            if _name_has_newline(info.compare_key or ""):
+                return False
+            return glob(info) if glob is not None else True
+
         return self._transfer(
             verbose,
             f"sync {src_dir} {dst}",
@@ -857,8 +864,20 @@ def iter_local_tree(outpath: str, excludes: list[str]) -> Iterator[tuple[str, bo
 # =============================================================================
 
 
-def format_stat_line(rel: str, st: os.stat_result, sym_target: str | None) -> str:
-    """Format like: stat -c '%a %U %G %s %y %N' with QUOTING_STYLE=shell-always."""
+def _name_has_newline(name: str) -> bool:
+    return "\n" in name or "\r" in name
+
+
+def format_stat_line(rel: str, st: os.stat_result, sym_target: str | None) -> str | None:
+    """Format like: stat -c '%a %U %G %s %y %N' with QUOTING_STYLE=shell-always.
+
+    Returns None (after a warning) when the name or symlink target contains a
+    newline/CR: the manifest is line-oriented and cannot represent it, so the
+    file is skipped instead of silently corrupting the manifest.
+    """
+    if _name_has_newline(rel) or (sym_target is not None and _name_has_newline(sym_target)):
+        _note_warning(f"warning: skipping {rel!r}: a newline in the filename is not supported")
+        return None
     mode = format(stat_mod.S_IMODE(st.st_mode), "o")
 
     if pwd is not None:
@@ -907,12 +926,16 @@ def write_manifest_to_aws(
     lines: list[str] = []
     if os.path.isdir(target):
         for rel, st, sym_target in iter_tree(target, excludes):
-            lines.append(format_stat_line(rel, st, sym_target))
+            line = format_stat_line(rel, st, sym_target)
+            if line is not None:
+                lines.append(line)
     else:
         basename = os.path.basename(target)
         st = os.lstat(target)
         sym = os.readlink(target) if stat_mod.S_ISLNK(st.st_mode) else None
-        lines.append(format_stat_line(basename, st, sym))
+        line = format_stat_line(basename, st, sym)
+        if line is not None:
+            lines.append(line)
 
     manifest_data = "\n".join(lines) + "\n" if lines else ""
     assert cfg.store is not None
@@ -941,11 +964,14 @@ def _manifest_line_key(line: str) -> str:
 def _iter_sub_tree_lines(local_sub: str, sub: str, excludes: list[str]) -> Iterator[str]:
     st = os.lstat(local_sub)
     if stat_mod.S_ISLNK(st.st_mode):
-        sym = os.readlink(local_sub)
-        yield format_stat_line(f"./{sub}", st, sym)
+        line = format_stat_line(f"./{sub}", st, os.readlink(local_sub))
+        if line is not None:
+            yield line
         return
     if not os.path.isdir(local_sub):
-        yield format_stat_line(f"./{sub}", st, None)
+        line = format_stat_line(f"./{sub}", st, None)
+        if line is not None:
+            yield line
         return
     for rel, st2, sym_target in iter_tree(local_sub, excludes):
         if rel == ".":
@@ -953,7 +979,9 @@ def _iter_sub_tree_lines(local_sub: str, sub: str, excludes: list[str]) -> Itera
         else:
             tail = rel[2:]
             disp = f"./{sub}/{tail}"
-        yield format_stat_line(disp, st2, sym_target)
+        line = format_stat_line(disp, st2, sym_target)
+        if line is not None:
+            yield line
 
 
 def patch_manifest_subtree(
@@ -1393,6 +1421,11 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         if not (stat_mod.S_ISREG(mode) or stat_mod.S_ISDIR(mode)):
             err(f"entry path must be a regular file or directory: {target}")
             return 1
+        if stat_mod.S_ISREG(mode) and _name_has_newline(os.path.basename(target)):
+            # A single-file entry whose name has a newline cannot go in the
+            # manifest; skip the whole entry (warn -> exit 2 via run()).
+            _note_warning(f"warning: skipping entry {entry!r}: a newline in the filename")
+            return 0
 
     excludes: list[str] = entry_cfg.get("excludes", [])
 
