@@ -36,7 +36,11 @@ git clone git@github.com:izumo-m/s3bak.git
 cd s3bak
 uv sync
 uv run s3bak help
+uv run pytest        # hermetic test suite (uses moto; no AWS/Docker needed)
 ```
+
+To poke at s3bak against a real S3-compatible endpoint, `scripts/` brings up a
+local MinIO stack: `scripts/compose-up.sh && source scripts/minio-env.sh`.
 
 ## Configuration
 

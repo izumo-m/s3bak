@@ -1,15 +1,16 @@
 """Test fixtures for the s3bak suite.
 
-The suite drives s3bak in-process (cli.main) against a real S3 endpoint. It is
-opt-in: set S3BAK_E2E_BUCKET (and the AWS_* / AWS_CONFIG_FILE pointing at the
-endpoint) - `source scripts/minio-env.sh` does this for the local MinIO stack.
-Each test gets a unique prefix in the bucket and a temp local tree, both torn
-down afterwards.
+The suite drives s3bak in-process (cli.main) against moto's in-memory S3 mock,
+so it is hermetic - no Docker, no network, no credentials. (The scripts/ MinIO
+stack remains for manual testing against a real endpoint.)
+
+Each test gets a fresh mock, a unique prefix in the test bucket, and a temp
+local tree; output is captured with capfd so subprocess output (the `diff`
+child) is seen alongside s3bak's own writes.
 """
 
 from __future__ import annotations
 
-import os
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,17 +18,13 @@ from typing import Any
 
 import boto3
 import pytest
+from moto import mock_aws
 
 from s3bak import cli
 
-PROFILE = os.environ.get("S3BAK_E2E_PROFILE", "s3bak-minio")
-
-
-def _e2e_bucket() -> str:
-    bucket = os.environ.get("S3BAK_E2E_BUCKET")
-    if not bucket:
-        pytest.skip("S3BAK_E2E_BUCKET not set (run: source scripts/minio-env.sh)")
-    return bucket
+PROFILE = "s3bak-test"
+BUCKET = "s3bak-test-bucket"
+REGION = "us-east-1"
 
 
 @dataclass
@@ -37,10 +34,29 @@ class Result:
     err: str
 
 
-@pytest.fixture(scope="session")
-def s3() -> Any:
-    _e2e_bucket()  # skip the whole suite if the endpoint is not configured
-    return boto3.Session(profile_name=PROFILE).client("s3")
+@pytest.fixture
+def s3(monkeypatch: Any, tmp_path: Path) -> Any:
+    # An isolated AWS config carrying the named profile with dummy credentials,
+    # so the store's `boto3.Session(profile_name=...)` resolves under moto
+    # without reading the developer's ~/.aws or a sourced MinIO env. A named
+    # profile does NOT fall back to AWS_* env credentials, so they live in the
+    # profile here. Everything below runs inside the mock.
+    monkeypatch.setenv("AWS_DEFAULT_REGION", REGION)
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+    monkeypatch.delenv("AWS_ENDPOINT_URL_S3", raising=False)
+    awscfg = tmp_path / "awsconfig"
+    awscfg.write_text(
+        f"[profile {PROFILE}]\n"
+        f"region = {REGION}\n"
+        f"aws_access_key_id = testing\n"
+        f"aws_secret_access_key = testing\n"
+    )
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(awscfg))
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(tmp_path / "awscreds"))
+    with mock_aws():
+        client = boto3.Session(profile_name=PROFILE).client("s3")
+        client.create_bucket(Bucket=BUCKET)
+        yield client
 
 
 class Workspace:
@@ -71,9 +87,9 @@ class Workspace:
         self._monkeypatch.setenv("S3BAK_CONFIG", str(self._config))
 
     def run(self, *args: str, expect_rc: int | None = None) -> Result:
-        # capfd captures at the fd level, so subprocess output (the `show` /
-        # `diff` children) is captured alongside s3bak's own writes. Drain first
-        # so each call sees only its own output.
+        # capfd captures at the fd level, so subprocess output (the `diff` child)
+        # is captured alongside s3bak's own writes. Drain first so each call sees
+        # only its own output.
         self._capfd.readouterr()
         try:
             code = cli.main(list(args)) or 0
@@ -99,18 +115,8 @@ class Workspace:
 
 @pytest.fixture
 def ws(tmp_path: Path, monkeypatch: Any, s3: Any, capfd: Any) -> Any:
-    bucket = _e2e_bucket()
     prefix = f"test/{uuid.uuid4().hex[:12]}"
     root = tmp_path / "work"
     root.mkdir()
-    yield Workspace(root, bucket, prefix, s3, monkeypatch, capfd)
-
-    # Teardown: delete every object under the prefix.
-    paginator = s3.get_paginator("list_objects_v2")
-    objs = [
-        {"Key": o["Key"]}
-        for page in paginator.paginate(Bucket=bucket, Prefix=f"{prefix}/")
-        for o in page.get("Contents", [])
-    ]
-    for i in range(0, len(objs), 1000):
-        s3.delete_objects(Bucket=bucket, Delete={"Objects": objs[i : i + 1000]})
+    # No teardown: moto discards all state when the s3 fixture's mock exits.
+    return Workspace(root, BUCKET, prefix, s3, monkeypatch, capfd)
