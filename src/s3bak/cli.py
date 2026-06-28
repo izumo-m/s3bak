@@ -950,6 +950,7 @@ def write_manifest_to_aws(
 
 
 def upload_manifest(cfg: Config, entry: str, target: str, excludes: list[str], opts: Opts) -> int:
+    """Write the manifest to S3, then run the entry's post_hook."""
     post_hook: str | None = cfg.entries[entry].get("post_hook")
 
     if opts.dryrun:
@@ -1451,6 +1452,14 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
 
     excludes: list[str] = entry_cfg.get("excludes", [])
 
+    # Hook contract: pre_hook runs before every push attempt. post_hook is
+    # deliberately asymmetric - it runs only after a push that did work, i.e.
+    # that transferred data and/or refreshed the manifest (see upload_manifest,
+    # the data-only branch below, and _push_sub), or whenever --meta-only is
+    # given (which always refreshes the manifest and runs the hook). A pure
+    # no-op push runs no post_hook on purpose, so side-effecting hooks (e.g.
+    # rclone) do not fire when nothing changed; use --meta-only to run the hook
+    # on demand. By design, not a bug.
     pre_hook: str | None = entry_cfg.get("pre_hook")
     if pre_hook:
         if opts.dryrun:
@@ -1470,6 +1479,8 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         err(f"skipping manifest for {entry} (.git suffix convention)")
         return 0
 
+    # --meta-only refreshes the manifest and runs the post_hook even with no data
+    # change: the supported way to re-run the post_hook on demand (intended).
     if opts.meta_only:
         return upload_manifest(cfg, entry, target, excludes, opts)
 
