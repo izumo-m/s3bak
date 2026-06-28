@@ -1443,18 +1443,6 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
     return 0
 
 
-def _sub_remote_kind(cfg: Config, entry: str, sub: str, verbose: bool = False) -> str:
-    """Return "file", "dir", or "missing" for <entry>/<sub> on S3."""
-    assert cfg.store is not None
-    if cfg.store.head_object(f"{entry}/{sub}", verbose=verbose) is not None:
-        return "file"
-    prefix = sub + "/"
-    for k in cfg.store.list_keys_under(entry, verbose=verbose):
-        if k.startswith(prefix):
-            return "dir"
-    return "missing"
-
-
 def _entry_kind_from_manifest(manifest_path: str) -> str:
     """Return 'dir' or 'file' from manifest content.
 
@@ -1540,6 +1528,12 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 err(f"not found on S3: {entry}/{sub}")
                 return 1
             is_dir = kind == "dir"
+            if kind == "file":
+                # "file" is ambiguous - the manifest drops type bits, so a real
+                # file and an empty directory look the same. An empty dir has no
+                # S3 object, so a missing head-object means it is a directory.
+                assert cfg.store is not None
+                is_dir = cfg.store.head_object(f"{entry}/{sub}", verbose=opts.verbose) is None
         else:
             is_dir = entry_is_dir
 

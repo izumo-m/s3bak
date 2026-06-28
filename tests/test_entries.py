@@ -77,6 +77,19 @@ def test_symlink_restore_replaces_existing_dir(ws):
     assert os.readlink(dest / "link.txt") == "real.txt"
 
 
+def test_empty_directory_subpath_pull_restores_a_directory(ws):
+    ws.write("data/file.txt", "x")
+    (ws.root / "data" / "empty").mkdir()
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    # The empty dir is in the manifest but has no S3 object; pulling it as a
+    # sub-path must restore a directory, not fail as a missing single file.
+    dest = ws.root / "out"
+    ws.run("pull", str(ws.root / "data" / "empty"), "-o", str(dest), expect_rc=0)
+    assert dest.is_dir()
+
+
 def test_list_shows_configured_entries(ws):
     ws.write("data/a.txt", "x")
     ws.config({"data": {"path": str(ws.root / "data")}})
