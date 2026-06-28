@@ -878,6 +878,13 @@ def format_stat_line(rel: str, st: os.stat_result, sym_target: str | None) -> st
     if _name_has_newline(rel) or (sym_target is not None and _name_has_newline(sym_target)):
         _note_warning(f"warning: skipping {rel!r}: a newline in the filename is not supported")
         return None
+    # Permission bits only (S_IMODE); the file-type bits are dropped to keep the
+    # historical `stat -c %a`-style manifest format. KNOWN LIMITATION, deferred
+    # (out of current scope): without the type, an empty directory and a regular
+    # file that has no S3 object are indistinguishable on restore (see the kind
+    # inference in apply_manifest). A future change will record the file type
+    # here (e.g. the full st_mode) so the restore kind no longer depends on S3
+    # object presence. Tracked as a task.
     mode = format(stat_mod.S_IMODE(st.st_mode), "o")
 
     if pwd is not None:
@@ -1163,6 +1170,19 @@ def apply_manifest(
             write_output(f"{target} -> {m_entry.sym_target}\n")
             continue
 
+        # File-vs-dir classification. Symlinks are handled above (sym_target).
+        # For the rest the type is inferred from whether an S3 object exists,
+        # because the manifest mode field stores permission bits only and drops
+        # the file-type bits (see format_stat_line): an empty directory and a
+        # regular file with no object are indistinguishable here. Consequence: a
+        # regular file recorded but never uploaded (e.g. unreadable, skipped with
+        # a warning) is restored as a directory.
+        #
+        # KNOWN LIMITATION, deferred (out of current scope, tracked as a task):
+        # record the file type in the manifest so the kind no longer depends on
+        # object presence. Until then only un-uploaded regular files are
+        # affected; symlinks (incl. pid-style links) and uploaded files restore
+        # correctly.
         if not is_dir:
             kind = "file"
         elif rel == ".":
