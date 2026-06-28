@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 
 def test_single_file_entry_roundtrip_with_metadata(ws, s3):
     f = ws.write("solo.txt", "content\n")
@@ -31,6 +33,48 @@ def test_excludes_skip_matching_files(ws):
     keys = ws.keys()
     assert "data/keep.txt" in keys
     assert "data/skip.log" not in keys
+
+
+def test_symlinks_are_recorded_in_manifest_not_uploaded_as_data(ws):
+    ws.write("data/real.txt", "real")
+    ws.write("data/sub/x.txt", "insub")
+    os.symlink("real.txt", ws.root / "data" / "link.txt")
+    os.symlink("sub", ws.root / "data" / "linkdir")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+
+    ws.run("push", "data", expect_rc=0)
+
+    # symlinks must not be followed into data objects
+    keys = ws.keys()
+    assert "data/real.txt" in keys
+    assert "data/sub/x.txt" in keys
+    assert "data/link.txt" not in keys
+    assert not any(k.startswith("data/linkdir/") for k in keys)
+
+    # pull recreates them as symlinks from the manifest
+    dest = ws.root / "restore"
+    ws.run("pull", "data", "-o", str(dest), expect_rc=0)
+    assert os.path.islink(dest / "link.txt")
+    assert os.readlink(dest / "link.txt") == "real.txt"
+    assert os.path.islink(dest / "linkdir")
+    assert os.readlink(dest / "linkdir") == "sub"
+    assert (dest / "real.txt").read_text() == "real"
+
+
+def test_symlink_restore_replaces_existing_dir(ws):
+    # Simulate an older follow-symlinks backup: the symlink path already holds a
+    # real directory locally; restore must replace it with the symlink cleanly.
+    ws.write("data/real.txt", "real")
+    os.symlink("real.txt", ws.root / "data" / "link.txt")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    dest = ws.root / "restore"
+    (dest / "link.txt").mkdir(parents=True)
+    (dest / "link.txt" / "stale.txt").write_text("stale")
+    ws.run("pull", "data", "-o", str(dest), expect_rc=0)
+    assert os.path.islink(dest / "link.txt")
+    assert os.readlink(dest / "link.txt") == "real.txt"
 
 
 def test_list_shows_configured_entries(ws):

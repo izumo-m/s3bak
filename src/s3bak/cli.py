@@ -682,8 +682,16 @@ class Boto3S3Store:
         return self._transfer(
             verbose,
             f"sync {src_dir} {dst}",
+            # follow_symlinks=False: symlinks are not uploaded as data; the
+            # manifest records them and apply_manifest recreates them on restore.
             lambda cb: self._s3().sync(
-                src_dir, dst, delete=delete, dryrun=dryrun, filter=filt, on_result=cb
+                src_dir,
+                dst,
+                delete=delete,
+                dryrun=dryrun,
+                filter=filt,
+                follow_symlinks=False,
+                on_result=cb,
             ),
         )
 
@@ -1089,11 +1097,16 @@ def apply_manifest(
         mode = m_entry.mode_int
 
         if m_entry.sym_target is not None:
-            os.makedirs(os.path.dirname(target), exist_ok=True)
-            try:
+            parent = os.path.dirname(target)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            # Clear whatever is already there. islink first, so a symlink is
+            # removed as a link (never recursing into its target); a real dir
+            # (e.g. left by an older follow-symlinks backup) is removed wholesale.
+            if os.path.islink(target) or os.path.isfile(target):
                 os.remove(target)
-            except FileNotFoundError:
-                pass
+            elif os.path.isdir(target):
+                shutil.rmtree(target)
             os.symlink(m_entry.sym_target, target)
             write_output(f"{target} -> {m_entry.sym_target}\n")
             continue
