@@ -37,6 +37,35 @@ def test_excludes_skip_matching_files(ws):
     assert "data/skip.log" not in keys
 
 
+def test_push_file_subpath_uploads_and_keeps_status_clean(ws):
+    ws.write("data/a.txt", "a")
+    ws.write("data/sub/b.txt", "b")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "sub" / "b.txt").write_text("b-updated")
+    ws.run("push", str(ws.root / "data" / "sub" / "b.txt"), expect_rc=0)
+
+    body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/sub/b.txt")["Body"].read()
+    assert body == b"b-updated"
+    res = ws.run("status", "data", expect_rc=0)
+    assert res.out.strip() == ""  # the manifest subtree was patched too
+
+
+def test_push_dir_subpath_uploads_new_file(ws):
+    ws.write("data/keep.txt", "k")
+    ws.write("data/sub/x.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "sub" / "y.txt").write_text("y")
+    ws.run("push", str(ws.root / "data" / "sub"), expect_rc=0)
+
+    assert "data/sub/y.txt" in ws.keys()
+    res = ws.run("status", "data", expect_rc=0)
+    assert res.out.strip() == ""
+
+
 def test_symlinks_are_recorded_in_manifest_not_uploaded_as_data(ws):
     ws.write("data/real.txt", "real")
     ws.write("data/sub/x.txt", "insub")

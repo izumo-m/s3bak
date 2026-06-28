@@ -29,6 +29,37 @@ def test_ls_remote_lists_entry(ws):
     assert "data" in res.out.split()
 
 
+def test_ls_remote_entry_lists_manifest_files(ws):
+    ws.write("data/a.txt", "x")
+    ws.write("data/sub/b.txt", "y")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    res = ws.run("ls-remote", "data", expect_rc=0)
+    assert "a.txt" in res.out
+    assert "b.txt" in res.out
+
+
+def test_ls_remote_subpath_lists_files(ws):
+    ws.write("data/sub/b.txt", "y")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    res = ws.run("ls-remote", str(ws.root / "data" / "sub"), expect_rc=0)
+    assert "b.txt" in res.out
+
+
+def test_pull_is_noop_when_local_already_matches(ws):
+    ws.write("data/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    # Pulling back onto the matching tree hits the early "nothing to do" path.
+    res = ws.run("pull", "data", expect_rc=0)
+    assert res.out.strip() == ""
+    assert (ws.root / "data" / "a.txt").read_text() == "a"
+
+
 def test_pull_unpushed_entry_reports_not_found(ws):
     # download_manifest -> get_object hits NotFoundError for a never-pushed
     # entry, which must still map to a clean "not found" (not a crash).
