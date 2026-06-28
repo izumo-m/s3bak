@@ -1718,6 +1718,9 @@ def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
     try:
         if not download_manifest(cfg, entry, manifest_path, opts.verbose):
             return 1
+        if sub is not None and _sub_kind_from_manifest(manifest_path, sub) == "missing":
+            err(f"not found on S3: {entry}/{sub}")
+            return 1
 
         is_dir = os.path.isdir(outpath)
         excludes: list[str] = entry_cfg.get("excludes", [])
@@ -1919,6 +1922,9 @@ def cmd_ls_remote(cfg: Config, opts: Opts, entry: str | None = None, sub: str | 
     os.close(fd)
     try:
         if not download_manifest(cfg, entry, manifest_path, opts.verbose):
+            return 1
+        if sub is not None and _sub_kind_from_manifest(manifest_path, sub) == "missing":
+            err(f"not found on S3: {entry}/{sub}")
             return 1
         show_entry_files(manifest_path, sub=sub)
         return 0

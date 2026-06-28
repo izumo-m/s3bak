@@ -21,6 +21,16 @@ def test_status_clean_then_reports_changes(ws):
     assert any(line.startswith("A") and "c.txt" in line for line in lines)
 
 
+def test_status_missing_subpath_errors(ws):
+    ws.write("data/a.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    res = ws.run("status", str(ws.root / "data" / "nope"))
+    assert res.rc != 0
+    assert "not found" in (res.err + res.out).lower()
+
+
 def test_diff_shows_content_changes(ws):
     ws.write("data/a.txt", "one\n")
     ws.config({"data": {"path": str(ws.root / "data")}})

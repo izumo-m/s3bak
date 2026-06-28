@@ -29,6 +29,16 @@ def test_ls_remote_lists_entry(ws):
     assert "data" in res.out.split()
 
 
+def test_ls_remote_missing_subpath_errors(ws):
+    ws.write("data/a.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    res = ws.run("ls-remote", str(ws.root / "data" / "nope"))
+    assert res.rc != 0
+    assert "not found" in (res.err + res.out).lower()
+
+
 def test_pull_restores_content(ws):
     ws.write("data/a.txt", "alpha")
     ws.write("data/sub/b.txt", "beta")
