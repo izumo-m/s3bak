@@ -2117,8 +2117,8 @@ def resolve_entry_files(
     return [_resolve_one_arg(cfg, arg) for arg in positional]
 
 
-def main() -> int:
-    args = sys.argv[1:]
+def main(argv: list[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else argv
     if not args:
         print_usage()
 

@@ -43,6 +43,7 @@ dev = [
     "basedpyright>=1.13",
     "ruff>=0.6",
     "vermin>=1.6",
+    "pytest>=8.0",
 ]
 
 [tool.ruff]
@@ -63,4 +64,8 @@ select = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["s3bak"]
+known-first-party = ["s3bak", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
