@@ -11,7 +11,7 @@ import os
 
 HOME = os.environ.get("HOME", "")
 
-# AWS CLI profile used for every `aws` invocation (required).
+# AWS profile used for S3 access (required); read by boto3 / boto3-s3.
 profile = "default"
 
 # Destination root on S3 (required). Must start with "s3://".
@@ -21,7 +21,7 @@ prefix = "s3://my-bucket/backup"
 #
 # Per-entry keys:
 #   path       (required) local path to back up (build from HOME or absolute)
-#   excludes   (optional) patterns passed to `aws s3 sync --exclude`
+#   excludes   (optional) glob patterns excluded from the sync (aws s3-style)
 #   pre_hook   (optional) shell command run before the entry is pushed
 #   post_hook  (optional) shell command run after the entry is pushed/pulled
 entries = {

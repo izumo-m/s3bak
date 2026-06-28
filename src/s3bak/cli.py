@@ -11,7 +11,6 @@ from __future__ import annotations
 import calendar
 import concurrent.futures
 import datetime
-import json
 import os
 import re
 import shlex
@@ -44,6 +43,11 @@ IS_WINDOWS = sys.platform == "win32"
 
 _output_lock = threading.Lock()
 
+# Transfer warnings (WARNED outcomes) are printed as they occur and counted;
+# run() turns a warning-only run into exit code 2.
+_warning_lock = threading.Lock()
+_warning_count = 0
+
 
 def err(msg: str) -> None:
     sys.stderr.write(f"{PROG}: {msg}\n")
@@ -65,6 +69,14 @@ def write_stderr(text: str) -> None:
     with _output_lock:
         sys.stderr.write(text)
         sys.stderr.flush()
+
+
+def _note_warning(msg: str) -> None:
+    """Print a transfer warning and count it; run() maps any warning to exit 2."""
+    global _warning_count
+    write_stderr(f"{msg}\n")
+    with _warning_lock:
+        _warning_count += 1
 
 
 def echo_command(verbose: bool, args: list[str]) -> None:
@@ -104,11 +116,20 @@ def shell_unquote(s: str) -> str:
 
 
 def parse_fname(fname_field: str) -> tuple[str, str | None]:
-    m = re.match(r"^(.+?)' -> '(.+)$", fname_field)
-    if m:
-        link_part = m.group(1) + "'"
-        target_part = "'" + m.group(2)
-        return shell_unquote(link_part), shell_unquote(target_part)
+    """Split a manifest name field into (name, symlink_target | None).
+
+    Names are shell-always quoted (see shell_always_quote); a symlink is written
+    as 'link' -> 'target'. shlex parses the quoting, so a name that itself
+    contains the literal ' -> ' sequence is not mistaken for the separator.
+    """
+    try:
+        tokens = shlex.split(fname_field)
+    except ValueError:
+        return shell_unquote(fname_field), None
+    if len(tokens) == 3 and tokens[1] == "->":
+        return tokens[0], tokens[2]
+    if len(tokens) == 1:
+        return tokens[0], None
     return shell_unquote(fname_field), None
 
 
@@ -371,7 +392,7 @@ class Config:
     bucket: str
     path_prefix: str
     entries: dict[str, dict[str, Any]]
-    store: AwsCliStore | None = None
+    store: Boto3S3Store | None = None
 
 
 @dataclass
@@ -427,8 +448,6 @@ def load_config() -> Config:
         err("warning: entry name 'all' conflicts with --all flag; consider renaming")
     if not prefix.startswith("s3://"):
         die(f"prefix must start with s3:// (got '{prefix}')")
-    if not shutil.which("aws"):
-        die("aws command not found")
 
     rest = prefix[5:]
     bucket = rest.split("/", 1)[0]
@@ -444,7 +463,7 @@ def load_config() -> Config:
         path_prefix=path_prefix,
         entries=entries,
     )
-    cfg.store = AwsCliStore(profile, prefix, bucket, path_prefix)
+    cfg.store = Boto3S3Store(profile, prefix, bucket, path_prefix)
     return cfg
 
 
@@ -464,19 +483,24 @@ class ObjectMeta:
 
 @dataclass
 class TransferResult:
-    """Result of a sync/copy operation that may print AWS CLI output."""
+    """Result of a sync/copy operation that may print CLI output."""
 
     returncode: int
     stdout: str = ""
     stderr: str = ""
 
 
-class AwsCliStore:
-    """Object storage backend that shells out to the `aws` CLI.
+class Boto3S3Store:
+    """Object storage backend for s3bak, built on the boto3-s3 library.
+
+    Transfers (cp / sync) and listing go through the boto3-s3 ``S3`` API
+    in-process; head-object / list-objects-v2 use the underlying boto3 client.
+    Endpoint and credentials come from the AWS environment/profile, so the
+    MinIO dev profile and real AWS both work without special-casing.
 
     `rel_key` is a path relative to the configured prefix (e.g. "bin",
     "bin/foo.txt", "bin-ls-l.txt"). The store internally prepends
-    `path_prefix` for s3api calls and `prefix` (the s3:// URL) for `s3 cp`.
+    `path_prefix` for boto3 calls and `prefix` (the s3:// URL) for cp / sync.
     """
 
     def __init__(self, profile: str, prefix: str, bucket: str, path_prefix: str):
@@ -484,10 +508,23 @@ class AwsCliStore:
         self.prefix = prefix  # full s3:// URL
         self.bucket = bucket
         self.path_prefix = path_prefix
+        self._s3_cache: Any = None
+        self._client_cache: Any = None
 
     # --- internal ----------------------------------------------------------
-    def _build_cmd(self, *args: str) -> list[str]:
-        return ["aws", "--profile", self.profile, *args]
+    def _s3(self) -> Any:
+        """Lazily build the boto3-s3 S3 orchestrator for the configured profile."""
+        if self._s3_cache is None:
+            import boto3
+            from boto3_s3 import S3
+
+            self._s3_cache = S3(session=boto3.Session(profile_name=self.profile))
+        return self._s3_cache
+
+    def _client(self) -> Any:
+        if self._client_cache is None:
+            self._client_cache = self._s3().client()
+        return self._client_cache
 
     def _api_key(self, rel_key: str) -> str:
         return f"{self.path_prefix}/{rel_key}" if self.path_prefix else rel_key
@@ -495,55 +532,64 @@ class AwsCliStore:
     def _s3_url(self, rel_key: str = "") -> str:
         return f"{self.prefix}/{rel_key}" if rel_key else self.prefix
 
-    def _run(
-        self,
-        *args: str,
-        verbose: bool = False,
-        check: bool = True,
-        capture: bool = True,
-        input_data: str | None = None,
-        cwd: str | None = None,
-        merge_stderr: bool = False,
-    ) -> subprocess.CompletedProcess[str]:
-        cmd = self._build_cmd(*args)
-        echo_command(verbose, cmd)
-        kw: dict[str, Any] = {"text": True}
-        if capture:
-            kw["stdout"] = subprocess.PIPE
-            kw["stderr"] = subprocess.STDOUT if merge_stderr else subprocess.PIPE
-        if input_data is not None:
-            kw["input"] = input_data
-        if cwd is not None:
-            kw["cwd"] = cwd
-        result = subprocess.run(cmd, **kw)
-        if check and result.returncode != 0:
-            if capture and result.stderr:
-                write_stderr(result.stderr)
-            raise subprocess.CalledProcessError(
-                result.returncode, cmd, result.stdout, result.stderr
-            )
-        return result
+    def _transfer(self, verbose: bool, label: str, op: Callable[[Any], None]) -> TransferResult:
+        """Run a boto3-s3 transfer op, collecting aws-style result lines.
+
+        `op(on_result)` calls the S3 method with the given result callback;
+        SUCCEEDED/DRYRUN items become 'upload:'/'download:'/'delete:' stdout
+        lines, failures become stderr lines, and any boto3-s3 error sets
+        returncode 1. on_result runs on s3transfer worker threads, so a lock
+        guards the result lists.
+        """
+        from boto3_s3 import Boto3S3Error, OpKind, OpOutcome
+
+        if verbose:
+            write_stderr(f"+ (boto3-s3) {label}\n")
+        lines: list[str] = []
+        errs: list[str] = []
+        lock = threading.Lock()
+
+        def on_result(r: Any) -> None:
+            if r.outcome in (OpOutcome.SUCCEEDED, OpOutcome.DRYRUN):
+                pre = "(dryrun) " if r.outcome is OpOutcome.DRYRUN else ""
+                if r.kind is OpKind.DELETE:
+                    line = f"{pre}delete: {r.key}"
+                elif r.src is not None and r.dest is not None:
+                    line = f"{pre}{r.kind.value}: {r.src} to {r.dest}"
+                else:
+                    return
+                with lock:
+                    lines.append(line)
+            elif r.outcome is OpOutcome.FAILED:
+                with lock:
+                    errs.append(f"{r.key}: {r.error}")
+            elif r.outcome is OpOutcome.WARNED:
+                _note_warning(f"warning: {r.error}" if r.error else f"warning: skipped {r.key}")
+            elif r.outcome is OpOutcome.NOTICE:
+                if r.error:
+                    write_stderr(f"{r.error}\n")
+
+        try:
+            op(on_result)
+            rc = 0
+        except Boto3S3Error as e:
+            rc = 1
+            errs.append(str(e))
+        return TransferResult(returncode=rc, stdout="\n".join(lines), stderr="\n".join(errs))
 
     # --- Public API --------------------------------------------------------
     def head_object(self, rel_key: str, *, verbose: bool = False) -> ObjectMeta | None:
-        result = self._run(
-            "s3api",
-            "head-object",
-            "--bucket",
-            self.bucket,
-            "--key",
-            self._api_key(rel_key),
-            "--output",
-            "json",
-            verbose=verbose,
-            check=False,
-        )
-        if result.returncode != 0:
-            return None
+        from botocore.exceptions import ClientError
+
+        key = self._api_key(rel_key)
+        if verbose:
+            write_stderr(f"+ (boto3) head_object s3://{self.bucket}/{key}\n")
         try:
-            data = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            return ObjectMeta(key=rel_key)
+            data = self._client().head_object(Bucket=self.bucket, Key=key)
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code", "") in ("404", "NoSuchKey", "NotFound"):
+                return None
+            raise
         return ObjectMeta(
             key=rel_key,
             size=int(data.get("ContentLength", 0)),
@@ -553,35 +599,27 @@ class AwsCliStore:
     def list_keys_under(self, rel_prefix: str, *, verbose: bool = False) -> set[str]:
         norm = rel_prefix if rel_prefix.endswith("/") else f"{rel_prefix}/"
         prefix = self._api_key(norm)
-        try:
-            result = self._run(
-                "s3api",
-                "list-objects-v2",
-                "--bucket",
-                self.bucket,
-                "--prefix",
-                prefix,
-                "--output",
-                "text",
-                "--query",
-                "Contents[].Key",
-                verbose=verbose,
-            )
-        except subprocess.CalledProcessError:
-            return set()
+        if verbose:
+            write_stderr(f"+ (boto3) list_objects_v2 s3://{self.bucket}/{prefix}\n")
         keys: set[str] = set()
-        for line in result.stdout.splitlines():
-            for k in line.split("\t"):
-                k = k.strip()
-                if k and k != "None":
-                    rel = k[len(prefix) :]
-                    if rel:
-                        keys.add(rel)
+        paginator = self._client().get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                rel = obj["Key"][len(prefix) :]
+                if rel:
+                    keys.add(rel)
         return keys
 
     def list_top_level_lines(self, *, verbose: bool = False) -> list[str]:
-        result = self._run("s3", "ls", f"{self.prefix}/", verbose=verbose)
-        return result.stdout.splitlines()
+        from boto3_s3 import FileKind
+
+        if verbose:
+            write_stderr(f"+ (boto3-s3) ls {self.prefix}/\n")
+        names: list[str] = []
+        for info in self._s3().ls(f"{self.prefix}/", recursive=False):
+            if info.kind is FileKind.FILE:
+                names.append(info.key.rsplit("/", 1)[-1])
+        return names
 
     def get_object(
         self,
@@ -591,30 +629,29 @@ class AwsCliStore:
         verbose: bool = False,
         check: bool = True,
     ) -> bool:
+        from boto3_s3 import NotFoundError
+
+        if verbose:
+            write_stderr(f"+ (boto3-s3) cp {self._s3_url(rel_key)} {dest_path}\n")
         try:
-            self._run(
-                "s3",
-                "cp",
-                self._s3_url(rel_key),
-                dest_path,
-                verbose=verbose,
-                check=check,
-            )
+            self._s3().cp(self._s3_url(rel_key), dest_path)
             return True
-        except subprocess.CalledProcessError:
+        except NotFoundError:
+            # A genuinely-absent object is "not present"; other errors
+            # (access denied, transport, config) propagate to run().
             return False
 
     def stream_object_to_stdout(self, rel_key: str, *, verbose: bool = False) -> int:
-        cmd = self._build_cmd("s3", "cp", self._s3_url(rel_key), "-")
-        echo_command(verbose, cmd)
-        result = subprocess.run(
-            cmd,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        if result.returncode != 0 and result.stderr:
-            write_stderr(result.stderr)
-        return result.returncode
+        from boto3_s3 import Boto3S3Error, StdioStorage
+
+        if verbose:
+            write_stderr(f"+ (boto3-s3) cp {self._s3_url(rel_key)} -\n")
+        try:
+            self._s3().cp(self._s3_url(rel_key), StdioStorage())
+            return 0
+        except Boto3S3Error as e:
+            write_stderr(f"{e}\n")
+            return 1
 
     def sync_down(
         self,
@@ -623,29 +660,21 @@ class AwsCliStore:
         *,
         verbose: bool = False,
     ) -> TransferResult:
-        result = self._run(
-            "s3",
-            "sync",
-            f"{self._s3_url(rel_prefix)}/" if rel_prefix else f"{self.prefix}/",
-            f"{dest_dir}/",
-            verbose=verbose,
-            check=False,
-        )
-        return TransferResult(
-            returncode=result.returncode,
-            stdout=result.stdout,
-            stderr=result.stderr,
+        src = f"{self._s3_url(rel_prefix)}/" if rel_prefix else f"{self.prefix}/"
+        return self._transfer(
+            verbose,
+            f"sync {src} {dest_dir}/",
+            lambda cb: self._s3().sync(src, f"{dest_dir}/", follow_symlinks=False, on_result=cb),
         )
 
     def put_text(self, rel_key: str, text: str, *, verbose: bool = False) -> None:
-        self._run(
-            "s3",
-            "cp",
-            "-",
-            self._s3_url(rel_key),
-            verbose=verbose,
-            input_data=text,
-        )
+        import io
+
+        from boto3_s3 import IOStorage
+
+        if verbose:
+            write_stderr(f"+ (boto3-s3) cp - {self._s3_url(rel_key)}\n")
+        self._s3().cp(IOStorage(io.BytesIO(text.encode("utf-8"))), self._s3_url(rel_key))
 
     def put_object(
         self,
@@ -655,17 +684,13 @@ class AwsCliStore:
         verbose: bool = False,
         metadata: dict[str, str] | None = None,
     ) -> TransferResult:
-        args = ["s3", "cp", src_path, self._s3_url(rel_key)]
-        if metadata:
-            meta_str = ",".join(f"{k}={v}" for k, v in metadata.items())
-            args.extend(["--metadata", meta_str])
-        result = self._run(
-            *args,
-            verbose=verbose,
-            check=False,
-            merge_stderr=True,
+        dst = self._s3_url(rel_key)
+        options: dict[str, Any] = {"metadata": metadata} if metadata else {}
+        return self._transfer(
+            verbose,
+            f"cp {src_path} {dst}",
+            lambda cb: self._s3().cp(src_path, dst, on_result=cb, **options),
         )
-        return TransferResult(returncode=result.returncode, stdout=result.stdout)
 
     def sync_up(
         self,
@@ -677,22 +702,34 @@ class AwsCliStore:
         dryrun: bool = False,
         verbose: bool = False,
     ) -> TransferResult:
-        args = ["s3", "sync"]
-        if delete:
-            args.append("--delete")
-        if dryrun:
-            args.append("--dryrun")
-        args.extend(["./", f"{self._s3_url(rel_prefix)}/" if rel_prefix else f"{self.prefix}/"])
-        for p in excludes:
-            args.extend(["--exclude", p])
-        result = self._run(
-            *args,
-            verbose=verbose,
-            check=False,
-            cwd=src_dir,
-            merge_stderr=True,
+        dst = f"{self._s3_url(rel_prefix)}/" if rel_prefix else f"{self.prefix}/"
+        from boto3_s3 import GlobFilter
+
+        glob = GlobFilter().exclude(*excludes).compile() if excludes else None
+
+        def filt(info: Any) -> bool:
+            # Drop names the manifest cannot represent (newline/CR); this skip is
+            # silent because the manifest pass (format_stat_line) warns. Then
+            # apply the configured excludes.
+            if _name_has_newline(info.compare_key or ""):
+                return False
+            return glob(info) if glob is not None else True
+
+        return self._transfer(
+            verbose,
+            f"sync {src_dir} {dst}",
+            # follow_symlinks=False: symlinks are not uploaded as data; the
+            # manifest records them and apply_manifest recreates them on restore.
+            lambda cb: self._s3().sync(
+                src_dir,
+                dst,
+                delete=delete,
+                dryrun=dryrun,
+                filter=filt,
+                follow_symlinks=False,
+                on_result=cb,
+            ),
         )
-        return TransferResult(returncode=result.returncode, stdout=result.stdout)
 
 
 # =============================================================================
@@ -827,8 +864,27 @@ def iter_local_tree(outpath: str, excludes: list[str]) -> Iterator[tuple[str, bo
 # =============================================================================
 
 
-def format_stat_line(rel: str, st: os.stat_result, sym_target: str | None) -> str:
-    """Format like: stat -c '%a %U %G %s %y %N' with QUOTING_STYLE=shell-always."""
+def _name_has_newline(name: str) -> bool:
+    return "\n" in name or "\r" in name
+
+
+def format_stat_line(rel: str, st: os.stat_result, sym_target: str | None) -> str | None:
+    """Format like: stat -c '%a %U %G %s %y %N' with QUOTING_STYLE=shell-always.
+
+    Returns None (after a warning) when the name or symlink target contains a
+    newline/CR: the manifest is line-oriented and cannot represent it, so the
+    file is skipped instead of silently corrupting the manifest.
+    """
+    if _name_has_newline(rel) or (sym_target is not None and _name_has_newline(sym_target)):
+        _note_warning(f"warning: skipping {rel!r}: a newline in the filename is not supported")
+        return None
+    # Permission bits only (S_IMODE); the file-type bits are dropped to keep the
+    # historical `stat -c %a`-style manifest format. KNOWN LIMITATION, deferred
+    # (out of current scope): without the type, an empty directory and a regular
+    # file that has no S3 object are indistinguishable on restore (see the kind
+    # inference in apply_manifest). A future change will record the file type
+    # here (e.g. the full st_mode) so the restore kind no longer depends on S3
+    # object presence. Tracked as a task.
     mode = format(stat_mod.S_IMODE(st.st_mode), "o")
 
     if pwd is not None:
@@ -877,12 +933,16 @@ def write_manifest_to_aws(
     lines: list[str] = []
     if os.path.isdir(target):
         for rel, st, sym_target in iter_tree(target, excludes):
-            lines.append(format_stat_line(rel, st, sym_target))
+            line = format_stat_line(rel, st, sym_target)
+            if line is not None:
+                lines.append(line)
     else:
         basename = os.path.basename(target)
         st = os.lstat(target)
         sym = os.readlink(target) if stat_mod.S_ISLNK(st.st_mode) else None
-        lines.append(format_stat_line(basename, st, sym))
+        line = format_stat_line(basename, st, sym)
+        if line is not None:
+            lines.append(line)
 
     manifest_data = "\n".join(lines) + "\n" if lines else ""
     assert cfg.store is not None
@@ -890,6 +950,7 @@ def write_manifest_to_aws(
 
 
 def upload_manifest(cfg: Config, entry: str, target: str, excludes: list[str], opts: Opts) -> int:
+    """Write the manifest to S3, then run the entry's post_hook."""
     post_hook: str | None = cfg.entries[entry].get("post_hook")
 
     if opts.dryrun:
@@ -900,12 +961,7 @@ def upload_manifest(cfg: Config, entry: str, target: str, excludes: list[str], o
 
     write_manifest_to_aws(cfg, entry, target, excludes, opts.verbose)
 
-    if post_hook:
-        if opts.verbose:
-            write_stderr(f"+ {post_hook}\n")
-        subprocess.run(["bash", "-c", post_hook])
-
-    return 0
+    return _run_post_hook(post_hook, opts)
 
 
 def _manifest_line_key(line: str) -> str:
@@ -916,11 +972,14 @@ def _manifest_line_key(line: str) -> str:
 def _iter_sub_tree_lines(local_sub: str, sub: str, excludes: list[str]) -> Iterator[str]:
     st = os.lstat(local_sub)
     if stat_mod.S_ISLNK(st.st_mode):
-        sym = os.readlink(local_sub)
-        yield format_stat_line(f"./{sub}", st, sym)
+        line = format_stat_line(f"./{sub}", st, os.readlink(local_sub))
+        if line is not None:
+            yield line
         return
     if not os.path.isdir(local_sub):
-        yield format_stat_line(f"./{sub}", st, None)
+        line = format_stat_line(f"./{sub}", st, None)
+        if line is not None:
+            yield line
         return
     for rel, st2, sym_target in iter_tree(local_sub, excludes):
         if rel == ".":
@@ -928,7 +987,9 @@ def _iter_sub_tree_lines(local_sub: str, sub: str, excludes: list[str]) -> Itera
         else:
             tail = rel[2:]
             disp = f"./{sub}/{tail}"
-        yield format_stat_line(disp, st2, sym_target)
+        line = format_stat_line(disp, st2, sym_target)
+        if line is not None:
+            yield line
 
 
 def patch_manifest_subtree(
@@ -999,7 +1060,7 @@ def _windows_collect_writable_prep(
     #   - regular files (not dir / not symlink)
     #   - read-only (owner write bit clear)
     #   - differ from the manifest in size or mtime
-    # Temporarily add owner-write so `aws s3 sync`/`cp` can overwrite them.
+    # Temporarily add owner-write so `boto3-s3 sync`/`cp` can overwrite them.
     # Returns [(path, original_mode), ...] for later restoration.
     targets: list[tuple[str, int]] = []
     try:
@@ -1096,15 +1157,33 @@ def apply_manifest(
         mode = m_entry.mode_int
 
         if m_entry.sym_target is not None:
-            os.makedirs(os.path.dirname(target), exist_ok=True)
-            try:
+            parent = os.path.dirname(target)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            # Clear whatever is already there. islink first, so a symlink is
+            # removed as a link (never recursing into its target); a real dir
+            # (e.g. left by an older follow-symlinks backup) is removed wholesale.
+            if os.path.islink(target) or os.path.isfile(target):
                 os.remove(target)
-            except FileNotFoundError:
-                pass
+            elif os.path.isdir(target):
+                shutil.rmtree(target)
             os.symlink(m_entry.sym_target, target)
             write_output(f"{target} -> {m_entry.sym_target}\n")
             continue
 
+        # File-vs-dir classification. Symlinks are handled above (sym_target).
+        # For the rest the type is inferred from whether an S3 object exists,
+        # because the manifest mode field stores permission bits only and drops
+        # the file-type bits (see format_stat_line): an empty directory and a
+        # regular file with no object are indistinguishable here. Consequence: a
+        # regular file recorded but never uploaded (e.g. unreadable, skipped with
+        # a warning) is restored as a directory.
+        #
+        # KNOWN LIMITATION, deferred (out of current scope, tracked as a task):
+        # record the file type in the manifest so the kind no longer depends on
+        # object presence. Until then only un-uploaded regular files are
+        # affected; symlinks (incl. pid-style links) and uploaded files restore
+        # correctly.
         if not is_dir:
             kind = "file"
         elif rel == ".":
@@ -1154,8 +1233,8 @@ def download_manifest(cfg: Config, entry: str, dest: str, verbose: bool = False)
 
 
 def _print_transfer_lines(stdout: str) -> bool:
-    """Print interesting lines from `aws s3 sync/cp` stdout, skipping
-    progress noise. Returns True if any transfer line was printed.
+    """Print the transfer-result lines, skipping progress noise. Returns True
+    if any transfer line was printed.
     """
     if not stdout:
         return False
@@ -1182,30 +1261,25 @@ def download_from_s3(
 ) -> tuple[int, bool]:
     assert cfg.store is not None
     rel = f"{entry}/{sub}" if sub else entry
+
     if is_dir:
         result = cfg.store.sync_down(rel, outpath, verbose=verbose)
-    else:
-        parent = os.path.dirname(outpath)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        try:
-            ok = cfg.store.get_object(
-                rel,
-                outpath,
-                verbose=verbose,
-                check=True,
-            )
-            result = TransferResult(returncode=0 if ok else 1)
-        except subprocess.CalledProcessError as e:
-            result = TransferResult(returncode=e.returncode, stderr=e.stderr or "")
+        if result.returncode != 0:
+            if result.stderr:
+                write_stderr(result.stderr)
+            return result.returncode, False
+        return 0, _print_transfer_lines(result.stdout)
 
-    if result.returncode != 0:
-        if result.stderr:
-            write_stderr(result.stderr)
-        return result.returncode, False
-
-    changed = _print_transfer_lines(result.stdout)
-    return 0, changed
+    # Single file: cp always transfers (we only reach here on a manifest
+    # mismatch), so a successful download counts as changed -> apply_manifest
+    # runs and restores mode/mtime. Matters on Windows, where apply_manifest is
+    # skipped when nothing changed.
+    parent = os.path.dirname(outpath)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    if not cfg.store.get_object(rel, outpath, verbose=verbose):
+        return 1, False
+    return 0, True
 
 
 # =============================================================================
@@ -1236,9 +1310,11 @@ def delete_extra_files(
             write_output(f"A {path}\n")
         else:
             try:
-                if is_dir_entry:
+                if is_dir_entry and not os.path.islink(path):
                     os.rmdir(path)
                 else:
+                    # Files and symlinks (incl. symlinks to directories, which
+                    # iter_local_tree reports as is_dir) are unlinked.
                     os.remove(path)
                 write_output(f"delete: {path}\n")
             except OSError:
@@ -1265,15 +1341,18 @@ def _filter_aws_output(raw: str) -> str:
     return "\n".join(filtered)
 
 
-def _run_post_hook(post_hook: str | None, opts: Opts) -> None:
+def _run_post_hook(post_hook: str | None, opts: Opts) -> int:
     if not post_hook:
-        return
+        return 0
     if opts.dryrun:
         print(f"(dryrun) would run post_hook: {post_hook}")
-        return
+        return 0
     if opts.verbose:
         write_stderr(f"+ {post_hook}\n")
-    _ = subprocess.run(["bash", "-c", post_hook])
+    rc = subprocess.run(["bash", "-c", post_hook]).returncode
+    if rc != 0:
+        err(f"post_hook failed (exit {rc}): {post_hook}")
+    return rc
 
 
 def _push_sub(
@@ -1295,8 +1374,7 @@ def _push_sub(
 
     if opts.meta_only:
         patch_manifest_subtree(cfg, entry, target_root, sub, excludes, opts)
-        _run_post_hook(post_hook, opts)
-        return 0
+        return _run_post_hook(post_hook, opts)
 
     assert cfg.store is not None
     st = os.lstat(local_sub)
@@ -1315,6 +1393,8 @@ def _push_sub(
         )
         if result.returncode != 0:
             write_output(result.stdout)
+            if result.stderr:
+                write_stderr(result.stderr)
             return result.returncode
         filtered = _filter_aws_output(result.stdout)
         if filtered:
@@ -1334,6 +1414,8 @@ def _push_sub(
             )
             if result.returncode != 0:
                 write_output(result.stdout)
+                if result.stderr:
+                    write_stderr(result.stderr)
                 return result.returncode
             filtered = _filter_aws_output(result.stdout)
             if filtered:
@@ -1341,8 +1423,7 @@ def _push_sub(
 
     if not opts.data_only:
         patch_manifest_subtree(cfg, entry, target_root, sub, excludes, opts)
-    _run_post_hook(post_hook, opts)
-    return 0
+    return _run_post_hook(post_hook, opts)
 
 
 def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int:
@@ -1352,12 +1433,33 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         return 1
     target: str = entry_cfg["path"]
     target_root = _normalize_local_path(target)
-    if sub is None and not os.path.exists(target):
-        err(f"target does not exist: {target}")
-        return 1
+    if sub is None:
+        if not os.path.lexists(target):
+            err(f"target does not exist: {target}")
+            return 1
+        mode = os.lstat(target).st_mode
+        if stat_mod.S_ISLNK(mode):
+            err(f"entry path is a symlink, which is not allowed as an entry: {target}")
+            return 1
+        if not (stat_mod.S_ISREG(mode) or stat_mod.S_ISDIR(mode)):
+            err(f"entry path must be a regular file or directory: {target}")
+            return 1
+        if stat_mod.S_ISREG(mode) and _name_has_newline(os.path.basename(target)):
+            # A single-file entry whose name has a newline cannot go in the
+            # manifest; skip the whole entry (warn -> exit 2 via run()).
+            _note_warning(f"warning: skipping entry {entry!r}: a newline in the filename")
+            return 0
 
     excludes: list[str] = entry_cfg.get("excludes", [])
 
+    # Hook contract: pre_hook runs before every push attempt. post_hook is
+    # deliberately asymmetric - it runs only after a push that did work, i.e.
+    # that transferred data and/or refreshed the manifest (see upload_manifest,
+    # the data-only branch below, and _push_sub), or whenever --meta-only is
+    # given (which always refreshes the manifest and runs the hook). A pure
+    # no-op push runs no post_hook on purpose, so side-effecting hooks (e.g.
+    # rclone) do not fire when nothing changed; use --meta-only to run the hook
+    # on demand. By design, not a bug.
     pre_hook: str | None = entry_cfg.get("pre_hook")
     if pre_hook:
         if opts.dryrun:
@@ -1377,6 +1479,8 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         err(f"skipping manifest for {entry} (.git suffix convention)")
         return 0
 
+    # --meta-only refreshes the manifest and runs the post_hook even with no data
+    # change: the supported way to re-run the post_hook on demand (intended).
     if opts.meta_only:
         return upload_manifest(cfg, entry, target, excludes, opts)
 
@@ -1394,6 +1498,8 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         )
         if result.returncode != 0:
             write_output(result.stdout)
+            if result.stderr:
+                write_stderr(result.stderr)
             return result.returncode
         results = _filter_aws_output(result.stdout)
     else:
@@ -1415,35 +1521,32 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 )
                 if result.returncode != 0:
                     write_output(result.stdout)
+                    if result.stderr:
+                        write_stderr(result.stderr)
                     return result.returncode
                 results = _filter_aws_output(result.stdout)
 
     if results:
         write_output(f"{results}\n")
 
+    # Refresh the manifest only when file data was actually transferred. A change
+    # to mode/owner/group alone is not re-uploaded by sync (it compares size and
+    # mtime, which such a change leaves untouched), so a plain push does not
+    # refresh the manifest and `status` keeps showing that diff until you run
+    # `push --meta-only` (handled above). Note: a content or mtime change does
+    # refresh it; only mode/owner/group-only changes are affected. This is the
+    # deliberate current behavior (not a bug), but a spec choice that may be
+    # revisited later - not an invariant.
     if results and not opts.data_only:
-        try:
-            upload_manifest(cfg, entry, target, excludes, opts)
-        except subprocess.CalledProcessError as e:
-            return e.returncode
+        st = upload_manifest(cfg, entry, target, excludes, opts)
+        if st != 0:
+            return st
 
     if results and opts.data_only:
         post_hook: str | None = entry_cfg.get("post_hook")
-        _run_post_hook(post_hook, opts)
+        return _run_post_hook(post_hook, opts)
 
     return 0
-
-
-def _sub_remote_kind(cfg: Config, entry: str, sub: str, verbose: bool = False) -> str:
-    """Return "file", "dir", or "missing" for <entry>/<sub> on S3."""
-    assert cfg.store is not None
-    if cfg.store.head_object(f"{entry}/{sub}", verbose=verbose) is not None:
-        return "file"
-    prefix = sub + "/"
-    for k in cfg.store.list_keys_under(entry, verbose=verbose):
-        if k.startswith(prefix):
-            return "dir"
-    return "missing"
 
 
 def _entry_kind_from_manifest(manifest_path: str) -> str:
@@ -1480,7 +1583,7 @@ def _manifest_matches_local(
 ) -> bool:
     """True iff every manifest entry matches the local filesystem.
 
-    Returning True means 'aws s3 sync' would copy nothing AND apply_manifest
+    Returning True means 'boto3-s3 sync' would copy nothing AND apply_manifest
     would change nothing - so both can be skipped.
     """
     for entry in iter_manifest(manifest_path):
@@ -1531,6 +1634,12 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 err(f"not found on S3: {entry}/{sub}")
                 return 1
             is_dir = kind == "dir"
+            if kind == "file":
+                # "file" is ambiguous - the manifest drops type bits, so a real
+                # file and an empty directory look the same. An empty dir has no
+                # S3 object, so a missing head-object means it is a directory.
+                assert cfg.store is not None
+                is_dir = cfg.store.head_object(f"{entry}/{sub}", verbose=opts.verbose) is None
         else:
             is_dir = entry_is_dir
 
@@ -1548,22 +1657,22 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         if IS_WINDOWS and not opts.meta_only:
             prep = _windows_collect_writable_prep(outpath, is_dir, manifest_path, sub)
 
-        sync_changed = False
         if not opts.meta_only:
-            rc, sync_changed = download_from_s3(cfg, entry, outpath, is_dir, opts.verbose, sub=sub)
+            rc, _ = download_from_s3(cfg, entry, outpath, is_dir, opts.verbose, sub=sub)
             if rc != 0:
                 if IS_WINDOWS:
                     _windows_restore_modes(prep)
                 return rc
 
-        # 4. Apply manifest metadata (mode, mtime, symlinks).
-        #    Skipped entirely with --data-only.
+        # 4. Apply manifest metadata (mode, mtime, symlinks). We only reach here
+        #    after a confirmed mismatch, so always apply: objectless or
+        #    metadata-only diffs (empty dirs, symlinks, mode/mtime) have nothing
+        #    to download yet still need applying. apply_manifest sets the modes
+        #    itself, so the writable prep needs no separate restore. Skipped only
+        #    with --data-only.
         if opts.data_only:
             if IS_WINDOWS and not opts.meta_only:
                 _windows_restore_modes(prep)
-            st = 0
-        elif IS_WINDOWS and not opts.meta_only and not sync_changed:
-            _windows_restore_modes(prep)
             st = 0
         else:
             st = apply_manifest(
@@ -1710,6 +1819,9 @@ def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
     os.close(fd)
     try:
         if not download_manifest(cfg, entry, manifest_path, opts.verbose):
+            return 1
+        if sub is not None and _sub_kind_from_manifest(manifest_path, sub) == "missing":
+            err(f"not found on S3: {entry}/{sub}")
             return 1
 
         is_dir = os.path.isdir(outpath)
@@ -1913,6 +2025,9 @@ def cmd_ls_remote(cfg: Config, opts: Opts, entry: str | None = None, sub: str | 
     try:
         if not download_manifest(cfg, entry, manifest_path, opts.verbose):
             return 1
+        if sub is not None and _sub_kind_from_manifest(manifest_path, sub) == "missing":
+            err(f"not found on S3: {entry}/{sub}")
+            return 1
         show_entry_files(manifest_path, sub=sub)
         return 0
     finally:
@@ -2099,8 +2214,8 @@ def resolve_entry_files(
     return [_resolve_one_arg(cfg, arg) for arg in positional]
 
 
-def main() -> int:
-    args = sys.argv[1:]
+def main(argv: list[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else argv
     if not args:
         print_usage()
 
@@ -2285,18 +2400,41 @@ def main() -> int:
         print_usage()
 
 
+def _sdk_errors() -> tuple[type[BaseException], ...]:
+    """The boto3-s3 / botocore error types, imported lazily so `help` / `list`
+    stay SDK-free (the except clause only evaluates this on an error). Returns an
+    empty tuple if the SDK is unimportable, so matching never masks the original
+    error with an ImportError."""
+    try:
+        from boto3_s3 import Boto3S3Error
+        from botocore.exceptions import BotoCoreError, ClientError
+    except ImportError:
+        return ()
+    return (Boto3S3Error, BotoCoreError, ClientError)
+
+
 def run() -> int:
     """Console entry point: install signal handling and translate exceptions
     into exit codes. This is what the ``s3bak`` command invokes."""
+    global _warning_count
+    _warning_count = 0
     signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
     try:
-        return main() or 0
+        rc = main() or 0
     except subprocess.CalledProcessError as e:
         cmd_str = shlex.join(e.cmd) if isinstance(e.cmd, list) else str(e.cmd)
         err(f"command failed: {cmd_str}")
         return e.returncode or 1
     except BrokenPipeError:
         return 141
+    except _sdk_errors() as e:
+        err(str(e))
+        return 1
+    # A run that only warned (skipped files etc.) but hit no hard error exits 2
+    # (aws-style), after the manifest update has completed.
+    if rc == 0 and _warning_count > 0:
+        return 2
+    return rc
 
 
 if __name__ == "__main__":

@@ -19,8 +19,12 @@ classifiers = [
     "Topic :: System :: Archiving :: Backup",
     "Typing :: Typed",
 ]
-# Pure standard library at runtime; the `aws` CLI is required on PATH.
-dependencies = []
+# boto3-s3 provides the in-process S3 transfer/listing API; boto3 is used
+# directly for head-object / list-objects-v2.
+dependencies = [
+    "boto3-s3>=0.3",
+    "boto3>=1.28",
+]
 
 [project.scripts]
 s3bak = "s3bak.cli:run"
@@ -39,6 +43,8 @@ dev = [
     "basedpyright>=1.13",
     "ruff>=0.6",
     "vermin>=1.6",
+    "pytest>=8.0",
+    "moto[s3]>=5.0",
 ]
 
 [tool.ruff]
@@ -59,4 +65,8 @@ select = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["s3bak"]
+known-first-party = ["s3bak", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
