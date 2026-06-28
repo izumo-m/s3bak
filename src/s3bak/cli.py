@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # Requires Python 3.10+
 """s3bak - Unified S3 backup/restore tool
 
@@ -88,6 +87,7 @@ def expand_home(path: str) -> str:
 # Shell quoting (stat QUOTING_STYLE=shell-always compatible)
 # =============================================================================
 
+
 def shell_always_quote(s: str) -> str:
     return "'" + s.replace("'", "'\\''") + "'"
 
@@ -136,13 +136,9 @@ def parse_timestamp(date_str: str, time_str: str, zone_str: str) -> float:
     except (ValueError, IndexError):
         # Fall back to strptime for any unexpected shape.
         time_fb = time_str.split(".")[0]
-        dt = datetime.datetime.strptime(
-            f"{date_str} {time_fb} {zone_str}", "%Y-%m-%d %H:%M:%S %z"
-        )
+        dt = datetime.datetime.strptime(f"{date_str} {time_fb} {zone_str}", "%Y-%m-%d %H:%M:%S %z")
         return dt.timestamp()
-    utc_epoch = calendar.timegm(
-        (year, month, day, hour, minute, second, 0, 0, 0)
-    )
+    utc_epoch = calendar.timegm((year, month, day, hour, minute, second, 0, 0, 0))
     return float(utc_epoch - sign * (tz_h * 3600 + tz_m * 60))
 
 
@@ -150,9 +146,10 @@ def parse_timestamp(date_str: str, time_str: str, zone_str: str) -> float:
 # Manifest entry parsing
 # =============================================================================
 
+
 @dataclass(frozen=True)
 class ManifestEntry:
-    rel: str           # original name field: ".", "./foo/bar", or bare basename
+    rel: str  # original name field: ".", "./foo/bar", or bare basename
     mode_str: str
     user: str
     group: str
@@ -216,7 +213,7 @@ def resolve_manifest_rel(rel_field: str, sub: str | None) -> str | None:
     if rel == sub:
         return "."
     if rel.startswith(sub + "/"):
-        return rel[len(sub) + 1:]
+        return rel[len(sub) + 1 :]
     return None
 
 
@@ -238,11 +235,12 @@ def manifest_target(
 # Manifest-vs-local diff
 # =============================================================================
 
+
 @dataclass
 class EntryDiff:
-    status: str | None         # None=match, "M"=modified, "D"=missing/wrong-type
-    tags: list[str]            # ["mode", "mtime", "size", "link"]
-    details: list[str]         # human-readable per-field detail lines
+    status: str | None  # None=match, "M"=modified, "D"=missing/wrong-type
+    tags: list[str]  # ["mode", "mtime", "size", "link"]
+    details: list[str]  # human-readable per-field detail lines
 
     @property
     def is_match(self) -> bool:
@@ -250,7 +248,10 @@ class EntryDiff:
 
 
 def compare_to_local(
-    entry: ManifestEntry, target: str, *, use_color: bool = False,
+    entry: ManifestEntry,
+    target: str,
+    *,
+    use_color: bool = False,
     ignore_dir_mtime: bool = False,
 ) -> EntryDiff:
     diff = EntryDiff(status=None, tags=[], details=[])
@@ -271,9 +272,7 @@ def compare_to_local(
         if loc_link != entry.sym_target:
             diff.status = "M"
             diff.tags.append("link")
-            diff.details.append(
-                f"link: remote={entry.sym_target} local={loc_link}"
-            )
+            diff.details.append(f"link: remote={entry.sym_target} local={loc_link}")
         return diff
 
     if st is None:
@@ -311,15 +310,13 @@ def compare_to_local(
                     f"size: remote={remote_disp} {cmp} local={local_disp} ({diff_str})"
                 )
             else:
-                diff.details.append(
-                    f"size: remote={entry.size_str} local={loc_size}"
-                )
+                diff.details.append(f"size: remote={entry.size_str} local={loc_size}")
 
     loc_mode = format(stat_mod.S_IMODE(st.st_mode), "o")
     mode_differs = loc_mode != entry.mode_str
     if mode_differs and IS_WINDOWS:
         # Windows-native Python (incl. msys2 UCRT64) reports synthetic modes
-        # via os.stat: 0o666 for writable files, 0o444 for read-only — not
+        # via os.stat: 0o666 for writable files, 0o444 for read-only - not
         # the Unix permission bits. Only the owner-write bit is meaningful.
         try:
             if (entry.mode_int & 0o200) == (st.st_mode & 0o200):
@@ -344,12 +341,8 @@ def compare_to_local(
     except ValueError:
         return diff
     if loc_mtime != remote_epoch:
-        fmt_local = datetime.datetime.fromtimestamp(loc_mtime).strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
-        fmt_remote = datetime.datetime.fromtimestamp(remote_epoch).strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
+        fmt_local = datetime.datetime.fromtimestamp(loc_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        fmt_remote = datetime.datetime.fromtimestamp(remote_epoch).strftime("%Y-%m-%d %H:%M:%S")
         diff.status = "M"
         diff.tags.append("mtime")
         if remote_epoch < loc_mtime:
@@ -361,9 +354,7 @@ def compare_to_local(
             remote_disp = _color_wrap(fmt_remote, use_color)
             local_disp = fmt_local
         diff_str = _humanize_duration(loc_mtime - remote_epoch)
-        diff.details.append(
-            f"mtime: remote={remote_disp} {cmp} local={local_disp} ({diff_str})"
-        )
+        diff.details.append(f"mtime: remote={remote_disp} {cmp} local={local_disp} ({diff_str})")
 
     return diff
 
@@ -372,6 +363,7 @@ def compare_to_local(
 # Config / Options
 # =============================================================================
 
+
 @dataclass
 class Config:
     profile: str
@@ -379,7 +371,7 @@ class Config:
     bucket: str
     path_prefix: str
     entries: dict[str, dict[str, Any]]
-    store: "AwsCliStore | None" = None
+    store: AwsCliStore | None = None
 
 
 @dataclass
@@ -460,9 +452,11 @@ def load_config() -> Config:
 # Remote object store
 # =============================================================================
 
+
 @dataclass
 class ObjectMeta:
     """Subset of S3 head-object response that callers use."""
+
     key: str
     size: int = 0
     metadata: dict[str, str] = field(default_factory=dict)
@@ -471,6 +465,7 @@ class ObjectMeta:
 @dataclass
 class TransferResult:
     """Result of a sync/copy operation that may print AWS CLI output."""
+
     returncode: int
     stdout: str = ""
     stderr: str = ""
@@ -486,7 +481,7 @@ class AwsCliStore:
 
     def __init__(self, profile: str, prefix: str, bucket: str, path_prefix: str):
         self.profile = profile
-        self.prefix = prefix          # full s3:// URL
+        self.prefix = prefix  # full s3:// URL
         self.bucket = bucket
         self.path_prefix = path_prefix
 
@@ -501,10 +496,14 @@ class AwsCliStore:
         return f"{self.prefix}/{rel_key}" if rel_key else self.prefix
 
     def _run(
-        self, *args: str,
-        verbose: bool = False, check: bool = True,
-        capture: bool = True, input_data: str | None = None,
-        cwd: str | None = None, merge_stderr: bool = False,
+        self,
+        *args: str,
+        verbose: bool = False,
+        check: bool = True,
+        capture: bool = True,
+        input_data: str | None = None,
+        cwd: str | None = None,
+        merge_stderr: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         cmd = self._build_cmd(*args)
         echo_command(verbose, cmd)
@@ -528,11 +527,16 @@ class AwsCliStore:
     # --- Public API --------------------------------------------------------
     def head_object(self, rel_key: str, *, verbose: bool = False) -> ObjectMeta | None:
         result = self._run(
-            "s3api", "head-object",
-            "--bucket", self.bucket,
-            "--key", self._api_key(rel_key),
-            "--output", "json",
-            verbose=verbose, check=False,
+            "s3api",
+            "head-object",
+            "--bucket",
+            self.bucket,
+            "--key",
+            self._api_key(rel_key),
+            "--output",
+            "json",
+            verbose=verbose,
+            check=False,
         )
         if result.returncode != 0:
             return None
@@ -551,11 +555,16 @@ class AwsCliStore:
         prefix = self._api_key(norm)
         try:
             result = self._run(
-                "s3api", "list-objects-v2",
-                "--bucket", self.bucket,
-                "--prefix", prefix,
-                "--output", "text",
-                "--query", "Contents[].Key",
+                "s3api",
+                "list-objects-v2",
+                "--bucket",
+                self.bucket,
+                "--prefix",
+                prefix,
+                "--output",
+                "text",
+                "--query",
+                "Contents[].Key",
                 verbose=verbose,
             )
         except subprocess.CalledProcessError:
@@ -565,7 +574,7 @@ class AwsCliStore:
             for k in line.split("\t"):
                 k = k.strip()
                 if k and k != "None":
-                    rel = k[len(prefix):]
+                    rel = k[len(prefix) :]
                     if rel:
                         keys.add(rel)
         return keys
@@ -575,13 +584,21 @@ class AwsCliStore:
         return result.stdout.splitlines()
 
     def get_object(
-        self, rel_key: str, dest_path: str, *,
-        verbose: bool = False, check: bool = True,
+        self,
+        rel_key: str,
+        dest_path: str,
+        *,
+        verbose: bool = False,
+        check: bool = True,
     ) -> bool:
         try:
             self._run(
-                "s3", "cp", self._s3_url(rel_key), dest_path,
-                verbose=verbose, check=check,
+                "s3",
+                "cp",
+                self._s3_url(rel_key),
+                dest_path,
+                verbose=verbose,
+                check=check,
             )
             return True
         except subprocess.CalledProcessError:
@@ -591,49 +608,74 @@ class AwsCliStore:
         cmd = self._build_cmd("s3", "cp", self._s3_url(rel_key), "-")
         echo_command(verbose, cmd)
         result = subprocess.run(
-            cmd, stderr=subprocess.PIPE, text=True,
+            cmd,
+            stderr=subprocess.PIPE,
+            text=True,
         )
         if result.returncode != 0 and result.stderr:
             write_stderr(result.stderr)
         return result.returncode
 
     def sync_down(
-        self, rel_prefix: str, dest_dir: str, *, verbose: bool = False,
+        self,
+        rel_prefix: str,
+        dest_dir: str,
+        *,
+        verbose: bool = False,
     ) -> TransferResult:
         result = self._run(
-            "s3", "sync",
+            "s3",
+            "sync",
             f"{self._s3_url(rel_prefix)}/" if rel_prefix else f"{self.prefix}/",
             f"{dest_dir}/",
-            verbose=verbose, check=False,
+            verbose=verbose,
+            check=False,
         )
         return TransferResult(
             returncode=result.returncode,
-            stdout=result.stdout, stderr=result.stderr,
+            stdout=result.stdout,
+            stderr=result.stderr,
         )
 
     def put_text(self, rel_key: str, text: str, *, verbose: bool = False) -> None:
         self._run(
-            "s3", "cp", "-", self._s3_url(rel_key),
-            verbose=verbose, input_data=text,
+            "s3",
+            "cp",
+            "-",
+            self._s3_url(rel_key),
+            verbose=verbose,
+            input_data=text,
         )
 
     def put_object(
-        self, rel_key: str, src_path: str, *,
-        verbose: bool = False, metadata: dict[str, str] | None = None,
+        self,
+        rel_key: str,
+        src_path: str,
+        *,
+        verbose: bool = False,
+        metadata: dict[str, str] | None = None,
     ) -> TransferResult:
         args = ["s3", "cp", src_path, self._s3_url(rel_key)]
         if metadata:
             meta_str = ",".join(f"{k}={v}" for k, v in metadata.items())
             args.extend(["--metadata", meta_str])
         result = self._run(
-            *args, verbose=verbose, check=False, merge_stderr=True,
+            *args,
+            verbose=verbose,
+            check=False,
+            merge_stderr=True,
         )
         return TransferResult(returncode=result.returncode, stdout=result.stdout)
 
     def sync_up(
-        self, src_dir: str, rel_prefix: str, *,
-        excludes: list[str], delete: bool = False,
-        dryrun: bool = False, verbose: bool = False,
+        self,
+        src_dir: str,
+        rel_prefix: str,
+        *,
+        excludes: list[str],
+        delete: bool = False,
+        dryrun: bool = False,
+        verbose: bool = False,
     ) -> TransferResult:
         args = ["s3", "sync"]
         if delete:
@@ -644,12 +686,13 @@ class AwsCliStore:
         for p in excludes:
             args.extend(["--exclude", p])
         result = self._run(
-            *args, verbose=verbose, check=False,
-            cwd=src_dir, merge_stderr=True,
+            *args,
+            verbose=verbose,
+            check=False,
+            cwd=src_dir,
+            merge_stderr=True,
         )
         return TransferResult(returncode=result.returncode, stdout=result.stdout)
-
-
 
 
 # =============================================================================
@@ -705,9 +748,8 @@ def _split_excludes(excludes: list[str]) -> tuple[list[str], list[str]]:
 # Tree iteration
 # =============================================================================
 
-def iter_tree(
-    root: str, excludes: list[str]
-) -> Iterator[tuple[str, os.stat_result, str | None]]:
+
+def iter_tree(root: str, excludes: list[str]) -> Iterator[tuple[str, os.stat_result, str | None]]:
     """Walk directory tree yielding (rel, lstat_result, symlink_target|None).
 
     rel uses "./" prefix (e.g., ".", "./sub/file").
@@ -752,9 +794,7 @@ def iter_tree(
                 yield rel, st, None
 
 
-def iter_local_tree(
-    outpath: str, excludes: list[str]
-) -> Iterator[tuple[str, bool]]:
+def iter_local_tree(outpath: str, excludes: list[str]) -> Iterator[tuple[str, bool]]:
     """Walk local tree yielding (rel_without_dot_slash, is_dir)."""
     prune_patterns, skip_patterns = _split_excludes(excludes)
 
@@ -786,9 +826,8 @@ def iter_local_tree(
 # Manifest generation
 # =============================================================================
 
-def format_stat_line(
-    rel: str, st: os.stat_result, sym_target: str | None
-) -> str:
+
+def format_stat_line(rel: str, st: os.stat_result, sym_target: str | None) -> str:
     """Format like: stat -c '%a %U %G %s %y %N' with QUOTING_STYLE=shell-always."""
     mode = format(stat_mod.S_IMODE(st.st_mode), "o")
 
@@ -811,9 +850,7 @@ def format_stat_line(
 
     epoch_sec = st.st_mtime_ns // 1_000_000_000
     nsec = st.st_mtime_ns % 1_000_000_000
-    dt = datetime.datetime.fromtimestamp(
-        epoch_sec, tz=datetime.timezone.utc
-    ).astimezone()
+    dt = datetime.datetime.fromtimestamp(epoch_sec, tz=datetime.timezone.utc).astimezone()
     utc_off = dt.utcoffset()
     assert utc_off is not None
     total_sec = int(utc_off.total_seconds())
@@ -821,14 +858,10 @@ def format_stat_line(
     total_sec = abs(total_sec)
     h, rem = divmod(total_sec, 3600)
     m = rem // 60
-    mtime_str = (
-        f"{dt.strftime('%Y-%m-%d %H:%M:%S')}.{nsec:09d} {sign}{h:02d}{m:02d}"
-    )
+    mtime_str = f"{dt.strftime('%Y-%m-%d %H:%M:%S')}.{nsec:09d} {sign}{h:02d}{m:02d}"
 
     if sym_target is not None:
-        name_field = (
-            f"{shell_always_quote(rel)} -> {shell_always_quote(sym_target)}"
-        )
+        name_field = f"{shell_always_quote(rel)} -> {shell_always_quote(sym_target)}"
     else:
         name_field = shell_always_quote(rel)
 
@@ -856,9 +889,7 @@ def write_manifest_to_aws(
     cfg.store.put_text(entrylist, manifest_data, verbose=verbose)
 
 
-def upload_manifest(
-    cfg: Config, entry: str, target: str, excludes: list[str], opts: Opts
-) -> int:
+def upload_manifest(cfg: Config, entry: str, target: str, excludes: list[str], opts: Opts) -> int:
     post_hook: str | None = cfg.entries[entry].get("post_hook")
 
     if opts.dryrun:
@@ -882,9 +913,7 @@ def _manifest_line_key(line: str) -> str:
     return "" if entry is None else entry.rel.removeprefix("./")
 
 
-def _iter_sub_tree_lines(
-    local_sub: str, sub: str, excludes: list[str]
-) -> Iterator[str]:
+def _iter_sub_tree_lines(local_sub: str, sub: str, excludes: list[str]) -> Iterator[str]:
     st = os.lstat(local_sub)
     if stat_mod.S_ISLNK(st.st_mode):
         sym = os.readlink(local_sub)
@@ -910,10 +939,10 @@ def patch_manifest_subtree(
     excludes: list[str],
     opts: Opts,
 ) -> None:
-    """manifest をダウンロードし、sub 配下の行を入れ替えて再アップロード。
+    """Download the manifest, replace the lines under `sub`, and re-upload it.
 
-    target_root/sub がファイル/シンボリックリンク/ディレクトリのいずれでもよい。
-    存在しない場合は該当 sub 配下の行を削除するのみ。
+    target_root/sub may be a file, a symlink, or a directory.
+    If it does not exist, the lines under that `sub` are simply removed.
     """
     entrylist = f"{entry}-ls-l.txt"
     if opts.dryrun:
@@ -961,6 +990,7 @@ def patch_manifest_subtree(
 # =============================================================================
 # Manifest application (restore metadata)
 # =============================================================================
+
 
 def _windows_collect_writable_prep(
     outpath: str, is_dir: bool, manifest_path: str, sub: str | None
@@ -1050,7 +1080,7 @@ def apply_manifest(
             sub_prefix = sub + "/"
             for k in all_keys:
                 if k.startswith(sub_prefix):
-                    remote_keys.add(k[len(sub_prefix):])
+                    remote_keys.add(k[len(sub_prefix) :])
         else:
             remote_keys = all_keys
 
@@ -1062,9 +1092,7 @@ def apply_manifest(
         if res is None:
             continue
         target, rel = res
-        epoch = parse_timestamp(
-            m_entry.date_str, m_entry.time_str, m_entry.zone_str
-        )
+        epoch = parse_timestamp(m_entry.date_str, m_entry.time_str, m_entry.zone_str)
         mode = m_entry.mode_int
 
         if m_entry.sym_target is not None:
@@ -1114,12 +1142,14 @@ def apply_manifest(
 # S3 download helpers
 # =============================================================================
 
-def download_manifest(
-    cfg: Config, entry: str, dest: str, verbose: bool = False
-) -> bool:
+
+def download_manifest(cfg: Config, entry: str, dest: str, verbose: bool = False) -> bool:
     assert cfg.store is not None
     return cfg.store.get_object(
-        f"{entry}-ls-l.txt", dest, verbose=verbose, check=False,
+        f"{entry}-ls-l.txt",
+        dest,
+        verbose=verbose,
+        check=False,
     )
 
 
@@ -1160,7 +1190,10 @@ def download_from_s3(
             os.makedirs(parent, exist_ok=True)
         try:
             ok = cfg.store.get_object(
-                rel, outpath, verbose=verbose, check=True,
+                rel,
+                outpath,
+                verbose=verbose,
+                check=True,
             )
             result = TransferResult(returncode=0 if ok else 1)
         except subprocess.CalledProcessError as e:
@@ -1178,6 +1211,7 @@ def download_from_s3(
 # =============================================================================
 # delete_extra_files
 # =============================================================================
+
 
 def delete_extra_files(
     outpath: str,
@@ -1216,6 +1250,7 @@ def delete_extra_files(
 # =============================================================================
 # Commands
 # =============================================================================
+
 
 def _filter_aws_output(raw: str) -> str:
     filtered: list[str] = []
@@ -1271,9 +1306,12 @@ def _push_sub(
         pass
     elif os.path.isdir(local_sub):
         result = cfg.store.sync_up(
-            local_sub, sub_rel,
-            excludes=excludes, delete=opts.delete,
-            dryrun=opts.dryrun, verbose=opts.verbose,
+            local_sub,
+            sub_rel,
+            excludes=excludes,
+            delete=opts.delete,
+            dryrun=opts.dryrun,
+            verbose=opts.verbose,
         )
         if result.returncode != 0:
             write_output(result.stdout)
@@ -1289,7 +1327,9 @@ def _push_sub(
             print(msg)
         else:
             result = cfg.store.put_object(
-                sub_rel, local_sub, verbose=opts.verbose,
+                sub_rel,
+                local_sub,
+                verbose=opts.verbose,
                 metadata={"local-mtime": local_mtime},
             )
             if result.returncode != 0:
@@ -1305,9 +1345,7 @@ def _push_sub(
     return 0
 
 
-def cmd_push(
-    cfg: Config, entry: str, opts: Opts, sub: str | None = None
-) -> int:
+def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int:
     entry_cfg = cfg.entries.get(entry)
     if not entry_cfg:
         err(f"no such entry: {entry}")
@@ -1333,9 +1371,7 @@ def cmd_push(
 
     if sub is not None:
         post_hook_sub: str | None = entry_cfg.get("post_hook")
-        return _push_sub(
-            cfg, entry, post_hook_sub, target_root, sub, excludes, opts
-        )
+        return _push_sub(cfg, entry, post_hook_sub, target_root, sub, excludes, opts)
 
     if entry.endswith(".git") and opts.meta_only:
         err(f"skipping manifest for {entry} (.git suffix convention)")
@@ -1349,9 +1385,12 @@ def cmd_push(
 
     if os.path.isdir(target):
         result = cfg.store.sync_up(
-            target, entry,
-            excludes=excludes, delete=True,
-            dryrun=opts.dryrun, verbose=opts.verbose,
+            target,
+            entry,
+            excludes=excludes,
+            delete=True,
+            dryrun=opts.dryrun,
+            verbose=opts.verbose,
         )
         if result.returncode != 0:
             write_output(result.stdout)
@@ -1369,7 +1408,9 @@ def cmd_push(
                 results = msg
             else:
                 result = cfg.store.put_object(
-                    entry, target, verbose=opts.verbose,
+                    entry,
+                    target,
+                    verbose=opts.verbose,
                     metadata={"local-mtime": local_mtime},
                 )
                 if result.returncode != 0:
@@ -1440,7 +1481,7 @@ def _manifest_matches_local(
     """True iff every manifest entry matches the local filesystem.
 
     Returning True means 'aws s3 sync' would copy nothing AND apply_manifest
-    would change nothing — so both can be skipped.
+    would change nothing - so both can be skipped.
     """
     for entry in iter_manifest(manifest_path):
         res = manifest_target(entry, outpath, is_dir, sub)
@@ -1452,9 +1493,7 @@ def _manifest_matches_local(
     return True
 
 
-def cmd_pull(
-    cfg: Config, entry: str, opts: Opts, sub: str | None = None
-) -> int:
+def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int:
     outpath: str | None = opts.outpath
     entry_cfg = cfg.entries.get(entry)
     if outpath is None:
@@ -1499,9 +1538,7 @@ def cmd_pull(
         #    the s3 sync/cp and apply_manifest are no-ops. Skip them.
         if _manifest_matches_local(manifest_path, outpath, is_dir, sub):
             if not opts.meta_only and opts.delete and is_dir:
-                excludes: list[str] = (
-                    entry_cfg.get("excludes", []) if entry_cfg else []
-                )
+                excludes: list[str] = entry_cfg.get("excludes", []) if entry_cfg else []
                 remote_files = _read_manifest_files(manifest_path, sub=sub)
                 delete_extra_files(outpath, False, remote_files, excludes)
             return 0
@@ -1509,15 +1546,11 @@ def cmd_pull(
         # 3. Normal path: prep, then sync (dir) or cp (file).
         prep: list[tuple[str, int]] = []
         if IS_WINDOWS and not opts.meta_only:
-            prep = _windows_collect_writable_prep(
-                outpath, is_dir, manifest_path, sub
-            )
+            prep = _windows_collect_writable_prep(outpath, is_dir, manifest_path, sub)
 
         sync_changed = False
         if not opts.meta_only:
-            rc, sync_changed = download_from_s3(
-                cfg, entry, outpath, is_dir, opts.verbose, sub=sub
-            )
+            rc, sync_changed = download_from_s3(cfg, entry, outpath, is_dir, opts.verbose, sub=sub)
             if rc != 0:
                 if IS_WINDOWS:
                     _windows_restore_modes(prep)
@@ -1534,8 +1567,13 @@ def cmd_pull(
             st = 0
         else:
             st = apply_manifest(
-                cfg, entry, outpath, is_dir, manifest_path,
-                sub=sub, verbose=opts.verbose,
+                cfg,
+                entry,
+                outpath,
+                is_dir,
+                manifest_path,
+                sub=sub,
+                verbose=opts.verbose,
             )
 
         if not opts.meta_only and opts.delete and is_dir:
@@ -1548,9 +1586,7 @@ def cmd_pull(
         os.unlink(manifest_path)
 
 
-def _read_manifest_files(
-    manifest_path: str, sub: str | None = None
-) -> dict[str, int]:
+def _read_manifest_files(manifest_path: str, sub: str | None = None) -> dict[str, int]:
     remote_files: dict[str, int] = {}
     for entry in iter_manifest(manifest_path):
         rel = entry.rel.removeprefix("./")
@@ -1559,14 +1595,12 @@ def _read_manifest_files(
                 continue
             if not rel.startswith(sub + "/"):
                 continue
-            rel = rel[len(sub) + 1:]
+            rel = rel[len(sub) + 1 :]
         remote_files[rel] = 1
     return remote_files
 
 
-def cmd_show(
-    cfg: Config, entry: str, opts: Opts, file: str | None = None
-) -> int:
+def cmd_show(cfg: Config, entry: str, opts: Opts, file: str | None = None) -> int:
     if entry not in cfg.entries:
         err(f"no such entry: {entry}")
         return 1
@@ -1611,9 +1645,9 @@ def _humanize_size_diff(diff_bytes: int) -> str:
     if diff < 1024:
         return f"+{diff} bytes"
     for unit, threshold in (
-        ("TB", 1024 ** 4),
-        ("GB", 1024 ** 3),
-        ("MB", 1024 ** 2),
+        ("TB", 1024**4),
+        ("GB", 1024**3),
+        ("MB", 1024**2),
         ("KB", 1024),
     ):
         if diff >= threshold:
@@ -1660,15 +1694,11 @@ def check_metadata(
     use_color: bool = False,
     ignore_dir_mtime: bool = False,
 ) -> str | None:
-    diff = compare_to_local(
-        entry, target, use_color=use_color, ignore_dir_mtime=ignore_dir_mtime
-    )
+    diff = compare_to_local(entry, target, use_color=use_color, ignore_dir_mtime=ignore_dir_mtime)
     return format_diff_block(diff, target, verbose)
 
 
-def cmd_status(
-    cfg: Config, entry: str, opts: Opts, sub: str | None = None
-) -> int:
+def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int:
     entry_cfg = cfg.entries.get(entry)
     if not entry_cfg:
         err(f"no such entry: {entry}")
@@ -1695,8 +1725,11 @@ def cmd_status(
             if is_dir:
                 remote_files[rel] = 1
             block = check_metadata(
-                target, entry_obj, opts.verbose,
-                use_color=use_color, ignore_dir_mtime=True,
+                target,
+                entry_obj,
+                opts.verbose,
+                use_color=use_color,
+                ignore_dir_mtime=True,
             )
             if block:
                 write_output(block)
@@ -1709,9 +1742,7 @@ def cmd_status(
         os.unlink(manifest_path)
 
 
-def diff_single_file(
-    cfg: Config, rel_key: str, label: str, localfile: str, opts: Opts
-) -> int:
+def diff_single_file(cfg: Config, rel_key: str, label: str, localfile: str, opts: Opts) -> int:
     fd, tmppath = tempfile.mkstemp()
     os.close(fd)
     try:
@@ -1815,9 +1846,7 @@ def diff_backup(cfg: Config, entry: str, outpath: str, opts: Opts) -> int:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def cmd_diff(
-    cfg: Config, entry: str, opts: Opts, file: str | None = None
-) -> int:
+def cmd_diff(cfg: Config, entry: str, opts: Opts, file: str | None = None) -> int:
     entry_cfg = cfg.entries.get(entry)
     if not entry_cfg:
         err(f"no such entry: {entry}")
@@ -1864,9 +1893,7 @@ def show_entry_files(manifest_path: str, sub: str | None = None) -> None:
         )
 
 
-def cmd_ls_remote(
-    cfg: Config, opts: Opts, entry: str | None = None, sub: str | None = None
-) -> int:
+def cmd_ls_remote(cfg: Config, opts: Opts, entry: str | None = None, sub: str | None = None) -> int:
     assert cfg.store is not None
     if entry is None:
         for line in cfg.store.list_top_level_lines(verbose=opts.verbose):
@@ -1895,6 +1922,7 @@ def cmd_ls_remote(
 # =============================================================================
 # Parallel runner
 # =============================================================================
+
 
 def run_entries(
     fn: Callable[[Config, str, Opts], int],
@@ -1927,10 +1955,9 @@ def run_entries(
 # Usage
 # =============================================================================
 
+
 def print_usage(status: int = 1) -> NoReturn:
-    config_path = os.environ.get("S3BAK_CONFIG") or expand_home(
-        "~/.config/s3bak/config.py"
-    )
+    config_path = os.environ.get("S3BAK_CONFIG") or expand_home("~/.config/s3bak/config.py")
     text = f"""\
 Usage: s3bak <command> [options] [args]
 
@@ -2020,15 +2047,16 @@ Examples:
 # Main
 # =============================================================================
 
+
 def _normalize_local_path(arg: str) -> str:
     expanded = expand_home(arg) if arg.startswith("~") else arg
     return os.path.abspath(expanded)
 
 
 def _resolve_one_arg(cfg: Config, arg: str) -> tuple[str, str | None]:
-    # '/' を含まない: entry 名として厳密一致。
-    # '/' を含む: CWD/HOME 基準で絶対化したローカルパスとして、
-    #   各 entry の path 配下にあるかを判定し、最長 prefix の entry を採用。
+    # No '/': match strictly as an entry name.
+    # Contains '/': treat as a local path made absolute against CWD/HOME,
+    #   then find which entry's path contains it, preferring the longest prefix.
     if "/" not in arg:
         if arg in cfg.entries:
             return arg, None
@@ -2057,9 +2085,7 @@ def _resolve_one_arg(cfg: Config, arg: str) -> tuple[str, str | None]:
     return best_name, best_file
 
 
-def resolve_entry_file(
-    cfg: Config, positional: list[str], cmd: str
-) -> tuple[str, str | None]:
+def resolve_entry_file(cfg: Config, positional: list[str], cmd: str) -> tuple[str, str | None]:
     if len(positional) != 1:
         die(f"{cmd} takes <entry> or <path>")
     return _resolve_one_arg(cfg, positional[0])
@@ -2095,7 +2121,7 @@ def main() -> int:
     positional: list[str] = []
 
     def take_value(flag: str, idx: int) -> tuple[str, int]:
-        # --flag=value / --flag value 両対応
+        # Support both --flag=value and --flag value
         if "=" in flag:
             return flag.split("=", 1)[1], idx
         if idx + 1 >= len(args):
@@ -2117,9 +2143,7 @@ def main() -> int:
             opt_data_only = True
         elif a in ("-v", "--verbose"):
             opt_verbose = True
-        elif a in ("-o", "--output", "--outpath") or a.startswith(
-            ("--output=", "--outpath=")
-        ):
+        elif a in ("-o", "--output", "--outpath") or a.startswith(("--output=", "--outpath=")):
             opt_outpath, i = take_value(a, i)
         elif a == "--color":
             opt_color = "always"
@@ -2189,9 +2213,7 @@ def main() -> int:
 
     elif subcmd == "status":
         if opt_delete:
-            die(
-                "status does not support --delete (use 'pull --delete' to remove local extras)"
-            )
+            die("status does not support --delete (use 'pull --delete' to remove local extras)")
         if opt_meta_only:
             die("status does not support --meta-only")
         if opt_data_only:
@@ -2209,9 +2231,7 @@ def main() -> int:
                 status_sub_by_entry[e] = s
 
         def _status_one(cfg_: Config, entry_: str, opts_: Opts) -> int:
-            return cmd_status(
-                cfg_, entry_, opts_, sub=status_sub_by_entry.get(entry_)
-            )
+            return cmd_status(cfg_, entry_, opts_, sub=status_sub_by_entry.get(entry_))
 
         return run_entries(_status_one, cfg, entries, opts)
 
@@ -2243,9 +2263,7 @@ def main() -> int:
         if opt_data_only:
             die("list does not support --data-only")
         if positional:
-            die(
-                "list takes no arguments (use 'ls-remote <entry>' for manifest contents)"
-            )
+            die("list takes no arguments (use 'ls-remote <entry>' for manifest contents)")
         return cmd_list(cfg, opts)
 
     elif subcmd == "ls-remote":
@@ -2267,13 +2285,19 @@ def main() -> int:
         print_usage()
 
 
-if __name__ == "__main__":
+def run() -> int:
+    """Console entry point: install signal handling and translate exceptions
+    into exit codes. This is what the ``s3bak`` command invokes."""
     signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
     try:
-        sys.exit(main() or 0)
+        return main() or 0
     except subprocess.CalledProcessError as e:
         cmd_str = shlex.join(e.cmd) if isinstance(e.cmd, list) else str(e.cmd)
         err(f"command failed: {cmd_str}")
-        sys.exit(e.returncode or 1)
+        return e.returncode or 1
     except BrokenPipeError:
-        sys.exit(141)
+        return 141
+
+
+if __name__ == "__main__":
+    sys.exit(run())
