@@ -1557,22 +1557,22 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         if IS_WINDOWS and not opts.meta_only:
             prep = _windows_collect_writable_prep(outpath, is_dir, manifest_path, sub)
 
-        sync_changed = False
         if not opts.meta_only:
-            rc, sync_changed = download_from_s3(cfg, entry, outpath, is_dir, opts.verbose, sub=sub)
+            rc, _ = download_from_s3(cfg, entry, outpath, is_dir, opts.verbose, sub=sub)
             if rc != 0:
                 if IS_WINDOWS:
                     _windows_restore_modes(prep)
                 return rc
 
-        # 4. Apply manifest metadata (mode, mtime, symlinks).
-        #    Skipped entirely with --data-only.
+        # 4. Apply manifest metadata (mode, mtime, symlinks). We only reach here
+        #    after a confirmed mismatch, so always apply: objectless or
+        #    metadata-only diffs (empty dirs, symlinks, mode/mtime) have nothing
+        #    to download yet still need applying. apply_manifest sets the modes
+        #    itself, so the writable prep needs no separate restore. Skipped only
+        #    with --data-only.
         if opts.data_only:
             if IS_WINDOWS and not opts.meta_only:
                 _windows_restore_modes(prep)
-            st = 0
-        elif IS_WINDOWS and not opts.meta_only and not sync_changed:
-            _windows_restore_modes(prep)
             st = 0
         else:
             st = apply_manifest(

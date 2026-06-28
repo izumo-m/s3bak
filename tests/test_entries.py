@@ -105,6 +105,22 @@ def test_post_hook_runs_on_success(ws):
     assert marker.exists()
 
 
+def test_windows_pull_applies_manifest_without_downloads(ws, monkeypatch):
+    # On Windows, apply_manifest must run even when nothing was downloaded (an
+    # empty-dir sub-path here): the restore must not be gated on sync_changed.
+    from s3bak import cli
+
+    monkeypatch.setattr(cli, "IS_WINDOWS", True)
+    ws.write("data/file.txt", "x")
+    (ws.root / "data" / "empty").mkdir()
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    dest = ws.root / "out"
+    ws.run("pull", str(ws.root / "data" / "empty"), "-o", str(dest), expect_rc=0)
+    assert dest.is_dir()
+
+
 def test_list_shows_configured_entries(ws):
     ws.write("data/a.txt", "x")
     ws.config({"data": {"path": str(ws.root / "data")}})
