@@ -1,0 +1,62 @@
+[project]
+name = "s3bak"
+version = "0.1.0"
+description = "Unified S3 backup/restore tool"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Masanao Izumo", email = "49137441+izumo-m@users.noreply.github.com" },
+]
+keywords = ["aws", "s3", "backup", "restore", "sync"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Archiving :: Backup",
+    "Typing :: Typed",
+]
+# Pure standard library at runtime; the `aws` CLI is required on PATH.
+dependencies = []
+
+[project.scripts]
+s3bak = "s3bak.cli:run"
+
+[project.urls]
+Homepage = "https://github.com/izumo-m/s3bak"
+Repository = "https://github.com/izumo-m/s3bak"
+Issues = "https://github.com/izumo-m/s3bak/issues"
+
+[build-system]
+requires = ["uv_build>=0.11.14,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.13",
+    "ruff>=0.6",
+    "vermin>=1.6",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+    "N",   # pep8-naming
+    "RUF", # ruff-specific
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["s3bak"]
