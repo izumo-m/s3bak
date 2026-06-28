@@ -1,0 +1,8 @@
+# Repo-local AWS CLI config for the dev MinIO stack (scripts/compose.dev.yaml).
+# Selected via AWS_CONFIG_FILE by scripts/minio-env.sh, so your ~/.aws is left
+# untouched. These are MinIO's well-known default credentials, not secrets.
+[profile s3bak-minio]
+aws_access_key_id = minioadmin
+aws_secret_access_key = minioadmin
+region = us-east-1
+endpoint_url = http://127.0.0.1:9000
