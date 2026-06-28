@@ -901,12 +901,7 @@ def upload_manifest(cfg: Config, entry: str, target: str, excludes: list[str], o
 
     write_manifest_to_aws(cfg, entry, target, excludes, opts.verbose)
 
-    if post_hook:
-        if opts.verbose:
-            write_stderr(f"+ {post_hook}\n")
-        subprocess.run(["bash", "-c", post_hook])
-
-    return 0
+    return _run_post_hook(post_hook, opts)
 
 
 def _manifest_line_key(line: str) -> str:
@@ -1266,15 +1261,18 @@ def _filter_aws_output(raw: str) -> str:
     return "\n".join(filtered)
 
 
-def _run_post_hook(post_hook: str | None, opts: Opts) -> None:
+def _run_post_hook(post_hook: str | None, opts: Opts) -> int:
     if not post_hook:
-        return
+        return 0
     if opts.dryrun:
         print(f"(dryrun) would run post_hook: {post_hook}")
-        return
+        return 0
     if opts.verbose:
         write_stderr(f"+ {post_hook}\n")
-    _ = subprocess.run(["bash", "-c", post_hook])
+    rc = subprocess.run(["bash", "-c", post_hook]).returncode
+    if rc != 0:
+        err(f"post_hook failed (exit {rc}): {post_hook}")
+    return rc
 
 
 def _push_sub(
@@ -1296,8 +1294,7 @@ def _push_sub(
 
     if opts.meta_only:
         patch_manifest_subtree(cfg, entry, target_root, sub, excludes, opts)
-        _run_post_hook(post_hook, opts)
-        return 0
+        return _run_post_hook(post_hook, opts)
 
     assert cfg.store is not None
     st = os.lstat(local_sub)
@@ -1346,8 +1343,7 @@ def _push_sub(
 
     if not opts.data_only:
         patch_manifest_subtree(cfg, entry, target_root, sub, excludes, opts)
-    _run_post_hook(post_hook, opts)
-    return 0
+    return _run_post_hook(post_hook, opts)
 
 
 def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int:
@@ -1431,14 +1427,13 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         write_output(f"{results}\n")
 
     if results and not opts.data_only:
-        try:
-            upload_manifest(cfg, entry, target, excludes, opts)
-        except subprocess.CalledProcessError as e:
-            return e.returncode
+        st = upload_manifest(cfg, entry, target, excludes, opts)
+        if st != 0:
+            return st
 
     if results and opts.data_only:
         post_hook: str | None = entry_cfg.get("post_hook")
-        _run_post_hook(post_hook, opts)
+        return _run_post_hook(post_hook, opts)
 
     return 0
 

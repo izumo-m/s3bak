@@ -90,6 +90,21 @@ def test_empty_directory_subpath_pull_restores_a_directory(ws):
     assert dest.is_dir()
 
 
+def test_post_hook_failure_propagates(ws):
+    ws.write("data/a.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data"), "post_hook": "exit 3"}})
+    res = ws.run("push", "data")
+    assert res.rc == 3
+
+
+def test_post_hook_runs_on_success(ws):
+    marker = ws.root / "hook-ran"
+    ws.write("data/a.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data"), "post_hook": f"touch {marker}"}})
+    ws.run("push", "data", expect_rc=0)
+    assert marker.exists()
+
+
 def test_list_shows_configured_entries(ws):
     ws.write("data/a.txt", "x")
     ws.config({"data": {"path": str(ws.root / "data")}})
