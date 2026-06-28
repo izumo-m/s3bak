@@ -103,11 +103,20 @@ def shell_unquote(s: str) -> str:
 
 
 def parse_fname(fname_field: str) -> tuple[str, str | None]:
-    m = re.match(r"^(.+?)' -> '(.+)$", fname_field)
-    if m:
-        link_part = m.group(1) + "'"
-        target_part = "'" + m.group(2)
-        return shell_unquote(link_part), shell_unquote(target_part)
+    """Split a manifest name field into (name, symlink_target | None).
+
+    Names are shell-always quoted (see shell_always_quote); a symlink is written
+    as 'link' -> 'target'. shlex parses the quoting, so a name that itself
+    contains the literal ' -> ' sequence is not mistaken for the separator.
+    """
+    try:
+        tokens = shlex.split(fname_field)
+    except ValueError:
+        return shell_unquote(fname_field), None
+    if len(tokens) == 3 and tokens[1] == "->":
+        return tokens[0], tokens[2]
+    if len(tokens) == 1:
+        return tokens[0], None
     return shell_unquote(fname_field), None
 
 
