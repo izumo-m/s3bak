@@ -430,6 +430,9 @@ class Config:
     bucket: str
     path_prefix: str
     entries: dict[str, dict[str, Any]]
+    # Max entries processed at once under --all (None = one thread per entry,
+    # i.e. all at once). Consumed by run_entries, not the store.
+    entry_concurrency: int | None = None
     store: Boto3S3Store | None = None
 
 
@@ -509,10 +512,12 @@ def load_config() -> Config:
         die(f"could not parse bucket from prefix='{prefix}'")
 
     # Optional, independent concurrency knobs (see config.example.py):
-    #   max_concurrency - parallel S3 transfer threads for cp / sync
-    #   compare_workers - parallel ETag content comparisons during sync
+    #   max_concurrency   - parallel S3 transfer threads for cp / sync
+    #   compare_workers   - parallel ETag content comparisons during sync
+    #   entry_concurrency - entries processed at once under --all
     max_concurrency = _config_positive_int(ns, "max_concurrency", config_path)
     compare_workers = _config_positive_int(ns, "compare_workers", config_path)
+    entry_concurrency = _config_positive_int(ns, "entry_concurrency", config_path)
 
     cfg = Config(
         profile=profile,
@@ -520,6 +525,7 @@ def load_config() -> Config:
         bucket=bucket,
         path_prefix=path_prefix,
         entries=entries,
+        entry_concurrency=entry_concurrency,
     )
     cfg.store = Boto3S3Store(
         profile,
@@ -2181,8 +2187,13 @@ def run_entries(
     if len(entries) == 1:
         return fn(cfg, entries[0], opts)
 
+    # One thread per entry by default; cap at entry_concurrency when configured.
+    workers = len(entries)
+    if cfg.entry_concurrency is not None:
+        workers = min(workers, cfg.entry_concurrency)
+
     agg = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(entries)) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {executor.submit(fn, cfg, e, opts): e for e in entries}
         for future in concurrent.futures.as_completed(futures):
             try:
