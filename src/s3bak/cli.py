@@ -185,6 +185,37 @@ class ManifestEntry:
         return int(self.mode_str, 8)
 
     @property
+    def perm_bits(self) -> int:
+        """Permission bits only (S_IMODE), valid for both manifest formats:
+        the old one stores permission bits alone, the new one prefixes the
+        file-type bits (S_IFMT)."""
+        return stat_mod.S_IMODE(self.mode_int)
+
+    @property
+    def perm_str(self) -> str:
+        """perm_bits as octal; falls back to the raw mode field when it cannot
+        be parsed, so a malformed manifest line never crashes status."""
+        try:
+            return format(self.perm_bits, "o")
+        except ValueError:
+            return self.mode_str
+
+    @property
+    def has_type(self) -> bool:
+        """True when the mode field carries file-type bits (new format). Old
+        manifests store permission bits only, so S_IFMT is 0 and this is False
+        (also False for a malformed mode, falling back to legacy heuristics)."""
+        try:
+            return stat_mod.S_IFMT(self.mode_int) != 0
+        except ValueError:
+            return False
+
+    @property
+    def is_dir(self) -> bool:
+        """Directory per the recorded type bits. Only meaningful when has_type."""
+        return stat_mod.S_ISDIR(self.mode_int)
+
+    @property
     def size_int(self) -> int:
         return int(self.size_str)
 
@@ -308,6 +339,13 @@ def compare_to_local(
     else:
         is_dir_local = stat_mod.S_ISDIR(st.st_mode)
 
+    if entry.has_type and entry.is_dir != is_dir_local:
+        # The new manifest format records the file type; a directory where a
+        # regular file is expected (or vice versa) is a type change, reported
+        # like a missing/wrong-type entry rather than a metadata-only diff.
+        diff.status = "D"
+        return diff
+
     if not is_dir_local:
         loc_size = st.st_size
         if str(loc_size) != entry.size_str:
@@ -334,20 +372,20 @@ def compare_to_local(
                 diff.details.append(f"size: remote={entry.size_str} local={loc_size}")
 
     loc_mode = format(stat_mod.S_IMODE(st.st_mode), "o")
-    mode_differs = loc_mode != entry.mode_str
+    mode_differs = loc_mode != entry.perm_str
     if mode_differs and IS_WINDOWS:
         # Windows-native Python (incl. msys2 UCRT64) reports synthetic modes
         # via os.stat: 0o666 for writable files, 0o444 for read-only - not
         # the Unix permission bits. Only the owner-write bit is meaningful.
         try:
-            if (entry.mode_int & 0o200) == (st.st_mode & 0o200):
+            if (entry.perm_bits & 0o200) == (st.st_mode & 0o200):
                 mode_differs = False
         except ValueError:
             pass
     if mode_differs:
         diff.status = "M"
         diff.tags.append("mode")
-        diff.details.append(f"mode: remote={entry.mode_str} local={loc_mode}")
+        diff.details.append(f"mode: remote={entry.perm_str} local={loc_mode}")
 
     # A directory's mtime changes whenever its children are added/removed, so
     # it is noise in `status` and is suppressed there (ignore_dir_mtime=True).
@@ -879,12 +917,12 @@ def format_stat_line(rel: str, st: os.stat_result, sym_target: str | None) -> st
         _note_warning(f"warning: skipping {rel!r}: a newline in the filename is not supported")
         return None
     # Permission bits only (S_IMODE); the file-type bits are dropped to keep the
-    # historical `stat -c %a`-style manifest format. KNOWN LIMITATION, deferred
-    # (out of current scope): without the type, an empty directory and a regular
-    # file that has no S3 object are indistinguishable on restore (see the kind
-    # inference in apply_manifest). A future change will record the file type
-    # here (e.g. the full st_mode) so the restore kind no longer depends on S3
-    # object presence. Tracked as a task.
+    # historical `stat -c %a`-style manifest format. Consequence: without the
+    # type, an empty directory and a regular file that has no S3 object are
+    # indistinguishable on restore (see the kind inference in apply_manifest).
+    # The read side already understands a full st_mode here (it uses the type
+    # bits when present, see ManifestEntry.has_type); recording the full mode on
+    # this write side is the remaining step and is deferred (tracked as a task).
     mode = format(stat_mod.S_IMODE(st.st_mode), "o")
 
     if pwd is not None:
@@ -1154,7 +1192,7 @@ def apply_manifest(
             continue
         target, rel = res
         epoch = parse_timestamp(m_entry.date_str, m_entry.time_str, m_entry.zone_str)
-        mode = m_entry.mode_int
+        mode = m_entry.perm_bits
 
         if m_entry.sym_target is not None:
             parent = os.path.dirname(target)
@@ -1172,20 +1210,16 @@ def apply_manifest(
             continue
 
         # File-vs-dir classification. Symlinks are handled above (sym_target).
-        # For the rest the type is inferred from whether an S3 object exists,
-        # because the manifest mode field stores permission bits only and drops
-        # the file-type bits (see format_stat_line): an empty directory and a
-        # regular file with no object are indistinguishable here. Consequence: a
-        # regular file recorded but never uploaded (e.g. unreadable, skipped with
-        # a warning) is restored as a directory.
-        #
-        # KNOWN LIMITATION, deferred (out of current scope, tracked as a task):
-        # record the file type in the manifest so the kind no longer depends on
-        # object presence. Until then only un-uploaded regular files are
-        # affected; symlinks (incl. pid-style links) and uploaded files restore
-        # correctly.
+        # When the manifest records the file type (new format, has_type) trust
+        # it directly. Otherwise (old format, permission bits only) the type is
+        # inferred from whether an S3 object exists: an empty directory and a
+        # regular file with no object are indistinguishable, so a regular file
+        # recorded but never uploaded (e.g. unreadable, skipped with a warning)
+        # is restored as a directory. The recorded type removes that ambiguity.
         if not is_dir:
             kind = "file"
+        elif m_entry.has_type:
+            kind = "dir" if m_entry.is_dir else "file"
         elif rel == ".":
             kind = "dir"
         elif rel in remote_keys:
@@ -1204,7 +1238,7 @@ def apply_manifest(
             errors += 1
             continue
 
-        write_output(f"{m_entry.mode_str} {target}\n")
+        write_output(f"{m_entry.perm_str} {target}\n")
         if not _apply_meta(target, mode, epoch):
             errors += 1
 
@@ -1552,30 +1586,40 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
 def _entry_kind_from_manifest(manifest_path: str) -> str:
     """Return 'dir' or 'file' from manifest content.
 
-    write_manifest_to_aws emits './...' relative paths for directories
-    (always starting with a '.' entry) and a bare basename for single files.
-    Returns 'file' for empty/malformed manifests so callers fail fast.
+    The new manifest format records the file type in the mode field, so the
+    first entry's type bits decide it. For the old format (permission bits
+    only) fall back to the path shape: write_manifest_to_aws emits './...'
+    paths for directories (always starting with a '.' entry) and a bare
+    basename for single files. Returns 'file' for empty/malformed manifests so
+    callers fail fast.
     """
     for entry in iter_manifest(manifest_path):
+        if entry.has_type:
+            return "dir" if entry.is_dir else "file"
         return "dir" if entry.rel == "." or entry.rel.startswith("./") else "file"
     return "file"
 
 
 def _sub_kind_from_manifest(manifest_path: str, sub: str) -> str:
-    """Return 'file', 'dir', or 'missing' for sub by scanning manifest only.
+    """Return 'file', 'dir', or 'missing' for sub by scanning the manifest only.
 
-    Empty directories cannot be distinguished from files here (manifest
-    drops type bits); callers should treat 'file' as ambiguous and confirm
-    with a head-object when needed.
+    A descendant under sub proves it is a directory. Otherwise the recorded
+    type bits (new format) distinguish an empty directory from a file; old
+    manifests drop those bits, so 'file' stays ambiguous there and callers
+    confirm with a head-object when needed.
     """
-    found_self = False
+    self_entry: ManifestEntry | None = None
     for entry in iter_manifest(manifest_path):
         rel = entry.rel.removeprefix("./")
         if rel == sub:
-            found_self = True
+            self_entry = entry
         elif rel.startswith(sub + "/"):
             return "dir"
-    return "file" if found_self else "missing"
+    if self_entry is None:
+        return "missing"
+    if self_entry.has_type:
+        return "dir" if self_entry.is_dir else "file"
+    return "file"
 
 
 def _manifest_matches_local(
@@ -1635,9 +1679,12 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 return 1
             is_dir = kind == "dir"
             if kind == "file":
-                # "file" is ambiguous - the manifest drops type bits, so a real
-                # file and an empty directory look the same. An empty dir has no
-                # S3 object, so a missing head-object means it is a directory.
+                # 'file' is ambiguous only for old manifests, which drop the
+                # type bits: a real file and an empty directory look the same.
+                # An empty dir has no S3 object, so a missing head-object means
+                # it is a directory. New-format manifests resolve this above via
+                # the recorded type, so this head-object probe is the legacy
+                # fallback.
                 assert cfg.store is not None
                 is_dir = cfg.store.head_object(f"{entry}/{sub}", verbose=opts.verbose) is None
         else:
