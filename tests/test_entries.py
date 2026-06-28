@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 
+import pytest
+
 
 def test_single_file_entry_roundtrip_with_metadata(ws, s3):
     f = ws.write("solo.txt", "content\n")
@@ -119,6 +121,41 @@ def test_windows_pull_applies_manifest_without_downloads(ws, monkeypatch):
     dest = ws.root / "out"
     ws.run("pull", str(ws.root / "data" / "empty"), "-o", str(dest), expect_rc=0)
     assert dest.is_dir()
+
+
+def test_symlink_entry_path_is_rejected(ws):
+    (ws.root / "realdir").mkdir()
+    os.symlink("realdir", ws.root / "linkentry")
+    ws.config({"linkentry": {"path": str(ws.root / "linkentry")}})
+
+    res = ws.run("push", "linkentry")
+    assert res.rc != 0
+    assert "symlink" in (res.err + res.out).lower()
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no mkfifo on this platform")
+def test_special_file_entry_path_is_rejected(ws):
+    fifo = ws.root / "fifo"
+    os.mkfifo(fifo)
+    ws.config({"fifo": {"path": str(fifo)}})
+
+    res = ws.run("push", "fifo")
+    assert res.rc != 0
+    assert "regular file or directory" in (res.err + res.out).lower()
+
+
+def test_inner_symlink_subpath_pull_restores_symlink(ws):
+    # A symlink inside a dir entry, pulled as a sub-path, must come back as a
+    # symlink (no data object exists for it).
+    ws.write("data/real.txt", "r")
+    os.symlink("real.txt", ws.root / "data" / "link.txt")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    dest = ws.root / "out"
+    ws.run("pull", str(ws.root / "data" / "link.txt"), "-o", str(dest), expect_rc=0)
+    assert os.path.islink(dest)
+    assert os.readlink(dest) == "real.txt"
 
 
 def test_list_shows_configured_entries(ws):

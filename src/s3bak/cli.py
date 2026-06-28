@@ -646,7 +646,7 @@ class Boto3S3Store:
         return self._transfer(
             verbose,
             f"sync {src} {dest_dir}/",
-            lambda cb: self._s3().sync(src, f"{dest_dir}/", on_result=cb),
+            lambda cb: self._s3().sync(src, f"{dest_dir}/", follow_symlinks=False, on_result=cb),
         )
 
     def put_text(self, rel_key: str, text: str, *, verbose: bool = False) -> None:
@@ -1364,9 +1364,17 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         return 1
     target: str = entry_cfg["path"]
     target_root = _normalize_local_path(target)
-    if sub is None and not os.path.exists(target):
-        err(f"target does not exist: {target}")
-        return 1
+    if sub is None:
+        if not os.path.lexists(target):
+            err(f"target does not exist: {target}")
+            return 1
+        mode = os.lstat(target).st_mode
+        if stat_mod.S_ISLNK(mode):
+            err(f"entry path is a symlink, which is not allowed as an entry: {target}")
+            return 1
+        if not (stat_mod.S_ISREG(mode) or stat_mod.S_ISDIR(mode)):
+            err(f"entry path must be a regular file or directory: {target}")
+            return 1
 
     excludes: list[str] = entry_cfg.get("excludes", [])
 
