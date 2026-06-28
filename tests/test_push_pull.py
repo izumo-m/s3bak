@@ -116,6 +116,22 @@ def test_push_with_unreadable_file_warns_and_exits_2(ws, monkeypatch):
     assert "data/bad.txt" not in ws.keys()
 
 
+def test_pull_delete_removes_extra_symlink_to_dir(ws):
+    ws.write("data/keep.txt", "k")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    dest = ws.root / "restore"
+    dest.mkdir()
+    (dest / "keep.txt").write_text("k")
+    (dest / "realtarget").mkdir()
+    os.symlink("realtarget", dest / "extralink")  # an extra symlink-to-dir
+
+    ws.run("pull", "data", "-o", str(dest), "--delete", expect_rc=0)
+    assert not os.path.lexists(dest / "extralink")  # unlinked, not rmdir-skipped
+    assert (dest / "keep.txt").read_text() == "k"
+
+
 def test_push_after_delete_removes_remote_and_reports_it(ws):
     ws.write("data/a.txt", "a")
     ws.write("data/b.txt", "b")

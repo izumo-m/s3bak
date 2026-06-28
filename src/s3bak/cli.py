@@ -1289,9 +1289,11 @@ def delete_extra_files(
             write_output(f"A {path}\n")
         else:
             try:
-                if is_dir_entry:
+                if is_dir_entry and not os.path.islink(path):
                     os.rmdir(path)
                 else:
+                    # Files and symlinks (incl. symlinks to directories, which
+                    # iter_local_tree reports as is_dir) are unlinked.
                     os.remove(path)
                 write_output(f"delete: {path}\n")
             except OSError:
