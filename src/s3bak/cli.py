@@ -11,7 +11,6 @@ from __future__ import annotations
 import calendar
 import concurrent.futures
 import datetime
-import json
 import os
 import re
 import shlex
@@ -371,7 +370,7 @@ class Config:
     bucket: str
     path_prefix: str
     entries: dict[str, dict[str, Any]]
-    store: AwsCliStore | None = None
+    store: Boto3S3Store | None = None
 
 
 @dataclass
@@ -427,8 +426,7 @@ def load_config() -> Config:
         err("warning: entry name 'all' conflicts with --all flag; consider renaming")
     if not prefix.startswith("s3://"):
         die(f"prefix must start with s3:// (got '{prefix}')")
-    if not shutil.which("aws"):
-        die("aws command not found")
+    _boto3_s3_exe()  # validate the boto3-s3 CLI is available (dies if not)
 
     rest = prefix[5:]
     bucket = rest.split("/", 1)[0]
@@ -444,13 +442,37 @@ def load_config() -> Config:
         path_prefix=path_prefix,
         entries=entries,
     )
-    cfg.store = AwsCliStore(profile, prefix, bucket, path_prefix)
+    cfg.store = Boto3S3Store(profile, prefix, bucket, path_prefix)
     return cfg
 
 
 # =============================================================================
 # Remote object store
 # =============================================================================
+
+_BOTO3_S3_EXE: str | None = None
+
+
+def _boto3_s3_exe() -> str:
+    """Locate the boto3-s3 console script (a dependency of s3bak).
+
+    Prefer the script installed next to the running interpreter so it resolves
+    regardless of PATH, then fall back to PATH. Dies if not found.
+    """
+    global _BOTO3_S3_EXE
+    if _BOTO3_S3_EXE is None:
+        bindir = os.path.dirname(sys.executable)
+        for name in ("boto3-s3", "boto3-s3.exe"):
+            candidate = os.path.join(bindir, name)
+            if os.path.isfile(candidate):
+                _BOTO3_S3_EXE = candidate
+                break
+        else:
+            found = shutil.which("boto3-s3")
+            if not found:
+                die("boto3-s3 command not found; install s3bak with its dependencies")
+            _BOTO3_S3_EXE = found
+    return _BOTO3_S3_EXE
 
 
 @dataclass
@@ -464,19 +486,24 @@ class ObjectMeta:
 
 @dataclass
 class TransferResult:
-    """Result of a sync/copy operation that may print AWS CLI output."""
+    """Result of a sync/copy operation that may print CLI output."""
 
     returncode: int
     stdout: str = ""
     stderr: str = ""
 
 
-class AwsCliStore:
-    """Object storage backend that shells out to the `aws` CLI.
+class Boto3S3Store:
+    """Object storage backend for s3bak.
+
+    High-level transfers (cp/sync/ls) run through the `boto3-s3` CLI, an
+    aws-s3-compatible command. Low-level object inspection (head-object,
+    list-objects-v2) uses boto3 directly, since the CLI exposes no s3api
+    equivalents.
 
     `rel_key` is a path relative to the configured prefix (e.g. "bin",
     "bin/foo.txt", "bin-ls-l.txt"). The store internally prepends
-    `path_prefix` for s3api calls and `prefix` (the s3:// URL) for `s3 cp`.
+    `path_prefix` for boto3 calls and `prefix` (the s3:// URL) for cp/sync.
     """
 
     def __init__(self, profile: str, prefix: str, bucket: str, path_prefix: str):
@@ -484,10 +511,23 @@ class AwsCliStore:
         self.prefix = prefix  # full s3:// URL
         self.bucket = bucket
         self.path_prefix = path_prefix
+        self._client_cache: Any = None
 
     # --- internal ----------------------------------------------------------
     def _build_cmd(self, *args: str) -> list[str]:
-        return ["aws", "--profile", self.profile, *args]
+        return [_boto3_s3_exe(), "--profile", self.profile, *args]
+
+    def _client(self) -> Any:
+        """Lazily build a boto3 S3 client for the configured profile.
+
+        Endpoint and credentials come from the AWS environment/profile, so the
+        MinIO dev profile and real AWS both work without special-casing.
+        """
+        if self._client_cache is None:
+            import boto3
+
+            self._client_cache = boto3.Session(profile_name=self.profile).client("s3")
+        return self._client_cache
 
     def _api_key(self, rel_key: str) -> str:
         return f"{self.path_prefix}/{rel_key}" if self.path_prefix else rel_key
@@ -526,24 +566,15 @@ class AwsCliStore:
 
     # --- Public API --------------------------------------------------------
     def head_object(self, rel_key: str, *, verbose: bool = False) -> ObjectMeta | None:
-        result = self._run(
-            "s3api",
-            "head-object",
-            "--bucket",
-            self.bucket,
-            "--key",
-            self._api_key(rel_key),
-            "--output",
-            "json",
-            verbose=verbose,
-            check=False,
-        )
-        if result.returncode != 0:
-            return None
+        from botocore.exceptions import ClientError
+
+        key = self._api_key(rel_key)
+        if verbose:
+            write_stderr(f"+ (boto3) head_object s3://{self.bucket}/{key}\n")
         try:
-            data = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            return ObjectMeta(key=rel_key)
+            data = self._client().head_object(Bucket=self.bucket, Key=key)
+        except ClientError:
+            return None
         return ObjectMeta(
             key=rel_key,
             size=int(data.get("ContentLength", 0)),
@@ -551,36 +582,26 @@ class AwsCliStore:
         )
 
     def list_keys_under(self, rel_prefix: str, *, verbose: bool = False) -> set[str]:
+        from botocore.exceptions import ClientError
+
         norm = rel_prefix if rel_prefix.endswith("/") else f"{rel_prefix}/"
         prefix = self._api_key(norm)
-        try:
-            result = self._run(
-                "s3api",
-                "list-objects-v2",
-                "--bucket",
-                self.bucket,
-                "--prefix",
-                prefix,
-                "--output",
-                "text",
-                "--query",
-                "Contents[].Key",
-                verbose=verbose,
-            )
-        except subprocess.CalledProcessError:
-            return set()
+        if verbose:
+            write_stderr(f"+ (boto3) list_objects_v2 s3://{self.bucket}/{prefix}\n")
         keys: set[str] = set()
-        for line in result.stdout.splitlines():
-            for k in line.split("\t"):
-                k = k.strip()
-                if k and k != "None":
-                    rel = k[len(prefix) :]
+        try:
+            paginator = self._client().get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+                for obj in page.get("Contents", []):
+                    rel = obj["Key"][len(prefix) :]
                     if rel:
                         keys.add(rel)
+        except ClientError:
+            return set()
         return keys
 
     def list_top_level_lines(self, *, verbose: bool = False) -> list[str]:
-        result = self._run("s3", "ls", f"{self.prefix}/", verbose=verbose)
+        result = self._run("ls", f"{self.prefix}/", verbose=verbose)
         return result.stdout.splitlines()
 
     def get_object(
@@ -593,7 +614,6 @@ class AwsCliStore:
     ) -> bool:
         try:
             self._run(
-                "s3",
                 "cp",
                 self._s3_url(rel_key),
                 dest_path,
@@ -605,7 +625,7 @@ class AwsCliStore:
             return False
 
     def stream_object_to_stdout(self, rel_key: str, *, verbose: bool = False) -> int:
-        cmd = self._build_cmd("s3", "cp", self._s3_url(rel_key), "-")
+        cmd = self._build_cmd("cp", self._s3_url(rel_key), "-")
         echo_command(verbose, cmd)
         result = subprocess.run(
             cmd,
@@ -624,7 +644,6 @@ class AwsCliStore:
         verbose: bool = False,
     ) -> TransferResult:
         result = self._run(
-            "s3",
             "sync",
             f"{self._s3_url(rel_prefix)}/" if rel_prefix else f"{self.prefix}/",
             f"{dest_dir}/",
@@ -639,7 +658,6 @@ class AwsCliStore:
 
     def put_text(self, rel_key: str, text: str, *, verbose: bool = False) -> None:
         self._run(
-            "s3",
             "cp",
             "-",
             self._s3_url(rel_key),
@@ -655,7 +673,7 @@ class AwsCliStore:
         verbose: bool = False,
         metadata: dict[str, str] | None = None,
     ) -> TransferResult:
-        args = ["s3", "cp", src_path, self._s3_url(rel_key)]
+        args = ["cp", src_path, self._s3_url(rel_key)]
         if metadata:
             meta_str = ",".join(f"{k}={v}" for k, v in metadata.items())
             args.extend(["--metadata", meta_str])
@@ -677,7 +695,7 @@ class AwsCliStore:
         dryrun: bool = False,
         verbose: bool = False,
     ) -> TransferResult:
-        args = ["s3", "sync"]
+        args = ["sync"]
         if delete:
             args.append("--delete")
         if dryrun:
@@ -999,7 +1017,7 @@ def _windows_collect_writable_prep(
     #   - regular files (not dir / not symlink)
     #   - read-only (owner write bit clear)
     #   - differ from the manifest in size or mtime
-    # Temporarily add owner-write so `aws s3 sync`/`cp` can overwrite them.
+    # Temporarily add owner-write so `boto3-s3 sync`/`cp` can overwrite them.
     # Returns [(path, original_mode), ...] for later restoration.
     targets: list[tuple[str, int]] = []
     try:
@@ -1154,7 +1172,7 @@ def download_manifest(cfg: Config, entry: str, dest: str, verbose: bool = False)
 
 
 def _print_transfer_lines(stdout: str) -> bool:
-    """Print interesting lines from `aws s3 sync/cp` stdout, skipping
+    """Print interesting lines from `boto3-s3 sync/cp` stdout, skipping
     progress noise. Returns True if any transfer line was printed.
     """
     if not stdout:
@@ -1480,7 +1498,7 @@ def _manifest_matches_local(
 ) -> bool:
     """True iff every manifest entry matches the local filesystem.
 
-    Returning True means 'aws s3 sync' would copy nothing AND apply_manifest
+    Returning True means 'boto3-s3 sync' would copy nothing AND apply_manifest
     would change nothing - so both can be skipped.
     """
     for entry in iter_manifest(manifest_path):

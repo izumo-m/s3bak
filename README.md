@@ -2,18 +2,20 @@
 
 Unified S3 backup/restore tool.
 
-`s3bak` backs up and restores configured directories or files to/from S3. It is
-a single, dependency-free Python program that drives the official `aws` CLI, and
-keeps a metadata manifest alongside the data so it can report exactly what a
-push or pull would change.
+`s3bak` backs up and restores configured directories or files to/from S3. It
+drives [boto3-s3](https://pypi.org/project/boto3-s3/) (an aws-s3-compatible CLI
+built on boto3) for transfers and boto3 for object inspection, and keeps a
+metadata manifest alongside the data so it can report exactly what a push or
+pull would change.
 
 ## Requirements
 
 - Python **3.10+**
-- The [AWS CLI](https://docs.aws.amazon.com/cli/) (`aws`) installed and on `PATH`,
-  with a configured profile
+- AWS credentials configured (an `~/.aws` profile, or the usual `AWS_*`
+  environment variables)
 
-There are no third-party Python dependencies.
+s3bak depends on [boto3-s3](https://pypi.org/project/boto3-s3/) (installed
+automatically), which brings in boto3. No separate AWS CLI install is required.
 
 ## Install
 

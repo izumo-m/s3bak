@@ -19,8 +19,12 @@ classifiers = [
     "Topic :: System :: Archiving :: Backup",
     "Typing :: Typed",
 ]
-# Pure standard library at runtime; the `aws` CLI is required on PATH.
-dependencies = []
+# boto3-s3-cli provides the aws-s3-compatible `boto3-s3` command (for transfers);
+# boto3 is used directly for head-object / list-objects-v2.
+dependencies = [
+    "boto3-s3-cli>=0.2",
+    "boto3>=1.28",
+]
 
 [project.scripts]
 s3bak = "s3bak.cli:run"
