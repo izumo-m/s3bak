@@ -611,14 +611,16 @@ class Boto3S3Store:
         verbose: bool = False,
         check: bool = True,
     ) -> bool:
-        from boto3_s3 import Boto3S3Error
+        from boto3_s3 import NotFoundError
 
         if verbose:
             write_stderr(f"+ (boto3-s3) cp {self._s3_url(rel_key)} {dest_path}\n")
         try:
             self._s3().cp(self._s3_url(rel_key), dest_path)
             return True
-        except Boto3S3Error:
+        except NotFoundError:
+            # A genuinely-absent object is "not present"; other errors
+            # (access denied, transport, config) propagate to run().
             return False
 
     def stream_object_to_stdout(self, rel_key: str, *, verbose: bool = False) -> int:

@@ -29,6 +29,16 @@ def test_ls_remote_lists_entry(ws):
     assert "data" in res.out.split()
 
 
+def test_pull_unpushed_entry_reports_not_found(ws):
+    # download_manifest -> get_object hits NotFoundError for a never-pushed
+    # entry, which must still map to a clean "not found" (not a crash).
+    ws.write("data/a.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    res = ws.run("pull", "data", "-o", str(ws.root / "out"))
+    assert res.rc != 0
+    assert "not found" in (res.err + res.out).lower()
+
+
 def test_ls_remote_missing_subpath_errors(ws):
     ws.write("data/a.txt", "x")
     ws.config({"data": {"path": str(ws.root / "data")}})
