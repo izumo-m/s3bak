@@ -37,6 +37,24 @@ def test_pull_restores_content(ws):
     assert (dest / "sub" / "b.txt").read_text() == "beta"
 
 
+def test_push_after_delete_removes_remote_and_reports_it(ws):
+    ws.write("data/a.txt", "a")
+    ws.write("data/b.txt", "b")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    assert "data/b.txt" in ws.keys()
+
+    # Remove a file locally; the next push deletes the remote object (sync
+    # --delete). The delete must render as a proper line, not 'download: None'.
+    (ws.root / "data" / "b.txt").unlink()
+    res = ws.run("push", "data", expect_rc=0)
+
+    assert "data/b.txt" not in ws.keys()
+    assert "data/a.txt" in ws.keys()
+    assert "None" not in res.out
+    assert "delete" in res.out
+
+
 def test_pull_delete_removes_local_extras(ws):
     ws.write("data/keep.txt", "k")
     ws.config({"data": {"path": str(ws.root / "data")}})

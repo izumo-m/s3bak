@@ -514,23 +514,33 @@ class Boto3S3Store:
         """Run a boto3-s3 transfer op, collecting aws-style result lines.
 
         `op(on_result)` calls the S3 method with the given result callback;
-        SUCCEEDED/DRYRUN items become 'upload:'/'download:' stdout lines,
-        failures become stderr lines, and a BatchError sets returncode 1.
+        SUCCEEDED/DRYRUN items become 'upload:'/'download:'/'delete:' stdout
+        lines, failures become stderr lines, and any boto3-s3 error sets
+        returncode 1. on_result runs on s3transfer worker threads, so a lock
+        guards the result lists.
         """
-        from boto3_s3 import Boto3S3Error, OpOutcome
+        from boto3_s3 import Boto3S3Error, OpKind, OpOutcome
 
         if verbose:
             write_stderr(f"+ (boto3-s3) {label}\n")
         lines: list[str] = []
         errs: list[str] = []
+        lock = threading.Lock()
 
         def on_result(r: Any) -> None:
             if r.outcome in (OpOutcome.SUCCEEDED, OpOutcome.DRYRUN):
-                verb = "upload" if (r.dest or "").startswith("s3://") else "download"
                 pre = "(dryrun) " if r.outcome is OpOutcome.DRYRUN else ""
-                lines.append(f"{pre}{verb}: {r.src} to {r.dest}")
+                if r.kind is OpKind.DELETE:
+                    line = f"{pre}delete: {r.key}"
+                elif r.src is not None and r.dest is not None:
+                    line = f"{pre}{r.kind.value}: {r.src} to {r.dest}"
+                else:
+                    return
+                with lock:
+                    lines.append(line)
             elif r.outcome is OpOutcome.FAILED:
-                errs.append(f"{r.src} to {r.dest}: {r.error}")
+                with lock:
+                    errs.append(f"{r.key}: {r.error}")
 
         try:
             op(on_result)
@@ -549,8 +559,10 @@ class Boto3S3Store:
             write_stderr(f"+ (boto3) head_object s3://{self.bucket}/{key}\n")
         try:
             data = self._client().head_object(Bucket=self.bucket, Key=key)
-        except ClientError:
-            return None
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code", "") in ("404", "NoSuchKey", "NotFound"):
+                return None
+            raise
         return ObjectMeta(
             key=rel_key,
             size=int(data.get("ContentLength", 0)),
@@ -558,22 +570,17 @@ class Boto3S3Store:
         )
 
     def list_keys_under(self, rel_prefix: str, *, verbose: bool = False) -> set[str]:
-        from botocore.exceptions import ClientError
-
         norm = rel_prefix if rel_prefix.endswith("/") else f"{rel_prefix}/"
         prefix = self._api_key(norm)
         if verbose:
             write_stderr(f"+ (boto3) list_objects_v2 s3://{self.bucket}/{prefix}\n")
         keys: set[str] = set()
-        try:
-            paginator = self._client().get_paginator("list_objects_v2")
-            for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
-                for obj in page.get("Contents", []):
-                    rel = obj["Key"][len(prefix) :]
-                    if rel:
-                        keys.add(rel)
-        except ClientError:
-            return set()
+        paginator = self._client().get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                rel = obj["Key"][len(prefix) :]
+                if rel:
+                    keys.add(rel)
         return keys
 
     def list_top_level_lines(self, *, verbose: bool = False) -> list[str]:
@@ -2279,12 +2286,17 @@ def main(argv: list[str] | None = None) -> int:
         print_usage()
 
 
-def _boto3_s3_error() -> type[BaseException]:
-    """The boto3-s3 base exception, imported lazily so `help` / `list` stay
-    SDK-free (the except clause only evaluates this on an error)."""
-    from boto3_s3 import Boto3S3Error
-
-    return Boto3S3Error
+def _sdk_errors() -> tuple[type[BaseException], ...]:
+    """The boto3-s3 / botocore error types, imported lazily so `help` / `list`
+    stay SDK-free (the except clause only evaluates this on an error). Returns an
+    empty tuple if the SDK is unimportable, so matching never masks the original
+    error with an ImportError."""
+    try:
+        from boto3_s3 import Boto3S3Error
+        from botocore.exceptions import BotoCoreError, ClientError
+    except ImportError:
+        return ()
+    return (Boto3S3Error, BotoCoreError, ClientError)
 
 
 def run() -> int:
@@ -2299,7 +2311,7 @@ def run() -> int:
         return e.returncode or 1
     except BrokenPipeError:
         return 141
-    except _boto3_s3_error() as e:
+    except _sdk_errors() as e:
         err(str(e))
         return 1
 
