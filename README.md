@@ -3,9 +3,9 @@
 Unified S3 backup/restore tool.
 
 `s3bak` backs up and restores configured directories or files to/from S3. It
-drives [boto3-s3](https://pypi.org/project/boto3-s3/) (an aws-s3-compatible CLI
-built on boto3) for transfers and boto3 for object inspection, and keeps a
-metadata manifest alongside the data so it can report exactly what a push or
+uses [boto3-s3](https://pypi.org/project/boto3-s3/) (an aws-s3-compatible
+library built on boto3) for transfers and boto3 for object inspection, and keeps
+a metadata manifest alongside the data so it can report exactly what a push or
 pull would change.
 
 ## Requirements

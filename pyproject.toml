@@ -19,10 +19,10 @@ classifiers = [
     "Topic :: System :: Archiving :: Backup",
     "Typing :: Typed",
 ]
-# boto3-s3-cli provides the aws-s3-compatible `boto3-s3` command (for transfers);
-# boto3 is used directly for head-object / list-objects-v2.
+# boto3-s3 provides the in-process S3 transfer/listing API; boto3 is used
+# directly for head-object / list-objects-v2.
 dependencies = [
-    "boto3-s3-cli>=0.2",
+    "boto3-s3>=0.3",
     "boto3>=1.28",
 ]
 

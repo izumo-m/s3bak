@@ -426,7 +426,6 @@ def load_config() -> Config:
         err("warning: entry name 'all' conflicts with --all flag; consider renaming")
     if not prefix.startswith("s3://"):
         die(f"prefix must start with s3:// (got '{prefix}')")
-    _boto3_s3_exe()  # validate the boto3-s3 CLI is available (dies if not)
 
     rest = prefix[5:]
     bucket = rest.split("/", 1)[0]
@@ -450,30 +449,6 @@ def load_config() -> Config:
 # Remote object store
 # =============================================================================
 
-_BOTO3_S3_EXE: str | None = None
-
-
-def _boto3_s3_exe() -> str:
-    """Locate the boto3-s3 console script (a dependency of s3bak).
-
-    Prefer the script installed next to the running interpreter so it resolves
-    regardless of PATH, then fall back to PATH. Dies if not found.
-    """
-    global _BOTO3_S3_EXE
-    if _BOTO3_S3_EXE is None:
-        bindir = os.path.dirname(sys.executable)
-        for name in ("boto3-s3", "boto3-s3.exe"):
-            candidate = os.path.join(bindir, name)
-            if os.path.isfile(candidate):
-                _BOTO3_S3_EXE = candidate
-                break
-        else:
-            found = shutil.which("boto3-s3")
-            if not found:
-                die("boto3-s3 command not found; install s3bak with its dependencies")
-            _BOTO3_S3_EXE = found
-    return _BOTO3_S3_EXE
-
 
 @dataclass
 class ObjectMeta:
@@ -494,16 +469,16 @@ class TransferResult:
 
 
 class Boto3S3Store:
-    """Object storage backend for s3bak.
+    """Object storage backend for s3bak, built on the boto3-s3 library.
 
-    High-level transfers (cp/sync/ls) run through the `boto3-s3` CLI, an
-    aws-s3-compatible command. Low-level object inspection (head-object,
-    list-objects-v2) uses boto3 directly, since the CLI exposes no s3api
-    equivalents.
+    Transfers (cp / sync) and listing go through the boto3-s3 ``S3`` API
+    in-process; head-object / list-objects-v2 use the underlying boto3 client.
+    Endpoint and credentials come from the AWS environment/profile, so the
+    MinIO dev profile and real AWS both work without special-casing.
 
     `rel_key` is a path relative to the configured prefix (e.g. "bin",
     "bin/foo.txt", "bin-ls-l.txt"). The store internally prepends
-    `path_prefix` for boto3 calls and `prefix` (the s3:// URL) for cp/sync.
+    `path_prefix` for boto3 calls and `prefix` (the s3:// URL) for cp / sync.
     """
 
     def __init__(self, profile: str, prefix: str, bucket: str, path_prefix: str):
@@ -511,22 +486,22 @@ class Boto3S3Store:
         self.prefix = prefix  # full s3:// URL
         self.bucket = bucket
         self.path_prefix = path_prefix
+        self._s3_cache: Any = None
         self._client_cache: Any = None
 
     # --- internal ----------------------------------------------------------
-    def _build_cmd(self, *args: str) -> list[str]:
-        return [_boto3_s3_exe(), "--profile", self.profile, *args]
+    def _s3(self) -> Any:
+        """Lazily build the boto3-s3 S3 orchestrator for the configured profile."""
+        if self._s3_cache is None:
+            import boto3
+            from boto3_s3 import S3
+
+            self._s3_cache = S3(session=boto3.Session(profile_name=self.profile))
+        return self._s3_cache
 
     def _client(self) -> Any:
-        """Lazily build a boto3 S3 client for the configured profile.
-
-        Endpoint and credentials come from the AWS environment/profile, so the
-        MinIO dev profile and real AWS both work without special-casing.
-        """
         if self._client_cache is None:
-            import boto3
-
-            self._client_cache = boto3.Session(profile_name=self.profile).client("s3")
+            self._client_cache = self._s3().client()
         return self._client_cache
 
     def _api_key(self, rel_key: str) -> str:
@@ -535,34 +510,35 @@ class Boto3S3Store:
     def _s3_url(self, rel_key: str = "") -> str:
         return f"{self.prefix}/{rel_key}" if rel_key else self.prefix
 
-    def _run(
-        self,
-        *args: str,
-        verbose: bool = False,
-        check: bool = True,
-        capture: bool = True,
-        input_data: str | None = None,
-        cwd: str | None = None,
-        merge_stderr: bool = False,
-    ) -> subprocess.CompletedProcess[str]:
-        cmd = self._build_cmd(*args)
-        echo_command(verbose, cmd)
-        kw: dict[str, Any] = {"text": True}
-        if capture:
-            kw["stdout"] = subprocess.PIPE
-            kw["stderr"] = subprocess.STDOUT if merge_stderr else subprocess.PIPE
-        if input_data is not None:
-            kw["input"] = input_data
-        if cwd is not None:
-            kw["cwd"] = cwd
-        result = subprocess.run(cmd, **kw)
-        if check and result.returncode != 0:
-            if capture and result.stderr:
-                write_stderr(result.stderr)
-            raise subprocess.CalledProcessError(
-                result.returncode, cmd, result.stdout, result.stderr
-            )
-        return result
+    def _transfer(self, verbose: bool, label: str, op: Callable[[Any], None]) -> TransferResult:
+        """Run a boto3-s3 transfer op, collecting aws-style result lines.
+
+        `op(on_result)` calls the S3 method with the given result callback;
+        SUCCEEDED/DRYRUN items become 'upload:'/'download:' stdout lines,
+        failures become stderr lines, and a BatchError sets returncode 1.
+        """
+        from boto3_s3 import Boto3S3Error, OpOutcome
+
+        if verbose:
+            write_stderr(f"+ (boto3-s3) {label}\n")
+        lines: list[str] = []
+        errs: list[str] = []
+
+        def on_result(r: Any) -> None:
+            if r.outcome in (OpOutcome.SUCCEEDED, OpOutcome.DRYRUN):
+                verb = "upload" if (r.dest or "").startswith("s3://") else "download"
+                pre = "(dryrun) " if r.outcome is OpOutcome.DRYRUN else ""
+                lines.append(f"{pre}{verb}: {r.src} to {r.dest}")
+            elif r.outcome is OpOutcome.FAILED:
+                errs.append(f"{r.src} to {r.dest}: {r.error}")
+
+        try:
+            op(on_result)
+            rc = 0
+        except Boto3S3Error as e:
+            rc = 1
+            errs.append(str(e))
+        return TransferResult(returncode=rc, stdout="\n".join(lines), stderr="\n".join(errs))
 
     # --- Public API --------------------------------------------------------
     def head_object(self, rel_key: str, *, verbose: bool = False) -> ObjectMeta | None:
@@ -601,8 +577,15 @@ class Boto3S3Store:
         return keys
 
     def list_top_level_lines(self, *, verbose: bool = False) -> list[str]:
-        result = self._run("ls", f"{self.prefix}/", verbose=verbose)
-        return result.stdout.splitlines()
+        from boto3_s3 import FileKind
+
+        if verbose:
+            write_stderr(f"+ (boto3-s3) ls {self.prefix}/\n")
+        names: list[str] = []
+        for info in self._s3().ls(f"{self.prefix}/", recursive=False):
+            if info.kind is FileKind.FILE:
+                names.append(info.key.rsplit("/", 1)[-1])
+        return names
 
     def get_object(
         self,
@@ -612,29 +595,27 @@ class Boto3S3Store:
         verbose: bool = False,
         check: bool = True,
     ) -> bool:
+        from boto3_s3 import Boto3S3Error
+
+        if verbose:
+            write_stderr(f"+ (boto3-s3) cp {self._s3_url(rel_key)} {dest_path}\n")
         try:
-            self._run(
-                "cp",
-                self._s3_url(rel_key),
-                dest_path,
-                verbose=verbose,
-                check=check,
-            )
+            self._s3().cp(self._s3_url(rel_key), dest_path)
             return True
-        except subprocess.CalledProcessError:
+        except Boto3S3Error:
             return False
 
     def stream_object_to_stdout(self, rel_key: str, *, verbose: bool = False) -> int:
-        cmd = self._build_cmd("cp", self._s3_url(rel_key), "-")
-        echo_command(verbose, cmd)
-        result = subprocess.run(
-            cmd,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        if result.returncode != 0 and result.stderr:
-            write_stderr(result.stderr)
-        return result.returncode
+        from boto3_s3 import Boto3S3Error, StdioStorage
+
+        if verbose:
+            write_stderr(f"+ (boto3-s3) cp {self._s3_url(rel_key)} -\n")
+        try:
+            self._s3().cp(self._s3_url(rel_key), StdioStorage())
+            return 0
+        except Boto3S3Error as e:
+            write_stderr(f"{e}\n")
+            return 1
 
     def sync_down(
         self,
@@ -643,27 +624,21 @@ class Boto3S3Store:
         *,
         verbose: bool = False,
     ) -> TransferResult:
-        result = self._run(
-            "sync",
-            f"{self._s3_url(rel_prefix)}/" if rel_prefix else f"{self.prefix}/",
-            f"{dest_dir}/",
-            verbose=verbose,
-            check=False,
-        )
-        return TransferResult(
-            returncode=result.returncode,
-            stdout=result.stdout,
-            stderr=result.stderr,
+        src = f"{self._s3_url(rel_prefix)}/" if rel_prefix else f"{self.prefix}/"
+        return self._transfer(
+            verbose,
+            f"sync {src} {dest_dir}/",
+            lambda cb: self._s3().sync(src, f"{dest_dir}/", on_result=cb),
         )
 
     def put_text(self, rel_key: str, text: str, *, verbose: bool = False) -> None:
-        self._run(
-            "cp",
-            "-",
-            self._s3_url(rel_key),
-            verbose=verbose,
-            input_data=text,
-        )
+        import io
+
+        from boto3_s3 import IOStorage
+
+        if verbose:
+            write_stderr(f"+ (boto3-s3) cp - {self._s3_url(rel_key)}\n")
+        self._s3().cp(IOStorage(io.BytesIO(text.encode("utf-8"))), self._s3_url(rel_key))
 
     def put_object(
         self,
@@ -673,17 +648,13 @@ class Boto3S3Store:
         verbose: bool = False,
         metadata: dict[str, str] | None = None,
     ) -> TransferResult:
-        args = ["cp", src_path, self._s3_url(rel_key)]
-        if metadata:
-            meta_str = ",".join(f"{k}={v}" for k, v in metadata.items())
-            args.extend(["--metadata", meta_str])
-        result = self._run(
-            *args,
-            verbose=verbose,
-            check=False,
-            merge_stderr=True,
+        dst = self._s3_url(rel_key)
+        options: dict[str, Any] = {"metadata": metadata} if metadata else {}
+        return self._transfer(
+            verbose,
+            f"cp {src_path} {dst}",
+            lambda cb: self._s3().cp(src_path, dst, on_result=cb, **options),
         )
-        return TransferResult(returncode=result.returncode, stdout=result.stdout)
 
     def sync_up(
         self,
@@ -695,22 +666,19 @@ class Boto3S3Store:
         dryrun: bool = False,
         verbose: bool = False,
     ) -> TransferResult:
-        args = ["sync"]
-        if delete:
-            args.append("--delete")
-        if dryrun:
-            args.append("--dryrun")
-        args.extend(["./", f"{self._s3_url(rel_prefix)}/" if rel_prefix else f"{self.prefix}/"])
-        for p in excludes:
-            args.extend(["--exclude", p])
-        result = self._run(
-            *args,
-            verbose=verbose,
-            check=False,
-            cwd=src_dir,
-            merge_stderr=True,
+        dst = f"{self._s3_url(rel_prefix)}/" if rel_prefix else f"{self.prefix}/"
+        filt = None
+        if excludes:
+            from boto3_s3 import GlobFilter
+
+            filt = GlobFilter().exclude(*excludes).compile()
+        return self._transfer(
+            verbose,
+            f"sync {src_dir} {dst}",
+            lambda cb: self._s3().sync(
+                src_dir, dst, delete=delete, dryrun=dryrun, filter=filt, on_result=cb
+            ),
         )
-        return TransferResult(returncode=result.returncode, stdout=result.stdout)
 
 
 # =============================================================================
@@ -1172,8 +1140,8 @@ def download_manifest(cfg: Config, entry: str, dest: str, verbose: bool = False)
 
 
 def _print_transfer_lines(stdout: str) -> bool:
-    """Print interesting lines from `boto3-s3 sync/cp` stdout, skipping
-    progress noise. Returns True if any transfer line was printed.
+    """Print the transfer-result lines, skipping progress noise. Returns True
+    if any transfer line was printed.
     """
     if not stdout:
         return False
@@ -1333,6 +1301,8 @@ def _push_sub(
         )
         if result.returncode != 0:
             write_output(result.stdout)
+            if result.stderr:
+                write_stderr(result.stderr)
             return result.returncode
         filtered = _filter_aws_output(result.stdout)
         if filtered:
@@ -1352,6 +1322,8 @@ def _push_sub(
             )
             if result.returncode != 0:
                 write_output(result.stdout)
+                if result.stderr:
+                    write_stderr(result.stderr)
                 return result.returncode
             filtered = _filter_aws_output(result.stdout)
             if filtered:
@@ -1412,6 +1384,8 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         )
         if result.returncode != 0:
             write_output(result.stdout)
+            if result.stderr:
+                write_stderr(result.stderr)
             return result.returncode
         results = _filter_aws_output(result.stdout)
     else:
@@ -1433,6 +1407,8 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 )
                 if result.returncode != 0:
                     write_output(result.stdout)
+                    if result.stderr:
+                        write_stderr(result.stderr)
                     return result.returncode
                 results = _filter_aws_output(result.stdout)
 
@@ -2303,6 +2279,14 @@ def main(argv: list[str] | None = None) -> int:
         print_usage()
 
 
+def _boto3_s3_error() -> type[BaseException]:
+    """The boto3-s3 base exception, imported lazily so `help` / `list` stay
+    SDK-free (the except clause only evaluates this on an error)."""
+    from boto3_s3 import Boto3S3Error
+
+    return Boto3S3Error
+
+
 def run() -> int:
     """Console entry point: install signal handling and translate exceptions
     into exit codes. This is what the ``s3bak`` command invokes."""
@@ -2315,6 +2299,9 @@ def run() -> int:
         return e.returncode or 1
     except BrokenPipeError:
         return 141
+    except _boto3_s3_error() as e:
+        err(str(e))
+        return 1
 
 
 if __name__ == "__main__":

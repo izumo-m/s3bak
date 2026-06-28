@@ -43,19 +43,6 @@ wheels = [
 ]
 
 [[package]]
-name = "boto3-s3-cli"
-version = "0.2.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "boto3-s3" },
-    { name = "botocore" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/57/67/732effc0ee035d9e9a32e2c8604a7e0d9911c367471e2bc7a691593d208a/boto3_s3_cli-0.2.0.tar.gz", hash = "sha256:8ac21042f4ce622dd2f5eee7cacab87ecbed1dcd6303b0db9381192b1dd9c4ac", size = 60390, upload-time = "2026-06-27T14:17:27.913Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/ba/fd/7d825be71186786394cbbf608c929d825dbfcf93e8b198064fe8307f1e3f/boto3_s3_cli-0.2.0-py3-none-any.whl", hash = "sha256:8825aa74f141b5417032307701841f3901c59e8adaba5f494a2d5efb2d3b1291", size = 80561, upload-time = "2026-06-27T14:17:26.967Z" },
-]
-
-[[package]]
 name = "botocore"
 version = "1.43.36"
 source = { registry = "https://pypi.org/simple" }
@@ -212,7 +199,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "boto3" },
-    { name = "boto3-s3-cli" },
+    { name = "boto3-s3" },
 ]
 
 [package.dev-dependencies]
@@ -226,7 +213,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "boto3", specifier = ">=1.28" },
-    { name = "boto3-s3-cli", specifier = ">=0.2" },
+    { name = "boto3-s3", specifier = ">=0.3" },
 ]
 
 [package.metadata.requires-dev]
