@@ -15,7 +15,7 @@ def test_push_all_uploads_every_entry(ws):
     ws.run("push", "--all", expect_rc=0)
 
     keys = ws.keys()
-    assert {"d1/a.txt", "d2/b.txt", "d1-ls-l.txt", "d2-ls-l.txt"} <= keys
+    assert {"d1/a.txt", "d2/b.txt", "d1-manifest.jsonl", "d2-manifest.jsonl"} <= keys
 
 
 def test_status_all_is_clean_after_push_all(ws):
@@ -37,7 +37,7 @@ def test_push_meta_only_updates_manifest_not_data(ws):
     ws.run("push", "--meta-only", "data", expect_rc=0)
 
     assert "data/new.txt" not in ws.keys()  # data was not uploaded
-    body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-ls-l.txt")["Body"].read()
+    body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl")["Body"].read()
     assert "new.txt" in body.decode()  # but it is recorded in the manifest
 
 
@@ -59,14 +59,18 @@ def test_push_data_only_skips_manifest_refresh(ws):
     ws.write("data/a.txt", "a")
     ws.config({"data": {"path": str(ws.root / "data")}})
     ws.run("push", "data", expect_rc=0)
-    before = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-ls-l.txt")["Body"].read()
+    before = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl")[
+        "Body"
+    ].read()
 
     (ws.root / "data" / "a.txt").write_text("a-much-bigger-content")
     ws.run("push", "--data-only", "data", expect_rc=0)
 
     obj = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/a.txt")["Body"].read()
     assert obj == b"a-much-bigger-content"  # data was uploaded
-    after = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-ls-l.txt")["Body"].read()
+    after = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl")[
+        "Body"
+    ].read()
     assert before == after  # but the manifest was not rewritten
 
 
@@ -174,4 +178,4 @@ def test_push_git_entry_meta_only_skips_manifest(ws):
     ws.config({"repo.git": {"path": str(ws.root / "repo.git")}})
 
     ws.run("push", "--meta-only", "repo.git", expect_rc=0)
-    assert "repo.git-ls-l.txt" not in ws.keys()  # .git + --meta-only skips the manifest
+    assert "repo.git-manifest.jsonl" not in ws.keys()  # .git + --meta-only skips the manifest

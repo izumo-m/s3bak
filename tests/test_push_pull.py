@@ -17,7 +17,7 @@ def test_push_uploads_objects_and_manifest(ws):
     keys = ws.keys()
     assert "data/a.txt" in keys
     assert "data/sub/b.txt" in keys
-    assert "data-ls-l.txt" in keys  # the metadata manifest
+    assert "data-manifest.jsonl" in keys  # the metadata manifest
 
 
 def test_ls_remote_lists_entry(ws):

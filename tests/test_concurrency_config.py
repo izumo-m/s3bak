@@ -1,8 +1,10 @@
-"""config.py exposes two independent concurrency knobs.
+"""config.py knobs: concurrency settings and the quick-check mtime window.
 
 ``max_concurrency`` tunes the transfer thread pool (cp / sync), ``compare_workers``
-tunes the parallel ETag comparison; either may be set without the other. s3bak
-does not read aws-cli's ``[s3]`` config, so these are the only way to change them.
+tunes the parallel ETag comparison under --checksum; either may be set without
+the other. s3bak does not read aws-cli's ``[s3]`` config, so these are the only
+way to change them. ``mtime_window`` (seconds, 0 allowed = strict) bounds the
+quick-check mtime tolerance.
 """
 
 from __future__ import annotations
@@ -15,8 +17,10 @@ import pytest
 from s3bak import cli
 
 
-def _store(ws):
-    return cli.load_config().store
+def _store(ws) -> cli.Boto3S3Store:
+    store = cli.load_config().store
+    assert store is not None
+    return store
 
 
 def test_defaults_leave_both_unset(ws):
@@ -27,7 +31,7 @@ def test_defaults_leave_both_unset(ws):
     assert store.max_concurrency is None
     assert store.compare_workers is None
     assert store._s3()._transfer_config is None  # library default (10) applies
-    assert store._content_compare().workers is None  # library defaults it at sync time
+    assert store.content_compare().workers is None  # library defaults it at sync time
 
 
 def test_both_set_independently(ws):
@@ -43,7 +47,7 @@ def test_both_set_independently(ws):
     assert store.compare_workers == 3
     assert store._s3()._transfer_config.max_concurrency == 7
 
-    cmp = store._content_compare()
+    cmp = store.content_compare()
     assert cmp.workers == 3
     assert type(cmp.compare).__name__ == "EtagComparison"
 
@@ -54,7 +58,7 @@ def test_compare_workers_alone_leaves_transfer_default(ws):
 
     store = _store(ws)
     assert store._s3()._transfer_config is None  # transfers keep the default
-    assert store._content_compare().workers == 5
+    assert store.content_compare().workers == 5
 
 
 def test_max_concurrency_alone_leaves_compare_unset(ws):
@@ -64,7 +68,7 @@ def test_max_concurrency_alone_leaves_compare_unset(ws):
     store = _store(ws)
     assert store._s3()._transfer_config.max_concurrency == 6
     # compare_workers unset -> the library defaults it to max_concurrency at run time.
-    assert store._content_compare().workers is None
+    assert store.content_compare().workers is None
 
 
 @pytest.mark.parametrize("name", ["max_concurrency", "compare_workers", "entry_concurrency"])
@@ -86,6 +90,29 @@ def test_entry_concurrency_defaults_to_none(ws):
     ws.write("data/a.txt", "x")
     ws.config({"data": {"path": str(ws.root / "data")}})
     assert cli.load_config().entry_concurrency is None
+
+
+def test_mtime_window_defaults_to_two_seconds(ws):
+    ws.write("data/a.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    cfg = cli.load_config()
+    assert cfg.mtime_window == 2
+    assert cfg.window_ns == 2_000_000_000
+
+
+def test_mtime_window_zero_is_allowed(ws):
+    # 0 = strict st_mtime_ns equality; unlike the concurrency knobs it is valid.
+    ws.write("data/a.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}}, mtime_window=0)
+    assert cli.load_config().mtime_window == 0
+
+
+@pytest.mark.parametrize("bad", [-1, True, "lots", 1.5])
+def test_mtime_window_invalid_value_is_rejected(ws, bad):
+    ws.write("data/a.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}}, mtime_window=bad)
+    with pytest.raises(SystemExit):
+        cli.load_config()
 
 
 def _peak_concurrency(entry_concurrency: int | None, n_entries: int) -> tuple[int, int]:

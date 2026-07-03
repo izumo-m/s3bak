@@ -17,24 +17,32 @@ profile = "default"
 # Destination root on S3 (required). Must start with "s3://".
 prefix = "s3://my-bucket/backup"
 
-# Parallelism (both optional, both independent positive integers). s3bak does
-# not read aws-cli's [s3] settings, so set these here if the defaults don't fit.
+# Tuning (all optional). s3bak does not read aws-cli's [s3] settings, so set
+# these here if the defaults don't fit.
 #
 #   max_concurrency    parallel S3 transfer threads for cp / sync (default 10),
 #                      like aws-cli's s3.max_concurrent_requests.
-#   compare_workers    parallel ETag content comparisons during sync. sync
-#                      hashes each candidate file locally to compare it by
-#                      content; raise this to speed up a sync bottlenecked on
-#                      that hashing, lower it to cap CPU/IO. Defaults to
-#                      max_concurrency, else 10.
+#   compare_workers    parallel ETag comparisons under --checksum, which
+#                      hashes each candidate file locally; raise this to speed
+#                      up a --checksum sync bottlenecked on that hashing,
+#                      lower it to cap CPU/IO. Defaults to max_concurrency,
+#                      else 10. The default (non---checksum) compare is
+#                      stat-only and needs no workers.
 #   entry_concurrency  how many entries run at once under --all (default: all
 #                      of them, one thread each). Each entry also opens its own
-#                      transfer/compare pools, so cap this when you have many
-#                      entries to bound the total thread count.
+#                      transfer pool, so cap this when you have many entries
+#                      to bound the total thread count.
+#   mtime_window       quick-check mtime tolerance in seconds (default 2,
+#                      0 = exact st_mtime_ns match). The default absorbs every
+#                      common filesystem's mtime granularity (FAT 2s,
+#                      exFAT 10ms, NTFS 100ns), so a pull onto a coarser
+#                      filesystem cannot re-download forever over a restored
+#                      mtime the filesystem cannot represent.
 #
 # max_concurrency = 10
 # compare_workers = 10
 # entry_concurrency = 4
+# mtime_window = 2
 
 # Directories / files to back up (required), keyed by entry name.
 #
