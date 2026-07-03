@@ -162,3 +162,22 @@ def test_pull_empty_dir_subpath_restores_directory(ws):
     dest = ws.root / "out"
     ws.run("pull", str(ws.root / "data" / "empty"), "-o", str(dest), expect_rc=0)
     assert dest.is_dir()
+
+
+def test_pull_replaces_file_where_directory_recorded(ws):
+    # The manifest records ./conflict as a directory, but the restore target
+    # already holds a regular file at that name. Restore must replace it with a
+    # directory, not chmod the stray file and report success.
+    _put_manifest(
+        ws,
+        "data",
+        [_line("40755", "."), _line("40755", "./conflict")],
+    )
+    ws.config({"data": {"path": str(ws.root / "data")}})
+
+    dest = ws.root / "out"
+    dest.mkdir()
+    (dest / "conflict").write_text("i am a file")  # wrong type at the dir path
+
+    ws.run("pull", "data", "-o", str(dest), expect_rc=0)
+    assert (dest / "conflict").is_dir()

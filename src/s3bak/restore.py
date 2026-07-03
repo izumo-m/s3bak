@@ -185,7 +185,12 @@ def apply_manifest(outpath: str, is_dir: bool, manifest_path: str, sub: str | No
         # directory (including an empty one, which has no S3 object) from a
         # regular file that was recorded but never uploaded.
         if is_dir and m_entry.is_dir:
-            if not os.path.exists(target):
+            # A file or symlink where a directory belongs is a stale conflicting
+            # type; clear it so the recorded directory is what ends up there
+            # (the symlink branch above clears conflicting types the same way).
+            if os.path.islink(target) or (os.path.exists(target) and not os.path.isdir(target)):
+                os.remove(target)
+            if not os.path.isdir(target):
                 os.makedirs(target, exist_ok=True)
             deferred_dirs.append((target, mode, m_entry.mtime_ns))
             continue

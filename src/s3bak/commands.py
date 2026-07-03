@@ -438,6 +438,13 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         if IS_WINDOWS and not opts.meta_only:
             prep = windows_collect_writable_prep(outpath, is_dir, manifest_path, sub)
 
+        # A single-file restore must place a regular file at outpath. If a
+        # symlink sits there, replace it - writing through it would clobber the
+        # link target instead. (Directory syncs use follow_symlinks=False, and
+        # apply_manifest clears conflicting types on the metadata paths.)
+        if not is_dir and has_data and not opts.meta_only and os.path.islink(outpath):
+            os.remove(outpath)
+
         changed = False
         if not opts.meta_only and has_data:
             # The compare only matters for the dir sync; a single-file transfer
@@ -531,11 +538,18 @@ def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
     try:
         if not download_manifest(cfg, entry, manifest_path, opts.verbose):
             return 1
-        if sub is not None and _sub_kind_from_manifest(manifest_path, sub) == "missing":
-            err(f"not found on S3: {entry}/{sub}")
-            return 1
-
-        is_dir = os.path.isdir(outpath)
+        # Classify from the manifest (the record of the last push), not the
+        # local filesystem: a directory entry whose local tree was deleted must
+        # still map each record to its own child path (is_dir=False would fold
+        # every record onto outpath and print duplicate/wrong lines).
+        if sub is not None:
+            sub_kind = _sub_kind_from_manifest(manifest_path, sub)
+            if sub_kind == "missing":
+                err(f"not found on S3: {entry}/{sub}")
+                return 1
+            is_dir = sub_kind == "dir"
+        else:
+            is_dir = _entry_kind_from_manifest(manifest_path) == "dir"
         excludes: list[str] = entry_cfg.get("excludes", [])
         use_color = _resolve_use_color(opts.color)
 

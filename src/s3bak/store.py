@@ -15,6 +15,7 @@ import shutil
 import sys
 import threading
 from collections.abc import Callable
+from contextlib import closing
 from dataclasses import dataclass
 from typing import Any
 
@@ -312,8 +313,8 @@ class Boto3S3Store:
         parent = os.path.dirname(dest_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        with open(dest_path, "wb") as f:
-            shutil.copyfileobj(resp["Body"], f)
+        with closing(resp["Body"]) as body, open(dest_path, "wb") as f:
+            shutil.copyfileobj(body, f)
         return True
 
     def stream_object_to_stdout(self, rel_key: str, *, verbose: bool = False) -> int:
@@ -326,7 +327,8 @@ class Boto3S3Store:
         except ClientError as e:
             write_stderr(f"{e}\n")
             return 1
-        shutil.copyfileobj(resp["Body"], sys.stdout.buffer)
+        with closing(resp["Body"]) as body:
+            shutil.copyfileobj(body, sys.stdout.buffer)
         sys.stdout.buffer.flush()
         return 0
 
