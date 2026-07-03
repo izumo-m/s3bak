@@ -127,7 +127,32 @@ def test_mtime_window_defaults_to_two_seconds(ws):
     ws.config({"data": {"path": str(ws.root / "data")}})
     cfg = cli.load_config()
     assert cfg.mtime_window == 2
-    assert cfg.window_ns == 2_000_000_000
+    assert cfg.window_for("data") == 2
+    assert cfg.window_ns_for("data") == 2_000_000_000
+
+
+def test_per_entry_mtime_window_overrides_top_level(ws):
+    ws.write("data/a.txt", "x")
+    ws.config(
+        {
+            "strict": {"path": str(ws.root / "data"), "mtime_window": 0},
+            "loose": {"path": str(ws.root / "data")},
+        },
+        mtime_window=5,
+    )
+    cfg = cli.load_config()
+    assert cfg.window_for("strict") == 0  # per-entry wins
+    assert cfg.window_for("loose") == 5  # falls back to top-level
+    assert cfg.window_for("unknown") == 5  # unknown entry -> top-level
+
+
+def test_cli_override_beats_per_entry(ws):
+    ws.write("data/a.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data"), "mtime_window": 9}})
+    cfg = cli.load_config()
+    assert cfg.window_for("data") == 9
+    cfg.mtime_window_override = 0  # what --mtime-window sets
+    assert cfg.window_for("data") == 0  # CLI override wins over per-entry
 
 
 def test_mtime_window_zero_is_allowed(ws):
@@ -141,6 +166,14 @@ def test_mtime_window_zero_is_allowed(ws):
 def test_mtime_window_invalid_value_is_rejected(ws, bad):
     ws.write("data/a.txt", "x")
     ws.config({"data": {"path": str(ws.root / "data")}}, mtime_window=bad)
+    with pytest.raises(SystemExit):
+        cli.load_config()
+
+
+@pytest.mark.parametrize("bad", [-1, True, "lots", 1.5])
+def test_per_entry_mtime_window_invalid_value_is_rejected(ws, bad):
+    ws.write("data/a.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data"), "mtime_window": bad}})
     with pytest.raises(SystemExit):
         cli.load_config()
 

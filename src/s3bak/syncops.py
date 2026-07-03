@@ -97,19 +97,21 @@ def download_manifest(cfg: Config, entry: str, dest: str, verbose: bool = False)
     return cfg.store.get_object(manifest.manifest_key(entry), dest, verbose=verbose)
 
 
-def sync_compare(cfg: Config, opts: Opts, manifest_path: str | None, sub: str | None = None) -> Any:
+def sync_compare(
+    cfg: Config, opts: Opts, entry: str, manifest_path: str | None, sub: str | None = None
+) -> Any:
     """Build the sync `compare=` strategy: the stat-only ManifestFilter by
     default, EtagComparison under --checksum. `manifest_path=None` (nothing on
     S3 yet) yields an empty filter, so every pair transfers - which is also
     the entire v2->v3 migration story: the first push re-uploads everything
-    and writes the v3 manifest."""
+    and writes the v3 manifest. The quick-check window is resolved for `entry`."""
     assert cfg.store is not None
     if opts.checksum:
         return cfg.store.content_compare()
     entries: dict[str, ManifestEntry] = {}
     if manifest_path is not None:
         entries = manifest.load_map(manifest_path, sub=sub)
-    return manifest.ManifestFilter(entries, window_ns=cfg.window_ns)
+    return manifest.ManifestFilter(entries, window_ns=cfg.window_ns_for(entry))
 
 
 def _print_transfer_lines(stdout: str) -> bool:

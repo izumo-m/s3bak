@@ -127,7 +127,9 @@ def _push_sub(
             have_manifest = not opts.checksum and download_manifest(
                 cfg, entry, manifest_path, opts.verbose
             )
-            compare = sync_compare(cfg, opts, manifest_path if have_manifest else None, sub=sub)
+            compare = sync_compare(
+                cfg, opts, entry, manifest_path if have_manifest else None, sub=sub
+            )
             result = cfg.store.sync_up(
                 local_sub,
                 sub_rel,
@@ -190,7 +192,7 @@ def _single_file_needs_upload(cfg: Config, entry: str, target: str, opts: Opts) 
         basename = os.path.basename(target)
         for m in manifest.iter_manifest(manifest_path):
             if m.path == basename and m.sym_target is None and m.is_file:
-                if not m.matches_stat(st, cfg.window_ns):
+                if not m.matches_stat(st, cfg.window_ns_for(entry)):
                     return True
                 return cfg.store.head_object(entry, verbose=opts.verbose) is None
         return True
@@ -262,7 +264,7 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             have_manifest = not opts.checksum and download_manifest(
                 cfg, entry, manifest_path, opts.verbose
             )
-            compare = sync_compare(cfg, opts, manifest_path if have_manifest else None)
+            compare = sync_compare(cfg, opts, entry, manifest_path if have_manifest else None)
             result = cfg.store.sync_up(
                 target,
                 entry,
@@ -422,7 +424,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         #    blind spot --checksum exists to cover, so it must not stand
         #    between the user and the content comparison.
         manifest_matches = _manifest_matches_local(
-            manifest_path, outpath, is_dir, sub, cfg.window_ns
+            manifest_path, outpath, is_dir, sub, cfg.window_ns_for(entry)
         )
         if manifest_matches and not opts.checksum:
             if not opts.meta_only and opts.delete and is_dir:
@@ -441,7 +443,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             # The compare only matters for the dir sync; a single-file transfer
             # always happens (we only reach it on a manifest mismatch). Its
             # size (from the manifest) routes a large file through multipart.
-            compare = sync_compare(cfg, opts, manifest_path, sub=sub) if is_dir else None
+            compare = sync_compare(cfg, opts, entry, manifest_path, sub=sub) if is_dir else None
             file_size = None if is_dir else _single_file_size(manifest_path)
             rc, changed = download_from_s3(
                 cfg, entry, outpath, is_dir, opts.verbose, sub=sub, compare=compare, size=file_size
@@ -549,7 +551,7 @@ def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
                 target,
                 entry_obj,
                 opts.verbose,
-                cfg.window_ns,
+                cfg.window_ns_for(entry),
                 use_color=use_color,
                 ignore_dir_mtime=True,
             )

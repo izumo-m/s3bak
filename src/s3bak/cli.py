@@ -356,10 +356,11 @@ def main(argv: list[str] | None = None) -> int:
     if opt_checksum and subcmd not in ("push", "pull"):
         die("--checksum only applies to push and pull")
 
-    # A CLI --mtime-window overrides the config value for this run (0 = exact).
-    # Affects the quick-check compare shared by push / pull / status.
+    # A CLI --mtime-window overrides both the top-level and per-entry config
+    # windows for this run (0 = exact). Affects the quick-check compare shared
+    # by push / pull / status (see Config.window_for).
     if opt_mtime_window is not None:
-        cfg.mtime_window = opt_mtime_window
+        cfg.mtime_window_override = opt_mtime_window
 
     if subcmd == "push":
         if opt_all:

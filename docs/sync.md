@@ -60,8 +60,10 @@ parallelism of this path (it is idle otherwise).
 
 `status` and both compare directions share one size/mtime predicate
 (`compare_to_local`), so `status` never disagrees with what a push or pull would
-actually do. The window they use is `config.py`'s `mtime_window`, which
-`--mtime-window <seconds>` overrides for a single run (0 = exact). `status` additionally reports mode changes for the metadata view —
+actually do. The window is resolved per entry: `--mtime-window <seconds>` (CLI,
+one run) overrides a per-entry `mtime_window`, which overrides the top-level
+`mtime_window` in `config.py` (0 = exact everywhere). A per-entry window suits a
+tree whose filesystem needs a different tolerance than the rest. `status` additionally reports mode changes for the metadata view —
 but the sync never transfers over a mode change (that is a `--meta-only`
 refresh, below).
 

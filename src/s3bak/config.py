@@ -31,13 +31,27 @@ class Config:
     # Max entries processed at once under --all (None = one thread per entry,
     # i.e. all at once). Consumed by run_entries, not the store.
     entry_concurrency: int | None = None
-    # Quick-check mtime tolerance in seconds (0 = exact st_mtime_ns match).
+    # Top-level quick-check mtime tolerance in seconds (0 = exact st_mtime_ns
+    # match). An entry may override it with a per-entry `mtime_window`, and the
+    # CLI --mtime-window overrides both (see window_for).
     mtime_window: int = DEFAULT_MTIME_WINDOW
+    mtime_window_override: int | None = None  # set by CLI --mtime-window
     store: Boto3S3Store | None = None
 
-    @property
-    def window_ns(self) -> int:
-        return self.mtime_window * 1_000_000_000
+    def window_for(self, entry: str) -> int:
+        """Effective quick-check mtime window (seconds) for `entry`:
+        CLI override > per-entry `mtime_window` > top-level `mtime_window`."""
+        if self.mtime_window_override is not None:
+            return self.mtime_window_override
+        entry_cfg = self.entries.get(entry)
+        if entry_cfg is not None:
+            per_entry = entry_cfg.get("mtime_window")
+            if per_entry is not None:
+                return per_entry
+        return self.mtime_window
+
+    def window_ns_for(self, entry: str) -> int:
+        return self.window_for(entry) * 1_000_000_000
 
 
 @dataclass
@@ -52,18 +66,22 @@ class Opts:
     color: str = "auto"
 
 
-def _config_int(ns: dict[str, Any], name: str, config_path: str, *, minimum: int) -> int | None:
-    """Read an optional integer setting from the config namespace.
+def _config_int(
+    ns: dict[str, Any], name: str, config_path: str, *, minimum: int, label: str = ""
+) -> int | None:
+    """Read an optional integer setting from the config namespace `ns`.
 
     Returns None when unset; dies with a clear message on a non-int (bool
     included, since `True` is an int in Python) or a value below `minimum`.
+    `label` prefixes the setting name in the error (e.g. an entry name).
     """
     value = ns.get(name)
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
         kind = "a positive integer" if minimum > 0 else "a non-negative integer"
-        die(f"{name} must be {kind} in {config_path} (got {value!r})")
+        where = f"{label}.{name}" if label else name
+        die(f"{where} must be {kind} in {config_path} (got {value!r})")
     return value
 
 
@@ -121,11 +139,16 @@ def load_config() -> Config:
     #   max_concurrency   - parallel S3 transfer threads for cp / sync
     #   compare_workers   - parallel ETag comparisons under --checksum
     #   entry_concurrency - entries processed at once under --all
-    #   mtime_window      - quick-check mtime tolerance in seconds (0 = exact)
+    #   mtime_window      - quick-check mtime tolerance in seconds (0 = exact),
+    #                       top-level default; overridable per entry
     max_concurrency = _config_int(ns, "max_concurrency", config_path, minimum=1)
     compare_workers = _config_int(ns, "compare_workers", config_path, minimum=1)
     entry_concurrency = _config_int(ns, "entry_concurrency", config_path, minimum=1)
     mtime_window = _config_int(ns, "mtime_window", config_path, minimum=0)
+
+    # Per-entry mtime_window overrides the top-level one (validated the same way).
+    for name, entry_cfg in entries.items():
+        _config_int(entry_cfg, "mtime_window", config_path, minimum=0, label=f"entries[{name!r}]")
 
     cfg = Config(
         profile=profile,

@@ -103,7 +103,8 @@ dependency graph (no import cycles). Lower layers never import upper ones.
 s3bak reads `~/.config/s3bak/config.py` (override with `$S3BAK_CONFIG`). It is
 plain Python executed at startup. Required: `profile`, `prefix` (must start
 with `s3://`), and `entries`. Each entry has a required `path` and optional
-`excludes` / `pre_hook` / `post_hook`. Optional top-level tuning knobs:
+`excludes` / `pre_hook` / `post_hook` / `mtime_window` (per-entry override of
+the window below). Optional top-level tuning knobs:
 
 | Setting             | Default | Meaning                                                        |
 | ------------------- | ------- | -------------------------------------------------------------- |

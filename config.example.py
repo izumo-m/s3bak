@@ -47,13 +47,15 @@ prefix = "s3://my-bucket/backup"
 # Directories / files to back up (required), keyed by entry name.
 #
 # Per-entry keys:
-#   path       (required) local path to back up (build from HOME or absolute)
-#   excludes   (optional) glob patterns excluded from the sync (aws s3-style)
-#   pre_hook   (optional) shell command run before the entry is pushed
-#   post_hook  (optional) shell command run after the entry is pushed/pulled
+#   path          (required) local path to back up (build from HOME or absolute)
+#   excludes      (optional) glob patterns excluded from the sync (aws s3-style)
+#   pre_hook      (optional) shell command run before the entry is pushed
+#   post_hook     (optional) shell command run after the entry is pushed/pulled
+#   mtime_window  (optional) overrides the top-level mtime_window for this entry
+#                 (0 = exact); the CLI --mtime-window overrides both
 entries = {
     ".ssh": {"path": f"{HOME}/.ssh", "excludes": ["agent/*"]},
-    "bin": {"path": f"{HOME}/bin", "excludes": ["__pycache__/*"]},
+    "bin": {"path": f"{HOME}/bin", "excludes": ["__pycache__/*"], "mtime_window": 0},
     ".emacs.d": {
         "path": f"{HOME}/.emacs.d",
         "excludes": ["*.elc", "elpa/*", "eln-cache/*"],
