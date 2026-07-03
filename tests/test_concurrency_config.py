@@ -30,8 +30,36 @@ def test_defaults_leave_both_unset(ws):
     store = _store(ws)
     assert store.max_concurrency is None
     assert store.compare_workers is None
-    assert store._s3()._transfer_config is None  # library default (10) applies
+    assert store._s3._transfer_config is None  # library default (10) applies
     assert store.content_compare().workers is None  # library defaults it at sync time
+
+
+def test_client_built_once_and_reused(ws):
+    # boto3 client construction is not thread-safe, so the store builds one
+    # client up front and every S3-side location reuses it. Guard against a
+    # regression to per-call construction: patch S3.client to count calls and
+    # confirm push/pull issue no further builds.
+    ws.write("data/a.txt", "hello")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+
+    store = _store(ws)
+    assert store._client is not None  # eagerly built in __init__
+
+    calls = {"n": 0}
+    real_client = store._client
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(
+        store._s3, "client", lambda: calls.__setitem__("n", calls["n"] + 1) or real_client
+    )
+    try:
+        # Every S3-side location resolves to an S3Storage carrying the shared
+        # client, so the library never calls S3.client() again.
+        store.put_file("probe.txt", str(ws.root / "data" / "a.txt"))
+        store.sync_up(str(ws.root / "data"), "data")
+        assert store.head_object("data/a.txt") is not None
+    finally:
+        monkey.undo()
+    assert calls["n"] == 0  # no client was constructed after __init__
 
 
 def test_both_set_independently(ws):
@@ -45,7 +73,8 @@ def test_both_set_independently(ws):
     store = _store(ws)
     assert store.max_concurrency == 7
     assert store.compare_workers == 3
-    assert store._s3()._transfer_config.max_concurrency == 7
+    tc = store._s3._transfer_config
+    assert tc is not None and tc.max_concurrency == 7
 
     cmp = store.content_compare()
     assert cmp.workers == 3
@@ -57,7 +86,7 @@ def test_compare_workers_alone_leaves_transfer_default(ws):
     ws.config({"data": {"path": str(ws.root / "data")}}, compare_workers=5)
 
     store = _store(ws)
-    assert store._s3()._transfer_config is None  # transfers keep the default
+    assert store._s3._transfer_config is None  # transfers keep the default
     assert store.content_compare().workers == 5
 
 
@@ -66,7 +95,8 @@ def test_max_concurrency_alone_leaves_compare_unset(ws):
     ws.config({"data": {"path": str(ws.root / "data")}}, max_concurrency=6)
 
     store = _store(ws)
-    assert store._s3()._transfer_config.max_concurrency == 6
+    tc = store._s3._transfer_config
+    assert tc is not None and tc.max_concurrency == 6
     # compare_workers unset -> the library defaults it to max_concurrency at run time.
     assert store.content_compare().workers is None
 

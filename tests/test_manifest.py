@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import sys
 
 import pytest
 
@@ -138,17 +139,35 @@ def test_walk_tree_applies_excludes(tmp_path):
     assert rels == [".", "./keep.txt"]
 
 
-def test_walk_tree_handles_deep_nesting(tmp_path):
-    # The traversal is iterative; depth must not be bounded by the recursion
-    # limit (a recursive generator dies around ~1000 levels).
-    depth = 1200
-    p = tmp_path
+def _stack_depth() -> int:
+    d, f = 0, sys._getframe()
+    while f is not None:
+        d += 1
+        f = f.f_back
+    return d
+
+
+def test_walk_tree_is_iterative_not_recursion_bound(tmp_path):
+    # Prove the walk does not consume a stack frame per directory level: under
+    # a recursion limit set just above the current depth, a tree far deeper
+    # than that headroom would overflow a recursive `yield from` walk but must
+    # not overflow this iterative one. 300 dirs keeps I/O and teardown cheap
+    # (rmtree stays well under its own limit, so no landmine is left behind).
+    depth = 300
+    root = tmp_path / "deep"
+    root.mkdir()
+    p = root
     for _ in range(depth):
         p = p / "d"
         os.mkdir(p)
     (p / "f.txt").write_text("x")
 
-    count = sum(1 for _ in manifest.walk_tree(str(tmp_path), []))
+    old_limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(_stack_depth() + 50)  # < depth: a per-level recursion overflows
+    try:
+        count = sum(1 for _ in manifest.walk_tree(str(root), []))
+    finally:
+        sys.setrecursionlimit(old_limit)
     assert count == depth + 2  # root + each dir + the file
 
 

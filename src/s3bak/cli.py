@@ -443,39 +443,52 @@ class Boto3S3Store:
         self.path_prefix = path_prefix
         # Concurrency knobs (None = library default). max_concurrency tunes the
         # transfer thread pool (cp / sync); compare_workers tunes the parallel
-        # ETag comparison under --checksum (see _s3 / content_compare).
+        # ETag comparison under --checksum (see content_compare).
         self.max_concurrency = max_concurrency
         self.compare_workers = compare_workers
-        self._s3_cache: Any = None
-        self._client_cache: Any = None
+
+        # Build the S3 orchestrator and ONE boto3 client up front, here in the
+        # single-threaded config-load path. boto3 client CONSTRUCTION is not
+        # thread-safe, and --all runs entries - each with its own cp / sync,
+        # and each sync its own transfer threads - concurrently. Every S3-side
+        # location is handed to the library as an S3Storage bound to this one
+        # client (see _s3_loc), so no client is ever built lazily on a worker
+        # thread; head_object shares it too. A built client is safe to share
+        # across threads; only construction races.
+        import boto3
+        from boto3_s3 import S3
+
+        transfer_config = None
+        if max_concurrency is not None:
+            from boto3_s3 import TransferConfig
+
+            transfer_config = TransferConfig(max_concurrency=max_concurrency)
+        # A configured max_concurrency becomes the default TransferConfig for
+        # every cp / sync (the library otherwise uses boto3's default of 10 and
+        # never reads ~/.aws/config for it).
+        self._s3 = S3(
+            session=boto3.Session(profile_name=profile),
+            transfer_config=transfer_config,
+        )
+        self._client = self._s3.client()
 
     # --- internal ----------------------------------------------------------
-    def _s3(self) -> Any:
-        """Lazily build the boto3-s3 S3 orchestrator for the configured profile.
+    def _s3_loc(self, rel_key: str = "", *, is_dir: bool = False) -> Any:
+        """An ``s3://`` location for ``rel_key`` as an ``S3Storage`` bound to
+        this store's one shared client.
 
-        A configured `max_concurrency` becomes the default `TransferConfig` for
-        every cp / sync (the library otherwise uses boto3's default of 10 and
-        never reads `~/.aws/config` for it).
+        Passing an ``S3Storage`` (not a bare URL string) makes cp / sync / ls
+        reuse the pre-built client: ``S3.resolve`` returns a ``Storage``
+        unchanged, whereas a bare ``s3://`` string is resolved by building a
+        fresh client per call - the thread-unsafe path this exists to avoid.
+        ``is_dir`` appends the trailing ``/`` a directory sync expects.
         """
-        if self._s3_cache is None:
-            import boto3
-            from boto3_s3 import S3
+        from boto3_s3 import S3Storage
 
-            transfer_config = None
-            if self.max_concurrency is not None:
-                from boto3_s3 import TransferConfig
-
-                transfer_config = TransferConfig(max_concurrency=self.max_concurrency)
-            self._s3_cache = S3(
-                session=boto3.Session(profile_name=self.profile),
-                transfer_config=transfer_config,
-            )
-        return self._s3_cache
-
-    def _client(self) -> Any:
-        if self._client_cache is None:
-            self._client_cache = self._s3().client()
-        return self._client_cache
+        url = self._s3_url(rel_key)
+        if is_dir:
+            url += "/"
+        return S3Storage(url, client=self._client)
 
     def content_compare(self) -> Any:
         """The `--checksum` compare strategy: ETag content comparison, parallelized.
@@ -498,7 +511,7 @@ class Boto3S3Store:
         from boto3_s3 import ParallelCompare
         from boto3_s3.etagcompare import EtagComparison
 
-        return ParallelCompare(EtagComparison(self._s3()), workers=self.compare_workers)
+        return ParallelCompare(EtagComparison(self._s3), workers=self.compare_workers)
 
     def _api_key(self, rel_key: str) -> str:
         return f"{self.path_prefix}/{rel_key}" if self.path_prefix else rel_key
@@ -559,7 +572,7 @@ class Boto3S3Store:
         if verbose:
             write_stderr(f"+ (boto3) head_object s3://{self.bucket}/{key}\n")
         try:
-            data = self._client().head_object(Bucket=self.bucket, Key=key)
+            data = self._client.head_object(Bucket=self.bucket, Key=key)
         except ClientError as e:
             if e.response.get("Error", {}).get("Code", "") in ("404", "NoSuchKey", "NotFound"):
                 return None
@@ -594,7 +607,7 @@ class Boto3S3Store:
             src=LocalFileInfo(key=local_path, size=os.path.getsize(local_path)),
             dest=S3FileInfo(key=rel_key, size=head.size, etag=head.etag),
         )
-        return EtagComparison(self._s3())(pair)
+        return EtagComparison(self._s3)(pair)
 
     def list_top_level_lines(self, *, verbose: bool = False) -> list[str]:
         from boto3_s3 import FileKind
@@ -602,7 +615,7 @@ class Boto3S3Store:
         if verbose:
             write_stderr(f"+ (boto3-s3) ls {self.prefix}/\n")
         names: list[str] = []
-        for info in self._s3().ls(f"{self.prefix}/", recursive=False):
+        for info in self._s3.ls(self._s3_loc(is_dir=True), recursive=False):
             if info.kind is FileKind.FILE:
                 names.append(info.key.rsplit("/", 1)[-1])
         return names
@@ -620,7 +633,7 @@ class Boto3S3Store:
         if verbose:
             write_stderr(f"+ (boto3-s3) cp {self._s3_url(rel_key)} {dest_path}\n")
         try:
-            self._s3().cp(self._s3_url(rel_key), dest_path)
+            self._s3.cp(self._s3_loc(rel_key), dest_path)
             return True
         except NotFoundError:
             # A genuinely-absent object is "not present"; other errors
@@ -633,7 +646,7 @@ class Boto3S3Store:
         if verbose:
             write_stderr(f"+ (boto3-s3) cp {self._s3_url(rel_key)} -\n")
         try:
-            self._s3().cp(self._s3_url(rel_key), StdioStorage())
+            self._s3.cp(self._s3_loc(rel_key), StdioStorage())
             return 0
         except Boto3S3Error as e:
             write_stderr(f"{e}\n")
@@ -647,11 +660,11 @@ class Boto3S3Store:
         compare: Any = None,
         verbose: bool = False,
     ) -> TransferResult:
-        src = f"{self._s3_url(rel_prefix)}/" if rel_prefix else f"{self.prefix}/"
+        src = self._s3_loc(rel_prefix, is_dir=True)
         return self._transfer(
             verbose,
             f"sync {src} {dest_dir}/",
-            lambda cb: self._s3().sync(
+            lambda cb: self._s3.sync(
                 src,
                 f"{dest_dir}/",
                 compare=compare,
@@ -665,14 +678,14 @@ class Boto3S3Store:
         Errors surface as Boto3S3Error, handled by run()."""
         if verbose:
             write_stderr(f"+ (boto3-s3) cp {src_path} {self._s3_url(rel_key)}\n")
-        self._s3().cp(src_path, self._s3_url(rel_key))
+        self._s3.cp(src_path, self._s3_loc(rel_key))
 
     def put_object(self, rel_key: str, src_path: str, *, verbose: bool = False) -> TransferResult:
-        dst = self._s3_url(rel_key)
+        dst = self._s3_loc(rel_key)
         return self._transfer(
             verbose,
-            f"cp {src_path} {dst}",
-            lambda cb: self._s3().cp(src_path, dst, on_result=cb),
+            f"cp {src_path} {self._s3_url(rel_key)}",
+            lambda cb: self._s3.cp(src_path, dst, on_result=cb),
         )
 
     def sync_up(
@@ -689,13 +702,13 @@ class Boto3S3Store:
         """`file_filter` is the excludes predicate (manifest.exclude_filter):
         the same entry-rooted semantics the manifest walk applies, so the data
         sync and the manifest can never disagree on what an exclude means."""
-        dst = f"{self._s3_url(rel_prefix)}/" if rel_prefix else f"{self.prefix}/"
+        dst = self._s3_loc(rel_prefix, is_dir=True)
         return self._transfer(
             verbose,
             f"sync {src_dir} {dst}",
             # follow_symlinks=False: symlinks are not uploaded as data; the
             # manifest records them and apply_manifest recreates them on restore.
-            lambda cb: self._s3().sync(
+            lambda cb: self._s3.sync(
                 src_dir,
                 dst,
                 delete=delete,
