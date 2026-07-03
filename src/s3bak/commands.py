@@ -438,11 +438,13 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
 
         changed = False
         if not opts.meta_only and has_data:
-            # The compare only matters for the dir sync; a single-file cp
-            # always transfers (we only reach it on a manifest mismatch).
+            # The compare only matters for the dir sync; a single-file transfer
+            # always happens (we only reach it on a manifest mismatch). Its
+            # size (from the manifest) routes a large file through multipart.
             compare = sync_compare(cfg, opts, manifest_path, sub=sub) if is_dir else None
+            file_size = None if is_dir else _single_file_size(manifest_path)
             rc, changed = download_from_s3(
-                cfg, entry, outpath, is_dir, opts.verbose, sub=sub, compare=compare
+                cfg, entry, outpath, is_dir, opts.verbose, sub=sub, compare=compare, size=file_size
             )
             if rc != 0:
                 if IS_WINDOWS:
@@ -474,6 +476,15 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         return st
     finally:
         os.unlink(manifest_path)
+
+
+def _single_file_size(manifest_path: str) -> int | None:
+    """Size of a single-file entry's sole data record (for the download size
+    gate), or None if the manifest has no regular-file record."""
+    for m in manifest.iter_manifest(manifest_path):
+        if m.is_file and m.sym_target is None:
+            return m.size
+    return None
 
 
 def _read_manifest_files(manifest_path: str, sub: str | None = None) -> dict[str, int]:
@@ -558,7 +569,7 @@ def diff_single_file(cfg: Config, rel_key: str, label: str, localfile: str, opts
     os.close(fd)
     try:
         assert cfg.store is not None
-        if not cfg.store.get_object(rel_key, tmppath, verbose=opts.verbose, check=True):
+        if not cfg.store.get_object(rel_key, tmppath, verbose=opts.verbose):
             return 1
         cmd = [
             "diff",

@@ -92,12 +92,9 @@ def patch_manifest_subtree(
 
 def download_manifest(cfg: Config, entry: str, dest: str, verbose: bool = False) -> bool:
     assert cfg.store is not None
-    return cfg.store.get_object(
-        manifest.manifest_key(entry),
-        dest,
-        verbose=verbose,
-        check=False,
-    )
+    # Manifests are small and fetched on nearly every command: a direct
+    # GetObject (size unknown -> the direct path) saves s3transfer's HeadObject.
+    return cfg.store.get_object(manifest.manifest_key(entry), dest, verbose=verbose)
 
 
 def sync_compare(cfg: Config, opts: Opts, manifest_path: str | None, sub: str | None = None) -> Any:
@@ -142,6 +139,7 @@ def download_from_s3(
     verbose: bool,
     sub: str | None = None,
     compare: Any = None,
+    size: int | None = None,
 ) -> tuple[int, bool]:
     assert cfg.store is not None
     rel = f"{entry}/{sub}" if sub else entry
@@ -154,13 +152,11 @@ def download_from_s3(
             return result.returncode, False
         return 0, _print_transfer_lines(result.stdout)
 
-    # Single file: cp always transfers (we only reach here on a manifest
+    # Single file: a transfer always happens (we only reach here on a manifest
     # mismatch), so a successful download counts as changed -> apply_manifest
     # runs and restores mode/mtime. Matters on Windows, where apply_manifest is
-    # skipped when nothing changed.
-    parent = os.path.dirname(outpath)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    if not cfg.store.get_object(rel, outpath, verbose=verbose):
+    # skipped when nothing changed. `size` (from the manifest record) routes a
+    # large file through multipart download; a small one is a direct GetObject.
+    if not cfg.store.get_object(rel, outpath, size=size, verbose=verbose):
         return 1, False
     return 0, True

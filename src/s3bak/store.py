@@ -11,12 +11,21 @@ that shared client - see ``_s3_loc``.
 from __future__ import annotations
 
 import os
+import shutil
+import sys
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 from s3bak.console import note_warning, write_stderr
+
+# s3transfer's default multipart threshold, and boto3's default part size. Below
+# this an object is a single PutObject / GetObject in both the transfer path and
+# EtagComparison's reconstruction, so a direct client call is byte-identical to
+# S3.cp (same plain-MD5 ETag) - and skips s3transfer's machinery (a thread pool,
+# and for downloads a pre-transfer HeadObject probe).
+_DEFAULT_MULTIPART = 8 * 1024 * 1024
 
 
 @dataclass
@@ -94,6 +103,23 @@ class Boto3S3Store:
             transfer_config=transfer_config,
         )
         self._client = self._s3.client()
+        self._small_limit = self._resolve_small_limit()
+
+    def _resolve_small_limit(self) -> int:
+        """Objects strictly smaller than this go through a direct client call
+        instead of S3.cp.
+
+        The bound is ``min(multipart_threshold, part_size)`` so a small object
+        is single-part under both the transfer path (s3transfer uses multipart
+        at ``multipart_threshold``, default 8 MiB) and ``EtagComparison`` (which
+        reconstructs a composite ETag above ``part_size`` = ``s3.multipart_chunksize``).
+        Below the min, both agree the ETag is a plain MD5, so a direct
+        PutObject/GetObject cannot diverge from what S3.cp would store.
+        """
+        threshold = getattr(self._s3._transfer_config, "multipart_threshold", None)
+        threshold = threshold if threshold else _DEFAULT_MULTIPART
+        part_size = self._s3.aws_config().get_size("s3.multipart_chunksize", _DEFAULT_MULTIPART)
+        return min(threshold, part_size or _DEFAULT_MULTIPART)
 
     # --- internal ----------------------------------------------------------
     def _s3_loc(self, rel_key: str = "", *, is_dir: bool = False) -> Any:
@@ -243,37 +269,66 @@ class Boto3S3Store:
                 names.append(info.key.rsplit("/", 1)[-1])
         return names
 
+    def _is_not_found(self, e: Any) -> bool:
+        code = e.response.get("Error", {}).get("Code", "")
+        return code in ("404", "NoSuchKey", "NotFound")
+
     def get_object(
         self,
         rel_key: str,
         dest_path: str,
         *,
+        size: int | None = None,
         verbose: bool = False,
-        check: bool = True,
     ) -> bool:
-        from boto3_s3 import NotFoundError
+        """Download to dest_path; False if the object is absent (other errors
+        propagate to run()). A large object (``size`` >= the small-object
+        limit) goes through S3.cp for parallel multipart download; everything
+        else - and any object of unknown size - is a single streamed
+        GetObject, avoiding s3transfer's pre-transfer HeadObject probe."""
+        if size is not None and size >= self._small_limit:
+            from boto3_s3 import NotFoundError
+
+            if verbose:
+                write_stderr(f"+ (boto3-s3) cp {self._s3_url(rel_key)} {dest_path}\n")
+            try:
+                self._s3.cp(self._s3_loc(rel_key), dest_path)
+                return True
+            except NotFoundError:
+                return False
+
+        from botocore.exceptions import ClientError
 
         if verbose:
-            write_stderr(f"+ (boto3-s3) cp {self._s3_url(rel_key)} {dest_path}\n")
+            write_stderr(f"+ (boto3) get_object s3://{self.bucket}/{self._api_key(rel_key)}\n")
         try:
-            self._s3.cp(self._s3_loc(rel_key), dest_path)
-            return True
-        except NotFoundError:
-            # A genuinely-absent object is "not present"; other errors
-            # (access denied, transport, config) propagate to run().
-            return False
+            resp = self._client.get_object(Bucket=self.bucket, Key=self._api_key(rel_key))
+        except ClientError as e:
+            if self._is_not_found(e):
+                # A genuinely-absent object is "not present"; other errors
+                # (access denied, transport, config) propagate to run().
+                return False
+            raise
+        parent = os.path.dirname(dest_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(dest_path, "wb") as f:
+            shutil.copyfileobj(resp["Body"], f)
+        return True
 
     def stream_object_to_stdout(self, rel_key: str, *, verbose: bool = False) -> int:
-        from boto3_s3 import Boto3S3Error, StdioStorage
+        from botocore.exceptions import ClientError
 
         if verbose:
-            write_stderr(f"+ (boto3-s3) cp {self._s3_url(rel_key)} -\n")
+            write_stderr(f"+ (boto3) get_object s3://{self.bucket}/{self._api_key(rel_key)}\n")
         try:
-            self._s3.cp(self._s3_loc(rel_key), StdioStorage())
-            return 0
-        except Boto3S3Error as e:
+            resp = self._client.get_object(Bucket=self.bucket, Key=self._api_key(rel_key))
+        except ClientError as e:
             write_stderr(f"{e}\n")
             return 1
+        shutil.copyfileobj(resp["Body"], sys.stdout.buffer)
+        sys.stdout.buffer.flush()
+        return 0
 
     def sync_down(
         self,
@@ -297,19 +352,40 @@ class Boto3S3Store:
         )
 
     def put_file(self, rel_key: str, src_path: str, *, verbose: bool = False) -> None:
-        """Upload a local file without result-line collection (manifests).
-        Errors surface as Boto3S3Error, handled by run()."""
+        """Upload a local file without result-line collection (manifests). A
+        small file is a single PutObject; a large one keeps S3.cp for multipart.
+        Errors (ClientError / Boto3S3Error) surface to run()."""
+        if os.path.getsize(src_path) >= self._small_limit:
+            if verbose:
+                write_stderr(f"+ (boto3-s3) cp {src_path} {self._s3_url(rel_key)}\n")
+            self._s3.cp(src_path, self._s3_loc(rel_key))
+            return
         if verbose:
-            write_stderr(f"+ (boto3-s3) cp {src_path} {self._s3_url(rel_key)}\n")
-        self._s3.cp(src_path, self._s3_loc(rel_key))
+            write_stderr(f"+ (boto3) put_object s3://{self.bucket}/{self._api_key(rel_key)}\n")
+        with open(src_path, "rb") as f:
+            self._client.put_object(Bucket=self.bucket, Key=self._api_key(rel_key), Body=f)
 
     def put_object(self, rel_key: str, src_path: str, *, verbose: bool = False) -> TransferResult:
-        dst = self._s3_loc(rel_key)
-        return self._transfer(
-            verbose,
-            f"cp {src_path} {self._s3_url(rel_key)}",
-            lambda cb: self._s3.cp(src_path, dst, on_result=cb),
-        )
+        dst = self._s3_url(rel_key)
+        if os.path.getsize(src_path) >= self._small_limit:
+            loc = self._s3_loc(rel_key)
+            return self._transfer(
+                verbose,
+                f"cp {src_path} {dst}",
+                lambda cb: self._s3.cp(src_path, loc, on_result=cb),
+            )
+        # Small file: a single PutObject, and synthesize the result line the
+        # s3transfer callback would have produced (see _transfer.on_result).
+        from botocore.exceptions import ClientError
+
+        if verbose:
+            write_stderr(f"+ (boto3) put_object s3://{self.bucket}/{self._api_key(rel_key)}\n")
+        try:
+            with open(src_path, "rb") as f:
+                self._client.put_object(Bucket=self.bucket, Key=self._api_key(rel_key), Body=f)
+        except ClientError as e:
+            return TransferResult(returncode=1, stderr=str(e))
+        return TransferResult(returncode=0, stdout=f"upload: {src_path} to {dst}")
 
     def sync_up(
         self,
