@@ -34,7 +34,7 @@ def test_format_parse_roundtrip_tricky_names(tmp_path, name):
     assert "\n" not in line  # one entry stays one line, whatever the name
     e = manifest.parse_entry(line)
     assert e is not None
-    assert e.rel == f"./{name}"
+    assert e.path == f"./{name}"
     assert e.size == 1
     assert e.mtime_ns == st.st_mtime_ns
     assert e.is_file and not e.is_dir
@@ -60,15 +60,16 @@ def test_directory_entry_records_full_mode(tmp_path):
 
 
 def test_parse_entry_ignores_unknown_keys():
-    e = manifest.parse_entry('{"rel":"./a","mode":"100644","size":1,"mtime_ns":5,"future_key":"?"}')
+    line = '{"path":"./a","mode":"100644","size":1,"mtime_ns":5,"future_key":"?"}'
+    e = manifest.parse_entry(line)
     assert e is not None
-    assert e.rel == "./a"
+    assert e.path == "./a"
 
 
 def test_parse_entry_rejects_damage():
     assert manifest.parse_entry("not json") is None
-    assert manifest.parse_entry('{"mode":"100644"}') is None  # no rel
-    assert manifest.parse_entry('{"rel":"./a","mode":"notoctal"}') is None
+    assert manifest.parse_entry('{"mode":"100644"}') is None  # no path
+    assert manifest.parse_entry('{"path":"./a","mode":"notoctal"}') is None
     assert manifest.parse_entry("") is None
 
 
@@ -77,7 +78,7 @@ def test_parse_entry_rejects_damage():
 
 def test_iter_manifest_requires_header(tmp_path):
     p = tmp_path / "m.jsonl"
-    p.write_text('{"rel":".","mode":"40755","mtime_ns":0}\n')
+    p.write_text('{"path":".","mode":"40755","mtime_ns":0}\n')
     with pytest.raises(manifest.ManifestError):
         list(manifest.iter_manifest(str(p)))
 
@@ -92,9 +93,9 @@ def test_iter_manifest_rejects_future_version(tmp_path):
 def test_iter_manifest_skips_damaged_lines(tmp_path):
     p = tmp_path / "m.jsonl"
     p.write_text(
-        '{"s3bak_manifest":3}\ngarbage\n{"rel":"./a","mode":"100644","size":1,"mtime_ns":5}\n'
+        '{"s3bak_manifest":3}\ngarbage\n{"path":"./a","mode":"100644","size":1,"mtime_ns":5}\n'
     )
-    assert [e.rel for e in manifest.iter_manifest(str(p))] == ["./a"]
+    assert [e.path for e in manifest.iter_manifest(str(p))] == ["./a"]
 
 
 # --- quick check --------------------------------------------------------------
@@ -208,12 +209,12 @@ def test_write_patched_replaces_subtree_in_order(tmp_path):
     old.write_text(
         _manifest_text(
             [
-                '{"rel":".","mode":"40755","mtime_ns":0}',
-                '{"rel":"./a.txt","mode":"100644","size":1,"mtime_ns":0}',
-                '{"rel":"./sub.txt","mode":"100644","size":1,"mtime_ns":0}',
-                '{"rel":"./sub","mode":"40755","mtime_ns":0}',
-                '{"rel":"./sub/old.txt","mode":"100644","size":1,"mtime_ns":0}',
-                '{"rel":"./z.txt","mode":"100644","size":1,"mtime_ns":0}',
+                '{"path":".","mode":"40755","mtime_ns":0}',
+                '{"path":"./a.txt","mode":"100644","size":1,"mtime_ns":0}',
+                '{"path":"./sub.txt","mode":"100644","size":1,"mtime_ns":0}',
+                '{"path":"./sub","mode":"40755","mtime_ns":0}',
+                '{"path":"./sub/old.txt","mode":"100644","size":1,"mtime_ns":0}',
+                '{"path":"./z.txt","mode":"100644","size":1,"mtime_ns":0}',
             ]
         )
     )
@@ -225,7 +226,7 @@ def test_write_patched_replaces_subtree_in_order(tmp_path):
     manifest.write_patched(out, str(old), "sub", manifest.iter_subtree(str(local_sub), "sub", []))
     lines = out.getvalue().splitlines()
     assert json.loads(lines[0]) == {"s3bak_manifest": 3}
-    rels = [json.loads(ln)["rel"] for ln in lines[1:]]
+    rels = [json.loads(ln)["path"] for ln in lines[1:]]
     assert rels == [".", "./a.txt", "./sub.txt", "./sub", "./sub/new.txt", "./z.txt"]
 
 
@@ -234,16 +235,16 @@ def test_write_patched_removes_deleted_subtree(tmp_path):
     old.write_text(
         _manifest_text(
             [
-                '{"rel":".","mode":"40755","mtime_ns":0}',
-                '{"rel":"./gone","mode":"40755","mtime_ns":0}',
-                '{"rel":"./gone/x","mode":"100644","size":1,"mtime_ns":0}',
-                '{"rel":"./keep.txt","mode":"100644","size":1,"mtime_ns":0}',
+                '{"path":".","mode":"40755","mtime_ns":0}',
+                '{"path":"./gone","mode":"40755","mtime_ns":0}',
+                '{"path":"./gone/x","mode":"100644","size":1,"mtime_ns":0}',
+                '{"path":"./keep.txt","mode":"100644","size":1,"mtime_ns":0}',
             ]
         )
     )
     out = io.StringIO()
     manifest.write_patched(out, str(old), "gone", [])
-    rels = [json.loads(ln)["rel"] for ln in out.getvalue().splitlines()[1:]]
+    rels = [json.loads(ln)["path"] for ln in out.getvalue().splitlines()[1:]]
     assert rels == [".", "./keep.txt"]
 
 
@@ -262,7 +263,7 @@ def test_push_writes_v3_manifest(ws):
     assert json.loads(lines[0]) == {"s3bak_manifest": 3}
     entries = [json.loads(ln) for ln in lines[1:]]
 
-    rels = [e["rel"] for e in entries]
+    rels = [e["path"] for e in entries]
     assert rels == [".", "./a.txt", "./link", "./sub", "./sub/b.txt"]
 
     root = entries[0]

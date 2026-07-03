@@ -189,7 +189,7 @@ def _single_file_needs_upload(cfg: Config, entry: str, target: str, opts: Opts) 
         st = os.lstat(target)
         basename = os.path.basename(target)
         for m in manifest.iter_manifest(manifest_path):
-            if m.rel == basename and m.sym_target is None and m.is_file:
+            if m.path == basename and m.sym_target is None and m.is_file:
                 if not m.matches_stat(st, cfg.window_ns):
                     return True
                 return cfg.store.head_object(entry, verbose=opts.verbose) is None
@@ -329,7 +329,7 @@ def _entry_kind_from_manifest(manifest_path: str) -> str:
     still classifies as a directory entry. Returns 'file' for an empty
     manifest so callers fail fast."""
     for entry in manifest.iter_manifest(manifest_path):
-        return "dir" if entry.rel == "." or entry.rel.startswith("./") else "file"
+        return "dir" if entry.path == "." or entry.path.startswith("./") else "file"
     return "file"
 
 
@@ -343,7 +343,7 @@ def _sub_kind_from_manifest(manifest_path: str, sub: str) -> str:
     the manifest alone."""
     self_entry: ManifestEntry | None = None
     for entry in manifest.iter_manifest(manifest_path):
-        rel = entry.rel.removeprefix("./")
+        rel = entry.path.removeprefix("./")
         if rel == sub:
             self_entry = entry
         elif rel.startswith(sub + "/"):
@@ -490,7 +490,7 @@ def _single_file_size(manifest_path: str) -> int | None:
 def _read_manifest_files(manifest_path: str, sub: str | None = None) -> dict[str, int]:
     remote_files: dict[str, int] = {}
     for entry in manifest.iter_manifest(manifest_path):
-        rel = entry.rel.removeprefix("./")
+        rel = entry.path.removeprefix("./")
         if sub is not None:
             if rel == sub:
                 continue
@@ -702,12 +702,12 @@ def cmd_list(cfg: Config, opts: Opts) -> int:
 def show_entry_files(manifest_path: str, sub: str | None = None) -> None:
     for entry in manifest.iter_manifest(manifest_path):
         if sub is not None:
-            rel = entry.rel.removeprefix("./")
+            rel = entry.path.removeprefix("./")
             if rel != sub and not rel.startswith(sub + "/"):
                 continue
-        display = entry.rel
+        display = entry.path
         if entry.sym_target:
-            display = f"{entry.rel} -> {entry.sym_target}"
+            display = f"{entry.path} -> {entry.sym_target}"
         when = "" if entry.mtime_ns is None else _fmt_mtime(entry.mtime_ns)
         size = "" if entry.size is None else str(entry.size)
         write_output(

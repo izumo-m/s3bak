@@ -8,8 +8,9 @@ following line is one JSON object per tree entry, in S3 key order (aws-cli
 byte order, where a directory's contents sort at ``name/...`` - so ``foo.txt``
 comes before ``foo/bar``). Entry keys:
 
-    rel       "." (entry root), "./sub/path" below it, or a bare basename
-              (single-file entry) - the same convention the transfer keys use
+    path      "." (entry root), "./sub/path" below it, or a bare basename
+              (single-file entry) - the entry-relative path, same convention
+              the transfer keys use
     mode      full st_mode as an octal string ("100644", "40755", "120777")
     owner     user name, or the uid as a string when unresolvable
     group     group name, or the gid as a string
@@ -67,7 +68,7 @@ class ManifestError(Exception):
 
 @dataclass(frozen=True)
 class ManifestEntry:
-    rel: str  # ".", "./foo/bar", or a bare basename (single-file entry)
+    path: str  # ".", "./foo/bar", or a bare basename (single-file entry)
     mode: int  # full st_mode (type + permission bits)
     owner: str
     group: str
@@ -111,20 +112,20 @@ def parse_entry(line: str) -> ManifestEntry | None:
         return None
     try:
         obj = json.loads(line)
-        rel = obj["rel"]
+        path = obj["path"]
         mode = int(obj["mode"], 8)
         size = obj.get("size")
         mtime_ns = obj.get("mtime_ns")
         link = obj.get("link")
         if (
-            not isinstance(rel, str)
+            not isinstance(path, str)
             or not (size is None or isinstance(size, int))
             or not (mtime_ns is None or isinstance(mtime_ns, int))
             or not (link is None or isinstance(link, str))
         ):
             return None
         return ManifestEntry(
-            rel=rel,
+            path=path,
             mode=mode,
             owner=str(obj.get("owner", "")),
             group=str(obj.get("group", "")),
@@ -166,14 +167,14 @@ def iter_manifest(manifest_path: str) -> Iterator[ManifestEntry]:
 
 
 def load_map(manifest_path: str, sub: str | None = None) -> dict[str, ManifestEntry]:
-    """Manifest entries keyed by sync compare key: rel minus the ``./`` prefix,
-    relative to ``sub`` when given. The tree root itself never forms a sync
-    pair and is omitted."""
+    """Manifest entries keyed by sync compare key: the entry path minus the
+    ``./`` prefix, relative to ``sub`` when given. The tree root itself never
+    forms a sync pair and is omitted."""
     out: dict[str, ManifestEntry] = {}
     for e in iter_manifest(manifest_path):
-        if e.rel == ".":
+        if e.path == ".":
             continue
-        rel = e.rel.removeprefix("./")
+        rel = e.path.removeprefix("./")
         if sub is not None:
             if not rel.startswith(sub + "/"):
                 continue
@@ -205,11 +206,11 @@ def _owner_group(st: os.stat_result) -> tuple[str, str]:
     return owner, group
 
 
-def format_entry(rel: str, st: os.stat_result, sym_target: str | None) -> str:
+def format_entry(path: str, st: os.stat_result, sym_target: str | None) -> str:
     """One walk item -> one manifest line (no trailing newline)."""
     owner, group = _owner_group(st)
     obj: dict[str, Any] = {
-        "rel": rel,
+        "path": path,
         "mode": format(st.st_mode, "o"),
         "owner": owner,
         "group": group,
@@ -223,26 +224,26 @@ def format_entry(rel: str, st: os.stat_result, sym_target: str | None) -> str:
 
 
 def write_manifest(out: IO[str], entries: Iterable[tuple[str, os.stat_result, str | None]]) -> None:
-    """Stream ``(rel, lstat, sym_target)`` items to ``out`` as a v3 manifest.
+    """Stream ``(path, lstat, sym_target)`` items to ``out`` as a v3 manifest.
     The items must already be in walk order (walk_tree / iter_subtree)."""
     out.write(_header_line() + "\n")
-    for rel, st, sym_target in entries:
-        out.write(format_entry(rel, st, sym_target) + "\n")
+    for path, st, sym_target in entries:
+        out.write(format_entry(path, st, sym_target) + "\n")
 
 
-def entry_sort_key(rel: str, is_dir: bool) -> str:
+def entry_sort_key(path: str, is_dir: bool) -> str:
     """The manifest ordering key: the tree root is "" (always first), a
     directory sorts at ``path/`` (right before its children, after ``path.x``
     siblings), everything else at its bare relative path - S3 key byte order."""
-    if rel == ".":
+    if path == ".":
         return ""
-    norm = rel.removeprefix("./")
+    norm = path.removeprefix("./")
     return norm + "/" if is_dir else norm
 
 
 def write_patched(
     out: IO[str],
-    old_path: str | None,
+    old_manifest: str | None,
     sub: str,
     new_entries: Iterable[tuple[str, os.stat_result, str | None]],
 ) -> None:
@@ -252,7 +253,8 @@ def write_patched(
     outside ``sub`` are copied verbatim (preserving any unknown keys), old
     lines at/under ``sub`` are dropped, and the freshly walked ``new_entries``
     are spliced in at their sorted position. ``new_entries`` may be empty (the
-    sub-path was deleted locally)."""
+    sub-path was deleted locally). ``old_manifest`` is the path of the previous
+    manifest file, or None when none exists yet."""
     out.write(_header_line() + "\n")
     new_iter = iter(new_entries)
     pending = next(new_iter, None)
@@ -260,24 +262,24 @@ def write_patched(
     def flush_new_below(limit: str | None) -> None:
         nonlocal pending
         while pending is not None:
-            rel, st, sym_target = pending
-            key = entry_sort_key(rel, stat_mod.S_ISDIR(st.st_mode))
+            path, st, sym_target = pending
+            key = entry_sort_key(path, stat_mod.S_ISDIR(st.st_mode))
             if limit is not None and key >= limit:
                 return
-            out.write(format_entry(rel, st, sym_target) + "\n")
+            out.write(format_entry(path, st, sym_target) + "\n")
             pending = next(new_iter, None)
 
-    if old_path is not None:
-        with open(old_path, encoding="utf-8") as f:
+    if old_manifest is not None:
+        with open(old_manifest, encoding="utf-8") as f:
             _check_header(f.readline())
             for line in f:
                 e = parse_entry(line)
                 if e is None:
                     continue  # drop a damaged line rather than re-emit it
-                rel = e.rel.removeprefix("./")
+                rel = e.path.removeprefix("./")
                 if rel == sub or rel.startswith(sub + "/"):
                     continue  # the replaced range
-                flush_new_below(entry_sort_key(e.rel, e.is_dir))
+                flush_new_below(entry_sort_key(e.path, e.is_dir))
                 out.write(line if line.endswith("\n") else line + "\n")
     flush_new_below(None)
 
@@ -340,7 +342,7 @@ def walk_tree(
     root: str, excludes: list[str], *, root_rel: str = ".", rel_prefix: str = "./"
 ) -> Iterator[tuple[str, os.stat_result, str | None]]:
     """Walk a directory tree yielding ``(rel, lstat, sym_target | None)`` in
-    S3 key order.
+    S3 key order. Each ``rel`` is what a record's ``path`` field stores.
 
     rel uses the manifest convention: ``root_rel`` for the root, ``rel_prefix``
     + path below it - for an entry push that is "." / "./sub/file"; a sub-path

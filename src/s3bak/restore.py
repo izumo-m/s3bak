@@ -43,7 +43,7 @@ def manifest_target(
     entry: ManifestEntry, outpath: str, is_dir: bool, sub: str | None
 ) -> tuple[str, str] | None:
     """Resolve the manifest entry to (target_path, sub_rel) or None to skip."""
-    rel = resolve_manifest_rel(entry.rel, sub)
+    rel = resolve_manifest_rel(entry.path, sub)
     if rel is None:
         return None
     if is_dir:

@@ -17,7 +17,7 @@ MTIME_NS = 1_600_000_000 * 1_000_000_000
 
 
 def _line(mode: str, rel: str, *, mtime_ns: int = MTIME_NS, size: int | None = None) -> str:
-    obj: dict[str, object] = {"rel": rel, "mode": mode, "owner": "owner", "group": "group"}
+    obj: dict[str, object] = {"path": rel, "mode": mode, "owner": "owner", "group": "group"}
     if size is not None:
         obj["size"] = size
     obj["mtime_ns"] = mtime_ns
