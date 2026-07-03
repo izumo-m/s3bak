@@ -208,10 +208,12 @@ Examples:
 
 
 def _resolve_one_arg(cfg: Config, arg: str) -> tuple[str, str | None]:
-    # No '/': match strictly as an entry name.
-    # Contains '/': treat as a local path made absolute against CWD/HOME,
-    #   then find which entry's path contains it, preferring the longest prefix.
-    if "/" not in arg:
+    # No path separator: match strictly as an entry name.
+    # Otherwise: treat as a local path made absolute against CWD/HOME, then find
+    #   which entry's path contains it, preferring the longest prefix. Separators
+    #   are platform-aware so native Windows "C:\dir\f" is a path, not a name.
+    seps = [os.sep, os.altsep] if os.altsep else [os.sep]
+    if not (any(s in arg for s in seps) or os.path.isabs(arg)):
         if arg in cfg.entries:
             return arg, None
         die(f"no such entry: {arg}")
@@ -492,6 +494,11 @@ def run() -> int:
         return e.returncode or 1
     except BrokenPipeError:
         return 141
+    except FileNotFoundError as e:
+        # An external command is not on PATH (the `diff` binary), or a required
+        # file vanished mid-run: report cleanly instead of a raw traceback.
+        err(str(e))
+        return 1
     except manifest.ManifestError as e:
         err(str(e))
         return 1

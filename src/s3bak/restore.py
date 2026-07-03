@@ -53,6 +53,16 @@ def manifest_target(
     return target, rel
 
 
+def within_root(root_real: str, target: str) -> bool:
+    """True iff writing at `target` stays inside `root_real` (a realpath'd
+    restore root). Resolves symlinks in the parent chain, so a write *through*
+    a symlinked ancestor is caught, while the final component may still be
+    absent (about to be created) or a symlink we intend to replace."""
+    parent_real = os.path.realpath(os.path.dirname(target) or ".")
+    resolved = os.path.normpath(os.path.join(parent_real, os.path.basename(target)))
+    return resolved == root_real or resolved.startswith(root_real + os.sep)
+
+
 # =============================================================================
 # Tree iteration
 # =============================================================================
@@ -158,12 +168,22 @@ def _apply_meta(target: str, mode: int, mtime_ns: int | None) -> bool:
 def apply_manifest(outpath: str, is_dir: bool, manifest_path: str, sub: str | None = None) -> int:
     deferred_dirs: list[tuple[str, int, int | None]] = []
     errors = 0
+    # A manifest is downloaded from S3 and may be corrupt or hostile. Only a
+    # directory entry joins record-controlled paths onto outpath, so only it can
+    # escape (a single-file entry always writes at outpath). Reject any record
+    # that would create/chmod/symlink outside the restore root - via ".." , an
+    # absolute path, or a write through a symlink an earlier record planted.
+    root_real = os.path.realpath(outpath)
 
     for m_entry in manifest.iter_manifest(manifest_path):
         res = manifest_target(m_entry, outpath, is_dir, sub)
         if res is None:
             continue
-        target, _rel = res
+        target, rel = res
+        if is_dir and rel != "." and not within_root(root_real, target):
+            err(f"manifest path escapes restore root, skipped: {m_entry.path}")
+            errors += 1
+            continue
         mode = m_entry.perm_bits
 
         if m_entry.sym_target is not None:

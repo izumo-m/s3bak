@@ -68,6 +68,7 @@ def patch_manifest_subtree(
     fd_old, old_path = tempfile.mkstemp(suffix=".jsonl")
     os.close(fd_old)
     fd_new, new_path = tempfile.mkstemp(suffix=".jsonl")
+    os.close(fd_new)  # reopened by name below; closing now avoids an fd leak on error
     try:
         have_old = download_manifest(cfg, entry, old_path, opts.verbose)
         local_sub = os.path.join(target_root, sub)
@@ -80,7 +81,7 @@ def patch_manifest_subtree(
             # shape ('.'-rooted) and the root's metadata restores on pull.
             root_record = (".", os.lstat(target_root), None)
             new_entries = itertools.chain([root_record], new_entries)
-        with os.fdopen(fd_new, "w", encoding="utf-8") as out:
+        with open(new_path, "w", encoding="utf-8") as out:
             manifest.write_patched(out, old_path if have_old else None, sub, new_entries)
         write_stderr(f"Updating {cfg.prefix}/{key}\n")
         assert cfg.store is not None
