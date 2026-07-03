@@ -67,7 +67,7 @@ def _run_post_hook(post_hook: str | None, opts: Opts) -> int:
     if not post_hook:
         return 0
     if opts.dryrun:
-        print(f"(dryrun) would run post_hook: {post_hook}")
+        print(f"(dry-run) would run post_hook: {post_hook}")
         return 0
     if opts.verbose:
         write_stderr(f"+ {post_hook}\n")
@@ -82,9 +82,9 @@ def upload_manifest(cfg: Config, entry: str, target: str, excludes: list[str], o
     post_hook: str | None = cfg.entries[entry].get("post_hook")
 
     if opts.dryrun:
-        print(f"(dryrun) would update manifest: {manifest.manifest_key(entry)}")
+        print(f"(dry-run) would update manifest: {manifest.manifest_key(entry)}")
         if post_hook:
-            print(f"(dryrun) would run post_hook: {post_hook}")
+            print(f"(dry-run) would run post_hook: {post_hook}")
         return 0
 
     write_manifest_to_aws(cfg, entry, target, excludes, opts.verbose)
@@ -150,7 +150,7 @@ def _push_sub(
     else:
         # Regular file: an explicit sub-path push always uploads.
         if opts.dryrun:
-            print(f"(dryrun) upload: {local_sub} -> {s3_sub_path}")
+            print(f"(dry-run) upload: {local_sub} -> {s3_sub_path}")
         else:
             result = cfg.store.put_object(sub_rel, local_sub, verbose=opts.verbose)
             if result.returncode != 0:
@@ -230,7 +230,7 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
     pre_hook: str | None = entry_cfg.get("pre_hook")
     if pre_hook:
         if opts.dryrun:
-            print(f"(dryrun) would run pre_hook: {pre_hook}")
+            print(f"(dry-run) would run pre_hook: {pre_hook}")
         else:
             if opts.verbose:
                 write_stderr(f"+ {pre_hook}\n")
@@ -287,7 +287,7 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             # Set results only; the shared writer below emits it (and the truthy
             # results drives the dryrun manifest line). Printing here too would
             # double the line.
-            results = f"(dryrun) upload: {target} -> {cfg.prefix}/{entry}"
+            results = f"(dry-run) upload: {target} -> {cfg.prefix}/{entry}"
         else:
             result = cfg.store.put_object(entry, target, verbose=opts.verbose)
             if result.returncode != 0:

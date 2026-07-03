@@ -187,7 +187,7 @@ class Boto3S3Store:
 
         def on_result(r: Any) -> None:
             if r.outcome in (OpOutcome.SUCCEEDED, OpOutcome.DRYRUN):
-                pre = "(dryrun) " if r.outcome is OpOutcome.DRYRUN else ""
+                pre = "(dry-run) " if r.outcome is OpOutcome.DRYRUN else ""
                 if r.transfer_type is TransferType.DELETE:
                     line = f"{pre}delete: {r.key}"
                 elif r.src is not None and r.dest is not None:

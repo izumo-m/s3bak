@@ -62,7 +62,7 @@ def patch_manifest_subtree(
     """
     key = manifest.manifest_key(entry)
     if opts.dryrun:
-        print(f"(dryrun) would patch manifest: {key} (sub={sub})")
+        print(f"(dry-run) would patch manifest: {key} (sub={sub})")
         return
 
     fd_old, old_path = tempfile.mkstemp(suffix=".jsonl")

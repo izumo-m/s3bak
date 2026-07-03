@@ -1,4 +1,4 @@
-"""Option coverage: --all, --meta-only, --data-only, --dryrun, --color."""
+"""Option coverage: --all, --meta-only, --data-only, --dry-run, --color."""
 
 from __future__ import annotations
 
@@ -78,7 +78,7 @@ def test_push_dryrun_uploads_nothing(ws):
     ws.write("data/a.txt", "a")
     ws.config({"data": {"path": str(ws.root / "data")}})
 
-    res = ws.run("push", "--dryrun", "data", expect_rc=0)
+    res = ws.run("push", "--dry-run", "data", expect_rc=0)
     assert ws.keys() == set()  # nothing was actually uploaded
     assert "a.txt" in res.out  # the planned upload is reported
 
@@ -158,7 +158,7 @@ def test_push_single_file_dryrun_uploads_nothing(ws):
     f = ws.write("solo.txt", "x")
     ws.config({"solo.txt": {"path": str(f)}})
 
-    ws.run("push", "--dryrun", "solo.txt", expect_rc=0)
+    ws.run("push", "--dry-run", "solo.txt", expect_rc=0)
     assert ws.keys() == set()
 
 
@@ -168,8 +168,8 @@ def test_push_single_file_dryrun_prints_upload_once(ws):
     f = ws.write("solo.txt", "x")
     ws.config({"solo.txt": {"path": str(f)}})
 
-    res = ws.run("push", "--dryrun", "solo.txt", expect_rc=0)
-    uploads = [ln for ln in res.out.splitlines() if ln.startswith("(dryrun) upload:")]
+    res = ws.run("push", "--dry-run", "solo.txt", expect_rc=0)
+    uploads = [ln for ln in res.out.splitlines() if ln.startswith("(dry-run) upload:")]
     assert len(uploads) == 1
 
 

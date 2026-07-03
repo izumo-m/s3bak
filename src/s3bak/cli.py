@@ -128,7 +128,7 @@ Commands:
 
 Options:
   --all            Apply the command to all configured entries
-  --dryrun         Show what would happen without changing anything (push)
+  --dry-run        Show what would happen without changing anything (push)
   --delete         After restore, delete local files not in backup (pull only)
   --meta-only      Sync only metadata (the manifest), skip file data (push/pull)
   --data-only      Sync only file data, leave manifest/local-meta untouched (push/pull)
@@ -153,7 +153,7 @@ Examples:
   # push: back up one or more entries (or sub-paths)
   s3bak push bin .bash.d               # push selected entries
   s3bak push --all                     # push every configured entry
-  s3bak push --all --dryrun            # preview without uploading
+  s3bak push --all --dry-run           # preview without uploading
   s3bak push --meta-only bin           # upload metadata (the manifest) only
   s3bak push --meta-only --all         # upload metadata for all entries
   s3bak push --data-only bin           # upload data only, leave manifest unchanged
@@ -291,7 +291,7 @@ def main(argv: list[str] | None = None) -> int:
         a = args[i]
         if a == "--all":
             opt_all = True
-        elif a in ("--dryrun", "--dry-run"):
+        elif a == "--dry-run":
             opt_dryrun = True
         elif a == "--delete":
             opt_delete = True
