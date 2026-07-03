@@ -199,9 +199,10 @@ def test_post_hook_runs_on_success(ws):
 def test_windows_pull_applies_manifest_without_downloads(ws, monkeypatch):
     # On Windows, apply_manifest must run even when nothing was downloaded (an
     # empty-dir sub-path here): the restore must not be gated on sync_changed.
-    from s3bak import cli
+    # cmd_pull reads IS_WINDOWS from its own module, so patch it there.
+    from s3bak import commands
 
-    monkeypatch.setattr(cli, "IS_WINDOWS", True)
+    monkeypatch.setattr(commands, "IS_WINDOWS", True)
     ws.write("data/file.txt", "x")
     (ws.root / "data" / "empty").mkdir()
     ws.config({"data": {"path": str(ws.root / "data")}})
