@@ -127,9 +127,9 @@ See [`../config.example.py`](../config.example.py) for a commented template.
 | `ls-remote` | list S3 entries, or files recorded under an entry / sub-path        |
 
 Options: `--all`, `--dry-run` (push), `--delete` (pull), `--meta-only`,
-`--data-only`, `--checksum` (push/pull), `-o/--output` (pull), `-v/--verbose`,
-`--color[=WHEN]` / `--no-color`. Push/pull semantics and the meaning of each
-mode are in [sync.md](sync.md).
+`--data-only`, `--checksum` (push/pull), `--mtime-window <seconds>`,
+`-o/--output` (pull), `-v/--verbose`, `--color[=WHEN]` / `--no-color`. Push/pull
+semantics and the meaning of each mode are in [sync.md](sync.md).
 
 An `<entry>/<sub>` or a local path argument (containing `/`) resolves to the
 owning entry plus a sub-path; a bare name resolves to an entry. Path arguments

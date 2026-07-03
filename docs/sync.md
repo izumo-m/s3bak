@@ -31,8 +31,14 @@ Why size + mtime, and why a window:
   default covers all of them. `mtime_window = 0` restores exact-match behaviour.
 
 **Accepted blind spot:** a change that leaves size *and* mtime equal to the
-record — a content edit with the mtime restored, or an out-of-band S3 write at
-the same size — is invisible to the quick check. `--checksum` exists for those.
+record — a content edit with the mtime restored (an mtime-preserving tool), or
+an out-of-band S3 write at the same size — is invisible to the quick check. In a
+multi-terminal workflow this bites the **push** side first: the terminal that
+edited such a file never uploads it, so it never reaches S3 (its `status` is
+quiet too, since `status` shares the predicate). `--checksum` (content) covers
+it completely; a tighter `mtime_window` (e.g. `0`, exact) covers the case where
+the mtime did advance but within the window. The window is set in `config.py`,
+or overridden for one run with `--mtime-window <seconds>`.
 
 **Self-healing (push):** a spurious mtime-only difference re-transfers the file
 once; that push refreshes the manifest with the new mtime, and later runs pass
@@ -54,7 +60,8 @@ parallelism of this path (it is idle otherwise).
 
 `status` and both compare directions share one size/mtime predicate
 (`compare_to_local`), so `status` never disagrees with what a push or pull would
-actually do. `status` additionally reports mode changes for the metadata view —
+actually do. The window they use is `config.py`'s `mtime_window`, which
+`--mtime-window <seconds>` overrides for a single run (0 = exact). `status` additionally reports mode changes for the metadata view —
 but the sync never transfers over a mode change (that is a `--meta-only`
 refresh, below).
 

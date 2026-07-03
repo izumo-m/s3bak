@@ -134,6 +134,8 @@ Options:
   --data-only      Sync only file data, leave manifest/local-meta untouched (push/pull)
   --checksum       Compare by content (ETag) instead of the manifest quick
                    check; reads every candidate file (push/pull)
+  --mtime-window <seconds>  Override config's quick-check mtime tolerance for
+                   this run (0 = exact); affects push/pull/status
   -o, --output <path>  Restore destination for pull (default: entry's configured path)
   -v, --verbose    Verbose output (details per field in status)
   --color[=WHEN]   Colorize status (verbose) and diff output
@@ -274,6 +276,7 @@ def main(argv: list[str] | None = None) -> int:
     opt_data_only = False
     opt_verbose = False
     opt_checksum = False
+    opt_mtime_window: int | None = None
     opt_outpath: str | None = None
     opt_color: str = "auto"
     positional: list[str] = []
@@ -303,6 +306,14 @@ def main(argv: list[str] | None = None) -> int:
             opt_verbose = True
         elif a == "--checksum":
             opt_checksum = True
+        elif a == "--mtime-window" or a.startswith("--mtime-window="):
+            val, i = take_value(a, i)
+            try:
+                opt_mtime_window = int(val)
+            except ValueError:
+                die(f"--mtime-window requires a non-negative integer (got {val!r})")
+            if opt_mtime_window < 0:
+                die(f"--mtime-window must be >= 0 (got {opt_mtime_window})")
         elif a in ("-o", "--output", "--outpath") or a.startswith(("--output=", "--outpath=")):
             opt_outpath, i = take_value(a, i)
         elif a == "--color":
@@ -344,6 +355,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if opt_checksum and subcmd not in ("push", "pull"):
         die("--checksum only applies to push and pull")
+
+    # A CLI --mtime-window overrides the config value for this run (0 = exact).
+    # Affects the quick-check compare shared by push / pull / status.
+    if opt_mtime_window is not None:
+        cfg.mtime_window = opt_mtime_window
 
     if subcmd == "push":
         if opt_all:

@@ -62,6 +62,39 @@ def test_push_mtime_window_zero_is_strict(ws):
     assert "upload:" in res.out
 
 
+def test_cli_mtime_window_flag_overrides_config(ws):
+    # config sets a wide window; a +1s mtime drift is skipped by a plain push,
+    # but --mtime-window 0 (strict) overrides the config value for that run and
+    # re-uploads.
+    p = ws.write("data/a.txt", "hello")
+    ws.config({"data": {"path": str(ws.root / "data")}}, mtime_window=100)
+    ws.run("push", "data", expect_rc=0)
+
+    ns = _mtime_ns(p) + 1_000_000_000  # +1s, well inside the configured 100s window
+    os.utime(p, ns=(ns, ns))
+
+    res = ws.run("push", "data", expect_rc=0)  # config window -> skip
+    assert "upload:" not in res.out
+
+    res = ws.run("push", "--mtime-window", "0", "data", expect_rc=0)  # strict -> re-upload
+    assert "upload:" in res.out
+
+
+def test_cli_mtime_window_flag_affects_status(ws):
+    # --mtime-window also tightens `status`, which shares the quick-check
+    # predicate: a +1s drift is quiet by default, reported under --mtime-window 0.
+    p = ws.write("data/a.txt", "hello")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    ns = _mtime_ns(p) + 1_000_000_000
+    os.utime(p, ns=(ns, ns))
+
+    assert ws.run("status", "data", expect_rc=0).out.strip() == ""  # within default window
+    res = ws.run("status", "--mtime-window", "0", "data", expect_rc=0)
+    assert any("a.txt" in ln and ln.startswith("M") for ln in res.out.splitlines())
+
+
 def test_push_misses_same_size_same_mtime_content_change(ws):
     # The quick check's documented blind spot: identical size AND restored
     # mtime looks unchanged. --checksum exists for exactly this.
