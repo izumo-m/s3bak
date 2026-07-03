@@ -32,17 +32,17 @@ prefix = "s3://my-bucket/backup"
 #                      of them, one thread each). Each entry also opens its own
 #                      transfer pool, so cap this when you have many entries
 #                      to bound the total thread count.
-#   mtime_window       quick-check mtime tolerance in seconds (default 2,
-#                      0 = exact st_mtime_ns match). The default absorbs every
-#                      common filesystem's mtime granularity (FAT 2s,
-#                      exFAT 10ms, NTFS 100ns), so a pull onto a coarser
-#                      filesystem cannot re-download forever over a restored
-#                      mtime the filesystem cannot represent.
+#   mtime_window       quick-check mtime tolerance in seconds (fractional ok,
+#                      default 0.01 = 10ms, 0 = exact st_mtime_ns match). The
+#                      default absorbs the rounding of NTFS (100ns) and exFAT
+#                      (10ms) so a pull onto them cannot re-download an unchanged
+#                      file forever; a coarser filesystem (FAT32 2s, HFS+ 1s)
+#                      needs a larger value here. Overridable per entry.
 #
 # max_concurrency = 10
 # compare_workers = 10
 # entry_concurrency = 4
-# mtime_window = 2
+# mtime_window = 0.01
 
 # Directories / files to back up (required), keyed by entry name.
 #

@@ -135,7 +135,7 @@ Options:
   --checksum       Compare by content (ETag) instead of the manifest quick
                    check; reads every candidate file (push/pull)
   --mtime-window <seconds>  Override config's quick-check mtime tolerance for
-                   this run (0 = exact); affects push/pull/status
+                   this run (fractional ok, 0 = exact); affects push/pull/status
   -o, --output <path>  Restore destination for pull (default: entry's configured path)
   -v, --verbose    Verbose output (details per field in status)
   --color[=WHEN]   Colorize status (verbose) and diff output
@@ -276,7 +276,7 @@ def main(argv: list[str] | None = None) -> int:
     opt_data_only = False
     opt_verbose = False
     opt_checksum = False
-    opt_mtime_window: int | None = None
+    opt_mtime_window: float | None = None
     opt_outpath: str | None = None
     opt_color: str = "auto"
     positional: list[str] = []
@@ -309,9 +309,9 @@ def main(argv: list[str] | None = None) -> int:
         elif a == "--mtime-window" or a.startswith("--mtime-window="):
             val, i = take_value(a, i)
             try:
-                opt_mtime_window = int(val)
+                opt_mtime_window = float(val)
             except ValueError:
-                die(f"--mtime-window requires a non-negative integer (got {val!r})")
+                die(f"--mtime-window requires a non-negative number of seconds (got {val!r})")
             if opt_mtime_window < 0:
                 die(f"--mtime-window must be >= 0 (got {opt_mtime_window})")
         elif a in ("-o", "--output", "--outpath") or a.startswith(("--output=", "--outpath=")):

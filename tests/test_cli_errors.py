@@ -84,7 +84,7 @@ def test_show_rejects_meta_only(cfg_ws):
     assert res.rc == 1
 
 
-def test_mtime_window_flag_rejects_non_integer(cfg_ws):
+def test_mtime_window_flag_rejects_non_number(cfg_ws):
     res = cfg_ws.run("push", "--mtime-window", "abc", "data")
     assert res.rc == 1
     assert "mtime-window" in res.err.lower()

@@ -111,7 +111,7 @@ the window below). Optional top-level tuning knobs:
 | `max_concurrency`   | 10      | transfer threads for `cp` / `sync`                             |
 | `compare_workers`   | =above  | parallel ETag comparisons under `--checksum`                   |
 | `entry_concurrency` | all     | how many entries run at once under `--all`                     |
-| `mtime_window`      | 2 (s)   | quick-check mtime tolerance; `0` = exact `st_mtime_ns` match   |
+| `mtime_window`      | 0.01 (s) | quick-check mtime tolerance (fractional ok); `0` = exact match |
 
 See [`../config.example.py`](../config.example.py) for a commented template.
 

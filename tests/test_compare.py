@@ -1,7 +1,7 @@
 """Sync copy decisions: the manifest quick check by default, --checksum for content.
 
 The default push/pull compare is ManifestFilter - size + mtime (within
-mtime_window, default 2s) against the manifest, reading no file content.
+mtime_window, default 10ms) against the manifest, reading no file content.
 --checksum swaps in the ETag content comparison (reads every candidate file).
 """
 
@@ -42,10 +42,23 @@ def test_push_reuploads_on_mtime_drift_and_self_heals(ws):
 
 def test_push_skips_mtime_drift_within_window(ws):
     p = ws.write("data/a.txt", "hello")
-    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.config({"data": {"path": str(ws.root / "data")}}, mtime_window=2)
     ws.run("push", "data", expect_rc=0)
 
-    ns = _mtime_ns(p) + 1_000_000_000  # +1s: inside the default 2s window
+    ns = _mtime_ns(p) + 1_000_000_000  # +1s: inside the configured 2s window
+    os.utime(p, ns=(ns, ns))
+    res = ws.run("push", "data", expect_rc=0)
+    assert "upload:" not in res.out
+
+
+def test_push_skips_mtime_drift_within_default_10ms_window(ws):
+    # The default window (10ms) absorbs a sub-10ms drift (e.g. NTFS/exFAT
+    # rounding on a restored mtime) so an unchanged file is not re-uploaded.
+    p = ws.write("data/a.txt", "hello")
+    ws.config({"data": {"path": str(ws.root / "data")}})  # default 0.01s
+    ws.run("push", "data", expect_rc=0)
+
+    ns = _mtime_ns(p) + 5_000_000  # +5ms, inside the 10ms default
     os.utime(p, ns=(ns, ns))
     res = ws.run("push", "data", expect_rc=0)
     assert "upload:" not in res.out
@@ -98,15 +111,15 @@ def test_cli_mtime_window_flag_overrides_config(ws):
 
 def test_cli_mtime_window_flag_affects_status(ws):
     # --mtime-window also tightens `status`, which shares the quick-check
-    # predicate: a +1s drift is quiet by default, reported under --mtime-window 0.
+    # predicate: a +1s drift is quiet within a 2s window, reported at 0.
     p = ws.write("data/a.txt", "hello")
-    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.config({"data": {"path": str(ws.root / "data")}}, mtime_window=2)
     ws.run("push", "data", expect_rc=0)
 
     ns = _mtime_ns(p) + 1_000_000_000
     os.utime(p, ns=(ns, ns))
 
-    assert ws.run("status", "data", expect_rc=0).out.strip() == ""  # within default window
+    assert ws.run("status", "data", expect_rc=0).out.strip() == ""  # within the 2s window
     res = ws.run("status", "--mtime-window", "0", "data", expect_rc=0)
     assert any("a.txt" in ln and ln.startswith("M") for ln in res.out.splitlines())
 

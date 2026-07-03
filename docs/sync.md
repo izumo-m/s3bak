@@ -14,10 +14,10 @@ side for one key), does it need copying? s3bak has two.
 
 The default reads no file content. For a pair it copies unless the local file's
 **size and mtime both match the manifest record** — an rsync-style quick check —
-where mtime matches within `mtime_window` (default 2 s). A missing side, a key
-the manifest does not know, or a stat that drifted all copy. It also copies when
-the S3 side's size differs from the record, using the listing's size as free
-evidence.
+where mtime matches within `mtime_window` (default 10 ms, fractional seconds). A
+missing side, a key the manifest does not know, or a stat that drifted all copy.
+It also copies when the S3 side's size differs from the record, using the
+listing's size as free evidence.
 
 Why size + mtime, and why a window:
 
@@ -25,10 +25,14 @@ Why size + mtime, and why a window:
   push recorded the mtime, an unchanged file has a matching stat and is skipped
   without reading it.
 - **The window absorbs filesystem mtime granularity.** The manifest stores
-  nanosecond mtimes, but FAT rounds to 2 s, exFAT to 10 ms, NTFS to 100 ns. A
-  pull that restores a nanosecond mtime onto a coarser filesystem would
-  otherwise see a "difference" on the next run and re-download forever. The 2 s
-  default covers all of them. `mtime_window = 0` restores exact-match behaviour.
+  nanosecond mtimes, but a filesystem rounds them on restore: NTFS to 100 ns,
+  exFAT to 10 ms, FAT32 to 2 s. A pull that restores a nanosecond mtime onto a
+  coarser filesystem would otherwise see a "difference" on the next run and
+  re-download forever. The 10 ms default covers the common modern filesystems
+  (NTFS, exFAT); a coarser one (FAT32 2 s, HFS+ 1 s) needs a larger value. The
+  window is a pure rounding-tolerance, so among small values a larger one has
+  the same real-world blind spot with wider safety. `mtime_window = 0` restores
+  exact `st_mtime_ns` matching.
 
 **Accepted blind spot:** a change that leaves size *and* mtime equal to the
 record — a content edit with the mtime restored (an mtime-preserving tool), or
