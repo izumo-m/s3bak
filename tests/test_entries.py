@@ -63,7 +63,7 @@ def test_subpath_push_keeps_excludes_entry_rooted(ws):
 
 def test_entry_dir_replaced_by_same_stat_file_reuploads(ws):
     # The entry path was a directory; it becomes a single file whose stat
-    # matches a record inside the stale dir manifest. The quick check must
+    # matches a record inside the stale dir manifest. The size+mtime check must
     # match records by rel (the basename), not by stat coincidence.
     import shutil
 

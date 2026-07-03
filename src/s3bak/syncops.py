@@ -104,7 +104,7 @@ def sync_compare(
     default, EtagComparison under --checksum. `manifest_path=None` (nothing on
     S3 yet) yields an empty filter, so every pair transfers - which is also
     the entire v2->v3 migration story: the first push re-uploads everything
-    and writes the v3 manifest. The quick-check window is resolved for `entry`."""
+    and writes the v3 manifest. The size+mtime-check window is resolved for `entry`."""
     assert cfg.store is not None
     if opts.checksum:
         return cfg.store.content_compare()

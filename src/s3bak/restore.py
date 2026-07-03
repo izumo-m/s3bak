@@ -98,8 +98,8 @@ def windows_collect_writable_prep(
     #   - regular files (not dir / not symlink)
     #   - read-only (owner write bit clear)
     # Temporarily add owner-write so `boto3-s3 sync`/`cp` can overwrite them.
-    # Every read-only file is prepped, not just quick-check failures: the
-    # sync's copy decision can be broader than the local quick check (remote
+    # Every read-only file is prepped, not just size+mtime-check failures: the
+    # sync's copy decision can be broader than the local size+mtime check (remote
     # size drift; any content difference under --checksum), and prep must
     # never under-approximate what the sync may overwrite. apply_manifest
     # re-applies the recorded modes afterwards (or windows_restore_modes on

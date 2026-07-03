@@ -1,4 +1,4 @@
-"""Sync copy decisions: the manifest quick check by default, --checksum for content.
+"""Sync copy decisions: the manifest size+mtime check by default, --checksum for content.
 
 The default push/pull compare is ManifestFilter - size + mtime (within
 mtime_window, default 10ms) against the manifest, reading no file content.
@@ -14,7 +14,7 @@ def _mtime_ns(p) -> int:
     return os.lstat(p).st_mtime_ns
 
 
-# --- default: quick check ------------------------------------------------------
+# --- default: size+mtime check -------------------------------------------------
 
 
 def test_push_skips_when_nothing_changed(ws):
@@ -33,7 +33,7 @@ def test_push_reuploads_on_mtime_drift_and_self_heals(ws):
 
     os.utime(p, (2_000_000_000, 2_000_000_000))  # year 2033: outside any window
     res = ws.run("push", "data", expect_rc=0)
-    assert "upload:" in res.out  # quick check fails -> one spurious re-upload
+    assert "upload:" in res.out  # size+mtime check fails -> one spurious re-upload
 
     # ...which refreshed the manifest with the new mtime: self-healed.
     res = ws.run("push", "data", expect_rc=0)
@@ -110,7 +110,7 @@ def test_cli_mtime_window_flag_overrides_config(ws):
 
 
 def test_cli_mtime_window_flag_affects_status(ws):
-    # --mtime-window also tightens `status`, which shares the quick-check
+    # --mtime-window also tightens `status`, which shares the size+mtime-check
     # predicate: a +1s drift is quiet within a 2s window, reported at 0.
     p = ws.write("data/a.txt", "hello")
     ws.config({"data": {"path": str(ws.root / "data")}}, mtime_window=2)
@@ -125,7 +125,7 @@ def test_cli_mtime_window_flag_affects_status(ws):
 
 
 def test_push_misses_same_size_same_mtime_content_change(ws):
-    # The quick check's documented blind spot: identical size AND restored
+    # The size+mtime check's documented blind spot: identical size AND restored
     # mtime looks unchanged. --checksum exists for exactly this.
     p = ws.write("data/a.txt", "hello")
     ws.config({"data": {"path": str(ws.root / "data")}})
@@ -167,7 +167,7 @@ def test_pull_redownloads_on_local_mtime_drift_then_heals(ws):
 
     os.utime(dest / "a.txt", (2_000_000_000, 2_000_000_000))  # drift past the window
     res = ws.run("pull", "data", "-o", str(dest), expect_rc=0)
-    assert "download:" in res.out  # quick check fails -> re-download
+    assert "download:" in res.out  # size+mtime check fails -> re-download
 
     # apply_manifest restored the recorded mtime, so the next pull is a no-op.
     res = ws.run("pull", "data", "-o", str(dest), expect_rc=0)
@@ -261,7 +261,7 @@ def test_checksum_rejected_outside_push_pull(ws):
 # --- single-file entries --------------------------------------------------------
 
 
-def test_single_file_push_quick_check_and_self_heal(ws):
+def test_single_file_push_size_mtime_check_and_self_heal(ws):
     f = ws.write("solo.txt", "hello")
     ws.config({"solo.txt": {"path": str(f)}})
     ws.run("push", "solo.txt", expect_rc=0)

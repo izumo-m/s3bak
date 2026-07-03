@@ -10,10 +10,10 @@ module layout.
 Every sync needs a `compare=` strategy: given a pair (a local side and an S3
 side for one key), does it need copying? s3bak has two.
 
-### Default: `ManifestFilter` (stat quick check)
+### Default: `ManifestFilter` (size+mtime check)
 
 The default reads no file content. For a pair it copies unless the local file's
-**size and mtime both match the manifest record** — an rsync-style quick check —
+**size and mtime both match the manifest record** — an rsync-style size+mtime check —
 where mtime matches within `mtime_window` (default 10 ms, fractional seconds). A
 missing side, a key the manifest does not know, or a stat that drifted all copy.
 It also copies when the S3 side's size differs from the record, using the
@@ -36,7 +36,7 @@ Why size + mtime, and why a window:
 
 **Accepted blind spot:** a change that leaves size *and* mtime equal to the
 record — a content edit with the mtime restored (an mtime-preserving tool), or
-an out-of-band S3 write at the same size — is invisible to the quick check. In a
+an out-of-band S3 write at the same size — is invisible to the size+mtime check. In a
 multi-terminal workflow this bites the **push** side first: the terminal that
 edited such a file never uploads it, so it never reaches S3 (its `status` is
 quiet too, since `status` shares the predicate). `--checksum` (content) covers
@@ -46,7 +46,7 @@ or overridden for one run with `--mtime-window <seconds>`.
 
 **Self-healing (push):** a spurious mtime-only difference re-transfers the file
 once; that push refreshes the manifest with the new mtime, and later runs pass
-the quick check again. The converse does **not** hold for a *stale* manifest
+the size+mtime check again. The converse does **not** hold for a *stale* manifest
 (after `push --data-only`, or an out-of-band S3 write): `pull` never rewrites
 the manifest, so affected pairs re-transfer on every pull until a real
 `push` refreshes the record. This is deliberate — the manifest is the record of
@@ -123,12 +123,12 @@ files is exactly what its machinery is for.
    files are also removed on S3. Excludes are applied by the same entry-rooted
    matcher the manifest walk uses, so the data sync and the manifest can never
    disagree on what an exclude means.
-   **Single-file entry:** upload iff the quick check fails — the manifest holds
+   **Single-file entry:** upload iff the size+mtime check fails — the manifest holds
    no matching-basename record, the local stat differs, or the S3 object is
    missing (a HeadObject confirms existence, since a single file has no listing
    to self-heal from). `--checksum` uses the ETag comparison instead.
 3. **Refresh the manifest only if data was transferred** (or on `--meta-only`).
-   A change the quick check cannot see — a mode/owner/group edit, or an mtime
+   A change the size+mtime check cannot see — a mode/owner/group edit, or an mtime
    drift inside the window — transfers nothing and so does not refresh the
    manifest; `status` keeps showing it until a `--meta-only` push. This is
    deliberate.
@@ -147,8 +147,8 @@ record so the manifest keeps its directory-entry shape.
 
 - **`--meta-only`** refreshes the manifest (and runs `post_hook`) without
   transferring data. **Caution:** it asserts "S3 matches local" without making
-  it true — a never-pushed local edit becomes invisible to the later quick
-  check. It is a metadata refresh, never a substitute for a real push.
+  it true — a never-pushed local edit becomes invisible to the later
+  size+mtime check. It is a metadata refresh, never a substitute for a real push.
 - **`--data-only`** transfers data but does not rewrite the manifest or apply
   local metadata.
 - **`--dry-run`** reports what would happen and changes nothing; planned actions

@@ -93,7 +93,7 @@ class ManifestEntry:
         return format(self.perm_bits, "o")
 
     def matches_stat(self, st: os.stat_result, window_ns: int) -> bool:
-        """rsync-style quick check for a regular file: same size, and mtime
+        """rsync-style size+mtime check for a regular file: same size, and mtime
         within ``window_ns``. A record without size/mtime never matches, so an
         indeterminate comparison falls on the transfer side."""
         if self.size is None or self.mtime_ns is None:
@@ -464,8 +464,8 @@ def exclude_filter(excludes: list[str], sub: str | None = None) -> Any:
 
 
 class ManifestFilter:
-    """The default ``compare=`` strategy for sync: an rsync-style quick check
-    against the manifest (True = copy).
+    """The default ``compare=`` strategy for sync: an rsync-style size+mtime
+    check against the manifest (True = copy).
 
     A pair is skipped only when the local side's size and mtime both match the
     manifest record (mtime within ``window_ns``) and the remote side has the
@@ -479,7 +479,7 @@ class ManifestFilter:
 
     A spurious mtime-only difference self-heals on push: the file is
     re-transferred once, the manifest is refreshed with the new mtime, and
-    later runs pass the quick check again. The converse does not hold for a
+    later runs pass the size+mtime check again. The converse does not hold for a
     STALE manifest (``push --data-only``, or out-of-band S3 writes): pull
     never rewrites the manifest, so affected pairs re-transfer on every pull
     until a full push refreshes the record. Deliberate: the manifest is the

@@ -98,7 +98,7 @@ def test_iter_manifest_skips_damaged_lines(tmp_path):
     assert [e.path for e in manifest.iter_manifest(str(p))] == ["./a"]
 
 
-# --- quick check --------------------------------------------------------------
+# --- size+mtime check ----------------------------------------------------------
 
 
 def test_matches_stat_window(tmp_path):

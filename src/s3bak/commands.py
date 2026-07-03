@@ -170,7 +170,7 @@ def _push_sub(
 
 
 def _single_file_needs_upload(cfg: Config, entry: str, target: str, opts: Opts) -> bool:
-    """The single-file counterpart of the sync compare: quick check against
+    """The single-file counterpart of the sync compare: size+mtime check against
     the entry's one-record manifest (or EtagComparison under --checksum).
 
     Upload unless the manifest holds a regular-file record for exactly this
@@ -283,7 +283,7 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             return result.returncode
         results = _filter_aws_output(result.stdout)
     elif _single_file_needs_upload(cfg, entry, target, opts):
-        # Single-file entry that fails the quick check against its manifest
+        # Single-file entry that fails the size+mtime check against its manifest
         # (or the --checksum ETag comparison), or was never pushed: upload it.
         if opts.dryrun:
             # Set results only; the shared writer below emits it (and the truthy
@@ -303,13 +303,13 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         write_output(f"{results}\n")
 
     # Refresh the manifest only when file data was actually transferred. The
-    # default compare is the manifest quick check (size + mtime within the
+    # default compare is the manifest size+mtime check (mtime within the
     # window), so a change it cannot see - mode/owner/group, or an mtime drift
     # inside the window - transfers nothing and so does not refresh the
     # manifest; `status` keeps showing that diff until you run `push
     # --meta-only` (handled above). Deliberate spec choice, not a bug. Note
     # --meta-only asserts "S3 matches local" without making it true: any
-    # never-pushed local edit becomes invisible to the quick check afterwards,
+    # never-pushed local edit becomes invisible to the size+mtime check afterwards,
     # so it is a metadata refresh, never a substitute for a real push.
     if results and not opts.data_only:
         st = upload_manifest(cfg, entry, target, excludes, opts)
@@ -420,7 +420,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
 
         # 2. If everything in the manifest already matches local, both
         #    the s3 sync/cp and apply_manifest are no-ops. Skip them. Not
-        #    under --checksum: this gate is the same stat quick check whose
+        #    under --checksum: this gate is the same size+mtime check whose
         #    blind spot --checksum exists to cover, so it must not stand
         #    between the user and the content comparison.
         manifest_matches = _manifest_matches_local(

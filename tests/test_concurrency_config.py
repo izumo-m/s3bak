@@ -1,10 +1,10 @@
-"""config.py knobs: concurrency settings and the quick-check mtime window.
+"""config.py knobs: concurrency settings and the size+mtime-check window.
 
 ``max_concurrency`` tunes the transfer thread pool (cp / sync), ``compare_workers``
 tunes the parallel ETag comparison under --checksum; either may be set without
 the other. s3bak does not read aws-cli's ``[s3]`` config, so these are the only
 way to change them. ``mtime_window`` (seconds, 0 allowed = strict) bounds the
-quick-check mtime tolerance.
+size+mtime-check tolerance.
 """
 
 from __future__ import annotations

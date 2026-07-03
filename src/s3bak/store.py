@@ -240,7 +240,7 @@ class Boto3S3Store:
         matches a dir entry's `--checksum` sync - an unchanged file is
         skipped, a same-size/same-mtime content change is not. part_size comes
         from the same profile the upload uses. The default (non---checksum)
-        single-file decision is the manifest quick check, not this.
+        single-file decision is the manifest size+mtime check, not this.
         """
         head = self.head_object(rel_key, verbose=verbose)
         if head is None or not head.etag:

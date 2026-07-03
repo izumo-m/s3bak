@@ -2,7 +2,7 @@
 """Manifest-record vs local-filesystem comparison, plus the status/diff
 presentation helpers (color, humanized sizes/durations).
 
-``compare_to_local`` shares its size + mtime quick check with the sync's
+``compare_to_local`` shares its size+mtime check with the sync's
 ``ManifestFilter`` (see manifest.py), so ``status`` and push/pull agree on
 what counts as changed; mode is compared additionally for the metadata report.
 """
@@ -102,7 +102,7 @@ def compare_to_local(
 ) -> EntryDiff:
     """Manifest record vs local filesystem state.
 
-    The size + mtime part is the same quick check the sync's ManifestFilter
+    The size + mtime part is the same check the sync's ManifestFilter
     applies (mtime within ``window_ns``), so `status` and push/pull agree on
     what counts as changed; mode is additionally compared here for the
     metadata report (the sync never transfers over a mode change).

@@ -132,9 +132,9 @@ Options:
   --delete         After restore, delete local files not in backup (pull only)
   --meta-only      Sync only metadata (the manifest), skip file data (push/pull)
   --data-only      Sync only file data, leave manifest/local-meta untouched (push/pull)
-  --checksum       Compare by content (ETag) instead of the manifest quick
+  --checksum       Compare by content (ETag) instead of the manifest size+mtime
                    check; reads every candidate file (push/pull)
-  --mtime-window <seconds>  Override config's quick-check mtime tolerance for
+  --mtime-window <seconds>  Override config's size+mtime-check tolerance for
                    this run (fractional ok, 0 = exact); affects push/pull/status
   -o, --output <path>  Restore destination for pull (default: entry's configured path)
   -v, --verbose    Verbose output (details per field in status)
@@ -357,7 +357,7 @@ def main(argv: list[str] | None = None) -> int:
         die("--checksum only applies to push and pull")
 
     # A CLI --mtime-window overrides both the top-level and per-entry config
-    # windows for this run (0 = exact). Affects the quick-check compare shared
+    # windows for this run (0 = exact). Affects the size+mtime check shared
     # by push / pull / status (see Config.window_for).
     if opt_mtime_window is not None:
         cfg.mtime_window_override = opt_mtime_window
