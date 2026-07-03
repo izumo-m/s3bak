@@ -7,15 +7,12 @@ import os
 import pytest
 
 
-def test_single_file_entry_roundtrip_with_metadata(ws, s3):
+def test_single_file_entry_roundtrip(ws):
     f = ws.write("solo.txt", "content\n")
     ws.config({"solo.txt": {"path": str(f)}})
 
     ws.run("push", "solo.txt", expect_rc=0)
-
     assert "solo.txt" in ws.keys()
-    head = s3.head_object(Bucket=ws.bucket, Key=f"{ws.prefix}/solo.txt")
-    assert "local-mtime" in head["Metadata"]
 
     res = ws.run("status", "solo.txt", expect_rc=0)
     assert res.out.strip() == ""
@@ -35,6 +32,69 @@ def test_excludes_skip_matching_files(ws):
     keys = ws.keys()
     assert "data/keep.txt" in keys
     assert "data/skip.log" not in keys
+
+
+def test_subpath_push_keeps_excludes_entry_rooted(ws):
+    # "tmp/*" means <entry>/tmp - a sub-path push of build/ must NOT reanchor
+    # it at build/tmp (that would drop build/tmp from the manifest and make a
+    # later pull --delete remove never-excluded local files).
+    ws.write("data/tmp/skip.txt", "s")  # excluded: entry-root tmp
+    ws.write("data/build/tmp/keep.txt", "k")  # not excluded
+    ws.write("data/build/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["tmp/*"]}})
+    ws.run("push", "data", expect_rc=0)
+
+    keys = ws.keys()
+    assert "data/build/tmp/keep.txt" in keys
+    assert "data/tmp/skip.txt" not in keys
+
+    (ws.root / "data" / "build" / "tmp" / "keep.txt").write_text("k-v2")
+    ws.run("push", str(ws.root / "data" / "build"), expect_rc=0)
+
+    body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/build/tmp/keep.txt")[
+        "Body"
+    ].read()
+    assert body == b"k-v2"  # the sub sync did not exclude build/tmp
+    mani = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl")["Body"].read()
+    assert "./build/tmp/keep.txt" in mani.decode()  # nor did the manifest patch
+    res = ws.run("status", "data", expect_rc=0)
+    assert res.out.strip() == ""
+
+
+def test_entry_dir_replaced_by_same_stat_file_reuploads(ws):
+    # The entry path was a directory; it becomes a single file whose stat
+    # matches a record inside the stale dir manifest. The quick check must
+    # match records by rel (the basename), not by stat coincidence.
+    import shutil
+
+    ws.write("data/a.txt", "hello")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    st = os.lstat(ws.root / "data" / "a.txt")
+    shutil.rmtree(ws.root / "data")
+    f = ws.root / "data"
+    f.write_text("hello")  # same size as the old ./a.txt record
+    os.utime(f, ns=(st.st_mtime_ns, st.st_mtime_ns))  # and the same mtime
+
+    res = ws.run("push", "data", expect_rc=0)
+    assert "upload:" in res.out
+    body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data")["Body"].read()
+    assert body == b"hello"
+
+
+def test_first_subpath_push_keeps_dir_entry_shape(ws):
+    # A sub-path push with no manifest on S3 yet creates one; the entry must
+    # still classify as a directory entry afterwards (rel shape './...'), so
+    # a whole-entry pull syncs the tree instead of cp-ing a bogus single file.
+    ws.write("data/notes.txt", "n")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+
+    ws.run("push", str(ws.root / "data" / "notes.txt"), expect_rc=0)
+
+    dest = ws.root / "out"
+    ws.run("pull", "data", "-o", str(dest), expect_rc=0)
+    assert (dest / "notes.txt").read_text() == "n"
 
 
 def test_push_file_subpath_uploads_and_keeps_status_clean(ws):
@@ -139,9 +199,10 @@ def test_post_hook_runs_on_success(ws):
 def test_windows_pull_applies_manifest_without_downloads(ws, monkeypatch):
     # On Windows, apply_manifest must run even when nothing was downloaded (an
     # empty-dir sub-path here): the restore must not be gated on sync_changed.
-    from s3bak import cli
+    # cmd_pull reads IS_WINDOWS from its own module, so patch it there.
+    from s3bak import commands
 
-    monkeypatch.setattr(cli, "IS_WINDOWS", True)
+    monkeypatch.setattr(commands, "IS_WINDOWS", True)
     ws.write("data/file.txt", "x")
     (ws.root / "data" / "empty").mkdir()
     ws.config({"data": {"path": str(ws.root / "data")}})

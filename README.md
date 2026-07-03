@@ -82,8 +82,9 @@ Commands:
   help                     Show this help
 ```
 
-Common options: `--all`, `--dryrun` (push), `--delete` (pull), `--meta-only`,
-`--data-only`, `-o/--output <path>` (pull), `-v/--verbose`, `--color[=WHEN]`.
+Common options: `--all`, `--dry-run` (push), `--delete` (pull), `--meta-only`,
+`--data-only`, `--checksum` (push/pull), `-o/--output <path>` (pull),
+`-v/--verbose`, `--color[=WHEN]`.
 
 Run `s3bak help` for the full option list and worked examples.
 
@@ -91,7 +92,7 @@ Run `s3bak help` for the full option list and worked examples.
 
 ```sh
 s3bak push --all              # back up every configured entry
-s3bak push --all --dryrun     # preview without uploading
+s3bak push --all --dry-run    # preview without uploading
 s3bak status bin              # M/A/D summary for one entry
 s3bak pull bin -o /tmp/out    # restore the bin entry to /tmp/out
 s3bak ls-remote               # list entries stored on S3
@@ -99,6 +100,14 @@ s3bak ls-remote               # list entries stored on S3
 
 The `status` letters are push-oriented (what a push would change on the backup):
 `M` modified, `A` only local (push would add), `D` only in backup (push would delete).
+
+## Design
+
+- [`docs/overview.md`](docs/overview.md) — architecture, module layering, and
+  what s3bak stores on S3.
+- [`docs/manifest.md`](docs/manifest.md) — the v3 JSONL manifest format.
+- [`docs/sync.md`](docs/sync.md) — the compare model, transfer path, and the
+  push / pull pipelines.
 
 ## License
 

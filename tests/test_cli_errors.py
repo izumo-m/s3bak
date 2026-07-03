@@ -82,3 +82,20 @@ def test_ls_remote_rejects_data_only(cfg_ws):
 def test_show_rejects_meta_only(cfg_ws):
     res = cfg_ws.run("show", "--meta-only", "data")
     assert res.rc == 1
+
+
+def test_mtime_window_flag_rejects_non_number(cfg_ws):
+    res = cfg_ws.run("push", "--mtime-window", "abc", "data")
+    assert res.rc == 1
+    assert "mtime-window" in res.err.lower()
+
+
+def test_mtime_window_flag_rejects_negative(cfg_ws):
+    res = cfg_ws.run("push", "--mtime-window", "-1", "data")
+    assert res.rc == 1
+    assert "mtime-window" in res.err.lower()
+
+
+def test_mtime_window_flag_requires_value(cfg_ws):
+    res = cfg_ws.run("push", "data", "--mtime-window")
+    assert res.rc == 1
