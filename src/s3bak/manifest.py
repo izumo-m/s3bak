@@ -166,11 +166,18 @@ def iter_manifest(manifest_path: str) -> Iterator[ManifestEntry]:
                 yield entry
 
 
-def load_map(manifest_path: str, sub: str | None = None) -> dict[str, ManifestEntry]:
-    """Manifest entries keyed by sync compare key: the entry path minus the
-    ``./`` prefix, relative to ``sub`` when given. The tree root itself never
-    forms a sync pair and is omitted."""
-    out: dict[str, ManifestEntry] = {}
+def iter_compare_records(
+    manifest_path: str, sub: str | None = None
+) -> Iterator[tuple[str, ManifestEntry]]:
+    """Stream ``(compare_sort_key, entry)`` for every non-root record in the
+    sync's ascending compare-key order, optionally restricted to ``sub``.
+
+    The key carries a directory's trailing ``/`` (``entry_sort_key`` semantics),
+    so it merge-joins in lockstep with ``S3.sync``'s ascending pair keys - which
+    lets ``ManifestFilter`` decide each pair with a one-record lookahead instead
+    of loading the whole manifest. The tree root never forms a sync pair and is
+    omitted; a record outside ``sub`` is skipped, and one under it has the
+    ``sub/`` prefix stripped (matching the sync's sub-rooted compare keys)."""
     for e in iter_manifest(manifest_path):
         if e.path == ".":
             continue
@@ -179,8 +186,7 @@ def load_map(manifest_path: str, sub: str | None = None) -> dict[str, ManifestEn
             if not rel.startswith(sub + "/"):
                 continue
             rel = rel[len(sub) + 1 :]
-        out[rel] = e
-    return out
+        yield (rel + "/" if e.is_dir else rel), e
 
 
 # =============================================================================
@@ -467,6 +473,15 @@ class ManifestFilter:
     """The default ``compare=`` strategy for sync: an rsync-style size+mtime
     check against the manifest (True = copy).
 
+    Streaming: it reads the manifest once, front to back, merge-joining its
+    records against ``S3.sync``'s ascending compare-key pairs - the whole
+    manifest is never held in memory. This works because the manifest is
+    written in ``LocalStorage.scan`` order (``entry_sort_key``) and a bare
+    ``PairFilter`` is decided serially on one thread in that same order
+    (``ParallelCompare`` - opt-in, content strategies only - is the only
+    concurrent path), so a one-record lookahead suffices. A filter is a
+    forward-only cursor: one serves exactly one sync.
+
     A pair is skipped only when the local side's size and mtime both match the
     manifest record (mtime within ``window_ns``) and the remote side has the
     recorded size too. Everything else copies: a missing side, a key the
@@ -486,9 +501,34 @@ class ManifestFilter:
     record of the last real push, and only a push may change it.
     """
 
-    def __init__(self, entries: dict[str, ManifestEntry], *, window_ns: int):
-        self.entries = entries
+    def __init__(self, records: Iterator[tuple[str, ManifestEntry]], *, window_ns: int):
+        # (compare_sort_key, entry) in ascending key order - see iter_compare_records.
+        self._records = iter(records)
         self.window_ns = window_ns
+        self._head: tuple[str, ManifestEntry] | None = next(self._records, None)
+
+    def close(self) -> None:
+        """Release the manifest file handle the record stream holds open. The
+        sync keeps this filter alive for its whole run, so the caller closes it
+        before unlinking the temp manifest (an open file cannot be removed on
+        Windows). Idempotent, and a no-op for a non-generator record source."""
+        closer = getattr(self._records, "close", None)
+        if callable(closer):
+            closer()
+        self._head = None
+
+    def _lookup(self, key: str) -> ManifestEntry | None:
+        """The record for compare key ``key``, or None. Advances the one-record
+        cursor: skip records ordered before ``key`` (keys the sync did not pair,
+        e.g. deleted files), consume an exact hit, stop past a larger one.
+        Correct only because both sides ascend in the same compare-key order."""
+        while self._head is not None and self._head[0] < key:
+            self._head = next(self._records, None)
+        if self._head is not None and self._head[0] == key:
+            entry = self._head[1]
+            self._head = next(self._records, None)
+            return entry
+        return None
 
     def __call__(self, pair: Any) -> bool:
         if pair.src is None:
@@ -501,7 +541,7 @@ class ManifestFilter:
         else:
             raise ValueError(f"ManifestFilter cannot judge a {direction!r} pair: {pair.key!r}")
 
-        m = self.entries.get(pair.key)
+        m = self._lookup(pair.key)
         if m is None or not m.is_file:
             # Unknown to the manifest, or recorded as a dir/symlink: a push
             # uploads it (local is the source of truth); a pull downloads an

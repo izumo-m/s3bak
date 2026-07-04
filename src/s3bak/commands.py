@@ -122,6 +122,7 @@ def _push_sub(
     elif os.path.isdir(local_sub):
         fd, manifest_path = tempfile.mkstemp(suffix=".jsonl")
         os.close(fd)
+        compare = None
         try:
             # --checksum ignores the manifest entirely; skip the download.
             have_manifest = not opts.checksum and download_manifest(
@@ -140,6 +141,10 @@ def _push_sub(
                 verbose=opts.verbose,
             )
         finally:
+            # The streaming ManifestFilter holds the temp manifest open; close it
+            # before unlink (an open file cannot be removed on Windows).
+            if isinstance(compare, manifest.ManifestFilter):
+                compare.close()
             os.unlink(manifest_path)
         if result.returncode != 0:
             write_output(result.stdout)
@@ -259,6 +264,7 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
     if os.path.isdir(target):
         fd, manifest_path = tempfile.mkstemp(suffix=".jsonl")
         os.close(fd)
+        compare = None
         try:
             # --checksum ignores the manifest entirely; skip the download.
             have_manifest = not opts.checksum and download_manifest(
@@ -275,6 +281,10 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 verbose=opts.verbose,
             )
         finally:
+            # The streaming ManifestFilter holds the temp manifest open; close it
+            # before unlink (an open file cannot be removed on Windows).
+            if isinstance(compare, manifest.ManifestFilter):
+                compare.close()
             os.unlink(manifest_path)
         if result.returncode != 0:
             write_output(result.stdout)
@@ -452,9 +462,23 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             # size (from the manifest) routes a large file through multipart.
             compare = sync_compare(cfg, opts, entry, manifest_path, sub=sub) if is_dir else None
             file_size = None if is_dir else _single_file_size(manifest_path)
-            rc, changed = download_from_s3(
-                cfg, entry, outpath, is_dir, opts.verbose, sub=sub, compare=compare, size=file_size
-            )
+            try:
+                rc, changed = download_from_s3(
+                    cfg,
+                    entry,
+                    outpath,
+                    is_dir,
+                    opts.verbose,
+                    sub=sub,
+                    compare=compare,
+                    size=file_size,
+                )
+            finally:
+                # The streaming ManifestFilter holds the temp manifest open; close
+                # it before the outer finally unlinks it (Windows cannot remove an
+                # open file).
+                if isinstance(compare, manifest.ManifestFilter):
+                    compare.close()
             if rc != 0:
                 if IS_WINDOWS:
                     windows_restore_modes(prep)

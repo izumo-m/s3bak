@@ -14,6 +14,61 @@ def _mtime_ns(p) -> int:
     return os.lstat(p).st_mtime_ns
 
 
+# --- streaming merge-join (ManifestFilter reads the manifest once, in order) ---
+
+
+def test_streaming_compare_handles_interleaved_dir_and_file(ws):
+    # The manifest interleaves a directory marker ("foo/") between "foo.txt" and
+    # "foo/bar" (S3 byte order: '.' < '/'). The streaming compare must merge-join
+    # past the dir marker in lockstep with the sync's pairs, without desyncing.
+    ws.write("data/foo.txt", "A")
+    ws.write("data/foo/bar", "B")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "foo" / "bar").write_text("B-bigger")
+    res = ws.run("push", "data", expect_rc=0)
+    assert "foo/bar" in res.out
+    assert "foo.txt" not in res.out  # unchanged sibling not re-uploaded
+
+    # The reverse: modifying only foo.txt must not re-send foo/bar.
+    (ws.root / "data" / "foo.txt").write_text("A-bigger")
+    res = ws.run("push", "data", expect_rc=0)
+    assert "foo.txt" in res.out
+    assert "foo/bar" not in res.out
+
+
+def test_streaming_compare_after_deleted_file_does_not_desync(ws):
+    # A file in the manifest but deleted locally yields no source pair; the
+    # cursor must skip its record and still match the keys that follow.
+    ws.write("data/a.txt", "a")
+    ws.write("data/m.txt", "m")
+    ws.write("data/z.txt", "z")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "a.txt").unlink()  # no pair for "a.txt" (sorts first)
+    (ws.root / "data" / "z.txt").write_text("z-bigger")  # changed (sorts last)
+    res = ws.run("push", "data", expect_rc=0)
+    assert "z.txt" in res.out  # changed file re-uploaded
+    assert "m.txt" not in res.out  # unchanged middle file not re-uploaded
+
+
+def test_streaming_compare_subpath(ws):
+    # A sub-path sync strips the "sub/" prefix from both the pairs and the
+    # manifest records; the streaming compare must stay aligned.
+    ws.write("data/docs/a.txt", "a")
+    ws.write("data/docs/b.txt", "b")
+    ws.write("data/other.txt", "o")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "docs" / "b.txt").write_text("b-bigger")
+    res = ws.run("push", str(ws.root / "data" / "docs"), expect_rc=0)
+    assert "b.txt" in res.out
+    assert "a.txt" not in res.out  # unchanged sibling under the sub-path
+
+
 # --- default: size+mtime check -------------------------------------------------
 
 
