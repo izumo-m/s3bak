@@ -53,17 +53,33 @@ def manifest_target(
     return target, rel
 
 
+def within_root(root_real: str, target: str) -> bool:
+    """True iff writing at `target` stays inside `root_real` (a realpath'd
+    restore root). Resolves symlinks in the parent chain, so a write *through*
+    a symlinked ancestor is caught, while the final component may still be
+    absent (about to be created) or a symlink we intend to replace."""
+    parent_real = os.path.realpath(os.path.dirname(target) or ".")
+    resolved = os.path.normpath(os.path.join(parent_real, os.path.basename(target)))
+    return resolved == root_real or resolved.startswith(root_real + os.sep)
+
+
 # =============================================================================
 # Tree iteration
 # =============================================================================
 
 
 def iter_local_tree(outpath: str, excludes: list[str]) -> Iterator[tuple[str, bool]]:
-    """Walk local tree yielding (rel_without_dot_slash, is_dir)."""
+    """Walk local tree yielding (rel_without_dot_slash, is_dir).
+
+    Rels are '/'-separated on every platform: they are matched against the
+    '/'-separated exclude patterns and manifest keys (delete_extra_files),
+    so a native Windows os.sep must not leak in."""
     prune_patterns, skip_patterns = split_excludes(excludes)
 
     for dirpath, dirnames, filenames in os.walk(outpath, followlinks=False):
         rel_dir = os.path.relpath(dirpath, outpath)
+        if os.sep != "/":
+            rel_dir = rel_dir.replace(os.sep, "/")
         rel_prefix = "./" if rel_dir == "." else f"./{rel_dir}/"
 
         dirnames.sort()
@@ -98,8 +114,8 @@ def windows_collect_writable_prep(
     #   - regular files (not dir / not symlink)
     #   - read-only (owner write bit clear)
     # Temporarily add owner-write so `boto3-s3 sync`/`cp` can overwrite them.
-    # Every read-only file is prepped, not just quick-check failures: the
-    # sync's copy decision can be broader than the local quick check (remote
+    # Every read-only file is prepped, not just size+mtime-check failures: the
+    # sync's copy decision can be broader than the local size+mtime check (remote
     # size drift; any content difference under --checksum), and prep must
     # never under-approximate what the sync may overwrite. apply_manifest
     # re-applies the recorded modes afterwards (or windows_restore_modes on
@@ -158,12 +174,22 @@ def _apply_meta(target: str, mode: int, mtime_ns: int | None) -> bool:
 def apply_manifest(outpath: str, is_dir: bool, manifest_path: str, sub: str | None = None) -> int:
     deferred_dirs: list[tuple[str, int, int | None]] = []
     errors = 0
+    # A manifest is downloaded from S3 and may be corrupt or hostile. Only a
+    # directory entry joins record-controlled paths onto outpath, so only it can
+    # escape (a single-file entry always writes at outpath). Reject any record
+    # that would create/chmod/symlink outside the restore root - via ".." , an
+    # absolute path, or a write through a symlink an earlier record planted.
+    root_real = os.path.realpath(outpath)
 
     for m_entry in manifest.iter_manifest(manifest_path):
         res = manifest_target(m_entry, outpath, is_dir, sub)
         if res is None:
             continue
-        target, _rel = res
+        target, rel = res
+        if is_dir and rel != "." and not within_root(root_real, target):
+            err(f"manifest path escapes restore root, skipped: {m_entry.path}")
+            errors += 1
+            continue
         mode = m_entry.perm_bits
 
         if m_entry.sym_target is not None:
@@ -185,7 +211,12 @@ def apply_manifest(outpath: str, is_dir: bool, manifest_path: str, sub: str | No
         # directory (including an empty one, which has no S3 object) from a
         # regular file that was recorded but never uploaded.
         if is_dir and m_entry.is_dir:
-            if not os.path.exists(target):
+            # A file or symlink where a directory belongs is a stale conflicting
+            # type; clear it so the recorded directory is what ends up there
+            # (the symlink branch above clears conflicting types the same way).
+            if os.path.islink(target) or (os.path.exists(target) and not os.path.isdir(target)):
+                os.remove(target)
+            if not os.path.isdir(target):
                 os.makedirs(target, exist_ok=True)
             deferred_dirs.append((target, mode, m_entry.mtime_ns))
             continue

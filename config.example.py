@@ -32,7 +32,7 @@ prefix = "s3://my-bucket/backup"
 #                      of them, one thread each). Each entry also opens its own
 #                      transfer pool, so cap this when you have many entries
 #                      to bound the total thread count.
-#   mtime_window       quick-check mtime tolerance in seconds (fractional ok,
+#   mtime_window       size+mtime-check tolerance in seconds (fractional ok,
 #                      default 0.01 = 10ms, 0 = exact st_mtime_ns match). The
 #                      default absorbs the rounding of NTFS (100ns) and exFAT
 #                      (10ms) so a pull onto them cannot re-download an unchanged

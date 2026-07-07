@@ -50,19 +50,6 @@ from s3bak.syncops import (
 )
 
 
-def _filter_aws_output(raw: str) -> str:
-    filtered: list[str] = []
-    for line in raw.replace("\r", "\n").splitlines():
-        line = line.strip()
-        if (
-            line
-            and not line.startswith("Completed ")
-            and not line.startswith("warning: Skipping file")
-        ):
-            filtered.append(line)
-    return "\n".join(filtered)
-
-
 def _run_post_hook(post_hook: str | None, opts: Opts) -> int:
     if not post_hook:
         return 0
@@ -122,6 +109,7 @@ def _push_sub(
     elif os.path.isdir(local_sub):
         fd, manifest_path = tempfile.mkstemp(suffix=".jsonl")
         os.close(fd)
+        compare = None
         try:
             # --checksum ignores the manifest entirely; skip the download.
             have_manifest = not opts.checksum and download_manifest(
@@ -140,15 +128,18 @@ def _push_sub(
                 verbose=opts.verbose,
             )
         finally:
+            # The streaming ManifestFilter holds the temp manifest open; close it
+            # before unlink (an open file cannot be removed on Windows).
+            if isinstance(compare, manifest.ManifestFilter):
+                compare.close()
             os.unlink(manifest_path)
         if result.returncode != 0:
             write_output(result.stdout)
             if result.stderr:
                 write_stderr(result.stderr)
             return result.returncode
-        filtered = _filter_aws_output(result.stdout)
-        if filtered:
-            write_output(f"{filtered}\n")
+        if result.stdout:
+            write_output(f"{result.stdout}\n")
     else:
         # Regular file: an explicit sub-path push always uploads.
         if opts.dryrun:
@@ -160,9 +151,8 @@ def _push_sub(
                 if result.stderr:
                     write_stderr(result.stderr)
                 return result.returncode
-            filtered = _filter_aws_output(result.stdout)
-            if filtered:
-                write_output(f"{filtered}\n")
+            if result.stdout:
+                write_output(f"{result.stdout}\n")
 
     if not opts.data_only:
         patch_manifest_subtree(cfg, entry, target_root, sub, excludes, opts)
@@ -170,7 +160,7 @@ def _push_sub(
 
 
 def _single_file_needs_upload(cfg: Config, entry: str, target: str, opts: Opts) -> bool:
-    """The single-file counterpart of the sync compare: quick check against
+    """The single-file counterpart of the sync compare: size+mtime check against
     the entry's one-record manifest (or EtagComparison under --checksum).
 
     Upload unless the manifest holds a regular-file record for exactly this
@@ -259,6 +249,7 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
     if os.path.isdir(target):
         fd, manifest_path = tempfile.mkstemp(suffix=".jsonl")
         os.close(fd)
+        compare = None
         try:
             # --checksum ignores the manifest entirely; skip the download.
             have_manifest = not opts.checksum and download_manifest(
@@ -275,15 +266,19 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 verbose=opts.verbose,
             )
         finally:
+            # The streaming ManifestFilter holds the temp manifest open; close it
+            # before unlink (an open file cannot be removed on Windows).
+            if isinstance(compare, manifest.ManifestFilter):
+                compare.close()
             os.unlink(manifest_path)
         if result.returncode != 0:
             write_output(result.stdout)
             if result.stderr:
                 write_stderr(result.stderr)
             return result.returncode
-        results = _filter_aws_output(result.stdout)
+        results = result.stdout
     elif _single_file_needs_upload(cfg, entry, target, opts):
-        # Single-file entry that fails the quick check against its manifest
+        # Single-file entry that fails the size+mtime check against its manifest
         # (or the --checksum ETag comparison), or was never pushed: upload it.
         if opts.dryrun:
             # Set results only; the shared writer below emits it (and the truthy
@@ -297,19 +292,19 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 if result.stderr:
                     write_stderr(result.stderr)
                 return result.returncode
-            results = _filter_aws_output(result.stdout)
+            results = result.stdout
 
     if results:
         write_output(f"{results}\n")
 
     # Refresh the manifest only when file data was actually transferred. The
-    # default compare is the manifest quick check (size + mtime within the
+    # default compare is the manifest size+mtime check (mtime within the
     # window), so a change it cannot see - mode/owner/group, or an mtime drift
     # inside the window - transfers nothing and so does not refresh the
     # manifest; `status` keeps showing that diff until you run `push
     # --meta-only` (handled above). Deliberate spec choice, not a bug. Note
     # --meta-only asserts "S3 matches local" without making it true: any
-    # never-pushed local edit becomes invisible to the quick check afterwards,
+    # never-pushed local edit becomes invisible to the size+mtime check afterwards,
     # so it is a metadata refresh, never a substitute for a real push.
     if results and not opts.data_only:
         st = upload_manifest(cfg, entry, target, excludes, opts)
@@ -420,7 +415,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
 
         # 2. If everything in the manifest already matches local, both
         #    the s3 sync/cp and apply_manifest are no-ops. Skip them. Not
-        #    under --checksum: this gate is the same stat quick check whose
+        #    under --checksum: this gate is the same size+mtime check whose
         #    blind spot --checksum exists to cover, so it must not stand
         #    between the user and the content comparison.
         manifest_matches = _manifest_matches_local(
@@ -438,6 +433,13 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         if IS_WINDOWS and not opts.meta_only:
             prep = windows_collect_writable_prep(outpath, is_dir, manifest_path, sub)
 
+        # A single-file restore must place a regular file at outpath. If a
+        # symlink sits there, replace it - writing through it would clobber the
+        # link target instead. (Directory syncs use follow_symlinks=False, and
+        # apply_manifest clears conflicting types on the metadata paths.)
+        if not is_dir and has_data and not opts.meta_only and os.path.islink(outpath):
+            os.remove(outpath)
+
         changed = False
         if not opts.meta_only and has_data:
             # The compare only matters for the dir sync; a single-file transfer
@@ -445,9 +447,23 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             # size (from the manifest) routes a large file through multipart.
             compare = sync_compare(cfg, opts, entry, manifest_path, sub=sub) if is_dir else None
             file_size = None if is_dir else _single_file_size(manifest_path)
-            rc, changed = download_from_s3(
-                cfg, entry, outpath, is_dir, opts.verbose, sub=sub, compare=compare, size=file_size
-            )
+            try:
+                rc, changed = download_from_s3(
+                    cfg,
+                    entry,
+                    outpath,
+                    is_dir,
+                    opts.verbose,
+                    sub=sub,
+                    compare=compare,
+                    size=file_size,
+                )
+            finally:
+                # The streaming ManifestFilter holds the temp manifest open; close
+                # it before the outer finally unlinks it (Windows cannot remove an
+                # open file).
+                if isinstance(compare, manifest.ManifestFilter):
+                    compare.close()
             if rc != 0:
                 if IS_WINDOWS:
                     windows_restore_modes(prep)
@@ -509,7 +525,9 @@ def cmd_show(cfg: Config, entry: str, opts: Opts, file: str | None = None) -> in
         return 1
 
     if file:
-        file = file.lstrip("./")
+        # removeprefix, not lstrip: lstrip("./") strips *characters*, mangling a
+        # dotfile (".bashrc" -> "bashrc") into the wrong S3 key.
+        file = file.removeprefix("./")
         rel = f"{entry}/{file}"
     else:
         rel = entry
@@ -530,12 +548,20 @@ def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
     os.close(fd)
     try:
         if not download_manifest(cfg, entry, manifest_path, opts.verbose):
+            err(f"entry not found on S3: {entry}")
             return 1
-        if sub is not None and _sub_kind_from_manifest(manifest_path, sub) == "missing":
-            err(f"not found on S3: {entry}/{sub}")
-            return 1
-
-        is_dir = os.path.isdir(outpath)
+        # Classify from the manifest (the record of the last push), not the
+        # local filesystem: a directory entry whose local tree was deleted must
+        # still map each record to its own child path (is_dir=False would fold
+        # every record onto outpath and print duplicate/wrong lines).
+        if sub is not None:
+            sub_kind = _sub_kind_from_manifest(manifest_path, sub)
+            if sub_kind == "missing":
+                err(f"not found on S3: {entry}/{sub}")
+                return 1
+            is_dir = sub_kind == "dir"
+        else:
+            is_dir = _entry_kind_from_manifest(manifest_path) == "dir"
         excludes: list[str] = entry_cfg.get("excludes", [])
         use_color = _resolve_use_color(opts.color)
 
@@ -572,6 +598,7 @@ def diff_single_file(cfg: Config, rel_key: str, label: str, localfile: str, opts
     try:
         assert cfg.store is not None
         if not cfg.store.get_object(rel_key, tmppath, verbose=opts.verbose):
+            err(f"not found on S3: {rel_key}")
             return 1
         cmd = [
             "diff",
@@ -678,7 +705,8 @@ def cmd_diff(cfg: Config, entry: str, opts: Opts, file: str | None = None) -> in
     outpath: str = entry_cfg["path"]
 
     if file:
-        file = file.lstrip("./")
+        # removeprefix, not lstrip: see cmd_show.
+        file = file.removeprefix("./")
         return diff_single_file(
             cfg,
             f"{entry}/{file}",
@@ -721,12 +749,9 @@ def show_entry_files(manifest_path: str, sub: str | None = None) -> None:
 def cmd_ls_remote(cfg: Config, opts: Opts, entry: str | None = None, sub: str | None = None) -> int:
     assert cfg.store is not None
     if entry is None:
-        for line in cfg.store.list_top_level_lines(verbose=opts.verbose):
-            if line.endswith(manifest.MANIFEST_SUFFIX):
-                parts = line.split()
-                if parts:
-                    name = parts[-1].removesuffix(manifest.MANIFEST_SUFFIX)
-                    write_output(f"{name}\n")
+        for name in cfg.store.list_top_level_names(verbose=opts.verbose):
+            if name.endswith(manifest.MANIFEST_SUFFIX):
+                write_output(f"{name.removesuffix(manifest.MANIFEST_SUFFIX)}\n")
         return 0
 
     if entry not in cfg.entries:
@@ -737,6 +762,7 @@ def cmd_ls_remote(cfg: Config, opts: Opts, entry: str | None = None, sub: str | 
     os.close(fd)
     try:
         if not download_manifest(cfg, entry, manifest_path, opts.verbose):
+            err(f"entry not found on S3: {entry}")
             return 1
         if sub is not None and _sub_kind_from_manifest(manifest_path, sub) == "missing":
             err(f"not found on S3: {entry}/{sub}")

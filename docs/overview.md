@@ -82,7 +82,7 @@ dependency graph (no import cycles). Lower layers never import upper ones.
 - **The manifest is the record of the last real push.** Only a push rewrites
   it. `status` and both compare directions read it; nothing else mutates it.
 - **Decide by stat, not by content, in the common case.** The default compare
-  is an rsync-style size+mtime quick check against the manifest — no file is
+  is an rsync-style size+mtime check against the manifest — no file is
   read. Content comparison (ETag) is opt-in via `--checksum` (see
   [sync.md](sync.md)).
 - **Prefer one round trip.** Small objects use a direct `GetObject` /
@@ -111,7 +111,7 @@ the window below). Optional top-level tuning knobs:
 | `max_concurrency`   | 10      | transfer threads for `cp` / `sync`                             |
 | `compare_workers`   | =above  | parallel ETag comparisons under `--checksum`                   |
 | `entry_concurrency` | all     | how many entries run at once under `--all`                     |
-| `mtime_window`      | 0.01 (s) | quick-check mtime tolerance (fractional ok); `0` = exact match |
+| `mtime_window`      | 0.01 (s) | size+mtime-check tolerance (fractional ok); `0` = exact match |
 
 See [`../config.example.py`](../config.example.py) for a commented template.
 
@@ -127,10 +127,12 @@ See [`../config.example.py`](../config.example.py) for a commented template.
 | `list`      | list locally configured entries (no S3 access)                     |
 | `ls-remote` | list S3 entries, or files recorded under an entry / sub-path        |
 
-Options: `--all`, `--dry-run` (push), `--delete` (pull), `--meta-only`,
-`--data-only`, `--checksum` (push/pull), `--mtime-window <seconds>`,
-`-o/--output` (pull), `-v/--verbose`, `--color[=WHEN]` / `--no-color`. Push/pull
-semantics and the meaning of each mode are in [sync.md](sync.md).
+Options: `--all`, `--dry-run` (push), `--delete` (pull, sub-path push),
+`--meta-only`, `--data-only`, `--checksum` (push/pull),
+`--mtime-window <seconds>`, `-o/--output` (pull), `-v/--verbose`,
+`--color[=WHEN]` / `--no-color`. A flag that does not apply to the given
+command is rejected, not ignored. Push/pull semantics and the meaning of each
+mode are in [sync.md](sync.md).
 
 An `<entry>/<sub>` or a local path argument (containing `/`) resolves to the
 owning entry plus a sub-path; a bare name resolves to an entry. Path arguments

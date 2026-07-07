@@ -70,6 +70,14 @@ def test_pull_unpushed_entry_reports_not_found(ws):
     assert "not found" in (res.err + res.out).lower()
 
 
+def test_ls_remote_unpushed_entry_reports_not_found(ws):
+    ws.write("data/a.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    res = ws.run("ls-remote", "data")
+    assert res.rc == 1
+    assert "not found on s3" in res.err.lower()
+
+
 def test_ls_remote_missing_subpath_errors(ws):
     ws.write("data/a.txt", "x")
     ws.config({"data": {"path": str(ws.root / "data")}})
@@ -119,6 +127,24 @@ def test_single_file_pull_restores_original_mtime(ws):
     dest = ws.root / "out.txt"
     ws.run("pull", "solo.txt", "-o", str(dest), expect_rc=0)
     assert int(dest.stat().st_mtime) == old
+
+
+def test_single_file_pull_replaces_symlink_destination(ws):
+    # Restoring a regular file whose destination is a symlink must replace the
+    # link with the file, never write through it into the link's target.
+    f = ws.write("solo.txt", "backup-content")
+    ws.config({"solo.txt": {"path": str(f)}})
+    ws.run("push", "solo.txt", expect_rc=0)
+
+    victim = ws.write("victim.txt", "do-not-touch")
+    dest = ws.root / "out.txt"
+    os.symlink(victim, dest)  # dest is a symlink -> victim
+
+    ws.run("pull", "solo.txt", "-o", str(dest), expect_rc=0)
+
+    assert not dest.is_symlink()
+    assert dest.read_text() == "backup-content"
+    assert victim.read_text() == "do-not-touch"  # link target untouched
 
 
 def test_push_with_unreadable_file_warns_and_exits_2(ws, monkeypatch):

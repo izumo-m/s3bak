@@ -14,7 +14,9 @@ import os
 import shutil
 import sys
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -140,27 +142,54 @@ class Boto3S3Store:
         return S3Storage(url, client=self._client)
 
     def content_compare(self) -> Any:
-        """The `--checksum` compare strategy: ETag content comparison, parallelized.
+        """The `--checksum` update-lane strategy: ETag content comparison.
 
-        Copies a pair only when the S3 ETag differs from the local file's
-        reconstructed ETag - so a same-size, same-mtime content change is
-        still transferred, and an mtime-only drift is not. This reads and
-        hashes every candidate file locally, which is why it is opt-in; the
-        default is the stat-only ManifestFilter. `part_size` is read from the
+        Returns the bare `EtagComparison` PairFilter; `sync_up` / `sync_down`
+        wrap it in a `ParallelFilter` on a per-sync thread pool (see
+        `_update_lane`), so the per-pair local read + hash runs off the sync's
+        main thread instead of serially on it - the copy decision is identical,
+        only faster. It copies a pair only when the S3 ETag differs from the
+        local file's reconstructed ETag, so a same-size, same-mtime content
+        change is still transferred and an mtime-only drift is not; it reads and
+        hashes every candidate file locally, which is why it is opt-in (the
+        default is the stat-only ManifestFilter). `part_size` is read from the
         same profile the uploads use, so multipart ETags reconstruct to a
-        matching value.
-
-        Wrapped in `ParallelCompare` so the per-pair local read + hash runs on
-        the sync's thread pool instead of serially on its main thread; the copy
-        decision is identical, only faster. `EtagComparison` is thread-safe, as
-        `ParallelCompare` requires. The worker count is the configured
-        `compare_workers`; when unset (None) the library defaults it to the
-        transfer `max_concurrency`, else 10.
+        matching value. `EtagComparison` is thread-safe, as `ParallelFilter`
+        requires.
         """
-        from boto3_s3 import ParallelCompare
         from boto3_s3.etagcompare import EtagComparison
 
-        return ParallelCompare(EtagComparison(self._s3), workers=self.compare_workers)
+        return EtagComparison(self._s3)
+
+    def _compare_pool_size(self) -> int:
+        """Worker count for the `--checksum` parallel ETag comparison: the
+        configured `compare_workers`, else the transfer `max_concurrency`, else
+        boto3's default of 10 - the fallback the library-owned pool applied
+        before 0.5, now that the caller sizes the pool."""
+        return self.compare_workers or self.max_concurrency or 10
+
+    @contextmanager
+    def _update_lane(self, compare: Any) -> Iterator[Any]:
+        """Resolve `compare` into an `S3.sync` `update_filter`, owning any thread
+        pool it needs.
+
+        Since 0.5 the caller owns the compare pool (`ParallelFilter` replaced the
+        self-pooling `ParallelCompare`). A content strategy (`EtagComparison`,
+        from `--checksum`) is parallelized on a fresh `ThreadPoolExecutor` sized
+        by `_compare_pool_size` and shut down when the sync returns. A stat filter
+        (`ManifestFilter`) or `None` runs inline on the sync's own thread, so the
+        streaming merge-join stays serial and in compare-key order.
+        """
+        from boto3_s3 import ParallelFilter
+        from boto3_s3.etagcompare import EtagComparison
+
+        if isinstance(compare, EtagComparison):
+            with ThreadPoolExecutor(
+                max_workers=self._compare_pool_size(), thread_name_prefix="s3bak-cmp"
+            ) as pool:
+                yield ParallelFilter(decide=compare, executor=pool)
+        else:
+            yield compare
 
     def _api_key(self, rel_key: str) -> str:
         return f"{self.path_prefix}/{rel_key}" if self.path_prefix else rel_key
@@ -223,7 +252,7 @@ class Boto3S3Store:
         try:
             data = self._client.head_object(Bucket=self.bucket, Key=key)
         except ClientError as e:
-            if e.response.get("Error", {}).get("Code", "") in ("404", "NoSuchKey", "NotFound"):
+            if self._is_not_found(e):
                 return None
             raise
         return ObjectMeta(
@@ -240,25 +269,35 @@ class Boto3S3Store:
         matches a dir entry's `--checksum` sync - an unchanged file is
         skipped, a same-size/same-mtime content change is not. part_size comes
         from the same profile the upload uses. The default (non---checksum)
-        single-file decision is the manifest quick check, not this.
+        single-file decision is the manifest size+mtime check, not this.
         """
         head = self.head_object(rel_key, verbose=verbose)
         if head is None or not head.etag:
             return True
-        from boto3_s3 import LocalFileInfo, S3FileInfo, SyncPair, TransferType
+        from boto3_s3 import LocalFileInfo, LocalStorage, S3FileInfo, SyncPair, TransferType
         from boto3_s3.etagcompare import EtagComparison
 
-        # to_native_path(key) == local_path on POSIX (identity) and on Windows
-        # (a native path carries no '/'), so the local side resolves to the file.
+        # Since 0.5 EtagComparison reads the readable side through its
+        # ``storage.open(compare_key)``, not a bare path: root a LocalStorage at
+        # the file's parent and key it by basename, so the open resolves back to
+        # local_path (``os.path.join(parent_abspath, basename)``).
+        local_store = LocalStorage(os.path.dirname(local_path) or ".")
         pair = SyncPair(
             key=rel_key,
             transfer_type=TransferType.UPLOAD,
-            src=LocalFileInfo(key=local_path, size=os.path.getsize(local_path)),
+            src=LocalFileInfo(
+                key=local_path,
+                size=os.path.getsize(local_path),
+                compare_key=os.path.basename(local_path),
+                storage=local_store,
+            ),
             dest=S3FileInfo(key=rel_key, size=head.size, etag=head.etag),
         )
         return EtagComparison(self._s3)(pair)
 
-    def list_top_level_lines(self, *, verbose: bool = False) -> list[str]:
+    def list_top_level_names(self, *, verbose: bool = False) -> list[str]:
+        """Basenames of the objects directly under the prefix (no data keys
+        below entry directories - those are FileKind.DIR common prefixes)."""
         from boto3_s3 import FileKind
 
         if verbose:
@@ -312,8 +351,8 @@ class Boto3S3Store:
         parent = os.path.dirname(dest_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        with open(dest_path, "wb") as f:
-            shutil.copyfileobj(resp["Body"], f)
+        with closing(resp["Body"]) as body, open(dest_path, "wb") as f:
+            shutil.copyfileobj(body, f)
         return True
 
     def stream_object_to_stdout(self, rel_key: str, *, verbose: bool = False) -> int:
@@ -326,7 +365,8 @@ class Boto3S3Store:
         except ClientError as e:
             write_stderr(f"{e}\n")
             return 1
-        shutil.copyfileobj(resp["Body"], sys.stdout.buffer)
+        with closing(resp["Body"]) as body:
+            shutil.copyfileobj(body, sys.stdout.buffer)
         sys.stdout.buffer.flush()
         return 0
 
@@ -338,18 +378,24 @@ class Boto3S3Store:
         compare: Any = None,
         verbose: bool = False,
     ) -> TransferResult:
+        from boto3_s3 import LocalStorage
+
         src = self._s3_loc(rel_prefix, is_dir=True)
-        return self._transfer(
-            verbose,
-            f"sync {src} {dest_dir}/",
-            lambda cb: self._s3.sync(
-                src,
-                f"{dest_dir}/",
-                compare=compare,
-                follow_symlinks=False,
-                on_result=cb,
-            ),
-        )
+        # follow_symlinks moved onto the Storage in 0.5: the local dest is walked
+        # to find existing / orphan files, and a symlink there stays a symlink
+        # (never descended into), matching the push side.
+        dest = LocalStorage(dest_dir, follow_symlinks=False)
+        with self._update_lane(compare) as update_filter:
+            return self._transfer(
+                verbose,
+                f"sync {src} {dest_dir}/",
+                lambda cb: self._s3.sync(
+                    src,
+                    dest,
+                    update_filter=update_filter,
+                    on_result=cb,
+                ),
+            )
 
     def put_file(self, rel_key: str, src_path: str, *, verbose: bool = False) -> None:
         """Upload a local file without result-line collection (manifests). A
@@ -401,20 +447,27 @@ class Boto3S3Store:
         """`file_filter` is the excludes predicate (manifest.exclude_filter):
         the same entry-rooted semantics the manifest walk applies, so the data
         sync and the manifest can never disagree on what an exclude means."""
+        from boto3_s3 import LocalStorage
+
+        # follow_symlinks moved onto the Storage in 0.5: symlinks are not
+        # uploaded as data; the manifest records them and apply_manifest
+        # recreates them on restore.
+        src = LocalStorage(src_dir, follow_symlinks=False)
         dst = self._s3_loc(rel_prefix, is_dir=True)
-        return self._transfer(
-            verbose,
-            f"sync {src_dir} {dst}",
-            # follow_symlinks=False: symlinks are not uploaded as data; the
-            # manifest records them and apply_manifest recreates them on restore.
-            lambda cb: self._s3.sync(
-                src_dir,
-                dst,
-                delete=delete,
-                dryrun=dryrun,
-                filter=file_filter,
-                compare=compare,
-                follow_symlinks=False,
-                on_result=cb,
-            ),
-        )
+        with self._update_lane(compare) as update_filter:
+            return self._transfer(
+                verbose,
+                f"sync {src_dir} {dst}",
+                # delete_filter=True (from --delete) prunes S3 orphans; new local
+                # files take the default create lane, both-sides pairs the
+                # update_filter (the ManifestFilter, or EtagComparison pool).
+                lambda cb: self._s3.sync(
+                    src,
+                    dst,
+                    delete_filter=delete,
+                    dryrun=dryrun,
+                    filter=file_filter,
+                    update_filter=update_filter,
+                    on_result=cb,
+                ),
+            )

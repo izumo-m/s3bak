@@ -15,7 +15,7 @@ from typing import Any
 from s3bak.console import die, err, expand_home
 from s3bak.store import Boto3S3Store
 
-# Default quick-check mtime window (seconds). 2s absorbs every common
+# Default mtime window for the size+mtime check (seconds). 2s absorbs every common
 # restored mtime. 10 ms absorbs the rounding of the common modern filesystems -
 # NTFS's 100 ns and exFAT's 10 ms - so a pull onto them cannot loop re-downloading
 # an unchanged file. Coarser filesystems (FAT32 2 s, HFS+ 1 s) need a larger
@@ -33,7 +33,7 @@ class Config:
     # Max entries processed at once under --all (None = one thread per entry,
     # i.e. all at once). Consumed by run_entries, not the store.
     entry_concurrency: int | None = None
-    # Top-level quick-check mtime tolerance in seconds (0 = exact st_mtime_ns
+    # Top-level mtime tolerance for the size+mtime check, in seconds (0 = exact st_mtime_ns
     # match). An entry may override it with a per-entry `mtime_window`, and the
     # CLI --mtime-window overrides both (see window_for).
     mtime_window: float = DEFAULT_MTIME_WINDOW
@@ -41,7 +41,7 @@ class Config:
     store: Boto3S3Store | None = None
 
     def window_for(self, entry: str) -> float:
-        """Effective quick-check mtime window (seconds) for `entry`:
+        """Effective mtime window (seconds) for `entry`'s size+mtime check:
         CLI override > per-entry `mtime_window` > top-level `mtime_window`."""
         if self.mtime_window_override is not None:
             return float(self.mtime_window_override)
@@ -151,15 +151,31 @@ def load_config() -> Config:
     #   max_concurrency   - parallel S3 transfer threads for cp / sync
     #   compare_workers   - parallel ETag comparisons under --checksum
     #   entry_concurrency - entries processed at once under --all
-    #   mtime_window      - quick-check mtime tolerance in seconds (0 = exact),
+    #   mtime_window      - mtime tolerance for the size+mtime check, seconds (0 = exact),
     #                       top-level default; overridable per entry
     max_concurrency = _config_int(ns, "max_concurrency", config_path, minimum=1)
     compare_workers = _config_int(ns, "compare_workers", config_path, minimum=1)
     entry_concurrency = _config_int(ns, "entry_concurrency", config_path, minimum=1)
     mtime_window = _config_seconds(ns.get("mtime_window"), config_path, label="mtime_window")
 
-    # Per-entry mtime_window overrides the top-level one (validated the same way).
+    # Per-entry validation: every command dereferences entry_cfg["path"], so a
+    # malformed entry must die with a message, not a KeyError traceback.
     for name, entry_cfg in entries.items():
+        if not isinstance(entry_cfg, dict):
+            die(f"entries[{name!r}] must be a dict in {config_path} (got {entry_cfg!r})")
+        path = entry_cfg.get("path")
+        if not isinstance(path, str) or not path:
+            die(f"entries[{name!r}].path must be a non-empty string in {config_path}")
+        excludes = entry_cfg.get("excludes")
+        if excludes is not None and (
+            not isinstance(excludes, list) or not all(isinstance(x, str) for x in excludes)
+        ):
+            die(f"entries[{name!r}].excludes must be a list of strings in {config_path}")
+        for hook in ("pre_hook", "post_hook"):
+            hook_value = entry_cfg.get(hook)
+            if hook_value is not None and not isinstance(hook_value, str):
+                die(f"entries[{name!r}].{hook} must be a string in {config_path}")
+        # Per-entry mtime_window overrides the top-level one (validated the same way).
         _config_seconds(
             entry_cfg.get("mtime_window"), config_path, label=f"entries[{name!r}].mtime_window"
         )

@@ -2,9 +2,9 @@
 """The manifest <-> S3 bridge and download orchestration.
 
 Writes v3 manifests to S3 (full and sub-tree patch), downloads a manifest or
-a data tree, and builds the sync ``compare=`` strategy. This is the seam
-between the pure manifest format (manifest.py), the S3 backend (store.py), and
-the command layer (commands.py).
+a data tree, and builds the sync update-lane strategy (``S3.sync``'s
+``update_filter``). This is the seam between the pure manifest format
+(manifest.py), the S3 backend (store.py), and the command layer (commands.py).
 """
 
 from __future__ import annotations
@@ -68,6 +68,7 @@ def patch_manifest_subtree(
     fd_old, old_path = tempfile.mkstemp(suffix=".jsonl")
     os.close(fd_old)
     fd_new, new_path = tempfile.mkstemp(suffix=".jsonl")
+    os.close(fd_new)  # reopened by name below; closing now avoids an fd leak on error
     try:
         have_old = download_manifest(cfg, entry, old_path, opts.verbose)
         local_sub = os.path.join(target_root, sub)
@@ -80,7 +81,7 @@ def patch_manifest_subtree(
             # shape ('.'-rooted) and the root's metadata restores on pull.
             root_record = (".", os.lstat(target_root), None)
             new_entries = itertools.chain([root_record], new_entries)
-        with os.fdopen(fd_new, "w", encoding="utf-8") as out:
+        with open(new_path, "w", encoding="utf-8") as out:
             manifest.write_patched(out, old_path if have_old else None, sub, new_entries)
         write_stderr(f"Updating {cfg.prefix}/{key}\n")
         assert cfg.store is not None
@@ -100,37 +101,33 @@ def download_manifest(cfg: Config, entry: str, dest: str, verbose: bool = False)
 def sync_compare(
     cfg: Config, opts: Opts, entry: str, manifest_path: str | None, sub: str | None = None
 ) -> Any:
-    """Build the sync `compare=` strategy: the stat-only ManifestFilter by
-    default, EtagComparison under --checksum. `manifest_path=None` (nothing on
-    S3 yet) yields an empty filter, so every pair transfers - which is also
-    the entire v2->v3 migration story: the first push re-uploads everything
-    and writes the v3 manifest. The quick-check window is resolved for `entry`."""
+    """Build the sync update-lane strategy (`S3.sync`'s `update_filter`): the
+    stat-only streaming ManifestFilter by default, EtagComparison under
+    --checksum. `manifest_path=None` (nothing on S3 yet) yields an empty filter,
+    so every both-sides pair transfers - which, with the default create lane
+    copying every new entry, is also the entire v2->v3 migration story: the
+    first push re-uploads everything and writes the v3 manifest. The
+    size+mtime-check window is resolved for `entry`.
+
+    The ManifestFilter streams the manifest file, so the caller must `close()`
+    it before unlinking the temp manifest (see cmd_push / cmd_pull)."""
     assert cfg.store is not None
     if opts.checksum:
         return cfg.store.content_compare()
-    entries: dict[str, ManifestEntry] = {}
+    records: Iterator[tuple[str, ManifestEntry]] = iter(())
     if manifest_path is not None:
-        entries = manifest.load_map(manifest_path, sub=sub)
-    return manifest.ManifestFilter(entries, window_ns=cfg.window_ns_for(entry))
+        records = manifest.iter_compare_records(manifest_path, sub=sub)
+    return manifest.ManifestFilter(records, window_ns=cfg.window_ns_for(entry))
 
 
 def _print_transfer_lines(stdout: str) -> bool:
-    """Print the transfer-result lines, skipping progress noise. Returns True
-    if any transfer line was printed.
-    """
+    """Print the transfer-result lines. Returns True if any line was printed.
+    ``stdout`` is TransferResult.stdout: the store builds it line by line from
+    on_result callbacks, so it is already clean (no progress noise to filter)."""
     if not stdout:
         return False
-    changed = False
-    for line in stdout.replace("\r", "\n").splitlines():
-        line = line.strip()
-        if (
-            line
-            and not line.startswith("Completed ")
-            and not line.startswith("warning: Skipping file")
-        ):
-            changed = True
-            write_output(f"{line}\n")
-    return changed
+    write_output(f"{stdout}\n")
+    return True
 
 
 def download_from_s3(

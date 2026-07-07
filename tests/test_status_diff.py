@@ -33,6 +33,27 @@ def test_status_missing_subpath_errors(ws):
     assert "not found" in (res.err + res.out).lower()
 
 
+def test_status_of_missing_directory_tree_reports_each_child(ws):
+    # When the whole local tree is gone, status must classify the entry as a
+    # directory from the manifest (not os.path.isdir of the missing path), so
+    # each record maps to its own child path instead of folding onto one and
+    # printing duplicate lines.
+    import shutil
+
+    ws.write("data/a.txt", "alpha")
+    ws.write("data/sub/b.txt", "beta")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    shutil.rmtree(ws.root / "data")
+
+    res = ws.run("status", "data", expect_rc=0)
+    d_targets = [ln.split(None, 1)[1] for ln in res.out.splitlines() if ln.startswith("D")]
+    assert any(t.endswith("a.txt") for t in d_targets)
+    assert any(t.endswith(os.path.join("sub", "b.txt")) for t in d_targets)
+    assert len(d_targets) == len(set(d_targets))  # no folded duplicates
+
+
 def test_status_detects_changed_symlink_target(ws):
     ws.write("data/real.txt", "r")
     ws.write("data/other.txt", "o")
@@ -141,3 +162,47 @@ def test_show_streams_file_to_stdout(ws):
 
     res = ws.run("show", str(ws.root / "data" / "a.txt"), expect_rc=0)
     assert res.out == "hello\n"
+
+
+def test_show_dotfile_subpath(ws):
+    # Regression: file names were once cleaned with lstrip("./"), which strips
+    # *characters* and mangled a dotfile (".bashrc" -> "bashrc") into a
+    # nonexistent S3 key.
+    ws.write("data/.bashrc", "export A=1\n")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    res = ws.run("show", str(ws.root / "data" / ".bashrc"), expect_rc=0)
+    assert res.out == "export A=1\n"
+
+
+def test_diff_dotfile_subpath(ws):
+    # Same lstrip regression on the diff path.
+    ws.write("data/.bashrc", "v1\n")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / ".bashrc").write_text("v2\n")
+    res = ws.run("diff", str(ws.root / "data" / ".bashrc"))
+    assert res.rc == 1
+    assert "-v1" in res.out
+    assert "+v2" in res.out
+
+
+def test_status_of_unpushed_entry_reports_error(ws):
+    ws.write("data/a.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    res = ws.run("status", "data")
+    assert res.rc == 1
+    assert "not found on s3" in res.err.lower()
+
+
+def test_diff_of_unpushed_single_file_reports_error(ws):
+    ws.write("data/a.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    ws.write("data/new.txt", "n")
+    res = ws.run("diff", str(ws.root / "data" / "new.txt"))
+    assert res.rc == 1
+    assert "not found on s3" in res.err.lower()

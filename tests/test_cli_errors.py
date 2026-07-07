@@ -47,6 +47,42 @@ def test_status_rejects_delete(cfg_ws):
     assert "delete" in res.err.lower()
 
 
+def test_pull_rejects_dry_run(cfg_ws):
+    # --dry-run is push-only; silently ignoring it would perform a REAL
+    # restore the user believed was a preview.
+    res = cfg_ws.run("pull", "--dry-run", "data")
+    assert res.rc == 1
+    assert "--dry-run" in res.err
+
+
+def test_push_rejects_output_flag(cfg_ws):
+    res = cfg_ws.run("push", "-o", "/tmp/x", "data")
+    assert res.rc == 1
+    assert "--output" in res.err
+
+
+def test_diff_rejects_mtime_window(cfg_ws):
+    res = cfg_ws.run("diff", "--mtime-window", "1", "data")
+    assert res.rc == 1
+    assert "mtime-window" in res.err.lower()
+
+
+def test_entry_without_path_dies_cleanly(ws):
+    # A malformed entry must die with a message, not a KeyError traceback.
+    ws.config({"data": {}})
+    res = ws.run("list")
+    assert res.rc == 1
+    assert "path" in res.err
+
+
+def test_entry_with_non_list_excludes_dies_cleanly(ws):
+    ws.write("data/a.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": "*.log"}})
+    res = ws.run("list")
+    assert res.rc == 1
+    assert "excludes" in res.err
+
+
 def test_diff_rejects_all(cfg_ws):
     res = cfg_ws.run("diff", "--all")
     assert res.rc == 1

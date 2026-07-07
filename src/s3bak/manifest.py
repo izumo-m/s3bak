@@ -93,7 +93,7 @@ class ManifestEntry:
         return format(self.perm_bits, "o")
 
     def matches_stat(self, st: os.stat_result, window_ns: int) -> bool:
-        """rsync-style quick check for a regular file: same size, and mtime
+        """rsync-style size+mtime check for a regular file: same size, and mtime
         within ``window_ns``. A record without size/mtime never matches, so an
         indeterminate comparison falls on the transfer side."""
         if self.size is None or self.mtime_ns is None:
@@ -166,11 +166,18 @@ def iter_manifest(manifest_path: str) -> Iterator[ManifestEntry]:
                 yield entry
 
 
-def load_map(manifest_path: str, sub: str | None = None) -> dict[str, ManifestEntry]:
-    """Manifest entries keyed by sync compare key: the entry path minus the
-    ``./`` prefix, relative to ``sub`` when given. The tree root itself never
-    forms a sync pair and is omitted."""
-    out: dict[str, ManifestEntry] = {}
+def iter_compare_records(
+    manifest_path: str, sub: str | None = None
+) -> Iterator[tuple[str, ManifestEntry]]:
+    """Stream ``(compare_sort_key, entry)`` for every non-root record in the
+    sync's ascending compare-key order, optionally restricted to ``sub``.
+
+    The key carries a directory's trailing ``/`` (``entry_sort_key`` semantics),
+    so it merge-joins in lockstep with ``S3.sync``'s ascending pair keys - which
+    lets ``ManifestFilter`` decide each pair with a one-record lookahead instead
+    of loading the whole manifest. The tree root never forms a sync pair and is
+    omitted; a record outside ``sub`` is skipped, and one under it has the
+    ``sub/`` prefix stripped (matching the sync's sub-rooted compare keys)."""
     for e in iter_manifest(manifest_path):
         if e.path == ".":
             continue
@@ -179,8 +186,7 @@ def load_map(manifest_path: str, sub: str | None = None) -> dict[str, ManifestEn
             if not rel.startswith(sub + "/"):
                 continue
             rel = rel[len(sub) + 1 :]
-        out[rel] = e
-    return out
+        yield (rel + "/" if e.is_dir else rel), e
 
 
 # =============================================================================
@@ -308,8 +314,18 @@ def _glob_to_regex(pattern: str) -> str:
                 j += 1
             while j < len(pattern) and pattern[j] != "]":
                 j += 1
-            result.append(pattern[i : j + 1])
-            i = j
+            if j >= len(pattern):
+                # Unterminated class: a literal '[' (fnmatch behavior), not
+                # an invalid regex that would crash the pattern compile.
+                result.append(re.escape(c))
+            else:
+                cls = pattern[i + 1 : j]
+                # Shell negation is '!'; regex negation is '^'. Translate, but
+                # keep a lone '[!]' literal (an empty negated class is invalid).
+                if cls.startswith("!") and len(cls) > 1:
+                    cls = "^" + cls[1:]
+                result.append(f"[{cls}]")
+                i = j
         else:
             result.append(re.escape(c))
         i += 1
@@ -464,14 +480,27 @@ def exclude_filter(excludes: list[str], sub: str | None = None) -> Any:
 
 
 class ManifestFilter:
-    """The default ``compare=`` strategy for sync: an rsync-style quick check
-    against the manifest (True = copy).
+    """The default update-lane strategy for sync: an rsync-style size+mtime
+    check against the manifest (True = copy). Wired as ``S3.sync``'s
+    ``update_filter``, so it is handed only the both-sides pairs; new entries
+    (``create_filter``) and orphans (``delete_filter``) are decided by those
+    lanes, never here.
+
+    Streaming: it reads the manifest once, front to back, merge-joining its
+    records against ``S3.sync``'s ascending compare-key pairs - the whole
+    manifest is never held in memory. This works because the manifest is
+    written in ``LocalStorage.scan`` order (``entry_sort_key``) and a bare
+    ``update_filter`` is decided serially on one thread in that same order
+    (``--checksum``'s ``ParallelFilter`` content strategy is the only concurrent
+    path, and it never wraps this filter), so a one-record lookahead suffices -
+    the cursor self-heals over any key it is not asked about. A filter is a
+    forward-only cursor: one serves exactly one sync.
 
     A pair is skipped only when the local side's size and mtime both match the
     manifest record (mtime within ``window_ns``) and the remote side has the
-    recorded size too. Everything else copies: a missing side, a key the
-    manifest does not know, a drifted stat. Pure stat work - no file content
-    is read, and nothing beyond the sync's own listing is requested.
+    recorded size too. Everything else copies: a key the manifest does not know,
+    or a drifted stat. Pure stat work - no file content is read, and nothing
+    beyond the sync's own listing is requested.
 
     Accepted blind spot: a change that leaves size+mtime equal to the record
     (a content edit with a restored mtime, or an S3-side write that bypassed
@@ -479,20 +508,46 @@ class ManifestFilter:
 
     A spurious mtime-only difference self-heals on push: the file is
     re-transferred once, the manifest is refreshed with the new mtime, and
-    later runs pass the quick check again. The converse does not hold for a
+    later runs pass the size+mtime check again. The converse does not hold for a
     STALE manifest (``push --data-only``, or out-of-band S3 writes): pull
     never rewrites the manifest, so affected pairs re-transfer on every pull
     until a full push refreshes the record. Deliberate: the manifest is the
     record of the last real push, and only a push may change it.
     """
 
-    def __init__(self, entries: dict[str, ManifestEntry], *, window_ns: int):
-        self.entries = entries
+    def __init__(self, records: Iterator[tuple[str, ManifestEntry]], *, window_ns: int):
+        # (compare_sort_key, entry) in ascending key order - see iter_compare_records.
+        self._records = iter(records)
         self.window_ns = window_ns
+        self._head: tuple[str, ManifestEntry] | None = next(self._records, None)
+
+    def close(self) -> None:
+        """Release the manifest file handle the record stream holds open. The
+        sync keeps this filter alive for its whole run, so the caller closes it
+        before unlinking the temp manifest (an open file cannot be removed on
+        Windows). Idempotent, and a no-op for a non-generator record source."""
+        closer = getattr(self._records, "close", None)
+        if callable(closer):
+            closer()
+        self._head = None
+
+    def _lookup(self, key: str) -> ManifestEntry | None:
+        """The record for compare key ``key``, or None. Advances the one-record
+        cursor: skip records ordered before ``key`` (keys the sync did not pair,
+        e.g. deleted files), consume an exact hit, stop past a larger one.
+        Correct only because both sides ascend in the same compare-key order."""
+        while self._head is not None and self._head[0] < key:
+            self._head = next(self._records, None)
+        if self._head is not None and self._head[0] == key:
+            entry = self._head[1]
+            self._head = next(self._records, None)
+            return entry
+        return None
 
     def __call__(self, pair: Any) -> bool:
-        if pair.src is None:
-            return False  # destination-only: a delete candidate, never a copy
+        # As an ``update_filter`` this is only ever handed a both-sides pair
+        # (source and destination both present); the create lane (source-only)
+        # and delete lane (destination-only) never reach here.
         direction = pair.transfer_type.value
         if direction == "upload":
             local, remote = pair.src, pair.dest
@@ -501,15 +556,13 @@ class ManifestFilter:
         else:
             raise ValueError(f"ManifestFilter cannot judge a {direction!r} pair: {pair.key!r}")
 
-        m = self.entries.get(pair.key)
+        m = self._lookup(pair.key)
         if m is None or not m.is_file:
-            # Unknown to the manifest, or recorded as a dir/symlink: a push
-            # uploads it (local is the source of truth); a pull downloads an
-            # unknown key but skips a non-file - apply_manifest recreates
-            # those from the manifest, no data object needed.
+            # Both sides present, but the manifest is silent or records a
+            # dir/symlink at this key: a push re-uploads it (local is the source
+            # of truth); a pull re-downloads an unknown key but leaves a recorded
+            # non-file to apply_manifest, which recreates it with no data object.
             return m is None if direction == "download" else True
-        if local is None or remote is None:
-            return True  # exists on one side only
         if remote.size != m.size:
             return True  # the remote drifted from the record; size is free evidence
         try:

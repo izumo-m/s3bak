@@ -98,9 +98,21 @@ memory bounded by one directory level rather than the whole tree:
   outside the patched sub-path verbatim (preserving any unknown keys), drops
   old records at/under it, and splices the fresh records in at their sorted
   position.
+- **The default update strategy** (`ManifestFilter`) reads the manifest once,
+  front to back, merge-joining its records against `S3.sync`'s ascending
+  compare-key pairs (`iter_compare_records` keys a directory as `name/` to match
+  the pair order). It is wired as `S3.sync`'s `update_filter`, so it is handed
+  only the both-sides pairs — new entries (`create_filter`) and orphans
+  (`delete_filter`) are decided by those lanes, not here — and decides each with
+  a one-record lookahead; the whole manifest is never loaded into a map. This is
+  sound because a bare update filter is decided serially, in that same order (the
+  one-record cursor self-heals over any key it is not asked about); only
+  `--checksum`'s `ParallelFilter` content strategy runs in parallel, and it never
+  wraps this filter. Because the filter holds the manifest file open for the
+  whole sync, the caller `close()`s it before unlinking the temp manifest.
 
-Because the order matches an S3 listing, a manifest can be merge-joined against
-either side of a sync.
+Because the order matches an S3 listing, the compare merge-joins the manifest
+against either side of a sync without materializing it.
 
 ## Robustness
 
