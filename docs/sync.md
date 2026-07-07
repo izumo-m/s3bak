@@ -67,13 +67,23 @@ profile the uploads use, so multipart ETags reconstruct to a matching value.
 `compare_workers` sizes that pool (it is idle otherwise).
 
 `status` and both compare directions share one size/mtime predicate
-(`compare_to_local`), so `status` never disagrees with what a push or pull would
-actually do. The window is resolved per entry: `--mtime-window <seconds>` (CLI,
-one run) overrides a per-entry `mtime_window`, which overrides the top-level
-`mtime_window` in `config.py` (0 = exact everywhere). A per-entry window suits a
-tree whose filesystem needs a different tolerance than the rest. `status` additionally reports mode changes for the metadata view —
-but the sync never transfers over a mode change (that is a `--meta-only`
-refresh, below).
+(`compare_to_local` / `compare_to_stat`), so `status` never disagrees with what
+a push or pull would actually do. The window is resolved per entry:
+`--mtime-window <seconds>` (CLI, one run) overrides a per-entry `mtime_window`,
+which overrides the top-level `mtime_window` in `config.py` (0 = exact
+everywhere). A per-entry window suits a tree whose filesystem needs a different
+tolerance than the rest. `status` additionally reports mode changes for the
+metadata view — but the sync never transfers over a mode change (that is a
+`--meta-only` refresh, below).
+
+For a directory entry, `status` is one streaming merge-join
+(`manifest.merge_join`) of the manifest against a fresh local walk, both in S3
+key order: both-sides pairs run the shared predicate (M), manifest-only records
+report D, local-only paths report A — every line in key order, holding one pair
+in memory, so a manifest far larger than RAM still works. Excluded paths are
+invisible on the local side of the diff: never compared, never an A — so a
+record left in the manifest by a later-added exclude reads D until the next
+push drops it.
 
 ## The transfer path: direct client call vs. `S3.cp`
 
@@ -185,6 +195,8 @@ sub-path only with `--delete`.
 - **`--meta-only`** applies recorded metadata without downloading data.
 - **`--data-only`** downloads data without applying mode / mtime / symlinks.
 - **`--delete`** removes local files not present in the manifest (a mirror
-  restore).
+  restore). Candidates are the local-only lane of the same manifest×walk
+  merge-join `status` runs; only the extras themselves are held in memory, and
+  they are removed deepest-first so directories empty out before their `rmdir`.
 - **`-o/--output`** restores to an alternative path instead of the entry's
   configured path.

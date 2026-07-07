@@ -1,4 +1,4 @@
-"""Manifest v3: JSONL read/write, the S3-key-ordered tree walk, and the
+"""Manifest v3: JSONL read/write, the sorted-stream merge-join, and the
 stat-based sync compare (ManifestFilter).
 
 A manifest is stored as ``<entry>-manifest.jsonl`` next to the entry's data
@@ -22,9 +22,11 @@ Readers ignore unknown keys, so future fields never need a format bump; the
 header version only changes when an existing key's meaning does.
 
 The sorted-order invariant is what keeps everything here streaming: the walk
-emits in S3 key order with one directory level of memory, the writer streams
-walk -> file, and the sub-path patch is a merge of two sorted streams instead
-of a read-all + sort.
+(localwalk.py, boto3-s3's engine) emits in S3 key order, the writer streams
+walk -> file, and the sub-path patch, the sync compare (ManifestFilter), and
+the status / pull ``--delete`` diff (merge_join) are all merges of sorted
+streams instead of a read-all + sort. This module is pure stdlib - the format,
+the joins, and the pattern matching, with no boto3-s3 dependency.
 """
 
 from __future__ import annotations
@@ -35,7 +37,7 @@ import re
 import stat as stat_mod
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from typing import IO, Any
+from typing import IO, Any, TypeVar
 
 try:
     import grp
@@ -231,7 +233,7 @@ def format_entry(path: str, st: os.stat_result, sym_target: str | None) -> str:
 
 def write_manifest(out: IO[str], entries: Iterable[tuple[str, os.stat_result, str | None]]) -> None:
     """Stream ``(path, lstat, sym_target)`` items to ``out`` as a v3 manifest.
-    The items must already be in walk order (walk_tree / iter_subtree)."""
+    The items must already be in walk order (localwalk.walk_tree / iter_subtree)."""
     out.write(_header_line() + "\n")
     for path, st, sym_target in entries:
         out.write(format_entry(path, st, sym_target) + "\n")
@@ -350,95 +352,40 @@ def split_excludes(excludes: list[str]) -> tuple[list[str], list[str]]:
 
 
 # =============================================================================
-# Tree walk (S3 key order)
+# Sorted-stream merge-join
 # =============================================================================
 
+_A = TypeVar("_A")
+_B = TypeVar("_B")
 
-def walk_tree(
-    root: str, excludes: list[str], *, root_rel: str = ".", rel_prefix: str = "./"
-) -> Iterator[tuple[str, os.stat_result, str | None]]:
-    """Walk a directory tree yielding ``(rel, lstat, sym_target | None)`` in
-    S3 key order. Each ``rel`` is what a record's ``path`` field stores.
 
-    rel uses the manifest convention: ``root_rel`` for the root, ``rel_prefix``
-    + path below it - for an entry push that is "." / "./sub/file"; a sub-path
-    push passes "./{sub}" / "./{sub}/" so every rel (and thus every exclude
-    match) stays anchored at the ENTRY root, where the configured patterns are
-    defined. Each directory level is sorted with real directories keyed as
-    ``name+"/"`` (files and symlinks as ``name``) and traversed depth-first
-    inline, which makes the concatenated stream globally byte-ordered - the
-    same order as boto3-s3's ``LocalStorage.walk_local`` and an S3 listing, so
-    a manifest can be merge-joined against either. The traversal is iterative
-    (an explicit stack), so tree depth is not bounded by the recursion limit;
-    memory is one directory level per depth. An unreadable directory is
-    silently skipped (as os.walk did) - the data sync's own scan already
-    surfaces it as a warning. Symlinks are leaves (never followed).
-    """
-    prune_patterns, skip_patterns = split_excludes(excludes)
-    yield root_rel, os.lstat(root), None
+def merge_join(
+    a: Iterable[tuple[str, _A]], b: Iterable[tuple[str, _B]]
+) -> Iterator[tuple[str, _A | None, _B | None]]:
+    """Join two ascending ``(sort_key, item)`` streams on their keys.
 
-    stack: list[tuple[str, str, Iterator[tuple[str, str, bool]]]] = [
-        (root, rel_prefix, iter(_scan_sorted(root)))
-    ]
-    while stack:
-        dirpath, prefix, entries = stack[-1]
-        item = next(entries, None)
-        if item is None:
-            stack.pop()
-            continue
-        _sort_name, name, is_real_dir = item
-        rel = prefix + name
-        full = os.path.join(dirpath, name)
-        if is_real_dir:
-            if any(path_match(rel, p) for p in prune_patterns):
-                continue
-            yield rel, os.lstat(full), None
-            stack.append((full, rel + "/", iter(_scan_sorted(full))))
+    Yields ``(key, a_item | None, b_item | None)`` for every key present on
+    either side, in key order; a one-sided key carries ``None`` for the other
+    side. One-record lookahead per stream, so joining a manifest against a
+    fresh walk (both in ``entry_sort_key`` order) never holds more than two
+    records in memory - the status / pull ``--delete`` diff works on manifests
+    of any size. Both inputs must ascend strictly (no duplicate keys within a
+    stream), which the walk and the manifest do by construction."""
+    ita, itb = iter(a), iter(b)
+    ha = next(ita, None)
+    hb = next(itb, None)
+    while ha is not None or hb is not None:
+        if hb is None or (ha is not None and ha[0] < hb[0]):
+            assert ha is not None
+            yield ha[0], ha[1], None
+            ha = next(ita, None)
+        elif ha is None or hb[0] < ha[0]:
+            yield hb[0], None, hb[1]
+            hb = next(itb, None)
         else:
-            if any(path_match(rel, p) for p in skip_patterns):
-                continue
-            st = os.lstat(full)
-            if stat_mod.S_ISLNK(st.st_mode):
-                # A symlink named like a pruned directory is excluded too (it
-                # occupies the name the pattern targets).
-                if any(path_match(rel, p) for p in prune_patterns):
-                    continue
-                yield rel, st, os.readlink(full)
-            else:
-                yield rel, st, None
-
-
-def _scan_sorted(dirpath: str) -> list[tuple[str, str, bool]]:
-    """One directory level as ``(sort_name, name, is_real_dir)`` in S3 key
-    order (dirs keyed ``name+"/"``). Unreadable -> empty (silently skipped)."""
-    entries: list[tuple[str, str, bool]] = []
-    try:
-        with os.scandir(dirpath) as it:
-            for de in it:
-                is_real_dir = de.is_dir(follow_symlinks=False)
-                sort_name = de.name + "/" if is_real_dir else de.name
-                entries.append((sort_name, de.name, is_real_dir))
-    except OSError:
-        return []
-    entries.sort()
-    return entries
-
-
-def iter_subtree(
-    local_sub: str, sub: str, excludes: list[str]
-) -> Iterator[tuple[str, os.stat_result, str | None]]:
-    """Walk items for a sub-path push: ``local_sub`` as recorded under
-    ``./{sub}``. Handles the file / symlink / directory cases. The walk rels
-    are entry-rooted, so the entry's exclude patterns apply exactly as they
-    would in a full push."""
-    st = os.lstat(local_sub)
-    if stat_mod.S_ISLNK(st.st_mode):
-        yield f"./{sub}", st, os.readlink(local_sub)
-        return
-    if not os.path.isdir(local_sub):
-        yield f"./{sub}", st, None
-        return
-    yield from walk_tree(local_sub, excludes, root_rel=f"./{sub}", rel_prefix=f"./{sub}/")
+            yield ha[0], ha[1], hb[1]
+            ha = next(ita, None)
+            hb = next(itb, None)
 
 
 def _excluded(rel: str, prune: list[str], skip: list[str]) -> bool:
@@ -461,7 +408,7 @@ def exclude_filter(excludes: list[str], sub: str | None = None) -> Any:
     """The sync ``filter=`` for an entry's excludes (True = keep).
 
     Matches each side's compare_key against the entry-rooted patterns - the
-    same semantics walk_tree applies to the manifest - re-rooting a sub-path
+    same semantics the manifest walk applies - re-rooting a sub-path
     sync's keys with ``./{sub}/`` so the entry's patterns keep their meaning.
     Applies to both sides of the sync, so an excluded key is neither
     transferred nor treated as a delete candidate."""

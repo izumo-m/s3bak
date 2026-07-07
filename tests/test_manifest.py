@@ -1,15 +1,14 @@
-"""Manifest v3: JSONL parse/format, S3-key-order walk, and subtree patching."""
+"""Manifest v3: JSONL parse/format, the sorted merge-join, and subtree patching."""
 
 from __future__ import annotations
 
 import io
 import json
 import os
-import sys
 
 import pytest
 
-from s3bak import manifest
+from s3bak import localwalk, manifest
 
 # --- format / parse -----------------------------------------------------------
 
@@ -114,30 +113,7 @@ def test_matches_stat_window(tmp_path):
     assert not e.matches_stat(drifted, 0)  # strict
 
 
-# --- walk order ----------------------------------------------------------------
-
-
-def test_walk_tree_is_in_s3_key_order(tmp_path):
-    # "foo.txt" must sort BEFORE the "foo/" subtree ('.' < '/'), and a dir's
-    # record must stand immediately before its children.
-    (tmp_path / "foo").mkdir()
-    (tmp_path / "foo" / "bar").write_text("b")
-    (tmp_path / "foo.txt").write_text("f")
-    (tmp_path / "a.txt").write_text("a")
-    (tmp_path / ".hidden").write_text("h")
-
-    rels = [rel for rel, _st, _sym in manifest.walk_tree(str(tmp_path), [])]
-    assert rels == [".", "./.hidden", "./a.txt", "./foo.txt", "./foo", "./foo/bar"]
-
-
-def test_walk_tree_applies_excludes(tmp_path):
-    (tmp_path / "keep.txt").write_text("k")
-    (tmp_path / "skip.log").write_text("s")
-    (tmp_path / "pruned").mkdir()
-    (tmp_path / "pruned" / "x").write_text("x")
-
-    rels = [rel for rel, _st, _sym in manifest.walk_tree(str(tmp_path), ["*.log", "pruned/*"])]
-    assert rels == [".", "./keep.txt"]
+# --- pattern matching / sort key ------------------------------------------------
 
 
 def test_path_match_negated_class():
@@ -155,58 +131,46 @@ def test_path_match_unterminated_class_is_literal():
     assert not manifest.path_match("x", "x[")
 
 
-def _stack_depth() -> int:
-    d, f = 0, sys._getframe()
-    while f is not None:
-        d += 1
-        f = f.f_back
-    return d
-
-
-def test_walk_tree_is_iterative_not_recursion_bound(tmp_path):
-    # Prove the walk does not consume a stack frame per directory level: under
-    # a recursion limit set just above the current depth, a tree far deeper
-    # than that headroom would overflow a recursive `yield from` walk but must
-    # not overflow this iterative one. 300 dirs keeps I/O and teardown cheap
-    # (rmtree stays well under its own limit, so no landmine is left behind).
-    depth = 300
-    root = tmp_path / "deep"
-    root.mkdir()
-    p = root
-    for _ in range(depth):
-        p = p / "d"
-        os.mkdir(p)
-    (p / "f.txt").write_text("x")
-
-    old_limit = sys.getrecursionlimit()
-    sys.setrecursionlimit(_stack_depth() + 50)  # < depth: a per-level recursion overflows
-    try:
-        count = sum(1 for _ in manifest.walk_tree(str(root), []))
-    finally:
-        sys.setrecursionlimit(old_limit)
-    assert count == depth + 2  # root + each dir + the file
-
-
-def test_walk_tree_skips_unreadable_directory(tmp_path):
-    # An unreadable subdirectory is silently skipped (as os.walk did): its own
-    # record is kept, its children are not, and the walk does not raise.
-    (tmp_path / "good.txt").write_text("g")
-    locked = tmp_path / "locked"
-    locked.mkdir()
-    (locked / "x").write_text("x")
-    os.chmod(locked, 0)
-    try:
-        rels = [rel for rel, _st, _sym in manifest.walk_tree(str(tmp_path), [])]
-    finally:
-        os.chmod(locked, 0o755)
-    assert rels == [".", "./good.txt", "./locked"]
-
-
 def test_entry_sort_key():
     assert manifest.entry_sort_key(".", True) == ""  # root always first
     assert manifest.entry_sort_key("./foo", True) == "foo/"
     assert manifest.entry_sort_key("./foo.txt", False) == "foo.txt"
     assert manifest.entry_sort_key("solo.txt", False) == "solo.txt"
+
+
+# --- merge_join -----------------------------------------------------------------
+
+
+def test_merge_join_pairs_and_one_sided_keys_in_order():
+    a = [("a", 1), ("c", 3), ("d", 4)]
+    b = [("b", "B"), ("c", "C"), ("e", "E")]
+    assert list(manifest.merge_join(a, b)) == [
+        ("a", 1, None),
+        ("b", None, "B"),
+        ("c", 3, "C"),
+        ("d", 4, None),
+        ("e", None, "E"),
+    ]
+
+
+def test_merge_join_empty_sides():
+    assert list(manifest.merge_join([], [])) == []
+    assert list(manifest.merge_join([("k", 1)], [])) == [("k", 1, None)]
+    assert list(manifest.merge_join([], [("k", 2)])) == [("k", None, 2)]
+
+
+def test_merge_join_is_lazy():
+    # One-record lookahead per side: the join must not drain its inputs ahead
+    # of the consumer (that laziness is what makes status constant-memory).
+    def infinite():
+        n = 0
+        while True:
+            yield (f"{n:09d}", n)
+            n += 1
+
+    it = manifest.merge_join(infinite(), infinite())
+    key, left, right = next(it)
+    assert (key, left, right) == ("000000000", 0, 0)
 
 
 # --- subtree patch -------------------------------------------------------------
@@ -238,7 +202,7 @@ def test_write_patched_replaces_subtree_in_order(tmp_path):
     (local_sub / "new.txt").write_text("n")
 
     out = io.StringIO()
-    manifest.write_patched(out, str(old), "sub", manifest.iter_subtree(str(local_sub), "sub", []))
+    manifest.write_patched(out, str(old), "sub", localwalk.iter_subtree(str(local_sub), "sub", []))
     lines = out.getvalue().splitlines()
     assert json.loads(lines[0]) == {"s3bak_manifest": 3}
     rels = [json.loads(ln)["path"] for ln in lines[1:]]

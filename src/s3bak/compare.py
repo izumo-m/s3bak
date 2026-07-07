@@ -100,8 +100,50 @@ def compare_to_local(
     use_color: bool = False,
     ignore_dir_mtime: bool = False,
 ) -> EntryDiff:
-    """Manifest record vs local filesystem state.
+    """Manifest record vs local filesystem state, stat'd here.
 
+    The thin lstat-taking wrapper over :func:`compare_to_stat` for callers
+    that hold only a path (the pull no-op gate, single-file status); the
+    status merge-join already holds the walk's lstat and calls
+    ``compare_to_stat`` directly.
+    """
+    try:
+        st: os.stat_result | None = os.lstat(target)
+    except OSError:
+        st = None
+    local_sym: str | None = None
+    if st is not None and stat_mod.S_ISLNK(st.st_mode):
+        try:
+            local_sym = os.readlink(target)
+        except OSError:
+            local_sym = ""
+    return compare_to_stat(
+        entry,
+        target,
+        st,
+        local_sym,
+        window_ns=window_ns,
+        use_color=use_color,
+        ignore_dir_mtime=ignore_dir_mtime,
+    )
+
+
+def compare_to_stat(
+    entry: ManifestEntry,
+    target: str,
+    st: os.stat_result | None,
+    local_sym: str | None,
+    *,
+    window_ns: int,
+    use_color: bool = False,
+    ignore_dir_mtime: bool = False,
+) -> EntryDiff:
+    """Manifest record vs the local side's already-taken ``lstat``.
+
+    ``st`` is the local lstat (None = missing) and ``local_sym`` the readlink
+    target when ``st`` is a symlink - both come for free from the manifest
+    walk, so the status merge-join adds no syscalls here (except the one
+    follow-stat below when a symlink stands where a non-link is recorded).
     The size + mtime part is the same check the sync's ManifestFilter
     applies (mtime within ``window_ns``), so `status` and push/pull agree on
     what counts as changed; mode is additionally compared here for the
@@ -109,19 +151,11 @@ def compare_to_local(
     """
     diff = EntryDiff(status=None, tags=[], details=[])
 
-    try:
-        st: os.stat_result | None = os.lstat(target)
-    except OSError:
-        st = None
-
     if entry.sym_target is not None:
         if st is None or not stat_mod.S_ISLNK(st.st_mode):
             diff.status = "D"
             return diff
-        try:
-            loc_link = os.readlink(target)
-        except OSError:
-            loc_link = ""
+        loc_link = local_sym if local_sym is not None else ""
         if loc_link != entry.sym_target:
             diff.status = "M"
             diff.tags.append("link")

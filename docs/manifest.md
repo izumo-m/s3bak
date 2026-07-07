@@ -5,7 +5,9 @@ data objects. The manifest records every path in the entry's tree with the
 metadata S3 objects do not carry, and is the source of truth for `status`,
 metadata restore on `pull`, and the default sync comparison.
 
-The format lives in `src/s3bak/manifest.py`, which is pure (stdlib only).
+The format lives in `src/s3bak/manifest.py`, which is pure (stdlib only); the
+tree walk that produces the records lives in `src/s3bak/localwalk.py`, on
+boto3-s3's directory engine.
 
 ## File layout
 
@@ -85,13 +87,21 @@ directory keyed `foo/` comes *after* the sibling file `foo.txt` (because
 This single invariant is what keeps every manifest operation streaming, with
 memory bounded by one directory level rather than the whole tree:
 
-- **The walk** (`walk_tree`) sorts each directory level with real directories
-  keyed as `name + "/"` and files/symlinks as `name`, then traverses
-  depth-first — iteratively (an explicit stack), so tree depth is not bounded
-  by Python's recursion limit. An unreadable directory is skipped silently (as
-  `os.walk` was), since the data sync already surfaces it as a warning.
+- **The walk** (`localwalk.walk_tree`) is boto3-s3's `LocalFileGenerator` —
+  the data sync's own engine, so the sort definition cannot drift between the
+  two — customized into a backup-style walk: lstat-based (a symlink is a leaf
+  carrying its own stat and target, never followed), vetting-free (everything
+  lstat-able is recorded; the data sync's own scan is what warns), with
+  excludes applied as subtree pruning and each directory's record emitted
+  in-stream just before its children. An unreadable directory keeps its own
+  record and silently loses its children.
 - **The writer** streams walk → temp file → upload; it never buffers the whole
   manifest.
+- **The status / pull `--delete` diff** (`merge_join`) pairs the manifest
+  stream against a fresh walk on their shared sort keys with a one-record
+  lookahead per side — both-sides pairs are compared (M), manifest-only
+  records report D, local-only paths report A / become delete candidates — so
+  a manifest far larger than RAM still diffs in one pass.
 - **The sub-tree patch** (`write_patched`, used by a sub-path push) is a
   streaming merge of two already-sorted inputs — the old manifest and the newly
   walked sub-tree — instead of a read-all-then-sort. It copies old records

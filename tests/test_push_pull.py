@@ -219,3 +219,22 @@ def test_pull_delete_removes_local_extras(ws):
 
     assert (dest / "keep.txt").read_text() == "k"
     assert not (dest / "extra.txt").exists()
+
+
+def test_pull_delete_removes_extra_directory_tree(ws):
+    # Extra directories go too: children before parents (deepest-first), and
+    # an empty extra directory is rmdir'd, not skipped.
+    ws.write("data/keep.txt", "k")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    dest = ws.root / "restore"
+    (dest / "extradir" / "sub").mkdir(parents=True)
+    (dest / "extradir" / "sub" / "f.txt").write_text("x")
+    (dest / "emptydir").mkdir()
+    (dest / "keep.txt").write_text("k")
+
+    ws.run("pull", "data", "-o", str(dest), "--delete", expect_rc=0)
+    assert not (dest / "extradir").exists()
+    assert not (dest / "emptydir").exists()
+    assert (dest / "keep.txt").read_text() == "k"

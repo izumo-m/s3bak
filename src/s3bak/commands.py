@@ -14,14 +14,17 @@ import shutil
 import stat as stat_mod
 import subprocess
 import tempfile
+from collections.abc import Iterator
 
-from s3bak import manifest
+from s3bak import localwalk, manifest
 from s3bak.compare import (
     _diff_color_flag,
     _fmt_mtime,
     _resolve_use_color,
     check_metadata,
     compare_to_local,
+    compare_to_stat,
+    format_diff_block,
 )
 from s3bak.config import Config, Opts
 from s3bak.console import (
@@ -35,9 +38,9 @@ from s3bak.console import (
 from s3bak.manifest import ManifestEntry
 from s3bak.restore import (
     apply_manifest,
-    delete_extra_files,
-    iter_local_tree,
     manifest_target,
+    remove_extras,
+    resolve_manifest_rel,
     windows_collect_writable_prep,
     windows_restore_modes,
 )
@@ -424,8 +427,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         if manifest_matches and not opts.checksum:
             if not opts.meta_only and opts.delete and is_dir:
                 excludes: list[str] = entry_cfg.get("excludes", []) if entry_cfg else []
-                remote_files = _read_manifest_files(manifest_path, sub=sub)
-                delete_extra_files(outpath, False, remote_files, excludes)
+                _delete_extras(manifest_path, outpath, sub, excludes)
             return 0
 
         # 3. Normal path: prep, then sync (dir) or cp (file).
@@ -488,8 +490,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
 
         if not opts.meta_only and opts.delete and is_dir:
             excludes = entry_cfg.get("excludes", []) if entry_cfg else []
-            remote_files = _read_manifest_files(manifest_path, sub=sub)
-            delete_extra_files(outpath, False, remote_files, excludes)
+            _delete_extras(manifest_path, outpath, sub, excludes)
 
         return st
     finally:
@@ -505,18 +506,55 @@ def _single_file_size(manifest_path: str) -> int | None:
     return None
 
 
-def _read_manifest_files(manifest_path: str, sub: str | None = None) -> dict[str, int]:
-    remote_files: dict[str, int] = {}
+# The two sides of the status / pull --delete diff: the manifest and a fresh
+# local walk, each as an ascending (entry_sort_key, item) stream that
+# manifest.merge_join pairs up in one pass - constant memory, so a manifest
+# far larger than RAM still works. rels on both sides are sub-relative and
+# '.'-free ("." for the root itself, "x/y" below it).
+
+
+def _manifest_keyed(
+    manifest_path: str, sub: str | None
+) -> Iterator[tuple[str, tuple[str, ManifestEntry]]]:
+    """Stream ``(sort_key, (rel, record))`` for every record at/under ``sub``."""
     for entry in manifest.iter_manifest(manifest_path):
-        rel = entry.path.removeprefix("./")
-        if sub is not None:
-            if rel == sub:
-                continue
-            if not rel.startswith(sub + "/"):
-                continue
-            rel = rel[len(sub) + 1 :]
-        remote_files[rel] = 1
-    return remote_files
+        rel = resolve_manifest_rel(entry.path, sub)
+        if rel is None:
+            continue
+        yield manifest.entry_sort_key(rel, entry.is_dir), (rel, entry)
+
+
+def _local_keyed(
+    outpath: str, excludes: list[str]
+) -> Iterator[tuple[str, tuple[str, os.stat_result, str | None]]]:
+    """Stream ``(sort_key, (rel, lstat, sym_target))`` for the local tree.
+
+    The manifest walk under ``outpath``, excludes applied outpath-relative -
+    an excluded path is invisible to the diff on both lanes (never compared,
+    never a local extra). A missing ``outpath`` yields nothing, so status
+    degrades to reporting every record D."""
+    if not os.path.lexists(outpath):
+        return
+    for rel, st, sym in localwalk.walk_tree(outpath, excludes):
+        norm = "." if rel == "." else rel.removeprefix("./")
+        yield manifest.entry_sort_key(rel, stat_mod.S_ISDIR(st.st_mode)), (norm, st, sym)
+
+
+def _delete_extras(manifest_path: str, outpath: str, sub: str | None, excludes: list[str]) -> None:
+    """Remove local paths the manifest does not record (pull ``--delete``).
+
+    The local-only lane of the merge-join; only the extras themselves are
+    collected (never the whole key set) so the deepest-first removal order
+    costs memory proportional to what is actually deleted."""
+    extras: list[tuple[str, bool]] = []
+    for _key, m, loc in manifest.merge_join(
+        _manifest_keyed(manifest_path, sub), _local_keyed(outpath, excludes)
+    ):
+        if m is None and loc is not None:
+            rel, st, _sym = loc
+            if rel != ".":
+                extras.append((os.path.join(outpath, rel), stat_mod.S_ISDIR(st.st_mode)))
+    remove_extras(extras)
 
 
 def cmd_show(cfg: Config, entry: str, opts: Opts, file: str | None = None) -> int:
@@ -564,28 +602,58 @@ def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
             is_dir = _entry_kind_from_manifest(manifest_path) == "dir"
         excludes: list[str] = entry_cfg.get("excludes", [])
         use_color = _resolve_use_color(opts.color)
+        window_ns = cfg.window_ns_for(entry)
 
-        remote_files: dict[str, int] = {}
-        for entry_obj in manifest.iter_manifest(manifest_path):
-            res = manifest_target(entry_obj, outpath, is_dir, sub)
-            if res is None:
-                continue
-            target, rel = res
-            if is_dir:
-                remote_files[rel] = 1
-            block = check_metadata(
-                target,
-                entry_obj,
-                opts.verbose,
-                cfg.window_ns_for(entry),
-                use_color=use_color,
-                ignore_dir_mtime=True,
-            )
-            if block:
-                write_output(block)
+        if not is_dir:
+            # Single-file entry (or a file/symlink sub): one direct compare.
+            for entry_obj in manifest.iter_manifest(manifest_path):
+                res = manifest_target(entry_obj, outpath, is_dir, sub)
+                if res is None:
+                    continue
+                target, _rel = res
+                block = check_metadata(
+                    target,
+                    entry_obj,
+                    opts.verbose,
+                    window_ns,
+                    use_color=use_color,
+                    ignore_dir_mtime=True,
+                )
+                if block:
+                    write_output(block)
+            return 0
 
-        if is_dir:
-            delete_extra_files(outpath, True, remote_files, excludes)
+        # Directory tree: one streaming merge-join of the manifest against a
+        # fresh walk decides everything - M (both sides, drifted), D
+        # (manifest-only), A (local-only) - in key order, holding only the
+        # current pair in memory. The walk's lstat/readlink feed the compare,
+        # so no path is stat'd twice.
+        for _key, m, loc in manifest.merge_join(
+            _manifest_keyed(manifest_path, sub), _local_keyed(outpath, excludes)
+        ):
+            if m is not None:
+                rel, entry_obj = m
+                target = outpath if rel == "." else os.path.join(outpath, rel)
+                if loc is None:
+                    write_output(f"D {target}\n")
+                    continue
+                _rel, st, sym = loc
+                diff = compare_to_stat(
+                    entry_obj,
+                    target,
+                    st,
+                    sym,
+                    window_ns=window_ns,
+                    use_color=use_color,
+                    ignore_dir_mtime=True,
+                )
+                block = format_diff_block(diff, target, opts.verbose)
+                if block:
+                    write_output(block)
+            elif loc is not None:
+                rel, _st, _sym = loc
+                if rel != ".":
+                    write_output(f"A {os.path.join(outpath, rel)}\n")
 
         return 0
     finally:
@@ -670,9 +738,13 @@ def diff_backup(cfg: Config, entry: str, outpath: str, opts: Opts) -> int:
                 if r.returncode != 0:
                     has_diff = 1
 
-        for rel, is_dir_entry in iter_local_tree(outpath, excludes):
-            if is_dir_entry:
+        for walk_rel, walk_st, _sym in localwalk.walk_tree(outpath, excludes):
+            if walk_rel == "." or stat_mod.S_ISDIR(walk_st.st_mode):
                 continue
+            rel = walk_rel.removeprefix("./")
+            # isfile follows symlinks, like the os.walk-based scan this
+            # replaces: a symlink to a regular file still diffs (the backup
+            # holds no data object for it), a broken or dir link is skipped.
             if not os.path.isfile(os.path.join(outpath, rel)):
                 continue
             if rel in backup_files:

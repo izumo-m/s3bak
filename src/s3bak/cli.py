@@ -12,8 +12,9 @@ The implementation is split across sibling modules:
 
     console   terminal I/O, warnings, path helpers
     store     the boto3-s3 backend (Boto3S3Store)
+    localwalk the manifest walk (boto3-s3's engine, backup-style)
     config    config.py loading, Config / Opts
-    manifest  the v3 JSONL manifest format + walk + ManifestFilter
+    manifest  the v3 JSONL manifest format + merge_join + ManifestFilter
     compare   manifest-vs-local diff and status/diff presentation
     restore   pull-side filesystem operations (apply metadata, prune extras)
     syncops   the manifest <-> S3 bridge and download orchestration

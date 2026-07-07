@@ -1,7 +1,7 @@
 # Requires Python 3.10+
 """Pull-side filesystem operations: manifest-to-target path resolution,
 applying recorded metadata (mode / mtime / symlinks), the Windows
-read-only prep, local-tree enumeration, and pruning local extras.
+read-only prep, and pruning local extras.
 
 Everything here mutates (or reads) the local filesystem from a downloaded
 manifest; it does not touch S3.
@@ -12,11 +12,10 @@ from __future__ import annotations
 import os
 import shutil
 import stat as stat_mod
-from collections.abc import Iterator
 
 from s3bak import manifest
 from s3bak.console import err, write_output
-from s3bak.manifest import ManifestEntry, path_match, split_excludes
+from s3bak.manifest import ManifestEntry
 
 # =============================================================================
 # Manifest target resolution (restore paths)
@@ -61,45 +60,6 @@ def within_root(root_real: str, target: str) -> bool:
     parent_real = os.path.realpath(os.path.dirname(target) or ".")
     resolved = os.path.normpath(os.path.join(parent_real, os.path.basename(target)))
     return resolved == root_real or resolved.startswith(root_real + os.sep)
-
-
-# =============================================================================
-# Tree iteration
-# =============================================================================
-
-
-def iter_local_tree(outpath: str, excludes: list[str]) -> Iterator[tuple[str, bool]]:
-    """Walk local tree yielding (rel_without_dot_slash, is_dir).
-
-    Rels are '/'-separated on every platform: they are matched against the
-    '/'-separated exclude patterns and manifest keys (delete_extra_files),
-    so a native Windows os.sep must not leak in."""
-    prune_patterns, skip_patterns = split_excludes(excludes)
-
-    for dirpath, dirnames, filenames in os.walk(outpath, followlinks=False):
-        rel_dir = os.path.relpath(dirpath, outpath)
-        if os.sep != "/":
-            rel_dir = rel_dir.replace(os.sep, "/")
-        rel_prefix = "./" if rel_dir == "." else f"./{rel_dir}/"
-
-        dirnames.sort()
-        filenames.sort()
-
-        to_remove: list[str] = []
-        for d in dirnames:
-            rel = f"{rel_prefix}{d}"
-            if any(path_match(rel, p) for p in prune_patterns):
-                to_remove.append(d)
-                continue
-            yield rel[2:], True  # strip "./"
-        for d in to_remove:
-            dirnames.remove(d)
-
-        for f in filenames:
-            rel = f"{rel_prefix}{f}"
-            if any(path_match(rel, p) for p in skip_patterns):
-                continue
-            yield rel[2:], False
 
 
 # =============================================================================
@@ -240,41 +200,25 @@ def apply_manifest(outpath: str, is_dir: bool, manifest_path: str, sub: str | No
 
 
 # =============================================================================
-# delete_extra_files
+# remove_extras
 # =============================================================================
 
 
-def delete_extra_files(
-    outpath: str,
-    check_only: bool,
-    remote_files: dict[str, int],
-    excludes: list[str],
-) -> bool:
-    extras: list[tuple[str, bool]] = []
-    for rel, is_dir_entry in iter_local_tree(outpath, excludes):
-        if not rel or rel == ".":
-            continue
-        if rel not in remote_files:
-            extras.append((os.path.join(outpath, rel), is_dir_entry))
-
-    if not extras:
-        return False
-
+def remove_extras(extras: list[tuple[str, bool]]) -> None:
+    """Remove local extras (pull ``--delete``): ``(path, is_dir)`` pairs the
+    status/--delete merge-join found on the local side only. ``is_dir`` is the
+    lstat kind, so a symlink - even one pointing at a directory - is unlinked,
+    never rmdir'd. Deepest-first (reverse path order), so a directory's
+    children go before the rmdir that needs them gone; a failure (e.g. a
+    non-empty directory that lost a child to an exclude) is skipped silently,
+    matching the sync's own delete lane."""
     extras.sort(key=lambda x: x[0], reverse=True)
-
     for path, is_dir_entry in extras:
-        if check_only:
-            write_output(f"A {path}\n")
-        else:
-            try:
-                if is_dir_entry and not os.path.islink(path):
-                    os.rmdir(path)
-                else:
-                    # Files and symlinks (incl. symlinks to directories, which
-                    # iter_local_tree reports as is_dir) are unlinked.
-                    os.remove(path)
-                write_output(f"delete: {path}\n")
-            except OSError:
-                pass
-
-    return True
+        try:
+            if is_dir_entry:
+                os.rmdir(path)
+            else:
+                os.remove(path)
+            write_output(f"delete: {path}\n")
+        except OSError:
+            pass

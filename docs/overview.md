@@ -49,17 +49,22 @@ dependency graph (no import cycles). Lower layers never import upper ones.
         commands         one cmd_* per subcommand; orchestrates the layers below
         ┌──┴────────────┬───────────────┐
      compare          restore         syncops     status/diff · restore FS ops · manifest⇄S3
-        │                │            ┌──┴───┐
-        │                │         config   store   config load · the boto3-s3 backend
-        └────────┬───────┴────────────┴───────┘
+        │                │        ┌─────┼──────────┐
+        │                │     config  store  localwalk   config · S3 backend · manifest walk
+        └────────┬───────┴────────┴─────┴──────────┘
               manifest        console         the v3 format (pure) · terminal I/O (pure)
 ```
 
 - **console** — terminal output, the warning counter, and small path helpers.
   Depends on nothing in s3bak; everything depends on it.
-- **manifest** — the v3 JSONL format: parse / format, the S3-key-order tree
-  walk, the streaming sub-tree patch, and the stat-based `ManifestFilter`
+- **manifest** — the v3 JSONL format: parse / format, the streaming sub-tree
+  patch, the sorted-stream `merge_join`, and the stat-based `ManifestFilter`
   compare. Pure (stdlib only), so it is unit-testable in isolation.
+- **localwalk** — the manifest walk: boto3-s3's `LocalFileGenerator`
+  customized into a backup-style walk (lstat, so symlinks are leaves; no
+  vetting; excludes as subtree pruning; directory records in-stream), yielding
+  manifest items in S3 key order — the same sort definition the data sync
+  walks with, which is what guarantees the merge-joins line up.
 - **store** — `Boto3S3Store`, the thin S3 backend over the boto3-s3 library
   (transfers, listing, head-object). Builds one shared client up front.
 - **config** — loads the user's `config.py`, validates it, and attaches a ready

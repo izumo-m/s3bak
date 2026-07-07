@@ -16,7 +16,7 @@ import tempfile
 from collections.abc import Iterator
 from typing import Any
 
-from s3bak import manifest
+from s3bak import localwalk, manifest
 from s3bak.config import Config, Opts
 from s3bak.console import write_output, write_stderr
 from s3bak.manifest import ManifestEntry
@@ -34,7 +34,7 @@ def write_manifest_to_aws(
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             if os.path.isdir(target):
-                manifest.write_manifest(f, manifest.walk_tree(target, excludes))
+                manifest.write_manifest(f, localwalk.walk_tree(target, excludes))
             else:
                 st = os.lstat(target)
                 sym = os.readlink(target) if stat_mod.S_ISLNK(st.st_mode) else None
@@ -74,7 +74,7 @@ def patch_manifest_subtree(
         local_sub = os.path.join(target_root, sub)
         new_entries: Iterator[tuple[str, os.stat_result, str | None]] = iter(())
         if os.path.lexists(local_sub):
-            new_entries = manifest.iter_subtree(local_sub, sub, excludes)
+            new_entries = localwalk.iter_subtree(local_sub, sub, excludes)
         if not have_old:
             # First-ever manifest for this entry, born from a sub-path push:
             # record the entry root too, so the manifest keeps the dir-entry

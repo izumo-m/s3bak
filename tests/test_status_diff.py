@@ -23,6 +23,42 @@ def test_status_clean_then_reports_changes(ws):
     assert any(line.startswith("A") and "c.txt" in line for line in lines)
 
 
+def test_status_reports_m_d_a_interleaved_in_key_order(ws):
+    # status is one merge-join over the manifest and a fresh walk, so every
+    # line - M, D, and A alike - comes out in S3 key order (A is no longer
+    # batched at the end).
+    ws.write("data/b.txt", "b")
+    ws.write("data/d.txt", "d")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "a.txt").write_text("new")  # A, sorts first
+    (ws.root / "data" / "b.txt").write_text("changed!")  # M
+    (ws.root / "data" / "d.txt").unlink()  # D
+    (ws.root / "data" / "e.txt").write_text("new2")  # A, sorts last
+
+    res = ws.run("status", "data", expect_rc=0)
+    marks = [(line.split()[0], os.path.basename(line.split()[1])) for line in res.out.splitlines()]
+    assert marks == [("A", "a.txt"), ("M", "b.txt"), ("D", "d.txt"), ("A", "e.txt")]
+
+
+def test_status_excluded_paths_are_invisible_locally(ws):
+    # Excludes hide the local side of the diff on both lanes: an excluded
+    # local file is never an A, and a manifest record whose local file is now
+    # excluded reads D until the next push drops the record.
+    ws.write("data/keep.txt", "k")
+    ws.write("data/old.log", "o")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)  # old.log recorded: no excludes yet
+
+    ws.write("data/new.log", "n")
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["*.log"]}})
+    res = ws.run("status", "data", expect_rc=0)
+    lines = res.out.splitlines()
+    assert not any("new.log" in line for line in lines)
+    assert any(line.startswith("D") and "old.log" in line for line in lines)
+
+
 def test_status_missing_subpath_errors(ws):
     ws.write("data/a.txt", "x")
     ws.config({"data": {"path": str(ws.root / "data")}})
