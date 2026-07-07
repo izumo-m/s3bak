@@ -314,8 +314,18 @@ def _glob_to_regex(pattern: str) -> str:
                 j += 1
             while j < len(pattern) and pattern[j] != "]":
                 j += 1
-            result.append(pattern[i : j + 1])
-            i = j
+            if j >= len(pattern):
+                # Unterminated class: a literal '[' (fnmatch behavior), not
+                # an invalid regex that would crash the pattern compile.
+                result.append(re.escape(c))
+            else:
+                cls = pattern[i + 1 : j]
+                # Shell negation is '!'; regex negation is '^'. Translate, but
+                # keep a lone '[!]' literal (an empty negated class is invalid).
+                if cls.startswith("!") and len(cls) > 1:
+                    cls = "^" + cls[1:]
+                result.append(f"[{cls}]")
+                i = j
         else:
             result.append(re.escape(c))
         i += 1

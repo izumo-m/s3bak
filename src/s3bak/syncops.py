@@ -121,22 +121,13 @@ def sync_compare(
 
 
 def _print_transfer_lines(stdout: str) -> bool:
-    """Print the transfer-result lines, skipping progress noise. Returns True
-    if any transfer line was printed.
-    """
+    """Print the transfer-result lines. Returns True if any line was printed.
+    ``stdout`` is TransferResult.stdout: the store builds it line by line from
+    on_result callbacks, so it is already clean (no progress noise to filter)."""
     if not stdout:
         return False
-    changed = False
-    for line in stdout.replace("\r", "\n").splitlines():
-        line = line.strip()
-        if (
-            line
-            and not line.startswith("Completed ")
-            and not line.startswith("warning: Skipping file")
-        ):
-            changed = True
-            write_output(f"{line}\n")
-    return changed
+    write_output(f"{stdout}\n")
+    return True
 
 
 def download_from_s3(

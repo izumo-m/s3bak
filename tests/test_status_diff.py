@@ -162,3 +162,47 @@ def test_show_streams_file_to_stdout(ws):
 
     res = ws.run("show", str(ws.root / "data" / "a.txt"), expect_rc=0)
     assert res.out == "hello\n"
+
+
+def test_show_dotfile_subpath(ws):
+    # Regression: file names were once cleaned with lstrip("./"), which strips
+    # *characters* and mangled a dotfile (".bashrc" -> "bashrc") into a
+    # nonexistent S3 key.
+    ws.write("data/.bashrc", "export A=1\n")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    res = ws.run("show", str(ws.root / "data" / ".bashrc"), expect_rc=0)
+    assert res.out == "export A=1\n"
+
+
+def test_diff_dotfile_subpath(ws):
+    # Same lstrip regression on the diff path.
+    ws.write("data/.bashrc", "v1\n")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / ".bashrc").write_text("v2\n")
+    res = ws.run("diff", str(ws.root / "data" / ".bashrc"))
+    assert res.rc == 1
+    assert "-v1" in res.out
+    assert "+v2" in res.out
+
+
+def test_status_of_unpushed_entry_reports_error(ws):
+    ws.write("data/a.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    res = ws.run("status", "data")
+    assert res.rc == 1
+    assert "not found on s3" in res.err.lower()
+
+
+def test_diff_of_unpushed_single_file_reports_error(ws):
+    ws.write("data/a.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    ws.write("data/new.txt", "n")
+    res = ws.run("diff", str(ws.root / "data" / "new.txt"))
+    assert res.rc == 1
+    assert "not found on s3" in res.err.lower()

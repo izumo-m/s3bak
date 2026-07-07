@@ -145,7 +145,9 @@ A **sub-path push** (`push entry/sub` or a local path inside an entry) syncs or
 uploads just that sub-tree and patches the manifest sub-tree in place
 (`write_patched`). A symlink sub-path uploads no data — only its manifest record
 is updated. If the entry has no manifest yet, the patch also writes the `.` root
-record so the manifest keeps its directory-entry shape.
+record so the manifest keeps its directory-entry shape. Unlike a whole-entry
+push (which always mirrors), a sub-path push deletes S3 orphans under the
+sub-path only with `--delete`.
 
 ### Mode flags
 

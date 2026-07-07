@@ -50,19 +50,6 @@ from s3bak.syncops import (
 )
 
 
-def _filter_aws_output(raw: str) -> str:
-    filtered: list[str] = []
-    for line in raw.replace("\r", "\n").splitlines():
-        line = line.strip()
-        if (
-            line
-            and not line.startswith("Completed ")
-            and not line.startswith("warning: Skipping file")
-        ):
-            filtered.append(line)
-    return "\n".join(filtered)
-
-
 def _run_post_hook(post_hook: str | None, opts: Opts) -> int:
     if not post_hook:
         return 0
@@ -151,9 +138,8 @@ def _push_sub(
             if result.stderr:
                 write_stderr(result.stderr)
             return result.returncode
-        filtered = _filter_aws_output(result.stdout)
-        if filtered:
-            write_output(f"{filtered}\n")
+        if result.stdout:
+            write_output(f"{result.stdout}\n")
     else:
         # Regular file: an explicit sub-path push always uploads.
         if opts.dryrun:
@@ -165,9 +151,8 @@ def _push_sub(
                 if result.stderr:
                     write_stderr(result.stderr)
                 return result.returncode
-            filtered = _filter_aws_output(result.stdout)
-            if filtered:
-                write_output(f"{filtered}\n")
+            if result.stdout:
+                write_output(f"{result.stdout}\n")
 
     if not opts.data_only:
         patch_manifest_subtree(cfg, entry, target_root, sub, excludes, opts)
@@ -291,7 +276,7 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             if result.stderr:
                 write_stderr(result.stderr)
             return result.returncode
-        results = _filter_aws_output(result.stdout)
+        results = result.stdout
     elif _single_file_needs_upload(cfg, entry, target, opts):
         # Single-file entry that fails the size+mtime check against its manifest
         # (or the --checksum ETag comparison), or was never pushed: upload it.
@@ -307,7 +292,7 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 if result.stderr:
                     write_stderr(result.stderr)
                 return result.returncode
-            results = _filter_aws_output(result.stdout)
+            results = result.stdout
 
     if results:
         write_output(f"{results}\n")
@@ -540,7 +525,9 @@ def cmd_show(cfg: Config, entry: str, opts: Opts, file: str | None = None) -> in
         return 1
 
     if file:
-        file = file.lstrip("./")
+        # removeprefix, not lstrip: lstrip("./") strips *characters*, mangling a
+        # dotfile (".bashrc" -> "bashrc") into the wrong S3 key.
+        file = file.removeprefix("./")
         rel = f"{entry}/{file}"
     else:
         rel = entry
@@ -561,6 +548,7 @@ def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
     os.close(fd)
     try:
         if not download_manifest(cfg, entry, manifest_path, opts.verbose):
+            err(f"entry not found on S3: {entry}")
             return 1
         # Classify from the manifest (the record of the last push), not the
         # local filesystem: a directory entry whose local tree was deleted must
@@ -610,6 +598,7 @@ def diff_single_file(cfg: Config, rel_key: str, label: str, localfile: str, opts
     try:
         assert cfg.store is not None
         if not cfg.store.get_object(rel_key, tmppath, verbose=opts.verbose):
+            err(f"not found on S3: {rel_key}")
             return 1
         cmd = [
             "diff",
@@ -716,7 +705,8 @@ def cmd_diff(cfg: Config, entry: str, opts: Opts, file: str | None = None) -> in
     outpath: str = entry_cfg["path"]
 
     if file:
-        file = file.lstrip("./")
+        # removeprefix, not lstrip: see cmd_show.
+        file = file.removeprefix("./")
         return diff_single_file(
             cfg,
             f"{entry}/{file}",
@@ -759,12 +749,9 @@ def show_entry_files(manifest_path: str, sub: str | None = None) -> None:
 def cmd_ls_remote(cfg: Config, opts: Opts, entry: str | None = None, sub: str | None = None) -> int:
     assert cfg.store is not None
     if entry is None:
-        for line in cfg.store.list_top_level_lines(verbose=opts.verbose):
-            if line.endswith(manifest.MANIFEST_SUFFIX):
-                parts = line.split()
-                if parts:
-                    name = parts[-1].removesuffix(manifest.MANIFEST_SUFFIX)
-                    write_output(f"{name}\n")
+        for name in cfg.store.list_top_level_names(verbose=opts.verbose):
+            if name.endswith(manifest.MANIFEST_SUFFIX):
+                write_output(f"{name.removesuffix(manifest.MANIFEST_SUFFIX)}\n")
         return 0
 
     if entry not in cfg.entries:
@@ -775,6 +762,7 @@ def cmd_ls_remote(cfg: Config, opts: Opts, entry: str | None = None, sub: str | 
     os.close(fd)
     try:
         if not download_manifest(cfg, entry, manifest_path, opts.verbose):
+            err(f"entry not found on S3: {entry}")
             return 1
         if sub is not None and _sub_kind_from_manifest(manifest_path, sub) == "missing":
             err(f"not found on S3: {entry}/{sub}")

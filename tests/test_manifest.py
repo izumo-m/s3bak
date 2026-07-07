@@ -140,6 +140,21 @@ def test_walk_tree_applies_excludes(tmp_path):
     assert rels == [".", "./keep.txt"]
 
 
+def test_path_match_negated_class():
+    # Glob negation is '!'; regex would read a verbatim '[!a]' as a class
+    # holding the literal '!' - the exact inverse (matching 'a', missing 'b').
+    # The translator must emit '^'.
+    assert manifest.path_match("b", "[!a]")
+    assert not manifest.path_match("a", "[!a]")
+
+
+def test_path_match_unterminated_class_is_literal():
+    # fnmatch behavior: an unterminated '[' matches itself rather than
+    # crashing the regex compile.
+    assert manifest.path_match("x[", "x[")
+    assert not manifest.path_match("x", "x[")
+
+
 def _stack_depth() -> int:
     d, f = 0, sys._getframe()
     while f is not None:

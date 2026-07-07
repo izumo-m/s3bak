@@ -158,8 +158,24 @@ def load_config() -> Config:
     entry_concurrency = _config_int(ns, "entry_concurrency", config_path, minimum=1)
     mtime_window = _config_seconds(ns.get("mtime_window"), config_path, label="mtime_window")
 
-    # Per-entry mtime_window overrides the top-level one (validated the same way).
+    # Per-entry validation: every command dereferences entry_cfg["path"], so a
+    # malformed entry must die with a message, not a KeyError traceback.
     for name, entry_cfg in entries.items():
+        if not isinstance(entry_cfg, dict):
+            die(f"entries[{name!r}] must be a dict in {config_path} (got {entry_cfg!r})")
+        path = entry_cfg.get("path")
+        if not isinstance(path, str) or not path:
+            die(f"entries[{name!r}].path must be a non-empty string in {config_path}")
+        excludes = entry_cfg.get("excludes")
+        if excludes is not None and (
+            not isinstance(excludes, list) or not all(isinstance(x, str) for x in excludes)
+        ):
+            die(f"entries[{name!r}].excludes must be a list of strings in {config_path}")
+        for hook in ("pre_hook", "post_hook"):
+            hook_value = entry_cfg.get(hook)
+            if hook_value is not None and not isinstance(hook_value, str):
+                die(f"entries[{name!r}].{hook} must be a string in {config_path}")
+        # Per-entry mtime_window overrides the top-level one (validated the same way).
         _config_seconds(
             entry_cfg.get("mtime_window"), config_path, label=f"entries[{name!r}].mtime_window"
         )

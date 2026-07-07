@@ -69,11 +69,17 @@ def within_root(root_real: str, target: str) -> bool:
 
 
 def iter_local_tree(outpath: str, excludes: list[str]) -> Iterator[tuple[str, bool]]:
-    """Walk local tree yielding (rel_without_dot_slash, is_dir)."""
+    """Walk local tree yielding (rel_without_dot_slash, is_dir).
+
+    Rels are '/'-separated on every platform: they are matched against the
+    '/'-separated exclude patterns and manifest keys (delete_extra_files),
+    so a native Windows os.sep must not leak in."""
     prune_patterns, skip_patterns = split_excludes(excludes)
 
     for dirpath, dirnames, filenames in os.walk(outpath, followlinks=False):
         rel_dir = os.path.relpath(dirpath, outpath)
+        if os.sep != "/":
+            rel_dir = rel_dir.replace(os.sep, "/")
         rel_prefix = "./" if rel_dir == "." else f"./{rel_dir}/"
 
         dirnames.sort()

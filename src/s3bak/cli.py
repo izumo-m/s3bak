@@ -129,7 +129,9 @@ Commands:
 Options:
   --all            Apply the command to all configured entries
   --dry-run        Show what would happen without changing anything (push)
-  --delete         After restore, delete local files not in backup (pull only)
+  --delete         Delete extras: pull removes local files not in the backup;
+                   a sub-path push removes S3 orphans under the sub-path
+                   (a whole-entry push always mirrors)
   --meta-only      Sync only metadata (the manifest), skip file data (push/pull)
   --data-only      Sync only file data, leave manifest/local-meta untouched (push/pull)
   --checksum       Compare by content (ETag) instead of the manifest size+mtime
@@ -227,8 +229,12 @@ def _resolve_one_arg(cfg: Config, arg: str) -> tuple[str, str | None]:
         entry_path = normalize_local_path(raw_path)
         if local == entry_path:
             candidate_file: str | None = None
-        elif local.startswith(entry_path + "/"):
+        elif local.startswith(entry_path + os.sep):
+            # The sub-path doubles as an S3 key fragment and a manifest rel,
+            # both '/'-separated - normalize away a native Windows os.sep.
             candidate_file = local[len(entry_path) + 1 :]
+            if os.sep != "/":
+                candidate_file = candidate_file.replace(os.sep, "/")
         else:
             continue
         if best_name is None or len(entry_path) > len(best_path):
@@ -349,14 +355,35 @@ def main(argv: list[str] | None = None) -> int:
         color=opt_color,
     )
 
+    # Global option/command compatibility. Rejecting an inapplicable flag here
+    # (rather than silently ignoring it) matters most for --dry-run: `pull
+    # --dry-run` would otherwise perform a REAL restore the user believed was
+    # a preview.
     if opt_all and positional:
         die("--all cannot be combined with explicit entries")
+    if opt_all and subcmd not in ("push", "pull", "status"):
+        die(f"{subcmd} does not support --all")
 
     if opt_meta_only and opt_data_only:
         die("--meta-only and --data-only are mutually exclusive")
+    if (opt_meta_only or opt_data_only) and subcmd not in ("push", "pull"):
+        flag = "--meta-only" if opt_meta_only else "--data-only"
+        die(f"{flag} only applies to push and pull")
+
+    if opt_dryrun and subcmd != "push":
+        die("--dry-run only applies to push")
+
+    if opt_delete and subcmd not in ("push", "pull"):
+        die("--delete only applies to push and pull (pull removes local extras)")
 
     if opt_checksum and subcmd not in ("push", "pull"):
         die("--checksum only applies to push and pull")
+
+    if opt_mtime_window is not None and subcmd not in ("push", "pull", "status"):
+        die("--mtime-window only applies to push, pull, and status")
+
+    if opt_outpath is not None and subcmd != "pull":
+        die("-o/--output only applies to pull")
 
     # A CLI --mtime-window overrides both the top-level and per-entry config
     # windows for this run (0 = exact). Affects the size+mtime check shared
@@ -395,12 +422,6 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_pull(cfg, entry, opts, sub=sub)
 
     elif subcmd == "status":
-        if opt_delete:
-            die("status does not support --delete (use 'pull --delete' to remove local extras)")
-        if opt_meta_only:
-            die("status does not support --meta-only")
-        if opt_data_only:
-            die("status does not support --data-only")
         if opt_all:
             entries = sorted(cfg.entries.keys())
             status_sub_by_entry: dict[str, str | None] = {e: None for e in entries}
@@ -419,43 +440,19 @@ def main(argv: list[str] | None = None) -> int:
         return run_entries(_status_one, cfg, entries, opts)
 
     elif subcmd == "diff":
-        if opt_all:
-            die("diff does not support --all")
-        if opt_meta_only:
-            die("diff does not support --meta-only")
-        if opt_data_only:
-            die("diff does not support --data-only")
         entry, file = resolve_entry_file(cfg, positional, "diff")
         return cmd_diff(cfg, entry, opts, file)
 
     elif subcmd == "show":
-        if opt_all:
-            die("show does not support --all")
-        if opt_meta_only:
-            die("show does not support --meta-only")
-        if opt_data_only:
-            die("show does not support --data-only")
         entry, file = resolve_entry_file(cfg, positional, "show")
         return cmd_show(cfg, entry, opts, file)
 
     elif subcmd == "list":
-        if opt_all:
-            die("list does not support --all")
-        if opt_meta_only:
-            die("list does not support --meta-only")
-        if opt_data_only:
-            die("list does not support --data-only")
         if positional:
             die("list takes no arguments (use 'ls-remote <entry>' for manifest contents)")
         return cmd_list(cfg, opts)
 
     elif subcmd == "ls-remote":
-        if opt_all:
-            die("ls-remote does not support --all")
-        if opt_meta_only:
-            die("ls-remote does not support --meta-only")
-        if opt_data_only:
-            die("ls-remote does not support --data-only")
         if len(positional) > 1:
             die("ls-remote takes at most one entry or path")
         if not positional:

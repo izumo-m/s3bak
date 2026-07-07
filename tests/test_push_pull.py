@@ -70,6 +70,14 @@ def test_pull_unpushed_entry_reports_not_found(ws):
     assert "not found" in (res.err + res.out).lower()
 
 
+def test_ls_remote_unpushed_entry_reports_not_found(ws):
+    ws.write("data/a.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    res = ws.run("ls-remote", "data")
+    assert res.rc == 1
+    assert "not found on s3" in res.err.lower()
+
+
 def test_ls_remote_missing_subpath_errors(ws):
     ws.write("data/a.txt", "x")
     ws.config({"data": {"path": str(ws.root / "data")}})

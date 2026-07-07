@@ -252,7 +252,7 @@ class Boto3S3Store:
         try:
             data = self._client.head_object(Bucket=self.bucket, Key=key)
         except ClientError as e:
-            if e.response.get("Error", {}).get("Code", "") in ("404", "NoSuchKey", "NotFound"):
+            if self._is_not_found(e):
                 return None
             raise
         return ObjectMeta(
@@ -295,7 +295,9 @@ class Boto3S3Store:
         )
         return EtagComparison(self._s3)(pair)
 
-    def list_top_level_lines(self, *, verbose: bool = False) -> list[str]:
+    def list_top_level_names(self, *, verbose: bool = False) -> list[str]:
+        """Basenames of the objects directly under the prefix (no data keys
+        below entry directories - those are FileKind.DIR common prefixes)."""
         from boto3_s3 import FileKind
 
         if verbose:
