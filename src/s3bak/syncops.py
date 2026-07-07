@@ -2,9 +2,9 @@
 """The manifest <-> S3 bridge and download orchestration.
 
 Writes v3 manifests to S3 (full and sub-tree patch), downloads a manifest or
-a data tree, and builds the sync ``compare=`` strategy. This is the seam
-between the pure manifest format (manifest.py), the S3 backend (store.py), and
-the command layer (commands.py).
+a data tree, and builds the sync update-lane strategy (``S3.sync``'s
+``update_filter``). This is the seam between the pure manifest format
+(manifest.py), the S3 backend (store.py), and the command layer (commands.py).
 """
 
 from __future__ import annotations
@@ -101,11 +101,13 @@ def download_manifest(cfg: Config, entry: str, dest: str, verbose: bool = False)
 def sync_compare(
     cfg: Config, opts: Opts, entry: str, manifest_path: str | None, sub: str | None = None
 ) -> Any:
-    """Build the sync `compare=` strategy: the stat-only streaming ManifestFilter
-    by default, EtagComparison under --checksum. `manifest_path=None` (nothing on
-    S3 yet) yields an empty filter, so every pair transfers - which is also
-    the entire v2->v3 migration story: the first push re-uploads everything
-    and writes the v3 manifest. The size+mtime-check window is resolved for `entry`.
+    """Build the sync update-lane strategy (`S3.sync`'s `update_filter`): the
+    stat-only streaming ManifestFilter by default, EtagComparison under
+    --checksum. `manifest_path=None` (nothing on S3 yet) yields an empty filter,
+    so every both-sides pair transfers - which, with the default create lane
+    copying every new entry, is also the entire v2->v3 migration story: the
+    first push re-uploads everything and writes the v3 manifest. The
+    size+mtime-check window is resolved for `entry`.
 
     The ManifestFilter streams the manifest file, so the caller must `close()`
     it before unlinking the temp manifest (see cmd_push / cmd_pull)."""

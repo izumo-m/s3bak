@@ -470,23 +470,27 @@ def exclude_filter(excludes: list[str], sub: str | None = None) -> Any:
 
 
 class ManifestFilter:
-    """The default ``compare=`` strategy for sync: an rsync-style size+mtime
-    check against the manifest (True = copy).
+    """The default update-lane strategy for sync: an rsync-style size+mtime
+    check against the manifest (True = copy). Wired as ``S3.sync``'s
+    ``update_filter``, so it is handed only the both-sides pairs; new entries
+    (``create_filter``) and orphans (``delete_filter``) are decided by those
+    lanes, never here.
 
     Streaming: it reads the manifest once, front to back, merge-joining its
     records against ``S3.sync``'s ascending compare-key pairs - the whole
     manifest is never held in memory. This works because the manifest is
     written in ``LocalStorage.scan`` order (``entry_sort_key``) and a bare
-    ``PairFilter`` is decided serially on one thread in that same order
-    (``ParallelCompare`` - opt-in, content strategies only - is the only
-    concurrent path), so a one-record lookahead suffices. A filter is a
+    ``update_filter`` is decided serially on one thread in that same order
+    (``--checksum``'s ``ParallelFilter`` content strategy is the only concurrent
+    path, and it never wraps this filter), so a one-record lookahead suffices -
+    the cursor self-heals over any key it is not asked about. A filter is a
     forward-only cursor: one serves exactly one sync.
 
     A pair is skipped only when the local side's size and mtime both match the
     manifest record (mtime within ``window_ns``) and the remote side has the
-    recorded size too. Everything else copies: a missing side, a key the
-    manifest does not know, a drifted stat. Pure stat work - no file content
-    is read, and nothing beyond the sync's own listing is requested.
+    recorded size too. Everything else copies: a key the manifest does not know,
+    or a drifted stat. Pure stat work - no file content is read, and nothing
+    beyond the sync's own listing is requested.
 
     Accepted blind spot: a change that leaves size+mtime equal to the record
     (a content edit with a restored mtime, or an S3-side write that bypassed
@@ -531,8 +535,9 @@ class ManifestFilter:
         return None
 
     def __call__(self, pair: Any) -> bool:
-        if pair.src is None:
-            return False  # destination-only: a delete candidate, never a copy
+        # As an ``update_filter`` this is only ever handed a both-sides pair
+        # (source and destination both present); the create lane (source-only)
+        # and delete lane (destination-only) never reach here.
         direction = pair.transfer_type.value
         if direction == "upload":
             local, remote = pair.src, pair.dest
@@ -543,13 +548,11 @@ class ManifestFilter:
 
         m = self._lookup(pair.key)
         if m is None or not m.is_file:
-            # Unknown to the manifest, or recorded as a dir/symlink: a push
-            # uploads it (local is the source of truth); a pull downloads an
-            # unknown key but skips a non-file - apply_manifest recreates
-            # those from the manifest, no data object needed.
+            # Both sides present, but the manifest is silent or records a
+            # dir/symlink at this key: a push re-uploads it (local is the source
+            # of truth); a pull re-downloads an unknown key but leaves a recorded
+            # non-file to apply_manifest, which recreates it with no data object.
             return m is None if direction == "download" else True
-        if local is None or remote is None:
-            return True  # exists on one side only
         if remote.size != m.size:
             return True  # the remote drifted from the record; size is free evidence
         try:

@@ -7,8 +7,12 @@ module layout.
 
 ## The compare decision
 
-Every sync needs a `compare=` strategy: given a pair (a local side and an S3
-side for one key), does it need copying? s3bak has two.
+Every sync needs an **update-lane** strategy (`S3.sync`'s `update_filter`):
+given a pair present on *both* sides (a local side and its S3 side for one key),
+does it need re-copying? New entries and orphans are separate lanes —
+`create_filter` copies every new local/S3 file (the default), `delete_filter`
+prunes orphans under `--delete` — so the strategy below only judges the
+intersection. s3bak has two.
 
 ### Default: `ManifestFilter` (size+mtime check)
 
@@ -54,13 +58,13 @@ the last real push, and only a push may change it.
 
 ### Opt-in: ETag content comparison (`--checksum`)
 
-`--checksum` swaps in boto3-s3's `EtagComparison`, wrapped in `ParallelCompare`.
-It copies a pair when the S3 ETag does not match the local file's reconstructed
-ETag — so a same-size, same-mtime content change *is* transferred, and an
-mtime-only drift is not. It reads and hashes every candidate file, which is why
-it is opt-in. `part_size` comes from the same profile the uploads use, so
-multipart ETags reconstruct to a matching value. `compare_workers` sets the
-parallelism of this path (it is idle otherwise).
+`--checksum` swaps in boto3-s3's `EtagComparison`, wrapped in `ParallelFilter`
+on a per-sync thread pool s3bak owns. It copies a pair when the S3 ETag does not
+match the local file's reconstructed ETag — so a same-size, same-mtime content
+change *is* transferred, and an mtime-only drift is not. It reads and hashes
+every candidate file, which is why it is opt-in. `part_size` comes from the same
+profile the uploads use, so multipart ETags reconstruct to a matching value.
+`compare_workers` sizes that pool (it is idle otherwise).
 
 `status` and both compare directions share one size/mtime predicate
 (`compare_to_local`), so `status` never disagrees with what a push or pull would
