@@ -303,9 +303,12 @@ class Boto3S3Store:
         if verbose:
             write_stderr(f"+ (boto3-s3) ls {self.prefix}/\n")
         names: list[str] = []
-        for info in self._s3.ls(self._s3_loc(is_dir=True), recursive=False):
+
+        def collect(info: Any) -> None:
             if info.kind is FileKind.FILE:
                 names.append(info.key.rsplit("/", 1)[-1])
+
+        self._s3.ls(self._s3_loc(is_dir=True), recursive=False, on_result=collect)
         return names
 
     def _is_not_found(self, e: Any) -> bool:

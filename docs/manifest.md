@@ -87,14 +87,13 @@ directory keyed `foo/` comes *after* the sibling file `foo.txt` (because
 This single invariant is what keeps every manifest operation streaming, with
 memory bounded by one directory level rather than the whole tree:
 
-- **The walk** (`localwalk.walk_tree`) is boto3-s3's `LocalFileGenerator` —
-  the data sync's own engine, so the sort definition cannot drift between the
-  two — customized into a backup-style walk: lstat-based (a symlink is a leaf
-  carrying its own stat and target, never followed), vetting-free (everything
-  lstat-able is recorded; the data sync's own scan is what warns), with
-  excludes applied as subtree pruning and each directory's record emitted
-  in-stream just before its children. An unreadable directory keeps its own
-  record and silently loses its children.
+- **The walk** (`localwalk.walk_tree`) uses boto3-s3's complete, no-follow local
+  enumeration — the data sync's own engine, so the sort definition cannot drift
+  between the two. It returns directories, lstat-based symlink leaves, special
+  files, and unreadable entries before filtering. s3bak customizes only exclude
+  subtree pruning; boto3-s3 emits each directory record in-stream just before
+  its children. An unreadable directory keeps its own record and silently loses
+  its children.
 - **The writer** streams walk → temp file → upload; it never buffers the whole
   manifest.
 - **The status / pull `--delete` diff** (`merge_join`) pairs the manifest

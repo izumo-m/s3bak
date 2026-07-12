@@ -60,11 +60,11 @@ dependency graph (no import cycles). Lower layers never import upper ones.
 - **manifest** — the v3 JSONL format: parse / format, the streaming sub-tree
   patch, the sorted-stream `merge_join`, and the stat-based `ManifestFilter`
   compare. Pure (stdlib only), so it is unit-testable in isolation.
-- **localwalk** — the manifest walk: boto3-s3's `LocalFileGenerator`
-  customized into a backup-style walk (lstat, so symlinks are leaves; no
-  vetting; excludes as subtree pruning; directory records in-stream), yielding
-  manifest items in S3 key order — the same sort definition the data sync
-  walks with, which is what guarantees the merge-joins line up.
+- **localwalk** — the manifest walk: boto3-s3's complete, no-follow local
+  enumeration (directories, lstat symlinks, special and unreadable entries)
+  with a custom `LocalFileGenerator` only for exclude subtree pruning. It yields
+  manifest items in the same S3 key order as the data sync walk, which is what
+  guarantees the merge-joins line up.
 - **store** — `Boto3S3Store`, the thin S3 backend over the boto3-s3 library
   (transfers, listing, head-object). Builds one shared client up front.
 - **config** — loads the user's `config.py`, validates it, and attaches a ready

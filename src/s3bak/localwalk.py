@@ -5,14 +5,13 @@
 ``manifest.write_manifest`` records, in S3 key byte order (``foo.txt`` before
 ``foo/bar``). The traversal itself is boto3-s3's ``LocalFileGenerator`` - the
 same engine (and therefore the same sort definition) the data sync walks with -
-customized by ``ManifestWalker`` into a backup-style walk:
+configured for complete, no-follow entry enumeration. ``ManifestWalker`` only
+customizes exclude pruning:
 
-- **lstat-based**: symlinks surface as leaves (never followed, so a symlinked
-  directory is not descended) with the link's own stat;
-- **no vetting**: everything lstat-able is recorded - broken symlinks, special
-  files, unreadable files - because the manifest describes the tree, and the
-  data sync's own scan is what warns about what it cannot read. An unreadable
-  directory degrades silently to its own record with no children;
+- **complete enumeration**: boto3-s3 returns directories, broken symlinks,
+  special files, and unreadable entries before filtering. With symlink following
+  disabled, links surface as lstat-based leaves and are never descended. An
+  unreadable directory degrades silently to its own record with no children;
 - **excludes as pruning**: a ``dir/*`` pattern drops the directory child before
   the walk descends, so an excluded subtree costs nothing;
 - **directories in-stream**: each directory's record is yielded between the
@@ -31,47 +30,26 @@ import stat as stat_mod
 from typing import TYPE_CHECKING
 
 from boto3_s3 import LocalFileGenerator, LocalStorage, WalkChild
-from boto3_s3.types import FileKind, LocalFileInfo, LocalScanOptions
+from boto3_s3.types import FileKind
 
 from s3bak.manifest import path_match, split_excludes
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
-
-    from boto3_s3.localstorage import LoopDetector
+    from collections.abc import Iterator
 
 
 class ManifestWalker(LocalFileGenerator):
-    """``LocalFileGenerator`` specialized for the manifest walk (see the module
-    docstring for the behaviour it implements). One instance serves one walk:
-    it carries the walk's exclude patterns and the ``rel_prefix`` that anchors
-    them at the entry root (``"./"``, or ``"./{sub}/"`` for a sub-path push)."""
+    """Prune manifest excludes before boto3-s3 descends into directories.
+
+    One instance serves one walk: it carries the exclude patterns and the
+    ``rel_prefix`` that anchors them at the entry root (``"./"``, or
+    ``"./{sub}/"`` for a sub-path push).
+    """
 
     def __init__(self, prune: list[str], skip: list[str], rel_prefix: str) -> None:
         self._prune = prune
         self._skip = skip
         self._rel_prefix = rel_prefix
-
-    def entry_stat_result(self, entry: os.DirEntry[str]) -> os.stat_result | None:
-        # The one stat per entry, unfollowed: a symlink classifies as a leaf
-        # (its mode is not S_IFDIR) carrying its own lstat. lstat cannot fail
-        # on a broken link, so None here means the entry raced away.
-        try:
-            return entry.stat(follow_symlinks=False)
-        except OSError:
-            return None
-
-    def should_ignore_entry(
-        self,
-        entry: os.DirEntry[str],
-        full: str,
-        dir_fd: int | None,
-        st: os.stat_result,
-        *,
-        notify: Callable[[str], None],
-    ) -> bool:
-        # No vetting: everything lstat-able is recorded (see module docstring).
-        return False
 
     def finalize_children(self, children: list[WalkChild]) -> list[WalkChild]:
         # The exclude pruning: rels are entry-rooted via rel_prefix, matching
@@ -94,42 +72,6 @@ class ManifestWalker(LocalFileGenerator):
             kept.append(child)
         return self.normalize_sort(kept)
 
-    def walk_dir(
-        self,
-        dir_path: str,
-        options: LocalScanOptions,
-        *,
-        strip: int,
-        notify: Callable[[str], None],
-        detector: LoopDetector | None,
-    ) -> Iterator[list[LocalFileInfo]]:
-        # The base walk descends directories without yielding them; the
-        # manifest needs their records, so re-implement the loop to emit each
-        # directory's info just before descending - after the sibling files
-        # that sort before it, which keeps the stream in manifest order. The
-        # loop detector is unused: an lstat walk never follows a symlink, so
-        # it cannot re-enter an ancestor.
-        run: list[LocalFileInfo] = []
-        for sort_name, info, _loop_key in self.scan_children(
-            dir_path, strip=strip, follow_symlinks=options.follow_symlinks, notify=notify
-        ):
-            if info.kind != FileKind.DIRECTORY:
-                run.append(info)
-                continue
-            if run:
-                yield run
-                run = []
-            yield [info]
-            yield from self.walk_dir(
-                os.path.join(dir_path, sort_name),
-                options,
-                strip=strip,
-                notify=notify,
-                detector=None,
-            )
-        if run:
-            yield run
-
 
 def walk_tree(
     root: str, excludes: list[str], *, root_rel: str = ".", rel_prefix: str = "./"
@@ -147,9 +89,16 @@ def walk_tree(
     prune, skip = split_excludes(excludes)
     yield root_rel, os.lstat(root), None
 
-    storage = LocalStorage(root, walker=ManifestWalker(prune, skip, rel_prefix))
+    storage = LocalStorage(
+        root,
+        walker=ManifestWalker(prune, skip, rel_prefix),
+        follow_symlinks=False,
+        enumerate_all_entries=True,
+    )
     for info in storage.walk_local():
         assert info.compare_key is not None and info.stat_result is not None
+        if not info.compare_key:
+            continue  # root was emitted above to preserve missing-root errors
         if info.kind == FileKind.DIRECTORY:
             # A directory's compare_key carries the sort-order trailing "/".
             yield rel_prefix + info.compare_key[:-1], info.stat_result, None
