@@ -179,6 +179,84 @@ def test_diff_reports_removed_local_file(ws):
     assert "will be deleted" in res.out
 
 
+def test_diff_classifies_deleted_local_directory_from_manifest(ws):
+    import shutil
+
+    ws.write("data/a.txt", "from backup\n")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    shutil.rmtree(ws.root / "data")
+
+    res = ws.run("diff", "data")
+
+    assert res.rc == 1
+    assert "from backup" in res.out
+
+
+def test_diff_directory_subpath(ws):
+    ws.write("data/sub/a.txt", "v1\n")
+    ws.write("data/elsewhere.txt", "unchanged\n")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    (ws.root / "data" / "sub" / "a.txt").write_text("v2\n")
+
+    res = ws.run("diff", "data/sub")
+
+    assert res.rc == 1
+    assert "-v1" in res.out
+    assert "+v2" in res.out
+    assert "elsewhere" not in res.out
+
+
+def test_diff_whole_directory_understands_manifest_symlinks(ws):
+    ws.write("data/a.txt", "a\n")
+    ws.write("data/b.txt", "b\n")
+    os.symlink("a.txt", ws.root / "data" / "link")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    clean = ws.run("diff", "data", expect_rc=0)
+    assert clean.out == ""
+
+    (ws.root / "data" / "link").unlink()
+    os.symlink("b.txt", ws.root / "data" / "link")
+    changed = ws.run("diff", "data")
+    assert changed.rc == 1
+    assert "symlink" in changed.out
+    assert "a.txt" in changed.out
+    assert "b.txt" in changed.out
+
+
+def test_diff_does_not_follow_symlink_replacing_regular_file(ws):
+    local = ws.write("data/a.txt", "backup\n")
+    victim = ws.write("outside.txt", "must not be disclosed\n")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    local.unlink()
+    os.symlink(victim, local)
+
+    res = ws.run("diff", "data")
+
+    assert res.rc == 1
+    assert "symlink" in res.out
+    assert "must not be disclosed" not in res.out
+
+
+def test_diff_ignores_s3_object_removed_from_manifest_by_subpath_push(ws):
+    ws.write("data/sub/orphan.txt", "old\n")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    (ws.root / "data" / "sub" / "orphan.txt").unlink()
+
+    # Without --delete, the narrow push intentionally leaves the S3 object but
+    # patches it out of the source-of-truth manifest.
+    ws.run("push", "data/sub", expect_rc=0)
+    assert "data/sub/orphan.txt" in ws.keys()
+
+    res = ws.run("diff", "data", expect_rc=0)
+    assert res.out == ""
+
+
 def test_diff_subpath_file(ws):
     ws.write("data/sub/b.txt", "v1\n")
     ws.config({"data": {"path": str(ws.root / "data")}})

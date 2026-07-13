@@ -2,9 +2,10 @@
 
 s3bak backs up and restores configured directories or single files to and from
 S3. For each entry it stores the file **data** as plain S3 objects and a
-**manifest** object alongside, so it can report and restore metadata (mode,
-mtime, ownership, symlinks) that raw S3 objects do not carry, and decide what a
-push or pull would change without re-reading file contents.
+**manifest** object alongside, so it can report metadata that raw S3 objects do
+not carry, restore mode / mtime / symlinks, and decide what a push or pull would
+change without re-reading file contents. Recorded owner and group names are
+informational; s3bak never changes ownership on restore.
 
 This document is the entry point to the design docs:
 
@@ -34,9 +35,10 @@ s3://bucket/backup/bin-manifest.jsonl      # the metadata manifest
   entry key (`…/bin`).
 - **The manifest** (`<entry>-manifest.jsonl`) records every path in the tree
   with its mode / owner / group / size / mtime / symlink target. It is the
-  source of truth for `status`, for restoring metadata on `pull`, and for the
-  default sync comparison. The `-manifest.jsonl` suffix cannot collide with a
-  single-file entry's own data key (unlike a bare `<entry>.json` would).
+  source of truth for `status`, for restoring filesystem type / mode / mtime /
+  symlinks on `pull`, and for the default sync comparison. Owner and group are
+  retained for reporting only. The `-manifest.jsonl` suffix cannot collide
+  with a single-file entry's own data key (unlike a bare `<entry>.json` would).
 
 ## Module architecture
 
@@ -67,8 +69,9 @@ dependency graph (no import cycles). Lower layers never import upper ones.
   guarantees the merge-joins line up.
 - **store** — `Boto3S3Store`, the thin S3 backend over the boto3-s3 library
   (transfers, listing, head-object). Builds one shared client up front.
-- **config** — loads the user's `config.py`, validates it, and attaches a ready
-  store. Defines `Config` and `Opts`, the two values threaded through commands.
+- **config** — loads and validates the user's `config.py`, and attaches a ready
+  store for S3 commands (`list` deliberately stays local). Defines `Config`
+  and `Opts`, the two values threaded through commands.
 - **compare** — `compare_to_local` (manifest record vs. local file) plus the
   status/diff presentation (color, humanized sizes/durations).
 - **restore** — pull-side filesystem operations: manifest→target path
@@ -109,7 +112,10 @@ s3bak reads `~/.config/s3bak/config.py` (override with `$S3BAK_CONFIG`). It is
 plain Python executed at startup. Required: `profile`, `prefix` (must start
 with `s3://`), and `entries`. Each entry has a required `path` and optional
 `excludes` / `pre_hook` / `post_hook` / `mtime_window` (per-entry override of
-the window below). Optional top-level tuning knobs:
+the window below). An entry name is one non-empty path component and cannot end
+in `-manifest.jsonl`; this keeps entry syntax and manifest keys unambiguous. A
+trailing slash on `prefix` is accepted and normalized away. Optional top-level
+tuning knobs:
 
 | Setting             | Default | Meaning                                                        |
 | ------------------- | ------- | -------------------------------------------------------------- |
@@ -139,9 +145,10 @@ Options: `--all`, `--dry-run` (push), `--delete` (pull, sub-path push),
 command is rejected, not ignored. Push/pull semantics and the meaning of each
 mode are in [sync.md](sync.md).
 
-An `<entry>/<sub>` or a local path argument (containing `/`) resolves to the
-owning entry plus a sub-path; a bare name resolves to an entry. Path arguments
-are matched against entry paths, longest prefix wins.
+An `<entry>/<sub>` argument is entry-rooted syntax and resolves independently of
+the current working directory. Every other path argument is normalized as a
+local path and matched against configured entry roots; the longest containing
+root wins. A bare name resolves to an entry.
 
 ## Exit codes
 
@@ -151,8 +158,8 @@ are matched against entry paths, longest prefix wins.
 | ---- | ---------------------------------------------------------------------- |
 | 0    | success                                                                |
 | 1    | an error (bad usage, missing entry, SDK error, corrupt manifest, …)    |
-| 2    | completed but **warned** — e.g. an unreadable/skipped file; the backup |
-|      | is incomplete but the rest succeeded and the manifest was updated      |
+| 2    | completed but **warned** — e.g. an unreadable/skipped file; work that  |
+|      | could be completed was retained, but the result needs inspection       |
 | 3+   | a failing `post_hook` propagates its own exit code                     |
 | 130  | interrupted (SIGINT)                                                    |
 | 141  | broken pipe (e.g. `show … | head`)                                      |

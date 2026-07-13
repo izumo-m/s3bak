@@ -26,7 +26,7 @@ prefix = "s3://my-bucket/backup"
 #                      hashes each candidate file locally; raise this to speed
 #                      up a --checksum sync bottlenecked on that hashing,
 #                      lower it to cap CPU/IO. Defaults to max_concurrency,
-#                      else 10. The default (non---checksum) compare is
+#                      else 10. The default (non-checksum) compare is
 #                      stat-only and needs no workers.
 #   entry_concurrency  how many entries run at once under --all (default: all
 #                      of them, one thread each). Each entry also opens its own
@@ -50,7 +50,7 @@ prefix = "s3://my-bucket/backup"
 #   path          (required) local path to back up (build from HOME or absolute)
 #   excludes      (optional) glob patterns excluded from the sync (aws s3-style)
 #   pre_hook      (optional) shell command run before the entry is pushed
-#   post_hook     (optional) shell command run after the entry is pushed/pulled
+#   post_hook     (optional) shell command run after a push that did work
 #   mtime_window  (optional) overrides the top-level mtime_window for this entry
 #                 (0 = exact); the CLI --mtime-window overrides both
 entries = {

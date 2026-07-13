@@ -59,7 +59,10 @@ def within_root(root_real: str, target: str) -> bool:
     absent (about to be created) or a symlink we intend to replace."""
     parent_real = os.path.realpath(os.path.dirname(target) or ".")
     resolved = os.path.normpath(os.path.join(parent_real, os.path.basename(target)))
-    return resolved == root_real or resolved.startswith(root_real + os.sep)
+    try:
+        return os.path.commonpath((root_real, resolved)) == root_real
+    except ValueError:  # different Windows drives
+        return False
 
 
 # =============================================================================
@@ -120,13 +123,13 @@ def _apply_meta(target: str, mode: int, mtime_ns: int | None) -> bool:
     if mtime_ns is not None:
         try:
             os.utime(target, ns=(mtime_ns, mtime_ns))
-        except PermissionError as e:
-            err(f"utime failed (not owner?): {target}: {e}")
+        except OSError as e:
+            err(f"utime failed: {target}: {e}")
             ok = False
     try:
         os.chmod(target, mode)
-    except PermissionError as e:
-        err(f"chmod failed (not owner?): {target}: {e}")
+    except OSError as e:
+        err(f"chmod failed: {target}: {e}")
         ok = False
     return ok
 
@@ -139,7 +142,12 @@ def apply_manifest(outpath: str, is_dir: bool, manifest_path: str, sub: str | No
     # escape (a single-file entry always writes at outpath). Reject any record
     # that would create/chmod/symlink outside the restore root - via ".." , an
     # absolute path, or a write through a symlink an earlier record planted.
-    root_real = os.path.realpath(outpath)
+    # Resolve the root's parent chain but not its final component. The final
+    # component may itself be a hostile symlink that a directory/symlink record
+    # is about to replace; following it would both bless the outside target and
+    # make later children look spuriously outside the newly created root.
+    root_parent_real = os.path.realpath(os.path.dirname(outpath) or ".")
+    root_real = os.path.normpath(os.path.join(root_parent_real, os.path.basename(outpath)))
 
     for m_entry in manifest.iter_manifest(manifest_path):
         res = manifest_target(m_entry, outpath, is_dir, sub)
@@ -181,8 +189,17 @@ def apply_manifest(outpath: str, is_dir: bool, manifest_path: str, sub: str | No
             deferred_dirs.append((target, mode, m_entry.mtime_ns))
             continue
 
-        if not os.path.exists(target):
+        try:
+            local_mode = os.lstat(target).st_mode
+        except OSError:
             err(f"expected file missing (sync did not place it): {target}")
+            errors += 1
+            continue
+        if stat_mod.S_IFMT(local_mode) != stat_mod.S_IFMT(m_entry.mode):
+            # In particular, never chmod/utime through a local symlink where a
+            # regular file is recorded: --meta-only must not mutate the link's
+            # target outside the restore tree.
+            err(f"expected {m_entry.path} to have its recorded file type: {target}")
             errors += 1
             continue
 
@@ -204,14 +221,16 @@ def apply_manifest(outpath: str, is_dir: bool, manifest_path: str, sub: str | No
 # =============================================================================
 
 
-def remove_extras(extras: list[tuple[str, bool]]) -> None:
+def remove_extras(extras: list[tuple[str, bool]]) -> int:
     """Remove local extras (pull ``--delete``): ``(path, is_dir)`` pairs the
     status/--delete merge-join found on the local side only. ``is_dir`` is the
     lstat kind, so a symlink - even one pointing at a directory - is unlinked,
     never rmdir'd. Deepest-first (reverse path order), so a directory's
     children go before the rmdir that needs them gone; a failure (e.g. a
-    non-empty directory that lost a child to an exclude) is skipped silently,
-    matching the sync's own delete lane."""
+    non-empty directory that lost a child to an exclude) is reported so a
+    requested mirror restore cannot return success while extras remain.
+    Returns the number of failed removals."""
+    errors = 0
     extras.sort(key=lambda x: x[0], reverse=True)
     for path, is_dir_entry in extras:
         try:
@@ -220,5 +239,7 @@ def remove_extras(extras: list[tuple[str, bool]]) -> None:
             else:
                 os.remove(path)
             write_output(f"delete: {path}\n")
-        except OSError:
-            pass
+        except OSError as e:
+            err(f"delete failed: {path}: {e}")
+            errors += 1
+    return errors

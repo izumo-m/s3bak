@@ -9,6 +9,9 @@ a symlink an earlier record planted.
 from __future__ import annotations
 
 import json
+import os
+
+from s3bak import restore
 
 MTIME_NS = 1_600_000_000 * 1_000_000_000
 
@@ -51,7 +54,7 @@ def test_pull_rejects_absolute_path(ws):
     assert not pwned.exists()
 
 
-def test_pull_rejects_write_through_planted_symlink(ws):
+def test_pull_rejects_manifest_descendant_below_symlink(ws):
     victim = ws.root / "victim"
     victim.mkdir()
     dest = ws.root / "out"
@@ -69,4 +72,89 @@ def test_pull_rejects_write_through_planted_symlink(ws):
     res = ws.run("pull", "data", "-o", str(dest))
     assert res.rc != 0
     assert not (victim / "sub").exists()  # the planted symlink was not written through
-    assert (dest / "link").is_symlink()  # the link record itself still restores
+    assert not (dest / "link").exists()  # fail closed before applying any record
+
+
+def test_pull_meta_only_does_not_apply_file_metadata_through_symlink(ws):
+    source = ws.write("data/a.txt", "backup")
+    os.chmod(source, 0o600)
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    victim = ws.write("victim.txt", "do not touch")
+    os.chmod(victim, 0o644)
+    before = os.lstat(victim)
+    dest = ws.root / "out"
+    dest.mkdir()
+    os.symlink(victim, dest / "a.txt")
+
+    res = ws.run("pull", "--meta-only", "data", "-o", str(dest))
+
+    assert res.rc == 1
+    after = os.lstat(victim)
+    assert (after.st_mode, after.st_mtime_ns) == (before.st_mode, before.st_mtime_ns)
+    assert (dest / "a.txt").is_symlink()
+
+
+def test_pull_replaces_symlink_directory_root_without_writing_through_it(ws):
+    ws.write("data/a.txt", "backup")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    victim = ws.root / "victim"
+    victim.mkdir()
+    dest = ws.root / "out"
+    os.symlink(victim, dest)
+
+    ws.run("pull", "data", "-o", str(dest), expect_rc=0)
+
+    assert not dest.is_symlink()
+    assert (dest / "a.txt").read_text() == "backup"
+    assert not (victim / "a.txt").exists()
+
+
+def test_meta_only_pull_replaces_empty_directory_root_symlink_safely(ws):
+    (ws.root / "empty").mkdir()
+    ws.config({"empty": {"path": str(ws.root / "empty")}})
+    ws.run("push", "empty", expect_rc=0)
+
+    victim = ws.root / "victim"
+    victim.mkdir()
+    marker = victim / "untouched"
+    marker.write_text("keep")
+    dest = ws.root / "out"
+    os.symlink(victim, dest)
+
+    ws.run("pull", "--meta-only", "empty", "-o", str(dest), expect_rc=0)
+
+    assert dest.is_dir() and not dest.is_symlink()
+    assert marker.read_text() == "keep"
+
+
+def test_corrupt_manifest_fails_before_pull_delete(ws):
+    dest = ws.root / "out"
+    dest.mkdir()
+    extra = dest / "must-survive.txt"
+    extra.write_text("local")
+    body = b'{"s3bak_manifest":3}\n{"path":".","mode":"40755","mtime_ns":0}\ngarbage\n'
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl", Body=body)
+    ws.config({"data": {"path": str(ws.root / "data")}})
+
+    res = ws.run("pull", "data", "-o", str(dest), "--delete")
+
+    assert res.rc == 1
+    assert extra.read_text() == "local"
+
+
+def test_remove_extras_reports_deletion_failure(tmp_path, monkeypatch, capfd):
+    extra = tmp_path / "extra.txt"
+    extra.write_text("keep")
+
+    def fail_remove(_path):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(restore.os, "remove", fail_remove)
+
+    assert restore.remove_extras([(str(extra), False)]) == 1
+    assert extra.exists()
+    assert "delete failed" in capfd.readouterr().err

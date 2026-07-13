@@ -97,7 +97,9 @@ So the store routes by size:
 - **Below `min(multipart_threshold, s3.multipart_chunksize)`** (default 8 MiB):
   a direct `client.put_object` / `client.get_object`. One round trip; downloads
   skip the HeadObject probe (`status` and `ls-remote` drop from 2 S3 calls to
-  1).
+  1). A direct download streams into a sibling temporary file and atomically
+  replaces the destination only after success, preserving an existing file if
+  the response is interrupted and never following a final-path symlink.
 - **At or above the threshold:** `S3.cp`, for parallel multipart transfer and
   the composite multipart ETag.
 
@@ -121,31 +123,38 @@ files is exactly what its machinery is for.
   capped at `entry_concurrency`. Each entry's own `cp` / `sync` then spawns
   s3transfer's transfer threads (`max_concurrency`), and `--checksum` its
   compare workers (`compare_workers`).
-- boto3 client **construction** is not thread-safe. The store therefore builds
-  one `S3` orchestrator and one boto3 client up front, in the single-threaded
-  config-load path, and hands every S3-side location to the library as an
-  `S3Storage` already bound to that client — so no client is ever constructed on
-  a worker thread. A built client is safe to share; only construction races.
+- boto3 client **construction** is not thread-safe. For an S3 command, the store
+  therefore builds one `S3` orchestrator and one boto3 client up front, in the
+  single-threaded config-load path, and hands every S3-side location to the
+  library as an `S3Storage` already bound to that client — so no client is ever
+  constructed on a worker thread. A built client is safe to share; only
+  construction races. The local-only `list` command does not build a client.
 
 ## The push pipeline
 
 `cmd_push` for a whole entry:
 
-1. Run `pre_hook` (always, before any work).
-2. **Directory entry:** download the manifest (skipped under `--checksum`),
-   build the compare strategy, and `sync_up` with `--delete` so removed local
-   files are also removed on S3. Excludes are applied by the same entry-rooted
-   matcher the manifest walk uses, so the data sync and the manifest can never
-   disagree on what an exclude means.
+1. Run `pre_hook` (always, before target validation or any backup work), so a
+   hook may generate the file or tree being backed up.
+2. **Directory entry:** download and validate the manifest, build the compare
+   strategy, and `sync_up` with `--delete` so removed local files are also
+   removed on S3. `--checksum` ignores manifest file stats for its content
+   decision, but the manifest still detects objectless tree changes; only
+   `--checksum --data-only` can skip the download. Excludes are applied by the
+   same entry-rooted matcher the manifest walk uses, so the data sync and the
+   manifest can never disagree on what an exclude means.
    **Single-file entry:** upload iff the size+mtime check fails — the manifest holds
    no matching-basename record, the local stat differs, or the S3 object is
    missing (a HeadObject confirms existence, since a single file has no listing
    to self-heal from). `--checksum` uses the ETag comparison instead.
-3. **Refresh the manifest only if data was transferred** (or on `--meta-only`).
-   A change the size+mtime check cannot see — a mode/owner/group edit, or an mtime
-   drift inside the window — transfers nothing and so does not refresh the
-   manifest; `status` keeps showing it until a `--meta-only` push. This is
-   deliberate.
+3. **Refresh the manifest if data was transferred, its tree structure or a
+   symlink target changed, on `--meta-only`, or when no manifest exists yet.**
+   The structural check makes empty and symlink-only changes restorable even
+   though they have no data objects. A mode-only change or an mtime drift inside
+   the window transfers nothing and does not refresh an existing manifest;
+   `status` keeps showing the mode or mtime difference until a `--meta-only`
+   push. Owner and group are informational rather than comparison inputs, and
+   update whenever the manifest is rewritten.
 4. Run `post_hook` — but only after a push that did work (transferred data
    and/or refreshed the manifest), so a side-effecting hook does not fire on a
    pure no-op. `--meta-only` always refreshes and runs the hook, which is the
@@ -157,7 +166,11 @@ uploads just that sub-tree and patches the manifest sub-tree in place
 is updated. If the entry has no manifest yet, the patch also writes the `.` root
 record so the manifest keeps its directory-entry shape. Unlike a whole-entry
 push (which always mirrors), a sub-path push deletes S3 orphans under the
-sub-path only with `--delete`.
+sub-path only with `--delete`. If the local sub-path no longer exists, the push
+fails unless `--delete` is present; with it, s3bak deletes the exact data key and
+keys below `<sub>/` (without touching a similarly prefixed sibling) and removes
+that subtree from the manifest. `--data-only` and `--meta-only` continue to
+limit the operation to the data or manifest side respectively.
 
 ### Mode flags
 
@@ -186,9 +199,12 @@ sub-path only with `--delete`.
    (multipart via `S3.cp` if the recorded size is large). On Windows, read-only
    files the sync may overwrite are made writable first and restored after.
 4. **Apply manifest metadata** (unless `--data-only`): recreate symlinks and
-   empty directories, and set mode / mtime on everything. A regular file the
-   manifest records but that no object placed is reported missing (exit 1),
-   rather than silently created as a directory.
+   empty directories, and set mode / mtime on entries whose local filesystem
+   type matches the record. Directory and symlink conflicts are recreated from
+   the manifest; a regular-file conflict is reported instead of following a
+   hostile local symlink. A regular file the manifest records but that no
+   object placed is reported missing (exit 1), rather than silently created as
+   a directory. Recorded owner and group names are not applied.
 
 ### Mode flags
 
@@ -198,5 +214,7 @@ sub-path only with `--delete`.
   restore). Candidates are the local-only lane of the same manifest×walk
   merge-join `status` runs; only the extras themselves are held in memory, and
   they are removed deepest-first so directories empty out before their `rmdir`.
+  A failed removal makes the command fail instead of reporting a successful
+  mirror while an extra remains.
 - **`-o/--output`** restores to an alternative path instead of the entry's
   configured path.

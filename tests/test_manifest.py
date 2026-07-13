@@ -39,6 +39,18 @@ def test_format_parse_roundtrip_tricky_names(tmp_path, name):
     assert e.is_file and not e.is_dir
 
 
+def test_format_entry_escapes_posix_surrogate_filename_bytes(tmp_path):
+    p = tmp_path / "f"
+    p.write_text("x")
+    line = manifest.format_entry("./bad\udcff", os.lstat(p), None)
+
+    assert "\\udcff" in line
+    line.encode("utf-8")  # the JSONL stream itself remains valid UTF-8
+    entry = manifest.parse_entry(line)
+    assert entry is not None
+    assert entry.path == "./bad\udcff"
+
+
 def test_symlink_entry_records_target_and_no_size(tmp_path):
     os.symlink("target -> x", tmp_path / "link")
     st = os.lstat(tmp_path / "link")
@@ -89,12 +101,47 @@ def test_iter_manifest_rejects_future_version(tmp_path):
         list(manifest.iter_manifest(str(p)))
 
 
-def test_iter_manifest_skips_damaged_lines(tmp_path):
+def test_iter_manifest_rejects_damaged_lines(tmp_path):
     p = tmp_path / "m.jsonl"
     p.write_text(
         '{"s3bak_manifest":3}\ngarbage\n{"path":"./a","mode":"100644","size":1,"mtime_ns":5}\n'
     )
-    assert [e.path for e in manifest.iter_manifest(str(p))] == ["./a"]
+    with pytest.raises(manifest.ManifestError, match="line 2"):
+        list(manifest.iter_manifest(str(p)))
+
+
+def test_validate_manifest_rejects_header_only_file(tmp_path):
+    p = tmp_path / "m.jsonl"
+    p.write_text('{"s3bak_manifest":3}\n')
+    with pytest.raises(manifest.ManifestError, match="no records"):
+        manifest.validate_manifest(str(p))
+
+
+@pytest.mark.parametrize(
+    "records",
+    [
+        ['{"path":"./missing/child","mode":"100644","size":1,"mtime_ns":0}'],
+        [
+            '{"path":"./link","mode":"120777","mtime_ns":0,"link":"target"}',
+            '{"path":"./link/child","mode":"100644","size":1,"mtime_ns":0}',
+        ],
+    ],
+)
+def test_validate_manifest_requires_recorded_directory_parents(tmp_path, records):
+    p = tmp_path / "m.jsonl"
+    p.write_text(
+        "\n".join(
+            [
+                '{"s3bak_manifest":3}',
+                '{"path":".","mode":"40755","mtime_ns":0}',
+                *records,
+                "",
+            ]
+        )
+    )
+
+    with pytest.raises(manifest.ManifestError, match="directory parent"):
+        manifest.validate_manifest(str(p))
 
 
 # --- size+mtime check ----------------------------------------------------------
@@ -129,6 +176,10 @@ def test_path_match_unterminated_class_is_literal():
     # crashing the regex compile.
     assert manifest.path_match("x[", "x[")
     assert not manifest.path_match("x", "x[")
+
+
+def test_path_match_invalid_range_never_raises():
+    assert not manifest.path_match("a", "[z-a]")
 
 
 def test_entry_sort_key():

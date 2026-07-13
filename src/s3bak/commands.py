@@ -96,15 +96,35 @@ def _push_sub(
     s3_sub_path = f"{cfg.prefix}/{sub_rel}"
 
     if not os.path.lexists(local_sub):
-        err(f"local path does not exist: {local_sub}")
-        return 1
+        if not opts.delete:
+            err(f"local path does not exist (use --delete to remove its backup): {local_sub}")
+            return 1
+        if opts.meta_only:
+            did_work = patch_manifest_subtree(cfg, entry, target_root, sub, excludes, opts)
+            return _run_post_hook(post_hook, opts) if did_work else 0
+
+        assert cfg.store is not None
+        result = cfg.store.delete_subtree(sub_rel, dryrun=opts.dryrun, verbose=opts.verbose)
+        if result.stdout:
+            write_output(f"{result.stdout}\n")
+        if result.returncode != 0:
+            if result.stderr:
+                write_stderr(f"{result.stderr}\n")
+            return result.returncode
+        did_work = bool(result.stdout)
+        if not opts.data_only:
+            did_work = (
+                patch_manifest_subtree(cfg, entry, target_root, sub, excludes, opts) or did_work
+            )
+        return _run_post_hook(post_hook, opts) if did_work else 0
 
     if opts.meta_only:
-        patch_manifest_subtree(cfg, entry, target_root, sub, excludes, opts)
-        return _run_post_hook(post_hook, opts)
+        did_work = patch_manifest_subtree(cfg, entry, target_root, sub, excludes, opts)
+        return _run_post_hook(post_hook, opts) if did_work else 0
 
     assert cfg.store is not None
     st = os.lstat(local_sub)
+    did_work = False
 
     if stat_mod.S_ISLNK(st.st_mode):
         # symlink: upload nothing, just update manifest line.
@@ -143,10 +163,12 @@ def _push_sub(
             return result.returncode
         if result.stdout:
             write_output(f"{result.stdout}\n")
-    else:
+            did_work = True
+    elif stat_mod.S_ISREG(st.st_mode):
         # Regular file: an explicit sub-path push always uploads.
         if opts.dryrun:
             print(f"(dry-run) upload: {local_sub} -> {s3_sub_path}")
+            did_work = True
         else:
             result = cfg.store.put_object(sub_rel, local_sub, verbose=opts.verbose)
             if result.returncode != 0:
@@ -156,10 +178,14 @@ def _push_sub(
                 return result.returncode
             if result.stdout:
                 write_output(f"{result.stdout}\n")
+                did_work = True
+    else:
+        err(f"sub path must be a regular file, directory, or symlink: {local_sub}")
+        return 1
 
     if not opts.data_only:
-        patch_manifest_subtree(cfg, entry, target_root, sub, excludes, opts)
-    return _run_post_hook(post_hook, opts)
+        did_work = patch_manifest_subtree(cfg, entry, target_root, sub, excludes, opts) or did_work
+    return _run_post_hook(post_hook, opts) if did_work else 0
 
 
 def _single_file_needs_upload(cfg: Config, entry: str, target: str, opts: Opts) -> bool:
@@ -193,6 +219,48 @@ def _single_file_needs_upload(cfg: Config, entry: str, target: str, opts: Opts) 
         os.unlink(manifest_path)
 
 
+def _single_file_manifest_matches(cfg: Config, entry: str, target: str, opts: Opts) -> bool:
+    """Whether a valid manifest already describes this single-file entry."""
+    fd, manifest_path = tempfile.mkstemp(suffix=".jsonl")
+    os.close(fd)
+    try:
+        if not download_manifest(cfg, entry, manifest_path, opts.verbose):
+            return False
+        record = next(manifest.iter_manifest(manifest_path))
+        return record.path == os.path.basename(target)
+    finally:
+        os.unlink(manifest_path)
+
+
+def _manifest_structure_matches_local(manifest_path: str, target: str, excludes: list[str]) -> bool:
+    """Compare manifest-visible tree structure without treating metadata drift
+    as a reason to rewrite an existing manifest.
+
+    Data transfer output normally drives refresh, but empty directories and
+    symlinks have no S3 object. Their add/remove/type/target changes must still
+    make an ordinary push rewrite the manifest. The merge remains streaming.
+    """
+    manifest_items = (
+        (manifest.entry_sort_key(entry.path, entry.is_dir), entry)
+        for entry in manifest.iter_manifest(manifest_path)
+    )
+    local_items = (
+        (manifest.entry_sort_key(path, stat_mod.S_ISDIR(st.st_mode)), (st, sym))
+        for path, st, sym in localwalk.walk_tree(target, excludes)
+    )
+    matches = True
+    for _key, record, local in manifest.merge_join(manifest_items, local_items):
+        if record is None or local is None:
+            matches = False
+            continue
+        st, sym = local
+        if stat_mod.S_IFMT(record.mode) != stat_mod.S_IFMT(st.st_mode):
+            matches = False
+        if record.sym_target != sym:
+            matches = False
+    return matches
+
+
 def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int:
     entry_cfg = cfg.entries.get(entry)
     if not entry_cfg:
@@ -200,17 +268,6 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         return 1
     target: str = entry_cfg["path"]
     target_root = normalize_local_path(target)
-    if sub is None:
-        if not os.path.lexists(target):
-            err(f"target does not exist: {target}")
-            return 1
-        mode = os.lstat(target).st_mode
-        if stat_mod.S_ISLNK(mode):
-            err(f"entry path is a symlink, which is not allowed as an entry: {target}")
-            return 1
-        if not (stat_mod.S_ISREG(mode) or stat_mod.S_ISDIR(mode)):
-            err(f"entry path must be a regular file or directory: {target}")
-            return 1
 
     excludes: list[str] = entry_cfg.get("excludes", [])
 
@@ -233,13 +290,29 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             if st != 0:
                 return st
 
+    # Validate after pre_hook: hooks commonly generate the file/tree being
+    # backed up, and the documented pipeline promises they run first. A missing
+    # root is allowed only for an explicit sub-path deletion, which needs no
+    # local data source when an existing manifest can be patched.
+    if not os.path.lexists(target_root):
+        if sub is None or not opts.delete:
+            err(f"target does not exist: {target}")
+            return 1
+    else:
+        mode = os.lstat(target_root).st_mode
+        if stat_mod.S_ISLNK(mode):
+            err(f"entry path is a symlink, which is not allowed as an entry: {target}")
+            return 1
+        if not (stat_mod.S_ISREG(mode) or stat_mod.S_ISDIR(mode)):
+            err(f"entry path must be a regular file or directory: {target}")
+            return 1
+
     if sub is not None:
+        if os.path.lexists(target_root) and not os.path.isdir(target_root):
+            err(f"sub path not allowed for single-file entry: {entry}")
+            return 1
         post_hook_sub: str | None = entry_cfg.get("post_hook")
         return _push_sub(cfg, entry, post_hook_sub, target_root, sub, excludes, opts)
-
-    if entry.endswith(".git") and opts.meta_only:
-        err(f"skipping manifest for {entry} (.git suffix convention)")
-        return 0
 
     # --meta-only refreshes the manifest and runs the post_hook even with no data
     # change: the supported way to re-run the post_hook on demand (intended).
@@ -247,15 +320,20 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         return upload_manifest(cfg, entry, target, excludes, opts)
 
     results = ""
+    refresh_manifest = False
     assert cfg.store is not None
 
     if os.path.isdir(target):
         fd, manifest_path = tempfile.mkstemp(suffix=".jsonl")
         os.close(fd)
         compare = None
+        structure_changed = False
         try:
-            # --checksum ignores the manifest entirely; skip the download.
-            have_manifest = not opts.checksum and download_manifest(
+            # A checksum compare does not use manifest file stats, but an
+            # ordinary push still needs the manifest to notice objectless tree
+            # changes (empty directories and symlinks) and validate its source
+            # of truth. --data-only is the one mode that can skip it.
+            have_manifest = not (opts.checksum and opts.data_only) and download_manifest(
                 cfg, entry, manifest_path, opts.verbose
             )
             compare = sync_compare(cfg, opts, entry, manifest_path if have_manifest else None)
@@ -268,6 +346,15 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 dryrun=opts.dryrun,
                 verbose=opts.verbose,
             )
+            if (
+                result.returncode == 0
+                and not result.stdout
+                and not opts.data_only
+                and have_manifest
+            ):
+                structure_changed = not _manifest_structure_matches_local(
+                    manifest_path, target, excludes
+                )
         finally:
             # The streaming ManifestFilter holds the temp manifest open; close it
             # before unlink (an open file cannot be removed on Windows).
@@ -280,6 +367,9 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 write_stderr(result.stderr)
             return result.returncode
         results = result.stdout
+        refresh_manifest = bool(results)
+        if not refresh_manifest and not opts.data_only:
+            refresh_manifest = not have_manifest or structure_changed
     elif _single_file_needs_upload(cfg, entry, target, opts):
         # Single-file entry that fails the size+mtime check against its manifest
         # (or the --checksum ETag comparison), or was never pushed: upload it.
@@ -296,20 +386,27 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                     write_stderr(result.stderr)
                 return result.returncode
             results = result.stdout
+        refresh_manifest = bool(results)
+
+    if opts.checksum and not refresh_manifest and not opts.data_only and not os.path.isdir(target):
+        # ETag equality can skip an already-present data object even when its
+        # manifest was deleted or still names an older configured basename.
+        refresh_manifest = not _single_file_manifest_matches(cfg, entry, target, opts)
 
     if results:
         write_output(f"{results}\n")
 
-    # Refresh the manifest only when file data was actually transferred. The
-    # default compare is the manifest size+mtime check (mtime within the
-    # window), so a change it cannot see - mode/owner/group, or an mtime drift
-    # inside the window - transfers nothing and so does not refresh the
-    # manifest; `status` keeps showing that diff until you run `push
-    # --meta-only` (handled above). Deliberate spec choice, not a bug. Note
+    # Refresh after a data transfer, an objectless structural change, or the
+    # first push even when an empty tree produced no transfer lines. The default
+    # compare is the manifest size+mtime check (mtime within the window), so a
+    # mode-only change or an mtime drift inside the window does not refresh an
+    # existing manifest; `status` keeps showing that diff until `push
+    # --meta-only`. Owner/group are informational and not comparison inputs.
+    # Deliberate spec choice. Note
     # --meta-only asserts "S3 matches local" without making it true: any
     # never-pushed local edit becomes invisible to the size+mtime check afterwards,
     # so it is a metadata refresh, never a substitute for a real push.
-    if results and not opts.data_only:
+    if refresh_manifest and not opts.data_only:
         st = upload_manifest(cfg, entry, target, excludes, opts)
         if st != 0:
             return st
@@ -322,25 +419,21 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
 
 
 def _entry_kind_from_manifest(manifest_path: str) -> str:
-    """Return 'dir' or 'file' from the first record's rel shape: a dir-entry
-    manifest is '.'-rooted ('.' / './...'), a single-file manifest holds one
-    bare basename. Shape, not type bits, so a dir-entry manifest whose first
-    record happens to be a file (possible after a sub-path push created it)
-    still classifies as a directory entry. Returns 'file' for an empty
-    manifest so callers fail fast."""
-    for entry in manifest.iter_manifest(manifest_path):
-        return "dir" if entry.path == "." or entry.path.startswith("./") else "file"
-    return "file"
+    """Return ``"dir"`` or ``"file"`` for an already validated manifest."""
+    first = next(manifest.iter_manifest(manifest_path), None)
+    if first is None:  # Defensive for direct callers; downloads validate first.
+        raise manifest.ManifestError("manifest contains no records")
+    return "dir" if first.path == "." else "file"
 
 
 def _sub_kind_from_manifest(manifest_path: str, sub: str) -> str:
-    """Return 'file', 'dir', 'symlink', or 'missing' for sub from the manifest.
+    """Return file, dir, symlink, special, or missing for a manifest sub-path.
 
     A descendant under sub proves it is a directory; otherwise the recorded
     type decides (an empty directory has no descendants and no S3 object, but
-    its type is recorded). 'symlink' covers every non-file, non-dir record:
-    there is no data object to download - apply_manifest recreates it from
-    the manifest alone."""
+    its type is recorded). Symlinks and special files have no data object;
+    apply_manifest recreates a symlink, while a special file must already exist
+    locally for metadata to be applied."""
     self_entry: ManifestEntry | None = None
     for entry in manifest.iter_manifest(manifest_path):
         rel = entry.path.removeprefix("./")
@@ -352,7 +445,9 @@ def _sub_kind_from_manifest(manifest_path: str, sub: str) -> str:
         return "missing"
     if self_entry.is_dir:
         return "dir"
-    return "file" if self_entry.is_file else "symlink"
+    if self_entry.is_file:
+        return "file"
+    return "symlink" if self_entry.sym_target is not None else "special"
 
 
 def _manifest_matches_local(
@@ -411,7 +506,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 err(f"not found on S3: {entry}/{sub}")
                 return 1
             is_dir = kind == "dir"
-            has_data = kind != "symlink"  # a symlink has no data object
+            has_data = kind in ("file", "dir")
         else:
             is_dir = entry_is_dir
             has_data = True
@@ -427,20 +522,30 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         if manifest_matches and not opts.checksum:
             if not opts.meta_only and opts.delete and is_dir:
                 excludes: list[str] = entry_cfg.get("excludes", []) if entry_cfg else []
-                _delete_extras(manifest_path, outpath, sub, excludes)
+                return _delete_extras(manifest_path, outpath, sub, excludes)
             return 0
 
-        # 3. Normal path: prep, then sync (dir) or cp (file).
+        # Make the restore root's type agree before any transfer. In particular,
+        # never let a directory sync walk through a symlink root, and never let
+        # a single-file write follow one. s3transfer/direct downloads replace
+        # inner leaves atomically; this handles the operation root itself.
+        if has_data and not opts.meta_only and os.path.lexists(outpath):
+            if is_dir:
+                if os.path.islink(outpath) or not os.path.isdir(outpath):
+                    os.remove(outpath)
+                    os.makedirs(outpath, exist_ok=True)
+            elif not stat_mod.S_ISREG(os.lstat(outpath).st_mode):
+                if os.path.islink(outpath) or not os.path.isdir(outpath):
+                    os.remove(outpath)
+                else:
+                    shutil.rmtree(outpath)
+
+        # 3. Normal path: prep, then sync (dir) or cp (file). Root correction
+        # must precede the Windows writable pass so that pass cannot traverse a
+        # symlinked restore root and chmod a file outside the destination.
         prep: list[tuple[str, int]] = []
         if IS_WINDOWS and not opts.meta_only:
             prep = windows_collect_writable_prep(outpath, is_dir, manifest_path, sub)
-
-        # A single-file restore must place a regular file at outpath. If a
-        # symlink sits there, replace it - writing through it would clobber the
-        # link target instead. (Directory syncs use follow_symlinks=False, and
-        # apply_manifest clears conflicting types on the metadata paths.)
-        if not is_dir and has_data and not opts.meta_only and os.path.islink(outpath):
-            os.remove(outpath)
 
         changed = False
         if not opts.meta_only and has_data:
@@ -490,7 +595,9 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
 
         if not opts.meta_only and opts.delete and is_dir:
             excludes = entry_cfg.get("excludes", []) if entry_cfg else []
-            _delete_extras(manifest_path, outpath, sub, excludes)
+            delete_status = _delete_extras(manifest_path, outpath, sub, excludes)
+            if st == 0:
+                st = delete_status
 
         return st
     finally:
@@ -540,7 +647,7 @@ def _local_keyed(
         yield manifest.entry_sort_key(rel, stat_mod.S_ISDIR(st.st_mode)), (norm, st, sym)
 
 
-def _delete_extras(manifest_path: str, outpath: str, sub: str | None, excludes: list[str]) -> None:
+def _delete_extras(manifest_path: str, outpath: str, sub: str | None, excludes: list[str]) -> int:
     """Remove local paths the manifest does not record (pull ``--delete``).
 
     The local-only lane of the merge-join; only the extras themselves are
@@ -554,7 +661,7 @@ def _delete_extras(manifest_path: str, outpath: str, sub: str | None, excludes: 
             rel, st, _sym = loc
             if rel != ".":
                 extras.append((os.path.join(outpath, rel), stat_mod.S_ISDIR(st.st_mode)))
-    remove_extras(extras)
+    return 1 if remove_extras(extras) else 0
 
 
 def cmd_show(cfg: Config, entry: str, opts: Opts, file: str | None = None) -> int:
@@ -640,7 +747,6 @@ def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
                 _rel, st, sym = loc
                 diff = compare_to_stat(
                     entry_obj,
-                    target,
                     st,
                     sym,
                     window_ns=window_ns,
@@ -660,108 +766,201 @@ def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
         os.unlink(manifest_path)
 
 
-def diff_single_file(cfg: Config, rel_key: str, label: str, localfile: str, opts: Opts) -> int:
-    fd, tmppath = tempfile.mkstemp()
-    os.close(fd)
-    try:
-        assert cfg.store is not None
-        if not cfg.store.get_object(rel_key, tmppath, verbose=opts.verbose):
-            err(f"not found on S3: {rel_key}")
-            return 1
-        cmd = [
-            "diff",
-            _diff_color_flag(opts.color),
-            "-ru",
-            tmppath,
-            localfile,
+def _run_diff(left: str, right: str, label: str, opts: Opts) -> int:
+    cmd = ["diff"]
+    color_flag = _diff_color_flag(opts.color)
+    if color_flag is not None:
+        cmd.append(color_flag)
+    cmd.extend(
+        [
+            "-u",
             "--label",
             f"a/{label}",
             "--label",
             f"b/{label}",
+            "--",
+            left,
+            right,
         ]
-        echo_command(opts.verbose, cmd)
-        result = subprocess.run(cmd)
-        return 0 if result.returncode == 0 else 1
+    )
+    echo_command(opts.verbose, cmd)
+    return subprocess.run(cmd).returncode
+
+
+def _write_leaf_type_diff(label: str, backup: str, local: str) -> None:
+    write_output(f"--- a/{label}\n+++ b/{label}\n-{backup}\n+{local}\n")
+
+
+def _local_leaf_description(path: str, mode: int) -> str:
+    if stat_mod.S_ISLNK(mode):
+        return f"symlink -> {os.readlink(path)!r}"
+    if stat_mod.S_ISDIR(mode):
+        return "directory"
+    if stat_mod.S_ISREG(mode):
+        return "regular file"
+    return "special file"
+
+
+def diff_single_file(
+    cfg: Config,
+    rel_key: str,
+    label: str,
+    localfile: str,
+    opts: Opts,
+    *,
+    size: int | None = None,
+) -> int:
+    fd, tmppath = tempfile.mkstemp()
+    os.close(fd)
+    try:
+        assert cfg.store is not None
+        if not cfg.store.get_object(rel_key, tmppath, size=size, verbose=opts.verbose):
+            err(f"not found on S3: {rel_key}")
+            return 1
+        try:
+            local_mode = os.lstat(localfile).st_mode
+        except FileNotFoundError:
+            return 0 if _run_diff(tmppath, os.devnull, label, opts) == 0 else 1
+        if not stat_mod.S_ISREG(local_mode):
+            # Never let content diff follow a symlink that replaced a recorded
+            # regular file: it could disclose an unrelated target's contents.
+            _write_leaf_type_diff(
+                label,
+                "regular file",
+                _local_leaf_description(localfile, local_mode),
+            )
+            return 1
+        return 0 if _run_diff(tmppath, localfile, label, opts) == 0 else 1
     finally:
         os.unlink(tmppath)
 
 
-def diff_backup(cfg: Config, entry: str, outpath: str, opts: Opts) -> int:
+def diff_backup(
+    cfg: Config,
+    rel_prefix: str,
+    outpath: str,
+    opts: Opts,
+    manifest_path: str,
+    *,
+    entry: str,
+    sub: str | None = None,
+) -> int:
     excludes: list[str] = cfg.entries[entry].get("excludes", [])
     tmpdir = tempfile.mkdtemp()
     has_diff = 0
 
     try:
         assert cfg.store is not None
-        result = cfg.store.sync_down(entry, tmpdir, verbose=opts.verbose)
+        result = cfg.store.sync_down(rel_prefix, tmpdir, verbose=opts.verbose)
         if result.returncode != 0:
             if result.stderr:
                 write_stderr(result.stderr)
             return result.returncode
 
+        # The manifest, not every object that happens to remain under the S3
+        # prefix, defines the backup. A sub-path push without --delete may leave
+        # an orphan object; diff must ignore it just as pull/status do.
         backup_files: set[str] = set()
-        for dirpath, _, filenames in os.walk(tmpdir):
-            for f in sorted(filenames):
-                full = os.path.join(dirpath, f)
-                rel = os.path.relpath(full, tmpdir)
+        backup_symlinks: dict[str, str] = {}
+        backup_special: dict[str, int] = {}
+        for record in manifest.iter_manifest(manifest_path):
+            rel = resolve_manifest_rel(record.path, sub)
+            if rel is None or rel == ".":
+                continue
+            if record.is_file and record.sym_target is None:
                 backup_files.add(rel)
-                local = os.path.join(outpath, rel)
-                if not os.path.exists(local):
-                    cmd = [
-                        "diff",
-                        _diff_color_flag(opts.color),
-                        "-u",
-                        full,
-                        "/dev/null",
-                        "--label",
-                        f"a/{rel}",
-                        "--label",
-                        f"b/{rel}",
-                    ]
-                    echo_command(opts.verbose, cmd)
-                    subprocess.run(cmd)
-                    has_diff = 1
-                    continue
-                cmd = [
-                    "diff",
-                    _diff_color_flag(opts.color),
-                    "-u",
-                    full,
-                    local,
-                    "--label",
-                    f"a/{rel}",
-                    "--label",
-                    f"b/{rel}",
-                ]
-                echo_command(opts.verbose, cmd)
-                r = subprocess.run(cmd)
-                if r.returncode != 0:
-                    has_diff = 1
+            elif record.sym_target is not None:
+                backup_symlinks[rel] = record.sym_target
+            elif not record.is_dir:
+                backup_special[rel] = record.mode
 
-        for walk_rel, walk_st, _sym in localwalk.walk_tree(outpath, excludes):
-            if walk_rel == "." or stat_mod.S_ISDIR(walk_st.st_mode):
+        for rel in sorted(backup_files):
+            full = os.path.join(tmpdir, rel)
+            if not os.path.isfile(full):
+                err(f"expected backup object missing: {rel_prefix}/{rel}")
+                has_diff = 1
                 continue
-            rel = walk_rel.removeprefix("./")
-            # isfile follows symlinks, like the os.walk-based scan this
-            # replaces: a symlink to a regular file still diffs (the backup
-            # holds no data object for it), a broken or dir link is skipped.
-            if not os.path.isfile(os.path.join(outpath, rel)):
+            local = os.path.join(outpath, rel)
+            try:
+                local_mode = os.lstat(local).st_mode
+            except FileNotFoundError:
+                _run_diff(full, os.devnull, rel, opts)
+                has_diff = 1
                 continue
-            if rel in backup_files:
+            if not stat_mod.S_ISREG(local_mode):
+                _write_leaf_type_diff(
+                    rel,
+                    "regular file",
+                    _local_leaf_description(local, local_mode),
+                )
+                has_diff = 1
                 continue
-            cmd = [
-                "diff",
-                _diff_color_flag(opts.color),
-                "-u",
-                "/dev/null",
-                os.path.join(outpath, rel),
-                "--label",
-                f"a/{rel}",
-                "--label",
-                f"b/{rel}",
-            ]
-            echo_command(opts.verbose, cmd)
-            subprocess.run(cmd)
+            if _run_diff(full, local, rel, opts) != 0:
+                has_diff = 1
+
+        for rel, backup_target in sorted(backup_symlinks.items()):
+            local = os.path.join(outpath, rel)
+            try:
+                local_mode = os.lstat(local).st_mode
+            except FileNotFoundError:
+                local_value = "missing"
+            else:
+                local_value = _local_leaf_description(local, local_mode)
+                if stat_mod.S_ISLNK(local_mode) and os.readlink(local) == backup_target:
+                    continue
+            _write_leaf_type_diff(rel, f"symlink -> {backup_target!r}", local_value)
+            has_diff = 1
+
+        for rel, backup_mode in sorted(backup_special.items()):
+            local = os.path.join(outpath, rel)
+            try:
+                local_mode = os.lstat(local).st_mode
+            except FileNotFoundError:
+                local_value = "missing"
+            else:
+                if stat_mod.S_IFMT(local_mode) == stat_mod.S_IFMT(backup_mode):
+                    continue
+                local_value = _local_leaf_description(local, local_mode)
+            _write_leaf_type_diff(rel, "special file", local_value)
+            has_diff = 1
+
+        if sub is None:
+            local_items = (
+                localwalk.walk_tree(outpath, excludes)
+                if os.path.isdir(outpath) and not os.path.islink(outpath)
+                else ()
+            )
+            root_rel = "."
+            rel_prefix_local = "./"
+        else:
+            root_rel = f"./{sub}"
+            rel_prefix_local = f"./{sub}/"
+            local_items = (
+                localwalk.walk_tree(
+                    outpath,
+                    excludes,
+                    root_rel=root_rel,
+                    rel_prefix=rel_prefix_local,
+                )
+                if os.path.isdir(outpath) and not os.path.islink(outpath)
+                else ()
+            )
+
+        for walk_rel, walk_st, _sym in local_items:
+            if walk_rel == root_rel or stat_mod.S_ISDIR(walk_st.st_mode):
+                continue
+            rel = walk_rel.removeprefix(rel_prefix_local)
+            local = os.path.join(outpath, rel)
+            if rel in backup_files or rel in backup_symlinks or rel in backup_special:
+                continue
+            if stat_mod.S_ISREG(walk_st.st_mode):
+                _run_diff(os.devnull, local, rel, opts)
+            else:
+                _write_leaf_type_diff(
+                    rel,
+                    "missing",
+                    _local_leaf_description(local, walk_st.st_mode),
+                )
             has_diff = 1
 
         return has_diff
@@ -776,22 +975,103 @@ def cmd_diff(cfg: Config, entry: str, opts: Opts, file: str | None = None) -> in
         return 1
     outpath: str = entry_cfg["path"]
 
-    if file:
-        # removeprefix, not lstrip: see cmd_show.
-        file = file.removeprefix("./")
+    fd, manifest_path = tempfile.mkstemp(suffix=".jsonl")
+    os.close(fd)
+    try:
+        if not download_manifest(cfg, entry, manifest_path, opts.verbose):
+            err(f"entry not found on S3: {entry}")
+            return 1
+        entry_is_dir = _entry_kind_from_manifest(manifest_path) == "dir"
+
+        if file:
+            if not entry_is_dir:
+                err(f"sub path not allowed for single-file entry: {entry}")
+                return 1
+            file = file.removeprefix("./")
+            kind = _sub_kind_from_manifest(manifest_path, file)
+            if kind == "missing":
+                err(f"not found on S3: {entry}/{file}")
+                return 1
+            local = os.path.join(outpath, *file.split("/"))
+            if kind == "dir":
+                return diff_backup(
+                    cfg,
+                    f"{entry}/{file}",
+                    local,
+                    opts,
+                    manifest_path,
+                    entry=entry,
+                    sub=file,
+                )
+            if kind == "symlink":
+                for record in manifest.iter_manifest(manifest_path):
+                    if record.path.removeprefix("./") == file:
+                        local_mode: int | None
+                        try:
+                            local_mode = os.lstat(local).st_mode
+                        except FileNotFoundError:
+                            local_mode = None
+                            local_value = "missing"
+                        else:
+                            local_value = _local_leaf_description(local, local_mode)
+                        if (
+                            local_mode is not None
+                            and stat_mod.S_ISLNK(local_mode)
+                            and os.readlink(local) == record.sym_target
+                        ):
+                            return 0
+                        _write_leaf_type_diff(
+                            f"{entry}/{file}",
+                            f"symlink -> {record.sym_target!r}",
+                            local_value,
+                        )
+                        return 1
+                raise manifest.ManifestError(f"missing symlink record for {entry}/{file}")
+            if kind == "special":
+                record = next(
+                    record
+                    for record in manifest.iter_manifest(manifest_path)
+                    if record.path.removeprefix("./") == file
+                )
+                try:
+                    local_mode = os.lstat(local).st_mode
+                except FileNotFoundError:
+                    local_value = "missing"
+                else:
+                    if stat_mod.S_IFMT(local_mode) == stat_mod.S_IFMT(record.mode):
+                        return 0
+                    local_value = _local_leaf_description(local, local_mode)
+                _write_leaf_type_diff(f"{entry}/{file}", "special file", local_value)
+                return 1
+            size = next(
+                (
+                    record.size
+                    for record in manifest.iter_manifest(manifest_path)
+                    if record.path.removeprefix("./") == file
+                ),
+                None,
+            )
+            return diff_single_file(
+                cfg,
+                f"{entry}/{file}",
+                f"{entry}/{file}",
+                local,
+                opts,
+                size=size,
+            )
+
+        if entry_is_dir:
+            return diff_backup(cfg, entry, outpath, opts, manifest_path, entry=entry)
         return diff_single_file(
             cfg,
-            f"{entry}/{file}",
-            f"{entry}/{file}",
-            f"{outpath}/{file}",
+            entry,
+            entry,
+            outpath,
             opts,
+            size=_single_file_size(manifest_path),
         )
-
-    is_dir = os.path.isdir(outpath)
-    if not is_dir:
-        return diff_single_file(cfg, entry, entry, outpath, opts)
-
-    return diff_backup(cfg, entry, outpath, opts)
+    finally:
+        os.unlink(manifest_path)
 
 
 def cmd_list(cfg: Config, opts: Opts) -> int:

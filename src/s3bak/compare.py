@@ -10,8 +10,10 @@ what counts as changed; mode is compared additionally for the metadata report.
 from __future__ import annotations
 
 import datetime
+import functools
 import os
 import stat as stat_mod
+import subprocess
 import sys
 from dataclasses import dataclass
 
@@ -39,14 +41,33 @@ def _color_wrap(s: str, use_color: bool) -> str:
     return f"{_ANSI_GREEN}{s}{_ANSI_RESET}" if use_color else s
 
 
-def _diff_color_flag(color_mode: str) -> str:
-    return f"--color={'always' if _resolve_use_color(color_mode) else 'never'}"
+@functools.lru_cache(maxsize=1)
+def _diff_supports_color() -> bool:
+    try:
+        result = subprocess.run(
+            ["diff", "--color=never", "--help"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return False
+    return result.returncode == 0
+
+
+def _diff_color_flag(color_mode: str) -> str | None:
+    # --color is a GNU extension. Omit it entirely when color is disabled so
+    # the normal/default diff path also works with BSD diff. An interactive
+    # auto/always request uses color only when the installed diff supports it.
+    if not _resolve_use_color(color_mode) or not _diff_supports_color():
+        return None
+    return "--color=always"
 
 
 def _humanize_size_diff(diff_bytes: int) -> str:
+    sign = "+" if diff_bytes >= 0 else "-"
     diff = abs(diff_bytes)
     if diff < 1024:
-        return f"+{diff} bytes"
+        return f"{sign}{diff} bytes"
     for unit, threshold in (
         ("TB", 1024**4),
         ("GB", 1024**3),
@@ -54,11 +75,12 @@ def _humanize_size_diff(diff_bytes: int) -> str:
         ("KB", 1024),
     ):
         if diff >= threshold:
-            return f"+{diff} bytes (+{diff / threshold:.2f} {unit})"
-    return f"+{diff} bytes"
+            return f"{sign}{diff} bytes ({sign}{diff / threshold:.2f} {unit})"
+    return f"{sign}{diff} bytes"
 
 
 def _humanize_duration(diff_sec: int) -> str:
+    sign = "+" if diff_sec >= 0 else "-"
     diff = abs(diff_sec)
     if diff == 0:
         return "+0s"
@@ -74,11 +96,16 @@ def _humanize_duration(diff_sec: int) -> str:
         parts.append(f"{minutes}m")
     if seconds:
         parts.append(f"{seconds}s")
-    return "+" + " ".join(parts[:2])
+    return sign + " ".join(parts[:2])
 
 
 def _fmt_mtime(mtime_ns: int) -> str:
-    return datetime.datetime.fromtimestamp(mtime_ns / 1_000_000_000).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        return datetime.datetime.fromtimestamp(mtime_ns / 1_000_000_000).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+    except (OSError, OverflowError, ValueError):
+        return f"{mtime_ns}ns"
 
 
 @dataclass
@@ -119,7 +146,6 @@ def compare_to_local(
             local_sym = ""
     return compare_to_stat(
         entry,
-        target,
         st,
         local_sym,
         window_ns=window_ns,
@@ -130,7 +156,6 @@ def compare_to_local(
 
 def compare_to_stat(
     entry: ManifestEntry,
-    target: str,
     st: os.stat_result | None,
     local_sym: str | None,
     *,
@@ -142,8 +167,7 @@ def compare_to_stat(
 
     ``st`` is the local lstat (None = missing) and ``local_sym`` the readlink
     target when ``st`` is a symlink - both come for free from the manifest
-    walk, so the status merge-join adds no syscalls here (except the one
-    follow-stat below when a symlink stands where a non-link is recorded).
+    walk, so the status merge-join adds no syscalls here.
     The size + mtime part is the same check the sync's ManifestFilter
     applies (mtime within ``window_ns``), so `status` and push/pull agree on
     what counts as changed; mode is additionally compared here for the
@@ -166,20 +190,13 @@ def compare_to_stat(
         diff.status = "D"
         return diff
 
-    if stat_mod.S_ISLNK(st.st_mode):
-        try:
-            is_dir_local = stat_mod.S_ISDIR(os.stat(target).st_mode)
-        except OSError:
-            is_dir_local = False
-    else:
-        is_dir_local = stat_mod.S_ISDIR(st.st_mode)
-
-    if entry.is_dir != is_dir_local:
-        # A directory where a regular file is expected (or vice versa) is a
-        # type change, reported like a missing/wrong-type entry rather than a
-        # metadata-only diff.
+    if stat_mod.S_IFMT(entry.mode) != stat_mod.S_IFMT(st.st_mode):
+        # A symlink or any other filesystem type where a different type was
+        # recorded is a replacement, not a metadata-only modification.
         diff.status = "D"
         return diff
+
+    is_dir_local = stat_mod.S_ISDIR(st.st_mode)
 
     if not is_dir_local:
         loc_size = st.st_size

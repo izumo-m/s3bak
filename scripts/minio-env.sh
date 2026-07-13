@@ -26,8 +26,4 @@ export AWS_REGION=us-east-1
 # Dev s3bak config (profile = s3bak-minio, prefix = s3://s3bak-test/dev).
 export S3BAK_CONFIG="$_s3bak_scriptdir/s3bak.config.dev.py"
 
-# Gates the e2e suite (added with the test work); the bucket is created by
-# mc-init and must stay empty between runs.
-export S3BAK_E2E_BUCKET=s3bak-e2e
-
 unset _s3bak_scriptdir

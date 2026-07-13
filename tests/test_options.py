@@ -173,9 +173,9 @@ def test_push_single_file_dryrun_prints_upload_once(ws):
     assert len(uploads) == 1
 
 
-def test_push_git_entry_meta_only_skips_manifest(ws):
+def test_push_git_entry_meta_only_writes_manifest_like_any_other_entry(ws):
     ws.write("repo.git/HEAD", "ref")
     ws.config({"repo.git": {"path": str(ws.root / "repo.git")}})
 
     ws.run("push", "--meta-only", "repo.git", expect_rc=0)
-    assert "repo.git-manifest.jsonl" not in ws.keys()  # .git + --meta-only skips the manifest
+    assert "repo.git-manifest.jsonl" in ws.keys()

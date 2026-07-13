@@ -188,6 +188,31 @@ def test_per_entry_mtime_window_invalid_value_is_rejected(ws, bad):
         cli.load_config()
 
 
+@pytest.mark.parametrize("expression", ["float('nan')", "float('inf')", "float('-inf')"])
+def test_mtime_window_rejects_non_finite_values(ws, expression):
+    ws.write("data/a.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws._config.write_text(ws._config.read_text() + f"mtime_window = {expression}\n")
+
+    with pytest.raises(SystemExit):
+        cli.load_config()
+
+
+def test_trailing_slash_in_prefix_is_canonicalized(ws):
+    ws.write("data/a.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    body = ws._config.read_text().replace(
+        f'prefix = "s3://{ws.bucket}/{ws.prefix}"',
+        f'prefix = "s3://{ws.bucket}/{ws.prefix}/"',
+    )
+    ws._config.write_text(body)
+
+    cfg = cli.load_config()
+
+    assert cfg.prefix == f"s3://{ws.bucket}/{ws.prefix}"
+    assert cfg.path_prefix == ws.prefix
+
+
 def _peak_concurrency(entry_concurrency: int | None, n_entries: int) -> tuple[int, int]:
     """Run n_entries through run_entries and report (rc, peak simultaneous fn calls)."""
     lock = threading.Lock()
@@ -230,6 +255,24 @@ def test_run_entries_cap_above_count_runs_all():
     rc, peak = _peak_concurrency(entry_concurrency=10, n_entries=3)
     assert rc == 0
     assert peak == 3  # cap is a ceiling, not padding
+
+
+def test_run_entries_exit_code_is_deterministic_by_entry_order():
+    def fn(_cfg, entry, _opts):
+        if entry == "first":
+            time.sleep(0.05)  # finish after the second entry
+            return 3
+        return 1
+
+    cfg = cli.Config(
+        profile="p",
+        prefix="s3://b",
+        bucket="b",
+        path_prefix="",
+        entries={},
+    )
+
+    assert cli.run_entries(fn, cfg, ["first", "second"], cli.Opts()) == 3
 
 
 def test_push_pull_roundtrip_with_concurrency_settings(ws):

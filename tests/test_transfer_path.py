@@ -10,7 +10,10 @@ the limit (same plain-MD5 ETag), so --checksum stays consistent.
 
 from __future__ import annotations
 
+import os
 from collections import Counter
+
+import pytest
 
 from s3bak import cli
 
@@ -105,3 +108,44 @@ def test_small_limit_defaults_to_8_mib(ws):
     ws.write("data/a.txt", "x")
     ws.config({"data": {"path": str(ws.root / "data")}})
     assert _store(ws)._small_limit == 8 * 1024 * 1024
+
+
+def test_failed_direct_download_preserves_existing_destination(ws, monkeypatch):
+    ws.write("data/a.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    store = _store(ws)
+    dest = ws.write("existing.txt", "original")
+
+    class FailingBody:
+        reads = 0
+
+        def read(self, _size=-1):
+            self.reads += 1
+            if self.reads == 1:
+                return b"partial"
+            raise OSError("simulated interrupted response")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(store._client, "get_object", lambda **_kwargs: {"Body": FailingBody()})
+
+    with pytest.raises(OSError, match="interrupted"):
+        store.get_object("data/a.txt", str(dest))
+
+    assert dest.read_text() == "original"
+    assert not any(p.name.startswith(".s3bak-download-") for p in dest.parent.iterdir())
+
+
+def test_direct_download_preserves_existing_file_mode(ws):
+    ws.write("data/a.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    store = _store(ws)
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/object", Body=b"new")
+    dest = ws.write("existing.txt", "old")
+    os.chmod(dest, 0o640)
+
+    assert store.get_object("object", str(dest))
+
+    assert dest.read_text() == "new"
+    assert os.stat(dest).st_mode & 0o777 == 0o640
