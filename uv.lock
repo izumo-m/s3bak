@@ -678,7 +678,7 @@ wheels = [
 
 [[package]]
 name = "s3bak"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "." }
 dependencies = [
     { name = "boto3" },
