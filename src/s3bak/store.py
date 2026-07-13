@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat as stat_mod
 import sys
+import tempfile
 import threading
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -268,7 +270,7 @@ class Boto3S3Store:
         ETag) means upload; otherwise reuse EtagComparison so the decision
         matches a dir entry's `--checksum` sync - an unchanged file is
         skipped, a same-size/same-mtime content change is not. part_size comes
-        from the same profile the upload uses. The default (non---checksum)
+        from the same profile the upload uses. The default (non-checksum)
         single-file decision is the manifest size+mtime check, not this.
         """
         head = self.head_object(rel_key, verbose=verbose)
@@ -303,9 +305,12 @@ class Boto3S3Store:
         if verbose:
             write_stderr(f"+ (boto3-s3) ls {self.prefix}/\n")
         names: list[str] = []
-        for info in self._s3.ls(self._s3_loc(is_dir=True), recursive=False):
+
+        def collect(info: Any) -> None:
             if info.kind is FileKind.FILE:
                 names.append(info.key.rsplit("/", 1)[-1])
+
+        self._s3.ls(self._s3_loc(is_dir=True), recursive=False, on_result=collect)
         return names
 
     def _is_not_found(self, e: Any) -> bool:
@@ -348,12 +353,98 @@ class Boto3S3Store:
                 # (access denied, transport, config) propagate to run().
                 return False
             raise
-        parent = os.path.dirname(dest_path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with closing(resp["Body"]) as body, open(dest_path, "wb") as f:
-            shutil.copyfileobj(body, f)
+        with closing(resp["Body"]) as body:
+            parent = os.path.dirname(dest_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            temp_dir = parent or os.curdir
+            fd, temp_path = tempfile.mkstemp(prefix=".s3bak-download-", dir=temp_dir)
+            try:
+                try:
+                    existing_mode = os.lstat(dest_path).st_mode
+                except OSError:
+                    existing_mode = None
+                if existing_mode is not None and stat_mod.S_ISREG(existing_mode):
+                    # Atomic replacement uses a new inode. Preserve the mode of
+                    # an existing regular destination so --data-only does not
+                    # turn it into tempfile's 0600 merely as a side effect.
+                    os.chmod(temp_path, stat_mod.S_IMODE(existing_mode))
+                # Match s3transfer's safety property: finish into a sibling temp
+                # file and replace atomically. A failed/truncated read leaves the
+                # previous destination intact, and a final-component symlink is
+                # replaced instead of followed into an unrelated target.
+                with os.fdopen(fd, "wb") as f:
+                    shutil.copyfileobj(body, f)
+                os.replace(temp_path, dest_path)
+            except BaseException:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                try:
+                    os.unlink(temp_path)
+                except FileNotFoundError:
+                    pass
+                raise
         return True
+
+    def delete_subtree(
+        self, rel_key: str, *, dryrun: bool = False, verbose: bool = False
+    ) -> TransferResult:
+        """Delete the object at ``rel_key`` and objects below ``rel_key/``.
+
+        Used by an explicit missing sub-path push with ``--delete``. Listing is
+        boundary-filtered so a request for ``docs`` can never remove a sibling
+        such as ``docs.txt``. DeleteObjects batches stay within S3's 1,000-key
+        limit; service-level per-key failures are returned as a failed result.
+        """
+        api_base = self._api_key(rel_key)
+        prefix = api_base + "/"
+        if verbose:
+            write_stderr(f"+ (boto3) delete subtree s3://{self.bucket}/{api_base}\n")
+
+        lines: list[str] = []
+        errors: list[str] = []
+        pending: list[dict[str, str]] = []
+
+        def flush() -> None:
+            if not pending or dryrun:
+                pending.clear()
+                return
+            response = self._client.delete_objects(
+                Bucket=self.bucket,
+                Delete={"Objects": list(pending), "Quiet": True},
+            )
+            for item in response.get("Errors", []):
+                errors.append(f"{item.get('Key', '?')}: {item.get('Code', 'delete failed')}")
+            pending.clear()
+
+        def queue(key: str) -> None:
+            rel = key[len(self.path_prefix) + 1 :] if self.path_prefix else key
+            marker = "(dry-run) " if dryrun else ""
+            lines.append(f"{marker}delete: {self._s3_url(rel)}")
+            pending.append({"Key": key})
+            if len(pending) == 1000:
+                flush()
+
+        # Probe the exact object separately, then list only the slash-bounded
+        # descendants. Listing Prefix=api_base would also scan every similarly
+        # named sibling (docs.txt, docs-archive, ...), which can be arbitrarily
+        # expensive even though the boundary filter would spare them.
+        if self.head_object(rel_key, verbose=verbose) is not None:
+            queue(api_base)
+
+        paginator = self._client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+            for item in page.get("Contents", []):
+                key = str(item["Key"])
+                queue(key)
+        flush()
+        return TransferResult(
+            returncode=1 if errors else 0,
+            stdout="\n".join(lines),
+            stderr="\n".join(errors),
+        )
 
     def stream_object_to_stdout(self, rel_key: str, *, verbose: bool = False) -> int:
         from botocore.exceptions import ClientError

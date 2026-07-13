@@ -11,8 +11,9 @@ pull would change.
 ## Requirements
 
 - Python **3.10+**
-- AWS credentials configured (an `~/.aws` profile, or the usual `AWS_*`
-  environment variables)
+- An AWS profile name in `config.py`, with usable credentials for that profile
+- A `diff` executable for the `s3bak diff` command (GNU diff enables color)
+- Bash only when an entry configures `pre_hook` or `post_hook`
 
 s3bak depends on [boto3-s3](https://pypi.org/project/boto3-s3/) (installed
 automatically), which brings in boto3. No separate AWS CLI install is required.
@@ -48,6 +49,8 @@ s3bak reads `~/.config/s3bak/config.py` (override with `$S3BAK_CONFIG`). It is
 plain Python, executed at startup, so build paths from `HOME` - entry paths are
 used as-is and `~` is not expanded. See
 [`config.example.py`](config.example.py) for a fully commented template.
+Entry names must be non-empty, single path components and cannot end in
+`-manifest.jsonl`.
 Minimal example:
 
 ```python
@@ -64,7 +67,8 @@ entries = {
 }
 ```
 
-Per-entry keys: `path` (required), `excludes`, `pre_hook`, `post_hook`.
+Per-entry keys: `path` (required), `excludes`, `pre_hook`, `post_hook`,
+`mtime_window`.
 
 ## Usage
 
@@ -82,9 +86,10 @@ Commands:
   help                     Show this help
 ```
 
-Common options: `--all`, `--dry-run` (push), `--delete` (pull), `--meta-only`,
-`--data-only`, `--checksum` (push/pull), `-o/--output <path>` (pull),
-`-v/--verbose`, `--color[=WHEN]`.
+Common options: `--all`, `--dry-run` (push), `--delete` (pull and sub-path
+push), `--meta-only`, `--data-only`, `--checksum` (push/pull),
+`--mtime-window <seconds>`, `-o/--output <path>` (pull), `-v/--verbose`,
+`--color[=WHEN]`.
 
 Run `s3bak help` for the full option list and worked examples.
 
@@ -95,6 +100,7 @@ s3bak push --all              # back up every configured entry
 s3bak push --all --dry-run    # preview without uploading
 s3bak status bin              # M/A/D summary for one entry
 s3bak pull bin -o /tmp/out    # restore the bin entry to /tmp/out
+s3bak push bin/subdir         # entry-rooted syntax; independent of CWD
 s3bak ls-remote               # list entries stored on S3
 ```
 

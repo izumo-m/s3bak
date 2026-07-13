@@ -16,7 +16,7 @@ import tempfile
 from collections.abc import Iterator
 from typing import Any
 
-from s3bak import manifest
+from s3bak import localwalk, manifest
 from s3bak.config import Config, Opts
 from s3bak.console import write_output, write_stderr
 from s3bak.manifest import ManifestEntry
@@ -34,7 +34,7 @@ def write_manifest_to_aws(
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             if os.path.isdir(target):
-                manifest.write_manifest(f, manifest.walk_tree(target, excludes))
+                manifest.write_manifest(f, localwalk.walk_tree(target, excludes))
             else:
                 st = os.lstat(target)
                 sym = os.readlink(target) if stat_mod.S_ISLNK(st.st_mode) else None
@@ -52,7 +52,7 @@ def patch_manifest_subtree(
     sub: str,
     excludes: list[str],
     opts: Opts,
-) -> None:
+) -> bool:
     """Download the manifest, replace the records under `sub`, and re-upload.
 
     target_root/sub may be a file, a symlink, or a directory. If it does not
@@ -63,7 +63,7 @@ def patch_manifest_subtree(
     key = manifest.manifest_key(entry)
     if opts.dryrun:
         print(f"(dry-run) would patch manifest: {key} (sub={sub})")
-        return
+        return True
 
     fd_old, old_path = tempfile.mkstemp(suffix=".jsonl")
     os.close(fd_old)
@@ -71,10 +71,15 @@ def patch_manifest_subtree(
     os.close(fd_new)  # reopened by name below; closing now avoids an fd leak on error
     try:
         have_old = download_manifest(cfg, entry, old_path, opts.verbose)
+        if not have_old and not os.path.lexists(target_root):
+            # Deleting a never-backed sub-path beneath a root that is gone has
+            # no manifest state to update (and no root metadata from which to
+            # create a valid directory manifest).
+            return False
         local_sub = os.path.join(target_root, sub)
         new_entries: Iterator[tuple[str, os.stat_result, str | None]] = iter(())
         if os.path.lexists(local_sub):
-            new_entries = manifest.iter_subtree(local_sub, sub, excludes)
+            new_entries = localwalk.iter_subtree(local_sub, sub, excludes)
         if not have_old:
             # First-ever manifest for this entry, born from a sub-path push:
             # record the entry root too, so the manifest keeps the dir-entry
@@ -86,6 +91,7 @@ def patch_manifest_subtree(
         write_stderr(f"Updating {cfg.prefix}/{key}\n")
         assert cfg.store is not None
         cfg.store.put_file(key, new_path, verbose=opts.verbose)
+        return True
     finally:
         os.unlink(old_path)
         os.unlink(new_path)
@@ -95,7 +101,10 @@ def download_manifest(cfg: Config, entry: str, dest: str, verbose: bool = False)
     assert cfg.store is not None
     # Manifests are small and fetched on nearly every command: a direct
     # GetObject (size unknown -> the direct path) saves s3transfer's HeadObject.
-    return cfg.store.get_object(manifest.manifest_key(entry), dest, verbose=verbose)
+    found = cfg.store.get_object(manifest.manifest_key(entry), dest, verbose=verbose)
+    if found:
+        manifest.validate_manifest(dest)
+    return found
 
 
 def sync_compare(

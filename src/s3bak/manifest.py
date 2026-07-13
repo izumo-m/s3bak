@@ -1,4 +1,4 @@
-"""Manifest v3: JSONL read/write, the S3-key-ordered tree walk, and the
+"""Manifest v3: JSONL read/write, the sorted-stream merge-join, and the
 stat-based sync compare (ManifestFilter).
 
 A manifest is stored as ``<entry>-manifest.jsonl`` next to the entry's data
@@ -22,20 +22,22 @@ Readers ignore unknown keys, so future fields never need a format bump; the
 header version only changes when an existing key's meaning does.
 
 The sorted-order invariant is what keeps everything here streaming: the walk
-emits in S3 key order with one directory level of memory, the writer streams
-walk -> file, and the sub-path patch is a merge of two sorted streams instead
-of a read-all + sort.
+(localwalk.py, boto3-s3's engine) emits in S3 key order, the writer streams
+walk -> file, and the sub-path patch, the sync compare (ManifestFilter), and
+the status / pull ``--delete`` diff (merge_join) are all merges of sorted
+streams instead of a read-all + sort. This module is pure stdlib - the format,
+the joins, and the pattern matching, with no boto3-s3 dependency.
 """
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
-import re
 import stat as stat_mod
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from typing import IO, Any
+from typing import IO, Any, TypeVar
 
 try:
     import grp
@@ -57,8 +59,7 @@ def manifest_key(entry: str) -> str:
 
 
 class ManifestError(Exception):
-    """A manifest file is not readable as the current format (corrupt header
-    or a version this build does not understand)."""
+    """A manifest is corrupt or does not satisfy the current format."""
 
 
 # =============================================================================
@@ -104,9 +105,12 @@ class ManifestEntry:
 
 
 def parse_entry(line: str) -> ManifestEntry | None:
-    """One manifest line -> entry, or None for a blank/damaged line (never
-    raises, so one bad line degrades to 'missing' instead of crashing status).
-    Unknown keys are ignored (forward compatibility)."""
+    """Parse one record, returning ``None`` for invalid input.
+
+    ``iter_manifest`` turns ``None`` into a fail-closed ``ManifestError`` with
+    the line number. Keeping the primitive non-raising is useful to the
+    streaming patcher and focused format tests. Unknown keys are ignored.
+    """
     line = line.strip()
     if not line:
         return None
@@ -117,18 +121,29 @@ def parse_entry(line: str) -> ManifestEntry | None:
         size = obj.get("size")
         mtime_ns = obj.get("mtime_ns")
         link = obj.get("link")
+        owner = obj.get("owner", "")
+        group = obj.get("group", "")
         if (
             not isinstance(path, str)
-            or not (size is None or isinstance(size, int))
-            or not (mtime_ns is None or isinstance(mtime_ns, int))
+            or not path
+            or "\x00" in path
+            or mode < 0
+            or mode > 0o177777
+            or not (size is None or (isinstance(size, int) and not isinstance(size, bool)))
+            or (isinstance(size, int) and size < 0)
+            or not (
+                mtime_ns is None or (isinstance(mtime_ns, int) and not isinstance(mtime_ns, bool))
+            )
             or not (link is None or isinstance(link, str))
+            or not isinstance(owner, str)
+            or not isinstance(group, str)
         ):
             return None
         return ManifestEntry(
             path=path,
             mode=mode,
-            owner=str(obj.get("owner", "")),
-            group=str(obj.get("group", "")),
+            owner=owner,
+            group=group,
             size=size,
             mtime_ns=mtime_ns,
             sym_target=link,
@@ -156,14 +171,97 @@ def _header_line() -> str:
 
 
 def iter_manifest(manifest_path: str) -> Iterator[ManifestEntry]:
-    """Stream a manifest's entries. Raises ManifestError on a bad header;
-    damaged entry lines are skipped."""
-    with open(manifest_path, encoding="utf-8") as f:
-        _check_header(f.readline())
-        for line in f:
-            entry = parse_entry(line)
-            if entry is not None:
+    """Stream a manifest's entries, failing closed on any damaged line.
+
+    Treating a corrupt record as absent is unsafe: ``pull --delete`` could then
+    classify the corresponding local path as an extra and remove it. A bad
+    header, invalid UTF-8, or malformed entry therefore aborts the operation
+    with ``ManifestError`` before any manifest-driven mutation starts.
+    """
+    try:
+        with open(manifest_path, encoding="utf-8") as f:
+            _check_header(f.readline())
+            for line_number, line in enumerate(f, start=2):
+                entry = parse_entry(line)
+                if entry is None:
+                    raise ManifestError(f"invalid manifest record at line {line_number}")
                 yield entry
+    except UnicodeError as e:
+        raise ManifestError(f"manifest is not valid UTF-8: {e}") from e
+
+
+def validate_manifest(manifest_path: str) -> str:
+    """Validate whole-manifest invariants and return ``"dir"`` or ``"file"``.
+
+    Writers always emit either a ``.``-rooted, strictly key-ordered directory
+    tree or exactly one bare-basename regular-file record. Verifying that shape
+    after download prevents corrupt/hostile records from confusing streaming
+    joins or mapping several records onto one single-file restore target.
+    """
+    kind: str | None = None
+    previous_key: str | None = None
+    count = 0
+    # Directory records must precede all of their descendants in key order.
+    # Keeping only the current ancestry proves every record has a recorded
+    # directory parent without turning validation into an O(tree-size) map.
+    directory_stack: list[tuple[str, ...]] = [()]
+
+    for entry in iter_manifest(manifest_path):
+        count += 1
+        if kind is None:
+            if entry.path == ".":
+                if not entry.is_dir or entry.sym_target is not None:
+                    raise ManifestError("directory manifest root must be a directory record")
+                kind = "dir"
+            else:
+                if (
+                    entry.path.startswith("./")
+                    or "/" in entry.path
+                    or entry.path in (".", "..")
+                    or not entry.is_file
+                    or entry.sym_target is not None
+                ):
+                    raise ManifestError("single-file manifest must contain one regular-file record")
+                kind = "file"
+        elif kind == "file":
+            raise ManifestError("single-file manifest contains more than one record")
+
+        if kind == "dir" and entry.path != ".":
+            if not entry.path.startswith("./"):
+                raise ManifestError(f"invalid directory-manifest path: {entry.path!r}")
+            parts = entry.path[2:].split("/")
+            if any(part in ("", ".", "..") for part in parts):
+                raise ManifestError(f"manifest path escapes restore root: {entry.path!r}")
+            parent = tuple(parts[:-1])
+            while directory_stack and len(directory_stack[-1]) > len(parent):
+                directory_stack.pop()
+            if not directory_stack or directory_stack[-1] != parent:
+                raise ManifestError(f"manifest record has no directory parent: {entry.path!r}")
+            if entry.is_dir:
+                directory_stack.append(tuple(parts))
+
+        is_symlink = stat_mod.S_ISLNK(entry.mode)
+        if is_symlink != (entry.sym_target is not None):
+            raise ManifestError(f"manifest type/link mismatch for {entry.path!r}")
+        if entry.is_file:
+            if entry.size is None:
+                raise ManifestError(f"regular-file record has no size: {entry.path!r}")
+        elif entry.size is not None:
+            raise ManifestError(f"non-file record has a size: {entry.path!r}")
+        if entry.mtime_ns is None:
+            raise ManifestError(f"manifest record has no mtime_ns: {entry.path!r}")
+
+        key = entry_sort_key(entry.path, entry.is_dir)
+        if previous_key is not None and key <= previous_key:
+            raise ManifestError(
+                f"manifest records are duplicated or out of order at {entry.path!r}"
+            )
+        previous_key = key
+
+    if count == 0:
+        raise ManifestError("manifest contains no records")
+    assert kind is not None
+    return kind
 
 
 def iter_compare_records(
@@ -226,12 +324,15 @@ def format_entry(path: str, st: os.stat_result, sym_target: str | None) -> str:
     obj["mtime_ns"] = st.st_mtime_ns
     if sym_target is not None:
         obj["link"] = sym_target
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    # ASCII escaping is not cosmetic: POSIX exposes undecodable filename bytes
+    # as surrogate code points. Escaping them keeps the JSONL itself valid
+    # UTF-8 and lets Python's filesystem surrogateescape round-trip the name.
+    return json.dumps(obj, ensure_ascii=True, separators=(",", ":"))
 
 
 def write_manifest(out: IO[str], entries: Iterable[tuple[str, os.stat_result, str | None]]) -> None:
     """Stream ``(path, lstat, sym_target)`` items to ``out`` as a v3 manifest.
-    The items must already be in walk order (walk_tree / iter_subtree)."""
+    The items must already be in walk order (localwalk.walk_tree / iter_subtree)."""
     out.write(_header_line() + "\n")
     for path, st, sym_target in entries:
         out.write(format_entry(path, st, sym_target) + "\n")
@@ -281,7 +382,7 @@ def write_patched(
             for line in f:
                 e = parse_entry(line)
                 if e is None:
-                    continue  # drop a damaged line rather than re-emit it
+                    raise ManifestError("invalid record in manifest being patched")
                 rel = e.path.removeprefix("./")
                 if rel == sub or rel.startswith(sub + "/"):
                     continue  # the replaced range
@@ -294,48 +395,13 @@ def write_patched(
 # Exclude pattern matching (find -path semantics: * matches /)
 # =============================================================================
 
-_pattern_cache: dict[str, re.Pattern[str]] = {}
-
-
-def _glob_to_regex(pattern: str) -> str:
-    result: list[str] = []
-    i = 0
-    while i < len(pattern):
-        c = pattern[i]
-        if c == "*":
-            result.append(".*")
-        elif c == "?":
-            result.append(".")
-        elif c == "[":
-            j = i + 1
-            if j < len(pattern) and pattern[j] in "!^":
-                j += 1
-            if j < len(pattern) and pattern[j] == "]":
-                j += 1
-            while j < len(pattern) and pattern[j] != "]":
-                j += 1
-            if j >= len(pattern):
-                # Unterminated class: a literal '[' (fnmatch behavior), not
-                # an invalid regex that would crash the pattern compile.
-                result.append(re.escape(c))
-            else:
-                cls = pattern[i + 1 : j]
-                # Shell negation is '!'; regex negation is '^'. Translate, but
-                # keep a lone '[!]' literal (an empty negated class is invalid).
-                if cls.startswith("!") and len(cls) > 1:
-                    cls = "^" + cls[1:]
-                result.append(f"[{cls}]")
-                i = j
-        else:
-            result.append(re.escape(c))
-        i += 1
-    return "".join(result)
-
 
 def path_match(path: str, pattern: str) -> bool:
-    if pattern not in _pattern_cache:
-        _pattern_cache[pattern] = re.compile(_glob_to_regex(pattern))
-    return _pattern_cache[pattern].fullmatch(path) is not None
+    # fnmatchcase is platform-neutral and, because it matches plain strings
+    # rather than filesystem components, ``*`` also matches ``/``. Its mature
+    # translator handles malformed/range-heavy bracket expressions without the
+    # regex compilation failures a hand-rolled translator can introduce.
+    return fnmatch.fnmatchcase(path, pattern)
 
 
 def split_excludes(excludes: list[str]) -> tuple[list[str], list[str]]:
@@ -350,95 +416,40 @@ def split_excludes(excludes: list[str]) -> tuple[list[str], list[str]]:
 
 
 # =============================================================================
-# Tree walk (S3 key order)
+# Sorted-stream merge-join
 # =============================================================================
 
+_A = TypeVar("_A")
+_B = TypeVar("_B")
 
-def walk_tree(
-    root: str, excludes: list[str], *, root_rel: str = ".", rel_prefix: str = "./"
-) -> Iterator[tuple[str, os.stat_result, str | None]]:
-    """Walk a directory tree yielding ``(rel, lstat, sym_target | None)`` in
-    S3 key order. Each ``rel`` is what a record's ``path`` field stores.
 
-    rel uses the manifest convention: ``root_rel`` for the root, ``rel_prefix``
-    + path below it - for an entry push that is "." / "./sub/file"; a sub-path
-    push passes "./{sub}" / "./{sub}/" so every rel (and thus every exclude
-    match) stays anchored at the ENTRY root, where the configured patterns are
-    defined. Each directory level is sorted with real directories keyed as
-    ``name+"/"`` (files and symlinks as ``name``) and traversed depth-first
-    inline, which makes the concatenated stream globally byte-ordered - the
-    same order as boto3-s3's ``LocalStorage.walk_local`` and an S3 listing, so
-    a manifest can be merge-joined against either. The traversal is iterative
-    (an explicit stack), so tree depth is not bounded by the recursion limit;
-    memory is one directory level per depth. An unreadable directory is
-    silently skipped (as os.walk did) - the data sync's own scan already
-    surfaces it as a warning. Symlinks are leaves (never followed).
-    """
-    prune_patterns, skip_patterns = split_excludes(excludes)
-    yield root_rel, os.lstat(root), None
+def merge_join(
+    a: Iterable[tuple[str, _A]], b: Iterable[tuple[str, _B]]
+) -> Iterator[tuple[str, _A | None, _B | None]]:
+    """Join two ascending ``(sort_key, item)`` streams on their keys.
 
-    stack: list[tuple[str, str, Iterator[tuple[str, str, bool]]]] = [
-        (root, rel_prefix, iter(_scan_sorted(root)))
-    ]
-    while stack:
-        dirpath, prefix, entries = stack[-1]
-        item = next(entries, None)
-        if item is None:
-            stack.pop()
-            continue
-        _sort_name, name, is_real_dir = item
-        rel = prefix + name
-        full = os.path.join(dirpath, name)
-        if is_real_dir:
-            if any(path_match(rel, p) for p in prune_patterns):
-                continue
-            yield rel, os.lstat(full), None
-            stack.append((full, rel + "/", iter(_scan_sorted(full))))
+    Yields ``(key, a_item | None, b_item | None)`` for every key present on
+    either side, in key order; a one-sided key carries ``None`` for the other
+    side. One-record lookahead per stream, so joining a manifest against a
+    fresh walk (both in ``entry_sort_key`` order) never holds more than two
+    records in memory - the status / pull ``--delete`` diff works on manifests
+    of any size. Both inputs must ascend strictly (no duplicate keys within a
+    stream), which the walk and the manifest do by construction."""
+    ita, itb = iter(a), iter(b)
+    ha = next(ita, None)
+    hb = next(itb, None)
+    while ha is not None or hb is not None:
+        if hb is None or (ha is not None and ha[0] < hb[0]):
+            assert ha is not None
+            yield ha[0], ha[1], None
+            ha = next(ita, None)
+        elif ha is None or hb[0] < ha[0]:
+            yield hb[0], None, hb[1]
+            hb = next(itb, None)
         else:
-            if any(path_match(rel, p) for p in skip_patterns):
-                continue
-            st = os.lstat(full)
-            if stat_mod.S_ISLNK(st.st_mode):
-                # A symlink named like a pruned directory is excluded too (it
-                # occupies the name the pattern targets).
-                if any(path_match(rel, p) for p in prune_patterns):
-                    continue
-                yield rel, st, os.readlink(full)
-            else:
-                yield rel, st, None
-
-
-def _scan_sorted(dirpath: str) -> list[tuple[str, str, bool]]:
-    """One directory level as ``(sort_name, name, is_real_dir)`` in S3 key
-    order (dirs keyed ``name+"/"``). Unreadable -> empty (silently skipped)."""
-    entries: list[tuple[str, str, bool]] = []
-    try:
-        with os.scandir(dirpath) as it:
-            for de in it:
-                is_real_dir = de.is_dir(follow_symlinks=False)
-                sort_name = de.name + "/" if is_real_dir else de.name
-                entries.append((sort_name, de.name, is_real_dir))
-    except OSError:
-        return []
-    entries.sort()
-    return entries
-
-
-def iter_subtree(
-    local_sub: str, sub: str, excludes: list[str]
-) -> Iterator[tuple[str, os.stat_result, str | None]]:
-    """Walk items for a sub-path push: ``local_sub`` as recorded under
-    ``./{sub}``. Handles the file / symlink / directory cases. The walk rels
-    are entry-rooted, so the entry's exclude patterns apply exactly as they
-    would in a full push."""
-    st = os.lstat(local_sub)
-    if stat_mod.S_ISLNK(st.st_mode):
-        yield f"./{sub}", st, os.readlink(local_sub)
-        return
-    if not os.path.isdir(local_sub):
-        yield f"./{sub}", st, None
-        return
-    yield from walk_tree(local_sub, excludes, root_rel=f"./{sub}", rel_prefix=f"./{sub}/")
+            yield ha[0], ha[1], hb[1]
+            ha = next(ita, None)
+            hb = next(itb, None)
 
 
 def _excluded(rel: str, prune: list[str], skip: list[str]) -> bool:
@@ -461,7 +472,7 @@ def exclude_filter(excludes: list[str], sub: str | None = None) -> Any:
     """The sync ``filter=`` for an entry's excludes (True = keep).
 
     Matches each side's compare_key against the entry-rooted patterns - the
-    same semantics walk_tree applies to the manifest - re-rooting a sub-path
+    same semantics the manifest walk applies - re-rooting a sub-path
     sync's keys with ``./{sub}/`` so the entry's patterns keep their meaning.
     Applies to both sides of the sync, so an excluded key is neither
     transferred nor treated as a delete candidate."""

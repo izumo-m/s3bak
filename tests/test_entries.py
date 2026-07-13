@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import shlex
+import shutil
 
 import pytest
 
@@ -248,9 +250,113 @@ def test_inner_symlink_subpath_pull_restores_symlink(ws):
     assert os.readlink(dest) == "real.txt"
 
 
-def test_list_shows_configured_entries(ws):
+def test_list_shows_configured_entries_without_constructing_s3_store(ws, monkeypatch):
     ws.write("data/a.txt", "x")
     ws.config({"data": {"path": str(ws.root / "data")}})
+    from s3bak import config
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("list must not construct an S3 store")
+
+    monkeypatch.setattr(config, "Boto3S3Store", fail_if_called)
 
     res = ws.run("list", expect_rc=0)
     assert "data" in res.out
+
+
+def test_entry_subpath_syntax_is_independent_of_cwd(ws, monkeypatch):
+    ws.write("data/sub/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    elsewhere = ws.root / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    ws.run("push", "data/sub/a.txt", expect_rc=0)
+
+    assert "data/sub/a.txt" in ws.keys()
+
+
+def test_missing_subpath_push_delete_removes_only_that_s3_subtree(ws):
+    ws.write("data/sub/a.txt", "a")
+    ws.write("data/sub.txt", "sibling")
+    ws.write("data/submarine/b.txt", "b")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    shutil.rmtree(ws.root / "data" / "sub")
+
+    ws.run("push", "--delete", "data/sub", expect_rc=0)
+
+    keys = ws.keys()
+    assert not any(key == "data/sub" or key.startswith("data/sub/") for key in keys)
+    assert "data/sub.txt" in keys
+    assert "data/submarine/b.txt" in keys
+    manifest_body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl")[
+        "Body"
+    ].read()
+    assert b'"path":"./sub"' not in manifest_body
+
+
+def test_subpath_push_is_rejected_for_single_file_entry(ws):
+    target = ws.write("single.txt", "x")
+    ws.config({"single": {"path": str(target)}})
+
+    res = ws.run("push", "--delete", "single/child")
+
+    assert res.rc == 1
+    assert "single-file entry" in res.err
+
+
+def test_pre_hook_can_create_entry_target(ws):
+    target = ws.root / "generated.txt"
+    command = f"printf generated > {shlex.quote(str(target))}"
+    ws.config({"generated": {"path": str(target), "pre_hook": command}})
+
+    ws.run("push", "generated", expect_rc=0)
+
+    assert target.read_text() == "generated"
+    body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/generated")["Body"].read()
+    assert body == b"generated"
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no mkfifo on this platform")
+def test_special_file_subpath_is_rejected(ws):
+    (ws.root / "data").mkdir()
+    os.mkfifo(ws.root / "data" / "fifo")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+
+    res = ws.run("push", "data/fifo")
+
+    assert res.rc == 1
+    assert "regular file, directory, or symlink" in res.err
+
+
+def test_noop_subpath_data_only_push_does_not_run_post_hook(ws):
+    marker = ws.root / "hook-ran"
+    ws.write("data/sub/a.txt", "a")
+    ws.config(
+        {"data": {"path": str(ws.root / "data"), "post_hook": f"touch {shlex.quote(str(marker))}"}}
+    )
+    ws.run("push", "data", expect_rc=0)
+    marker.unlink()
+
+    ws.run("push", "--data-only", "data/sub", expect_rc=0)
+
+    assert not marker.exists()
+
+
+def test_local_path_resolution_handles_an_entry_at_filesystem_root(tmp_path):
+    from s3bak import cli
+
+    root = tmp_path.anchor
+    cfg = cli.Config(
+        profile="p",
+        prefix="s3://bucket",
+        bucket="bucket",
+        path_prefix="",
+        entries={"root": {"path": root}},
+    )
+
+    entry, sub = cli._resolve_one_arg(cfg, str(tmp_path / "child.txt"))
+
+    assert entry == "root"
+    assert sub == str(tmp_path / "child.txt").removeprefix(root).replace(os.sep, "/")

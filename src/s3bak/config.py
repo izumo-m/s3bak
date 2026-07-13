@@ -2,17 +2,20 @@
 """Runtime config (``config.py`` loading) and per-invocation options.
 
 ``load_config`` reads the user's ``~/.config/s3bak/config.py`` (plain Python),
-validates it, and attaches a ready ``Boto3S3Store``. ``Config`` and ``Opts``
-are the two values threaded through every command.
+validates it, and attaches a ready ``Boto3S3Store`` for S3 commands. ``Config``
+and ``Opts`` are the two values threaded through every command.
 """
 
 from __future__ import annotations
 
+import math
 import os
+import tokenize
 from dataclasses import dataclass
 from typing import Any
 
-from s3bak.console import die, err, expand_home
+from s3bak.console import die, expand_home
+from s3bak.manifest import MANIFEST_SUFFIX
 from s3bak.store import Boto3S3Store
 
 # Default mtime window for the size+mtime check (seconds). 2s absorbs every common
@@ -92,12 +95,29 @@ def _config_seconds(value: Any, config_path: str, *, label: str) -> float | None
     fractional allowed; bool rejected). Returns None when unset."""
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
         die(f"{label} must be a non-negative number of seconds in {config_path} (got {value!r})")
     return float(value)
 
 
-def load_config() -> Config:
+def _validate_entry_name(name: Any, config_path: str) -> str:
+    if not isinstance(name, str) or not name:
+        die(f"entry names must be non-empty strings in {config_path} (got {name!r})")
+    if name in (".", "..") or "/" in name or "\\" in name:
+        die(f"entry name must be one path component in {config_path} (got {name!r})")
+    if name.endswith(MANIFEST_SUFFIX):
+        die(f"entry name must not end with {MANIFEST_SUFFIX!r} in {config_path} (got {name!r})")
+    if any(ord(char) < 32 or ord(char) == 127 for char in name):
+        die(f"entry name must not contain control characters in {config_path} (got {name!r})")
+    return name
+
+
+def load_config(*, create_store: bool = True) -> Config:
     config_path = os.environ.get("S3BAK_CONFIG")
     if not config_path:
         config_path = expand_home("~/.config/s3bak/config.py")
@@ -119,24 +139,22 @@ def load_config() -> Config:
             f"  }}"
         )
 
-    ns: dict[str, Any] = {}
-    with open(config_path) as f:
-        code = f.read()
+    ns: dict[str, Any] = {"__file__": config_path, "__name__": "s3bak_config"}
     try:
+        with tokenize.open(config_path) as f:
+            code = f.read()
         exec(compile(code, config_path, "exec"), ns)
     except Exception as e:
         die(f"error loading {config_path}: {e}")
 
-    profile: str | None = ns.get("profile")
-    prefix: str | None = ns.get("prefix")
-    entries: dict[str, dict[str, Any]] | None = ns.get("entries")
+    profile = ns.get("profile")
+    prefix = ns.get("prefix")
+    entries = ns.get("entries")
 
-    if not profile or not prefix:
+    if not isinstance(profile, str) or not profile or not isinstance(prefix, str) or not prefix:
         die(f"profile and prefix must be set in {config_path}")
-    if not entries:
+    if not isinstance(entries, dict) or not entries:
         die(f"no entries defined in {config_path}")
-    if "all" in entries:
-        err("warning: entry name 'all' conflicts with --all flag; consider renaming")
     if not prefix.startswith("s3://"):
         die(f"prefix must start with s3:// (got '{prefix}')")
 
@@ -146,6 +164,10 @@ def load_config() -> Config:
 
     if not bucket:
         die(f"could not parse bucket from prefix='{prefix}'")
+    # Keep direct boto3 keys and boto3-s3 URLs on the same canonical prefix.
+    # A user-friendly trailing slash must not become a doubled slash in transfer
+    # URLs while direct GetObject/PutObject use the stripped path_prefix.
+    prefix = f"s3://{bucket}" + (f"/{path_prefix}" if path_prefix else "")
 
     # Optional knobs (see config.example.py):
     #   max_concurrency   - parallel S3 transfer threads for cp / sync
@@ -160,7 +182,8 @@ def load_config() -> Config:
 
     # Per-entry validation: every command dereferences entry_cfg["path"], so a
     # malformed entry must die with a message, not a KeyError traceback.
-    for name, entry_cfg in entries.items():
+    for raw_name, entry_cfg in entries.items():
+        name = _validate_entry_name(raw_name, config_path)
         if not isinstance(entry_cfg, dict):
             die(f"entries[{name!r}] must be a dict in {config_path} (got {entry_cfg!r})")
         path = entry_cfg.get("path")
@@ -189,12 +212,13 @@ def load_config() -> Config:
         entry_concurrency=entry_concurrency,
         mtime_window=DEFAULT_MTIME_WINDOW if mtime_window is None else mtime_window,
     )
-    cfg.store = Boto3S3Store(
-        profile,
-        prefix,
-        bucket,
-        path_prefix,
-        max_concurrency=max_concurrency,
-        compare_workers=compare_workers,
-    )
+    if create_store:
+        cfg.store = Boto3S3Store(
+            profile,
+            prefix,
+            bucket,
+            path_prefix,
+            max_concurrency=max_concurrency,
+            compare_workers=compare_workers,
+        )
     return cfg

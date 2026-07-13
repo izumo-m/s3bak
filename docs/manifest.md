@@ -3,9 +3,12 @@
 Each entry has one manifest object on S3, `<entry>-manifest.jsonl`, next to its
 data objects. The manifest records every path in the entry's tree with the
 metadata S3 objects do not carry, and is the source of truth for `status`,
-metadata restore on `pull`, and the default sync comparison.
+filesystem type / mode / mtime / symlink restore on `pull`, and the default
+sync comparison. Owner and group are recorded for reporting, not applied.
 
-The format lives in `src/s3bak/manifest.py`, which is pure (stdlib only).
+The format lives in `src/s3bak/manifest.py`, which is pure (stdlib only); the
+tree walk that produces the records lives in `src/s3bak/localwalk.py`, on
+boto3-s3's directory engine.
 
 ## File layout
 
@@ -51,6 +54,9 @@ error.
   object) or a symlink, and tell a recorded-but-never-uploaded file apart from
   a directory.
 - **`path`** is the tree-walk path (see [`path`](#the-path-field)).
+- **`owner` and `group` are informational.** They are shown by manifest-based
+  reporting and refreshed when a push rewrites the manifest, but do not take
+  part in comparison and are never applied with `chown`.
 - Inapplicable keys are omitted: a directory or symlink has no `size`; only
   symlinks carry `link`. Readers ignore unknown keys, so a future field can be
   added without a version bump — the version changes only when an existing
@@ -67,8 +73,10 @@ error.
 
 The `.` / `./` shape also tells `pull` whether the entry is a directory
 (`.`-rooted) or a single file (one bare-basename record) without a head-object
-probe. JSON encodes any byte sequence, so a filename containing a newline —
-which the old line-oriented format could not represent — round-trips fine.
+probe. JSON escaping keeps a filename containing a newline inside one record —
+which a raw line-oriented format could not do. On POSIX, Python's
+surrogate-escaped representation of non-UTF-8 filename bytes is also serialized
+as JSON escapes rather than written as invalid UTF-8.
 
 The value is named `rel` inside the tree walk (the mechanism that produces a
 *relative* path); the manifest record stores that produced value in its `path`
@@ -85,13 +93,20 @@ directory keyed `foo/` comes *after* the sibling file `foo.txt` (because
 This single invariant is what keeps every manifest operation streaming, with
 memory bounded by one directory level rather than the whole tree:
 
-- **The walk** (`walk_tree`) sorts each directory level with real directories
-  keyed as `name + "/"` and files/symlinks as `name`, then traverses
-  depth-first — iteratively (an explicit stack), so tree depth is not bounded
-  by Python's recursion limit. An unreadable directory is skipped silently (as
-  `os.walk` was), since the data sync already surfaces it as a warning.
+- **The walk** (`localwalk.walk_tree`) uses boto3-s3's complete, no-follow local
+  enumeration — the data sync's own engine, so the sort definition cannot drift
+  between the two. It returns directories, lstat-based symlink leaves, special
+  files, and unreadable entries before filtering. s3bak customizes only exclude
+  subtree pruning; boto3-s3 emits each directory record in-stream just before
+  its children. An unreadable directory keeps its own record and silently loses
+  its children.
 - **The writer** streams walk → temp file → upload; it never buffers the whole
   manifest.
+- **The status / pull `--delete` diff** (`merge_join`) pairs the manifest
+  stream against a fresh walk on their shared sort keys with a one-record
+  lookahead per side — both-sides pairs are compared (M), manifest-only
+  records report D, local-only paths report A / become delete candidates — so
+  a manifest far larger than RAM still diffs in one pass.
 - **The sub-tree patch** (`write_patched`, used by a sub-path push) is a
   streaming merge of two already-sorted inputs — the old manifest and the newly
   walked sub-tree — instead of a read-all-then-sort. It copies old records
@@ -116,11 +131,13 @@ against either side of a sync without materializing it.
 
 ## Robustness
 
-- A blank or damaged entry line is skipped, not fatal: a single corrupt line
-  degrades that one record to "missing" rather than crashing `status`.
-- A bad **header**, by contrast, aborts the read with `ManifestError` — the
-  file is not a manifest this build understands, and silently reading it as
-  empty would make `status` wrongly report "clean".
+- Manifest reads fail closed. A bad header, invalid UTF-8, blank or malformed
+  record, unsafe path, inconsistent type fields, duplicate, or out-of-order
+  record aborts with `ManifestError` before manifest-driven mutation starts.
+  Treating a damaged record as absent would be unsafe: `pull --delete` could
+  otherwise classify the corresponding local path as an extra and remove it.
+- Unknown record keys remain accepted and are preserved by sub-tree patches,
+  so additive metadata does not require a version bump.
 
 ## Versioning and migration
 

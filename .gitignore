@@ -35,3 +35,7 @@ CLAUDE.local.md
 
 # Local-only working notes
 /.local/
+
+# Agent tools
+/.agents/
+/skills-lock.json

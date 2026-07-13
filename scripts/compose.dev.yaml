@@ -1,4 +1,4 @@
-# Ephemeral MinIO for s3bak manual testing and the e2e suite.
+# Ephemeral MinIO for s3bak manual testing.
 #
 # Usage (from repo root):
 #   scripts/compose-up.sh          # start the stack, wait for bucket init
@@ -12,8 +12,8 @@
 # State lives in tmpfs and disappears on `down`. To persist between runs,
 # replace the tmpfs entry with a named volume (e.g. `volumes: [minio-data:/data]`).
 
-# Pinned so compose-up.sh can match the exact container name
-# (s3bak-dev-minio-1) rather than any compose stack with a minio service.
+# Stable project name keeps manual compose commands and container names
+# predictable regardless of the caller's current working directory.
 name: s3bak-dev
 
 services:
@@ -29,9 +29,7 @@ services:
     tmpfs:
       - /data
 
-  # Creates the buckets the dev workflow expects: s3bak-test for manual play,
-  # s3bak-e2e for the e2e suite (which expects it to exist and stay empty
-  # between runs).
+  # Creates the bucket used for manual play.
   mc-init:
     image: minio/mc:latest
     depends_on:
@@ -39,7 +37,6 @@ services:
     entrypoint: >
       /bin/sh -c "
       until mc alias set local http://minio:9000 minioadmin minioadmin >/dev/null 2>&1; do sleep 1; done &&
-      mc mb --ignore-existing local/s3bak-test &&
-      mc mb --ignore-existing local/s3bak-e2e
+      mc mb --ignore-existing local/s3bak-test
       "
     restart: "no"

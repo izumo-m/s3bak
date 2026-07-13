@@ -12,8 +12,9 @@ The implementation is split across sibling modules:
 
     console   terminal I/O, warnings, path helpers
     store     the boto3-s3 backend (Boto3S3Store)
+    localwalk the manifest walk (boto3-s3's engine, backup-style)
     config    config.py loading, Config / Opts
-    manifest  the v3 JSONL manifest format + walk + ManifestFilter
+    manifest  the v3 JSONL manifest format + merge_join + ManifestFilter
     compare   manifest-vs-local diff and status/diff presentation
     restore   pull-side filesystem operations (apply metadata, prune extras)
     syncops   the manifest <-> S3 bridge and download orchestration
@@ -23,7 +24,9 @@ The implementation is split across sibling modules:
 from __future__ import annotations
 
 import concurrent.futures
+import math
 import os
+import posixpath
 import shlex
 import signal
 import subprocess
@@ -90,20 +93,23 @@ def run_entries(
     if cfg.entry_concurrency is not None:
         workers = min(workers, cfg.entry_concurrency)
 
-    agg = 0
+    statuses = [0] * len(entries)
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(fn, cfg, e, opts): e for e in entries}
+        futures = {
+            executor.submit(fn, cfg, entry, opts): index for index, entry in enumerate(entries)
+        }
         for future in concurrent.futures.as_completed(futures):
+            index = futures[future]
             try:
-                st = future.result()
-                if st and not agg:
-                    agg = st
+                statuses[index] = future.result()
             except Exception as exc:
-                entry = futures[future]
-                err(f"{entry}: {exc}")
-                if not agg:
-                    agg = 1
-    return agg
+                err(f"{entries[index]}: {exc}")
+                statuses[index] = 1
+    # Completion order varies with scheduling. Preserve the first configured
+    # entry's failure so --all has a deterministic exit code (including a
+    # post_hook's documented 3+ code) rather than whichever worker happened to
+    # finish first.
+    return next((status for status in statuses if status), 0)
 
 
 # =============================================================================
@@ -177,7 +183,7 @@ Examples:
 
   # show: print a single backed-up file to stdout
   s3bak show wsl.conf                  # single-file entry (no slash = entry name)
-  s3bak show bin/s3bak                 # local path, CWD-relative
+  s3bak show bin/s3bak                 # entry-rooted path, independent of CWD
   s3bak show ~/bin/s3bak               # local path with ~ expansion
   s3bak show /home/me/bin/s3bak | less # absolute local path
 
@@ -189,7 +195,7 @@ Examples:
 
   # diff: content diff between backup and local
   s3bak diff bin                       # diff the whole entry
-  s3bak diff bin/s3bak                 # single-file diff, CWD-relative local path
+  s3bak diff bin/s3bak                 # entry-rooted path, independent of CWD
   s3bak diff ~/bin/s3bak               # single-file diff with ~ expansion
 
   # list: locally configured entries (no S3 access)
@@ -210,41 +216,51 @@ Examples:
 
 
 def _resolve_one_arg(cfg: Config, arg: str) -> tuple[str, str | None]:
-    # No path separator: match strictly as an entry name.
-    # Otherwise: treat as a local path made absolute against CWD/HOME, then find
-    #   which entry's path contains it, preferring the longest prefix. Separators
-    #   are platform-aware so native Windows "C:\dir\f" is a path, not a name.
+    # A bare name is an entry. ``entry/sub`` is entry-rooted syntax independent
+    # of CWD; every other path is resolved locally and matched to the containing
+    # configured entry (longest root wins).
     seps = [os.sep, os.altsep] if os.altsep else [os.sep]
     if not (any(s in arg for s in seps) or os.path.isabs(arg)):
         if arg in cfg.entries:
             return arg, None
         die(f"no such entry: {arg}")
 
+    if not os.path.isabs(arg):
+        entry_form = arg
+        for sep in seps:
+            if sep and sep != "/":
+                entry_form = entry_form.replace(sep, "/")
+        name, separator, raw_sub = entry_form.partition("/")
+        if separator and name in cfg.entries:
+            sub = posixpath.normpath(raw_sub)
+            if sub == ".":
+                return name, None
+            if sub == ".." or sub.startswith("../") or sub.startswith("/"):
+                die(f"sub path must stay inside entry {name}: {arg}")
+            return name, sub
+
     local = normalize_local_path(arg)
-    best_name: str | None = None
-    best_path: str = ""
-    best_file: str | None = None
+    matches: list[tuple[int, str, str | None]] = []
     for name, entry_cfg in cfg.entries.items():
         raw_path: str = entry_cfg["path"]
         entry_path = normalize_local_path(raw_path)
-        if local == entry_path:
-            candidate_file: str | None = None
-        elif local.startswith(entry_path + os.sep):
-            # The sub-path doubles as an S3 key fragment and a manifest rel,
-            # both '/'-separated - normalize away a native Windows os.sep.
-            candidate_file = local[len(entry_path) + 1 :]
-            if os.sep != "/":
-                candidate_file = candidate_file.replace(os.sep, "/")
-        else:
+        try:
+            if os.path.commonpath((local, entry_path)) != entry_path:
+                continue
+        except ValueError:  # different Windows drives
             continue
-        if best_name is None or len(entry_path) > len(best_path):
-            best_name = name
-            best_path = entry_path
-            best_file = candidate_file
+        rel = os.path.relpath(local, entry_path)
+        candidate_file = None if rel == os.curdir else rel.replace(os.sep, "/")
+        matches.append((len(entry_path), name, candidate_file))
 
-    if best_name is None:
+    if not matches:
         die(f"no such entry for path: {arg}")
-    return best_name, best_file
+    longest = max(length for length, _name, _sub in matches)
+    best = [(name, sub) for length, name, sub in matches if length == longest]
+    if len(best) > 1:
+        names = ", ".join(sorted(name for name, _sub in best))
+        die(f"path is ambiguous between entries {names}: {arg}")
+    return best[0]
 
 
 def resolve_entry_file(cfg: Config, positional: list[str], cmd: str) -> tuple[str, str | None]:
@@ -274,8 +290,10 @@ def main(argv: list[str] | None = None) -> int:
     subcmd = args[0]
     if subcmd in ("help", "-h", "--help"):
         print_usage(0)
-
-    cfg = load_config()
+    commands = {"push", "pull", "show", "status", "diff", "list", "ls-remote"}
+    if subcmd not in commands:
+        err(f"unknown command: {subcmd}")
+        print_usage()
 
     opt_all = False
     opt_dryrun = False
@@ -320,10 +338,12 @@ def main(argv: list[str] | None = None) -> int:
                 opt_mtime_window = float(val)
             except ValueError:
                 die(f"--mtime-window requires a non-negative number of seconds (got {val!r})")
-            if opt_mtime_window < 0:
+            if not math.isfinite(opt_mtime_window) or opt_mtime_window < 0:
                 die(f"--mtime-window must be >= 0 (got {opt_mtime_window})")
         elif a in ("-o", "--output", "--outpath") or a.startswith(("--output=", "--outpath=")):
             opt_outpath, i = take_value(a, i)
+            if "=" not in a and opt_outpath.startswith("-"):
+                die(f"{a} requires a path value (use --output=<path> for a path starting with '-')")
         elif a == "--color":
             opt_color = "always"
         elif a.startswith("--color="):
@@ -374,16 +394,31 @@ def main(argv: list[str] | None = None) -> int:
         die("--dry-run only applies to push")
 
     if opt_delete and subcmd not in ("push", "pull"):
-        die("--delete only applies to push and pull (pull removes local extras)")
+        die("--delete only applies to pull and sub-path push")
+    if subcmd == "push" and opt_all and opt_delete:
+        die("push --delete only controls sub-path pushes; whole-entry push always mirrors")
 
     if opt_checksum and subcmd not in ("push", "pull"):
         die("--checksum only applies to push and pull")
+    if opt_checksum and opt_meta_only:
+        die("--checksum cannot be combined with --meta-only (no file data is compared)")
+    if opt_checksum and opt_mtime_window is not None:
+        die("--mtime-window cannot be combined with --checksum (content comparison ignores it)")
+    if subcmd == "pull" and opt_delete and opt_meta_only:
+        die("pull --delete cannot be combined with --meta-only")
 
     if opt_mtime_window is not None and subcmd not in ("push", "pull", "status"):
         die("--mtime-window only applies to push, pull, and status")
 
     if opt_outpath is not None and subcmd != "pull":
         die("-o/--output only applies to pull")
+    if opt_outpath == "":
+        die("-o/--output requires a non-empty path")
+
+    # Parsing and option validation deliberately precede config/S3 setup, so a
+    # typo reports the typo even when the user's AWS profile is unavailable.
+    # `list` needs config entries only and therefore does not construct a client.
+    cfg = load_config(create_store=subcmd != "list")
 
     # A CLI --mtime-window overrides both the top-level and per-entry config
     # windows for this run (0 = exact). Affects the size+mtime check shared
@@ -397,6 +432,8 @@ def main(argv: list[str] | None = None) -> int:
             sub_by_entry: dict[str, str | None] = {e: None for e in entries}
         else:
             resolved = resolve_entry_files(cfg, positional, "push")
+            if opts.delete and any(sub is None for _entry, sub in resolved):
+                die("push --delete only controls sub-path pushes; whole-entry push always mirrors")
             seen: set[str] = set()
             for e, _s in resolved:
                 if e in seen:
@@ -433,6 +470,7 @@ def main(argv: list[str] | None = None) -> int:
                 if e in status_sub_by_entry and status_sub_by_entry[e] != s:
                     die(f"conflicting sub paths for entry {e}")
                 status_sub_by_entry[e] = s
+            entries = list(status_sub_by_entry)
 
         def _status_one(cfg_: Config, entry_: str, opts_: Opts) -> int:
             return cmd_status(cfg_, entry_, opts_, sub=status_sub_by_entry.get(entry_))
@@ -460,16 +498,15 @@ def main(argv: list[str] | None = None) -> int:
         entry, sub = _resolve_one_arg(cfg, positional[0])
         return cmd_ls_remote(cfg, opts, entry, sub)
 
-    else:
-        err(f"unknown command: {subcmd}")
-        print_usage()
+    raise AssertionError(f"unhandled command: {subcmd}")
 
 
 def _sdk_errors() -> tuple[type[BaseException], ...]:
-    """The boto3-s3 / botocore error types, imported lazily so `help` / `list`
-    stay SDK-free (the except clause only evaluates this on an error). Returns an
-    empty tuple if the SDK is unimportable, so matching never masks the original
-    error with an ImportError."""
+    """Return boto3-s3 / botocore operational error types lazily.
+
+    An empty tuple when the SDK is unimportable ensures exception matching
+    never masks the original failure with a second ImportError.
+    """
     try:
         from boto3_s3 import Boto3S3Error
         from botocore.exceptions import BotoCoreError, ClientError
@@ -496,6 +533,12 @@ def run() -> int:
         # file vanished mid-run: report cleanly instead of a raw traceback.
         err(str(e))
         return 1
+    except OSError as e:
+        # Permission errors, disk-full failures, and local I/O races are normal
+        # operational failures for a backup tool, not reasons to expose a Python
+        # traceback to the CLI user.
+        err(str(e))
+        return 1
     except manifest.ManifestError as e:
         err(str(e))
         return 1
@@ -503,7 +546,7 @@ def run() -> int:
         err(str(e))
         return 1
     # A run that only warned (skipped files etc.) but hit no hard error exits 2
-    # (aws-style), after the manifest update has completed.
+    # (aws-style). Successful work is retained, but callers must inspect it.
     if rc == 0 and warning_count() > 0:
         return 2
     return rc

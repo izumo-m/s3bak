@@ -20,6 +20,57 @@ def test_push_uploads_objects_and_manifest(ws):
     assert "data-manifest.jsonl" in keys  # the metadata manifest
 
 
+def test_first_push_of_empty_directory_writes_restorable_manifest(ws):
+    (ws.root / "empty").mkdir()
+    ws.config({"empty": {"path": str(ws.root / "empty")}})
+
+    ws.run("push", "empty", expect_rc=0)
+
+    assert ws.keys() == {"empty-manifest.jsonl"}
+    dest = ws.root / "restored-empty"
+    ws.run("pull", "empty", "-o", str(dest), expect_rc=0)
+    assert dest.is_dir()
+
+
+def test_push_records_new_empty_directory_without_data_transfer(ws):
+    ws.write("data/a.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    (ws.root / "data" / "empty").mkdir()
+
+    ws.run("push", "data", expect_rc=0)
+
+    dest = ws.root / "restored"
+    ws.run("pull", "data", "-o", str(dest), expect_rc=0)
+    assert (dest / "empty").is_dir()
+
+
+def test_push_records_changed_symlink_target_without_data_transfer(ws):
+    ws.write("data/a.txt", "a")
+    ws.write("data/b.txt", "b")
+    os.symlink("a.txt", ws.root / "data" / "link")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    (ws.root / "data" / "link").unlink()
+    os.symlink("b.txt", ws.root / "data" / "link")
+
+    ws.run("push", "data", expect_rc=0)
+
+    dest = ws.root / "restored"
+    ws.run("pull", "data", "-o", str(dest), expect_rc=0)
+    assert os.readlink(dest / "link") == "b.txt"
+
+
+def test_checksum_push_writes_missing_manifest_for_existing_single_object(ws):
+    local = ws.write("solo.txt", "same")
+    ws.config({"solo": {"path": str(local)}})
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/solo", Body=b"same")
+
+    ws.run("push", "--checksum", "solo", expect_rc=0)
+
+    assert "solo-manifest.jsonl" in ws.keys()
+
+
 def test_ls_remote_lists_entry(ws):
     ws.write("data/a.txt", "x")
     ws.config({"data": {"path": str(ws.root / "data")}})
@@ -219,3 +270,22 @@ def test_pull_delete_removes_local_extras(ws):
 
     assert (dest / "keep.txt").read_text() == "k"
     assert not (dest / "extra.txt").exists()
+
+
+def test_pull_delete_removes_extra_directory_tree(ws):
+    # Extra directories go too: children before parents (deepest-first), and
+    # an empty extra directory is rmdir'd, not skipped.
+    ws.write("data/keep.txt", "k")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    dest = ws.root / "restore"
+    (dest / "extradir" / "sub").mkdir(parents=True)
+    (dest / "extradir" / "sub" / "f.txt").write_text("x")
+    (dest / "emptydir").mkdir()
+    (dest / "keep.txt").write_text("k")
+
+    ws.run("pull", "data", "-o", str(dest), "--delete", expect_rc=0)
+    assert not (dest / "extradir").exists()
+    assert not (dest / "emptydir").exists()
+    assert (dest / "keep.txt").read_text() == "k"

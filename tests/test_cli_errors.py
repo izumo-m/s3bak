@@ -110,6 +110,12 @@ def test_output_flag_requires_value(cfg_ws):
     assert res.rc == 1
 
 
+def test_output_flag_does_not_consume_the_next_option(cfg_ws):
+    res = cfg_ws.run("pull", "data", "--output", "--delete")
+    assert res.rc == 1
+    assert "requires a path" in res.err.lower()
+
+
 def test_ls_remote_rejects_data_only(cfg_ws):
     res = cfg_ws.run("ls-remote", "--data-only")
     assert res.rc == 1
@@ -135,3 +141,64 @@ def test_mtime_window_flag_rejects_negative(cfg_ws):
 def test_mtime_window_flag_requires_value(cfg_ws):
     res = cfg_ws.run("push", "data", "--mtime-window")
     assert res.rc == 1
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("push", "--checksum", "--meta-only", "data"),
+        ("push", "--checksum", "--mtime-window", "0", "data"),
+        ("pull", "--delete", "--meta-only", "data"),
+        ("push", "--delete", "data"),
+    ],
+)
+def test_ignored_option_combinations_are_rejected(cfg_ws, args):
+    res = cfg_ws.run(*args)
+    assert res.rc == 1
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+def test_mtime_window_flag_rejects_non_finite_values(cfg_ws, value):
+    res = cfg_ws.run("push", "--mtime-window", value, "data")
+    assert res.rc == 1
+    assert "mtime-window" in res.err.lower()
+
+
+def test_unknown_command_is_reported_before_loading_config(monkeypatch, capfd):
+    monkeypatch.setenv("S3BAK_CONFIG", "/definitely/missing/config.py")
+    from s3bak import cli
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["bogus"])
+    assert exc.value.code == 1
+    captured = capfd.readouterr()
+    assert "unknown command" in captured.err.lower()
+    assert "config file not found" not in captured.err.lower()
+
+
+@pytest.mark.parametrize(
+    "bad_name",
+    ["", ".", "..", "nested/name", "windows\\name", "x-manifest.jsonl", "line\nbreak"],
+)
+def test_invalid_entry_names_are_rejected(ws, bad_name):
+    ws.write("data/a.txt", "x")
+    ws.config({bad_name: {"path": str(ws.root / "data")}})
+
+    res = ws.run("list")
+
+    assert res.rc == 1
+    assert "entry name" in res.err.lower() or "no entries" in res.err.lower()
+
+
+@pytest.mark.parametrize("field", ["profile", "prefix"])
+def test_non_string_required_config_values_are_rejected(ws, field):
+    ws.write("data/a.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    body = ws._config.read_text()
+    body = body.replace(f'{field} = "', f"{field} = 123  # ", 1)
+    ws._config.write_text(body)
+
+    res = ws.run("list")
+
+    assert res.rc == 1
+    assert "profile and prefix" in res.err.lower()

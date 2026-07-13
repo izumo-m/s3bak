@@ -20,7 +20,8 @@ import boto3
 import pytest
 from moto import mock_aws
 
-from s3bak import cli
+from s3bak import cli, manifest
+from s3bak.console import err
 
 PROFILE = "s3bak-test"
 BUCKET = "s3bak-test-bucket"
@@ -98,6 +99,11 @@ class Workspace:
             code = cli.main(list(args)) or 0
         except SystemExit as e:
             code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+        except manifest.ManifestError as e:
+            # Mirror cli.run's exception-to-exit-code boundary without installing
+            # process-global signal handlers in every in-process test.
+            err(str(e))
+            code = 1
         captured = self._capfd.readouterr()
         res = Result(rc=code, out=captured.out, err=captured.err)
         if expect_rc is not None:
