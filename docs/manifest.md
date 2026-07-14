@@ -1,10 +1,9 @@
 # Manifest format (v3)
 
-Each entry has one manifest object on S3, `<entry>-manifest.jsonl`, next to its
-data objects. The manifest records every path in the entry's tree with the
-metadata S3 objects do not carry, and is the source of truth for `status`,
-filesystem type / mode / mtime / symlink restore on `pull`, and the default
-sync comparison. Owner and group are recorded for reporting, not applied.
+Each entry has one `<entry>-manifest.jsonl` object that records its filesystem
+tree and metadata. It provides the input for `status`, metadata restoration on
+`pull`, and the default sync comparison. See [storage.md](storage.md) for its
+place alongside directly accessible data objects.
 
 The format lives in `src/s3bak/manifest.py`, which is pure (stdlib only); the
 tree walk that produces the records lives in `src/s3bak/localwalk.py`, on
@@ -148,5 +147,5 @@ very first push performs — with no manifest on S3, every pair transfers and a
 fresh manifest is written.
 
 An old manifest object left behind after a filename change (e.g. a pre-v3
-`<entry>-ls-l.txt`) is removed manually with `aws s3 rm`; s3bak keeps no code
-to clean up formats it no longer writes.
+`<entry>-ls-l.txt`) is removed manually with the aws-cli command `aws s3 rm`;
+s3bak keeps no code to clean up formats it no longer writes.

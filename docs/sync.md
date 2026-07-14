@@ -2,8 +2,8 @@
 
 This document covers how s3bak decides what to transfer, how it moves bytes, and
 how the push and pull commands are assembled. See [manifest.md](manifest.md) for
-the format the compare reads against, and [overview.md](overview.md) for the
-module layout.
+the format the compare reads against, [storage.md](storage.md) for the S3 object
+layout, and [architecture.md](architecture.md) for module boundaries.
 
 ## The compare decision
 
@@ -117,18 +117,16 @@ accordingly; a manifest download (small, size unknown) always takes the direct
 path. Directory syncs (`sync_up` / `sync_down`) always use `S3.cp` — moving many
 files is exactly what its machinery is for.
 
-## Concurrency and the shared client
+## Concurrency
 
 - `--all` runs entries through a thread pool, one thread per entry by default,
   capped at `entry_concurrency`. Each entry's own `cp` / `sync` then spawns
   s3transfer's transfer threads (`max_concurrency`), and `--checksum` its
   compare workers (`compare_workers`).
-- boto3 client **construction** is not thread-safe. For an S3 command, the store
-  therefore builds one `S3` orchestrator and one boto3 client up front, in the
-  single-threaded config-load path, and hands every S3-side location to the
-  library as an `S3Storage` already bound to that client — so no client is ever
-  constructed on a worker thread. A built client is safe to share; only
-  construction races. The local-only `list` command does not build a client.
+
+All workers share the client constructed before the entry pool starts. See
+[architecture.md](architecture.md#s3-client-lifetime) for its lifetime and
+thread-safety boundary.
 
 ## The push pipeline
 

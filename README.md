@@ -109,11 +109,16 @@ The `status` letters are push-oriented (what a push would change on the backup):
 
 ## Design
 
-- [`docs/overview.md`](docs/overview.md) — architecture, module layering, and
-  what s3bak stores on S3.
-- [`docs/manifest.md`](docs/manifest.md) — the v3 JSONL manifest format.
-- [`docs/sync.md`](docs/sync.md) — the compare model, transfer path, and the
+- [`docs/overview.md`](docs/overview.md) — project goals and the design document
+  index.
+- [`docs/storage.md`](docs/storage.md) — the S3 key layout and storage model.
+- [`docs/manifest.md`](docs/manifest.md) — the JSONL manifest format and its
+  streaming invariants.
+- [`docs/sync.md`](docs/sync.md) — comparison, transfer, concurrency, and the
   push / pull pipelines.
+- [`docs/cli.md`](docs/cli.md) — argument resolution, results, and exit codes.
+- [`docs/architecture.md`](docs/architecture.md) — module boundaries,
+  dependency direction, and S3 client lifetime.
 
 ## License
 
