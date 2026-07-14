@@ -32,6 +32,7 @@ import signal
 import subprocess
 import sys
 from collections.abc import Callable
+from importlib.metadata import version
 from typing import NoReturn
 
 from s3bak import manifest
@@ -150,6 +151,7 @@ Options:
                    (WHEN: auto|always|never; default auto).
                    --color alone == --color=always. Honors NO_COLOR env var.
   --no-color       Disable color (same as --color=never)
+  --version        Show the program version and exit
   -h, --help       Show this help
 
 status letters (push-oriented: what would change on the backup):
@@ -290,6 +292,9 @@ def main(argv: list[str] | None = None) -> int:
     subcmd = args[0]
     if subcmd in ("help", "-h", "--help"):
         print_usage(0)
+    if subcmd == "--version":
+        sys.stdout.write(f"s3bak {version('s3bak')}\n")
+        return 0
     commands = {"push", "pull", "show", "status", "diff", "list", "ls-remote"}
     if subcmd not in commands:
         err(f"unknown command: {subcmd}")
