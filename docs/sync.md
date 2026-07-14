@@ -130,6 +130,13 @@ thread-safety boundary.
 
 ## The push pipeline
 
+An entry's `pre_hook` and `post_hook` are non-empty argument lists. s3bak
+executes the listed program directly and passes each remaining item as one
+argument. It never inserts a command shell, so hooks do not perform shell
+parsing, expansion, pipelines, or redirection. Complex hook behaviour belongs
+in a standalone executable or script selected by `config.py` for the current
+environment.
+
 `cmd_push` for a whole entry:
 
 1. Run `pre_hook` (always, before target validation or any backup work), so a

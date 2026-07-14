@@ -13,7 +13,6 @@ pull would change.
 - Python **3.10+**
 - An AWS profile name in `config.py`, with usable credentials for that profile
 - A `diff` executable for the `s3bak diff` command (GNU diff enables color)
-- Bash only when an entry configures `pre_hook` or `post_hook`
 
 s3bak depends on [boto3-s3](https://pypi.org/project/boto3-s3/) (installed
 automatically), which brings in boto3. No separate AWS CLI install is required.
@@ -69,6 +68,11 @@ entries = {
 
 Per-entry keys: `path` (required), `excludes`, `pre_hook`, `post_hook`,
 `mtime_window`.
+
+Hooks are non-empty argument lists whose first item is the executable. s3bak
+runs them directly without a command shell, so shell parsing, expansion,
+pipelines, and redirection are unavailable. Put complex work in a standalone
+executable or script instead.
 
 ## Usage
 

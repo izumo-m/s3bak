@@ -196,8 +196,16 @@ def load_config(*, create_store: bool = True) -> Config:
             die(f"entries[{name!r}].excludes must be a list of strings in {config_path}")
         for hook in ("pre_hook", "post_hook"):
             hook_value = entry_cfg.get(hook)
-            if hook_value is not None and not isinstance(hook_value, str):
-                die(f"entries[{name!r}].{hook} must be a string in {config_path}")
+            if hook_value is not None and (
+                not isinstance(hook_value, list)
+                or not hook_value
+                or not all(isinstance(arg, str) for arg in hook_value)
+                or not hook_value[0]
+            ):
+                die(
+                    f"entries[{name!r}].{hook} must be a non-empty list of strings "
+                    f"with a non-empty executable in {config_path}"
+                )
         # Per-entry mtime_window overrides the top-level one (validated the same way).
         _config_seconds(
             entry_cfg.get("mtime_window"), config_path, label=f"entries[{name!r}].mtime_window"
