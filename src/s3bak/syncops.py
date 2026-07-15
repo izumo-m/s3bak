@@ -18,7 +18,7 @@ from typing import Any
 
 from s3bak import localwalk, manifest
 from s3bak.config import Config, Opts
-from s3bak.console import write_output, write_stderr
+from s3bak.console import note_warning, write_output, write_stderr
 from s3bak.manifest import ManifestEntry
 
 
@@ -58,7 +58,7 @@ def patch_manifest_subtree(
     target_root/sub may be a file, a symlink, or a directory. If it does not
     exist locally, the records under `sub` are simply removed. Old and new
     records are both in sort-key order, so this is a streaming merge
-    (manifest.write_patched), not a read-all + sort.
+    (manifest.write_merged), not a read-all + sort.
     """
     key = manifest.manifest_key(entry)
     if opts.dryrun:
@@ -87,7 +87,9 @@ def patch_manifest_subtree(
             root_record = (".", os.lstat(target_root), None)
             new_entries = itertools.chain([root_record], new_entries)
         with open(new_path, "w", encoding="utf-8") as out:
-            manifest.write_patched(out, old_path if have_old else None, sub, new_entries)
+            manifest.write_merged(
+                out, old_path if have_old else None, sub, new_entries, warn=note_warning
+            )
         write_stderr(f"Updating {cfg.prefix}/{key}\n")
         assert cfg.store is not None
         cfg.store.put_file(key, new_path, verbose=opts.verbose)

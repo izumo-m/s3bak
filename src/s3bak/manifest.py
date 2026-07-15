@@ -35,7 +35,7 @@ import fnmatch
 import json
 import os
 import stat as stat_mod
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from typing import IO, Any, TypeVar
 
@@ -348,33 +348,143 @@ def entry_sort_key(path: str, is_dir: bool) -> str:
     return norm + "/" if is_dir else norm
 
 
-def write_patched(
+class KeptKeys:
+    """Streaming reader of a kept-keys file: the entry-relative keys of the S3
+    objects the user chose NOT to delete, one ``json.dumps(rel)`` per line
+    (JSON-encoded because filenames may contain newlines). The file is written
+    in delete-lane decide order, which the sync guarantees is ascending key
+    order, so a one-line lookahead answers every query - but queries must also
+    arrive in ascending order (they do: old-only records are examined in
+    manifest order)."""
+
+    def __init__(self, path: str) -> None:
+        self._f = open(path, encoding="utf-8")
+        self._head = self._read()
+
+    def _read(self) -> str | None:
+        line = self._f.readline()
+        if not line:
+            return None
+        rel = json.loads(line)
+        if not isinstance(rel, str):
+            raise ManifestError("invalid kept-keys line")
+        return rel
+
+    def consume_file(self, rel: str) -> bool:
+        """True iff ``rel`` was kept. Keys skipped while advancing had no old
+        record (pre-existing orphan objects) and stay unrecorded."""
+        while self._head is not None and self._head < rel:
+            self._head = self._read()
+        if self._head == rel:
+            self._head = self._read()
+            return True
+        return False
+
+    def keeps_dir(self, rel: str) -> bool:
+        """True iff some kept key lives under the directory ``rel``. In sort
+        order a directory's descendant range is contiguous and starts right at
+        ``rel + "/"``, so peeking one key suffices (nothing is consumed)."""
+        prefix = rel + "/"
+        while self._head is not None and self._head < prefix:
+            self._head = self._read()
+        return self._head is not None and self._head.startswith(prefix)
+
+    def close(self) -> None:
+        self._f.close()
+
+
+# The keep policy for old-only records in write_merged's replaced range:
+# False drops them all (mirror), True keeps them all (no deletions were made),
+# a KeptKeys stream keeps the files the user answered "keep" plus the
+# directories above them. Mirrors the shape of S3.sync's bool|filter lanes.
+KeepOld = bool | KeptKeys
+
+
+def write_merged(
     out: IO[str],
     old_manifest: str | None,
-    sub: str,
+    sub: str | None,
     new_entries: Iterable[tuple[str, os.stat_result, str | None]],
+    *,
+    keep_old: KeepOld = False,
+    warn: Callable[[str], None] | None = None,
 ) -> None:
-    """Rewrite a manifest with the records under ``sub`` replaced.
+    """Write a v3 manifest merging a fresh local walk into the old manifest.
 
-    Both inputs are in sort-key order, so this is a streaming merge: old lines
-    outside ``sub`` are copied verbatim (preserving any unknown keys), old
-    lines at/under ``sub`` are dropped, and the freshly walked ``new_entries``
-    are spliced in at their sorted position. ``new_entries`` may be empty (the
-    sub-path was deleted locally). ``old_manifest`` is the path of the previous
-    manifest file, or None when none exists yet."""
+    Old records outside the replaced range (everything when ``sub`` is None,
+    the records at/under ``sub`` otherwise) are copied verbatim (preserving
+    any unknown keys). Inside the range, a walked path always wins over its
+    old record; an old-only record survives per ``keep_old``, except symlink /
+    special / empty-dir records, which have no S3 object and therefore no
+    delete prompt - they survive only under ``keep_old=True``. Everything
+    streams in sort-key order: one pending walk item, one old line, one
+    kept-key lookahead.
+
+    ``warn`` is called once per subtree that the merge leaves unrestorable:
+    records surviving under a path that another record says is not a
+    directory (a local change replaced a directory with a file, or vice
+    versa). Such records stay backed up but ``pull`` cannot materialize both.
+    """
     out.write(_header_line() + "\n")
     new_iter = iter(new_entries)
     pending = next(new_iter, None)
 
-    def flush_new_below(limit: str | None) -> None:
+    # Restorability check: every emitted record passes through emit(), which
+    # tracks the most recent non-directory records whose descendant key range
+    # is still open ("blockers", a stack because siblings like `sub.txt` sort
+    # between a file `sub` and the `sub/...` range).
+    blockers: list[list[Any]] = []  # [rel, warned]
+
+    def emit(rel: str, is_dir: bool, text: str) -> None:
+        key = rel + "/" if is_dir else rel
+        while blockers:
+            top_rel = blockers[-1][0]
+            if rel == top_rel or rel.startswith(top_rel + "/"):
+                if not blockers[-1][1] and warn is not None:
+                    warn(
+                        f"warning: manifest keeps records under non-directory"
+                        f" ./{top_rel}; pull cannot restore them"
+                        f" (push --delete prunes them)"
+                    )
+                    blockers[-1][1] = True
+                break
+            if key > top_rel + "/":
+                blockers.pop()
+                continue
+            break  # a sibling like `{top_rel}.x`: the blocker's range is still ahead
+        if not is_dir and rel != ".":
+            blockers.append([rel, False])
+        out.write(text)
+
+    def pending_key() -> str:
+        assert pending is not None
+        path, st, _sym = pending
+        return entry_sort_key(path, stat_mod.S_ISDIR(st.st_mode))
+
+    def emit_pending() -> None:
         nonlocal pending
+        assert pending is not None
+        path, st, sym_target = pending
+        rel = "." if path == "." else path.removeprefix("./")
+        emit(rel, stat_mod.S_ISDIR(st.st_mode), format_entry(path, st, sym_target) + "\n")
+        pending = next(new_iter, None)
+
+    def flush_new_below(limit: str | None) -> None:
         while pending is not None:
-            path, st, sym_target = pending
-            key = entry_sort_key(path, stat_mod.S_ISDIR(st.st_mode))
-            if limit is not None and key >= limit:
+            if limit is not None and pending_key() >= limit:
                 return
-            out.write(format_entry(path, st, sym_target) + "\n")
-            pending = next(new_iter, None)
+            emit_pending()
+
+    def keeps(rel: str, e: ManifestEntry) -> bool:
+        if keep_old is True:
+            return True
+        if keep_old is False:
+            return False
+        if e.is_dir:
+            return keep_old.keeps_dir(rel)
+        if e.is_file:
+            return keep_old.consume_file(rel)
+        return False  # objectless (symlink/special): never a delete candidate
 
     if old_manifest is not None:
         with open(old_manifest, encoding="utf-8") as f:
@@ -382,12 +492,17 @@ def write_patched(
             for line in f:
                 e = parse_entry(line)
                 if e is None:
-                    raise ManifestError("invalid record in manifest being patched")
+                    raise ManifestError("invalid record in manifest being merged")
                 rel = e.path.removeprefix("./")
-                if rel == sub or rel.startswith(sub + "/"):
-                    continue  # the replaced range
-                flush_new_below(entry_sort_key(e.path, e.is_dir))
-                out.write(line if line.endswith("\n") else line + "\n")
+                key = entry_sort_key(e.path, e.is_dir)
+                flush_new_below(key)
+                if pending is not None and pending_key() == key:
+                    emit_pending()  # both sides: the fresh walk record wins
+                    continue
+                in_range = sub is None or rel == sub or rel.startswith(sub + "/")
+                if in_range and not keeps(rel, e):
+                    continue
+                emit(rel, e.is_dir, line if line.endswith("\n") else line + "\n")
     flush_new_below(None)
 
 
