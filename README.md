@@ -89,10 +89,11 @@ Commands:
   ls-remote [entry|path]   List S3 entries, or files under an entry/sub-path
 ```
 
-Common options: `--all`, `--dry-run` (push/pull), `--delete` (pull and sub-path
-push), `--meta-only`, `--data-only`, `--checksum` (push/pull),
-`--mtime-window <seconds>`, `-o/--output <path>` (single-target pull),
-`-v/--verbose`, `--color[=WHEN]`.
+Common options: `--all`, `--dry-run` (push/pull), `--delete` (confirmed
+deletions: push removes S3 orphans, pull removes local extras — never the
+default), `--yes` (answer yes to every `--delete` confirmation), `--meta-only`,
+`--data-only`, `--checksum` (push/pull), `--mtime-window <seconds>`,
+`-o/--output <path>` (single-target pull), `-v/--verbose`, `--color[=WHEN]`.
 
 Run `s3bak --help` for the full option list and worked examples.
 
@@ -105,12 +106,14 @@ s3bak status bin              # M/A/D summary for one entry
 s3bak pull bin home-docs      # restore selected entries in parallel
 s3bak pull bin -o /tmp/out    # restore the bin entry to /tmp/out
 s3bak pull bin --delete --dry-run  # preview a mirror restore
+s3bak push --all --delete --yes    # unattended mirror (e.g. cron)
 s3bak push bin/subdir         # entry-rooted syntax; independent of CWD
 s3bak ls-remote               # list entries stored on S3
 ```
 
 The `status` letters are push-oriented (what a push would change on the backup):
-`M` modified, `A` only local (push would add), `D` only in backup (push would delete).
+`M` modified, `A` only local (push would add), `D` only in backup
+(`push --delete` would remove; a plain push keeps it).
 
 ## Design
 

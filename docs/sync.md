@@ -11,9 +11,10 @@ Every sync needs an **update-lane** strategy (`S3.sync`'s `update_filter`):
 given a pair present on *both* sides (a local side and its S3 side for one key),
 does it need re-copying? New entries and orphans are separate lanes —
 `create_filter` copies every new local/S3 file (the default), `delete_filter`
-prunes orphans (every push enables it; pull prunes local extras itself, see
-`--delete` below) — so the strategy below only judges the intersection. s3bak
-has two.
+prunes orphans (off by default; `push --delete` turns it into the per-orphan
+confirmation, `--yes` into an unconditional prune; pull prunes local extras
+itself, see `--delete` below) — so the strategy below only judges the
+intersection. s3bak has two.
 
 ### Default: `ManifestFilter` (size+mtime check)
 
@@ -144,19 +145,28 @@ environment.
 1. Run `pre_hook` (always, before target validation or any backup work), so a
    hook may generate the file or tree being backed up.
 2. **Directory entry:** download and validate the manifest, build the compare
-   strategy, and `sync_up` with the delete lane enabled so removed local files
-   are also removed on S3. `--checksum` ignores manifest file stats for its content
-   decision, but the manifest still detects objectless tree changes; only
-   `--checksum --data-only` can skip the download. Excludes are applied by the
-   same entry-rooted matcher the manifest walk uses, so the data sync and the
-   manifest can never disagree on what an exclude means.
+   strategy, and `sync_up`. New and changed local files upload; a locally
+   deleted file keeps its S3 object AND its manifest record — **push never
+   deletes a backup unless `--delete` was given and the deletion confirmed**
+   (see "Deleting backups" below). `--checksum` ignores manifest file stats
+   for its content decision, but the manifest still detects objectless tree
+   changes; only `--checksum --data-only` can skip the download. Excludes are
+   applied by the same entry-rooted matcher the manifest walk uses, so the
+   data sync and the manifest can never disagree on what an exclude means.
    **Single-file entry:** upload iff the size+mtime check fails — the manifest holds
    no matching-basename record, the local stat differs, or the S3 object is
    missing (a HeadObject confirms existence, since a single file has no listing
    to self-heal from). `--checksum` uses the ETag comparison instead.
-3. **Refresh the manifest if data was transferred, its tree structure or a
-   symlink target changed, on `--meta-only`, or when no manifest exists yet.**
-   The structural check makes empty and symlink-only changes restorable even
+3. **Refresh the manifest if data was transferred or deleted, its tree
+   structure or a symlink target changed, on `--meta-only`, or when no
+   manifest exists yet.** The refresh merges the fresh local walk into the
+   old manifest (`write_merged`): a walked path always wins, and old-only
+   records — the backups of locally vanished files — are kept, except those
+   whose object a confirmed `--delete` removed. A record kept under a path
+   that is no longer a directory (the local tree replaced a directory with a
+   same-named file) makes the entry unrestorable as a tree; the merge detects
+   this and warns (exit 2), and a `push --delete` prunes such records. The
+   structural check makes empty and symlink-only changes restorable even
    though they have no data objects. A mode-only change or an mtime drift inside
    the window transfers nothing and does not refresh an existing manifest;
    `status` keeps showing the mode or mtime difference until a `--meta-only`
@@ -169,29 +179,59 @@ environment.
 
 A **sub-path push** (`push entry/sub` or a local path inside an entry) syncs or
 uploads just that sub-tree and patches the manifest sub-tree in place
-(`write_patched`). A symlink sub-path uploads no data — only its manifest record
-is updated. If the entry has no manifest yet, the patch also writes the `.` root
-record so the manifest keeps its directory-entry shape. A sub-path push is a
-whole-entry push scoped to the sub-path, so it mirrors too: S3 objects under
-the sub-path with no local counterpart are deleted, matching the manifest
-patch, which drops the sub-tree's old records unconditionally. If the local
-sub-path no longer exists, the push fails unless `--delete` is present — the
-guard that keeps a typo from silently erasing a backup; with it, s3bak deletes
-the exact data key and keys below `<sub>/` (without touching a similarly
-prefixed sibling) and removes that subtree from the manifest. `--data-only`
-and `--meta-only` continue to limit the operation to the data or manifest side
-respectively.
+(`write_merged` over the replaced range). A symlink sub-path uploads no data —
+only its manifest record is updated. If the entry has no manifest yet, the
+patch also writes the `.` root record so the manifest keeps its directory-entry
+shape. A sub-path push is a whole-entry push scoped to the sub-path: the same
+keep-by-default and `--delete` confirmation rules apply within the range, and
+records outside it are copied verbatim. A file-typed sub-path has no S3
+listing, so `--delete` there cannot offer orphans under a same-named former
+directory: their records fall out of the patch while the objects stay until a
+directory-level `push --delete`.
+
+If the local sub-path no longer exists, the push fails unless `--delete` is
+present — the guard that keeps a typo from silently erasing a backup — and the
+deletion is confirmed as ONE question for the whole subtree. Confirmed, s3bak
+deletes the exact data key and keys below `<sub>/` (without touching a
+similarly prefixed sibling) and removes that subtree from the manifest.
+
+### Deleting backups (`--delete`, `--yes`)
+
+Deleting is opt-in and confirmed:
+
+- **`--delete`** enables the delete lane behind a per-orphan prompt
+  (`y/n/a/d/q`): y deletes this object, n keeps it, a deletes this and every
+  later candidate, d keeps this and every later candidate, q aborts the whole
+  command. Candidates arrive in ascending key order (the sync decides the
+  delete lane serially). An object answered n keeps its manifest record too —
+  the record and the object always travel together — and shows up as `D` in
+  `status` until a later `--delete` removes it. Prompts of parallel `--all`
+  entries are serialized and carry the entry name.
+- **`--yes`** answers yes to every confirmation: the unattended mirror for
+  cron. Without a TTY (stdin/stderr), `--delete` without `--yes` answers no
+  to everything — nothing is deleted and the run still succeeds (rc 0).
+- **`q` (abort)** exits 1 without rewriting the manifest or running
+  `post_hook`. Deletions already confirmed may have run; their records then
+  linger until the next `push --delete`, whose merge drops any old-only file
+  record that no longer has a delete candidate (the object is gone) and was
+  not explicitly kept. The same self-healing covers a push interrupted
+  mid-deletion.
+- **`--meta-only` / `--data-only` cannot combine with `--delete`**: a deletion
+  drops the object and its record atomically, which a one-sided push cannot.
 
 ### Mode flags
 
 - **`--meta-only`** refreshes the manifest (and runs `post_hook`) without
-  transferring data. **Caution:** it asserts "S3 matches local" without making
-  it true — a never-pushed local edit becomes invisible to the later
-  size+mtime check. It is a metadata refresh, never a substitute for a real push.
+  transferring data. The refresh is the same keep merge as an ordinary push,
+  so records of locally vanished files survive it. **Caution:** it asserts
+  "S3 matches local" without making it true — a never-pushed local edit
+  becomes invisible to the later size+mtime check. It is a metadata refresh,
+  never a substitute for a real push.
 - **`--data-only`** transfers data but does not rewrite the manifest or apply
   local metadata.
 - **`--dry-run`** reports what would happen and changes nothing; planned actions
-  print with a `(dry-run)` marker. Applies to pull too (see below).
+  print with a `(dry-run)` marker. With `--delete` it lists every deletion
+  candidate without prompting. Applies to pull too (see below).
 
 ## The pull pipeline
 
@@ -221,7 +261,12 @@ respectively.
 - **`--meta-only`** applies recorded metadata without downloading data.
 - **`--data-only`** downloads data without applying mode / mtime / symlinks.
 - **`--delete`** removes local files not present in the manifest (a mirror
-  restore). Candidates are the local-only lane of the same manifest×walk
+  restore), behind the same per-item confirmation as push: each extra is
+  prompted `y/n/a/d/q` deepest-first (the removal order), `--yes` answers
+  yes to everything, and a non-TTY run without `--yes` answers no (removes
+  nothing, still exits 0). Keeping an item silently keeps its ancestor extra
+  directories too — their `rmdir` could only fail — and is a choice, not a
+  failure. Candidates are the local-only lane of the same manifest×walk
   merge-join `status` runs; only the extras themselves are held in memory, and
   they are removed deepest-first so directories empty out before their `rmdir`.
   A failed removal makes the command fail instead of reporting a successful

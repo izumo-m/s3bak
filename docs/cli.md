@@ -81,3 +81,8 @@ exit codes:
 Status 2 distinguishes retained but incomplete work from both success and a
 hard failure, allowing scripts to require inspection without discarding work
 that did complete.
+
+A `--delete` confirmation answered no — including the automatic no of a
+non-interactive run without `--yes` — is a successful outcome (status 0), not
+a warning: keeping a backup is a valid answer. Answering q aborts the command
+with status 1.

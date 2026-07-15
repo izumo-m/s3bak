@@ -106,12 +106,17 @@ memory bounded by one directory level rather than the whole tree:
   lookahead per side — both-sides pairs are compared (M), manifest-only
   records report D, local-only paths report A / become delete candidates — so
   a manifest far larger than RAM still diffs in one pass.
-- **The sub-tree patch** (`write_patched`, used by a sub-path push) is a
-  streaming merge of two already-sorted inputs — the old manifest and the newly
-  walked sub-tree — instead of a read-all-then-sort. It copies old records
-  outside the patched sub-path verbatim (preserving any unknown keys), drops
-  old records at/under it, and splices the fresh records in at their sorted
-  position.
+- **The manifest rewrite** (`write_merged`, used by every push) is a streaming
+  merge of already-sorted inputs — the old manifest, the newly walked tree (or
+  sub-tree: records outside the replaced range are copied verbatim, preserving
+  any unknown keys), and optionally the kept-keys stream — instead of a
+  read-all-then-sort. A walked path always wins over its old record. Old-only
+  records in the range follow the keep policy: all kept (the default push —
+  deleting is opt-in), all dropped (`--delete --yes`, the mirror), or decided
+  by the kept-keys stream (`KeptKeys`) that the `--delete` confirmation wrote —
+  one JSON-encoded key per line, in ascending key order because the sync's
+  delete lane decides serially in that order, so one line of lookahead keeps a
+  kept file's record and its ancestor directory records with constant memory.
 - **The default update strategy** (`ManifestFilter`) reads the manifest once,
   front to back, merge-joining its records against `S3.sync`'s ascending
   compare-key pairs (`iter_compare_records` keys a directory as `name/` to match
