@@ -91,6 +91,26 @@ def test_push_data_only_warns_about_unrecorded_uploads(ws):
     assert "./new.txt" not in _manifest_paths(ws)
 
 
+def test_push_data_only_warns_again_for_an_object_it_left_unrecorded(ws):
+    # The creating run counts the upload on the create lane; the object then
+    # exists on S3, so the next --data-only run meets it as an update pair -
+    # ManifestFilter re-uploads the manifest-unknown key and the warning must
+    # repeat, not go silent after the first run (the cron case). A push
+    # without --data-only then records it and ends the warnings.
+    ws.write("data/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.write("data/new.txt", "n")
+
+    for _ in range(2):
+        res = ws.run("push", "--data-only", "data", expect_rc=0)
+        assert "1 object(s) the manifest does not record" in res.err
+
+    res = ws.run("push", "data", expect_rc=0)
+    assert "does not record" not in res.err
+    assert "./new.txt" in _manifest_paths(ws)
+
+
 def test_push_data_only_of_recorded_files_does_not_warn(ws):
     ws.write("data/a.txt", "a")
     ws.config({"data": {"path": str(ws.root / "data")}})

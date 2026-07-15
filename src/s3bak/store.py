@@ -559,9 +559,10 @@ class Boto3S3Store:
             return self._transfer(
                 verbose,
                 f"sync {src_dir} {dst}",
-                # New local files take the default create lane, both-sides
-                # pairs the update_filter (the ManifestFilter, or the
-                # EtagComparison pool), orphans the delete lane above.
+                # New local files take the caller's create lane (default:
+                # copy them all), both-sides pairs the update_filter (the
+                # ManifestFilter, or the EtagComparison pool), orphans the
+                # delete lane above.
                 lambda cb: self._s3.sync(
                     src,
                     dst,

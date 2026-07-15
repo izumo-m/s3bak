@@ -145,6 +145,10 @@ against either side of a sync without materializing it.
   record aborts with `ManifestError` before manifest-driven mutation starts.
   Treating a damaged record as absent would be unsafe: `pull --delete` could
   otherwise classify the corresponding local path as an extra and remove it.
+  A directory push reads the manifest at some stage in every mode, so a
+  damaged one blocks pushes too; to recover, remove the manifest object with
+  `aws s3 rm` and push the entry again — with no manifest on S3 the push
+  transfers every pair and writes a fresh one, like a first push.
 - Unknown record keys remain accepted and are preserved by sub-tree patches,
   so additive metadata does not require a version bump.
 

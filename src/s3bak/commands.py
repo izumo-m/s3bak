@@ -179,13 +179,15 @@ def _plan_data_only_creates(
     plan: _PushDeletePlan, sub: str | None, opts: Opts
 ) -> tuple[Any, list[int]]:
     """Create-lane hook for --data-only: count uploads of files the manifest
-    does not record - the unrecorded objects this push leaves behind (see
-    storage.md). The count feeds _warn_unrecorded_creates after the sync.
-    Everything still copies (the hook always returns True). Outside
-    --data-only the lane is the plain default; a dry run transfers nothing,
-    so it has nothing to count. The manifest lookup reuses plan.recorded():
-    --delete cannot combine with --data-only, so the delete lane never
-    queries the same stream."""
+    does not record - the unrecorded objects this push creates (see
+    storage.md). The count feeds _warn_unrecorded_uploads after the sync.
+    Everything still copies (the hook always returns True), and the tally is
+    taken at decision time: a file that vanishes before its transfer
+    completes still counts (the sync reports that as its own warning).
+    Outside --data-only the lane is the plain default; a dry run transfers
+    nothing, so it has nothing to count. The manifest lookup reuses
+    plan.recorded(): --delete cannot combine with --data-only, so the delete
+    lane never queries the same stream."""
     count = [0]
     if not opts.data_only or opts.dryrun:
         return True, count
@@ -199,10 +201,18 @@ def _plan_data_only_creates(
     return note, count
 
 
-def _warn_unrecorded_creates(entry: str, count: list[int]) -> None:
-    if count[0]:
+def _warn_unrecorded_uploads(entry: str, opts: Opts, count: list[int], compare: Any) -> None:
+    """Emit the --data-only unrecorded-upload warning after a successful sync.
+    `count` is the create-lane tally (the run that creates the object); a
+    later --data-only push meets the same object as an update pair instead,
+    which ManifestFilter re-uploads and counts, so the warning repeats on
+    every push while the object stays unrecorded."""
+    total = count[0]
+    if opts.data_only and not opts.dryrun and isinstance(compare, manifest.ManifestFilter):
+        total += compare.unknown_uploads
+    if total:
         note_warning(
-            f"warning: {entry}: --data-only uploaded {count[0]} object(s) the manifest"
+            f"warning: {entry}: --data-only uploaded {total} object(s) the manifest"
             f" does not record; run a push without --data-only to record them"
         )
 
@@ -310,7 +320,7 @@ def _push_sub(
             if result.stdout:
                 write_output(f"{result.stdout}\n")
                 did_work = True
-            _warn_unrecorded_creates(entry, unrecorded)
+            _warn_unrecorded_uploads(entry, opts, unrecorded, compare)
             patch_keep = plan.keep_old()
         elif stat_mod.S_ISREG(st.st_mode):
             # Regular file: an explicit sub-path push always uploads.
@@ -530,11 +540,11 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             compare = None
             structure_changed = False
             try:
-                # A checksum compare does not use manifest file stats, but every
-                # dir push still downloads the manifest: an ordinary push
-                # compares against it, any push uses it to notice objectless
-                # tree changes, and --data-only reads it to warn about the
-                # uploads it leaves unrecorded.
+                # A checksum compare does not use manifest file stats, but a
+                # whole-entry dir push always downloads the manifest: an
+                # ordinary push compares against it, any push uses it to notice
+                # objectless tree changes, and --data-only reads it to warn
+                # about the uploads it leaves unrecorded.
                 have_manifest = download_manifest(cfg, entry, manifest_path, opts.verbose)
                 if have_manifest:
                     plan.old_manifest = manifest_path
@@ -570,7 +580,7 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 if result.stderr:
                     write_stderr(result.stderr)
                 return result.returncode
-            _warn_unrecorded_creates(entry, unrecorded)
+            _warn_unrecorded_uploads(entry, opts, unrecorded, compare)
             results = result.stdout
             refresh_manifest = bool(results)
             if not refresh_manifest and not opts.data_only:

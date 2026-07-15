@@ -69,7 +69,7 @@ uploaded it), is invisible the same way: `pull --delete` sees a file the
 manifest does not record — a local extra — and offers to remove it. Those two
 confirmations, `pull --delete`'s and a later `push --delete`'s, are all that
 stand between such a file and total loss, which is why both prompt per item
-and why a `--data-only` push warns as it creates one.
+and why a `--data-only` push warns whenever it uploads one.
 `push --delete` offers its deletion like any other orphan,
 flagging the prompt with `(not in manifest)`; answering n keeps the object
 for this run only. A manifest record is a stat snapshot of a local file, and

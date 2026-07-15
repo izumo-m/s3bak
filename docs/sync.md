@@ -149,7 +149,7 @@ environment.
    deleted file keeps its S3 object AND its manifest record — **push never
    deletes a backup unless `--delete` was given and the deletion confirmed**
    (see "Deleting backups" below). `--checksum` ignores manifest file stats
-   for its content decision, but every directory push still downloads the
+   for its content decision, but a whole-entry push still downloads the
    manifest: it detects objectless tree changes, and `--data-only` reads it
    to warn about the uploads it leaves unrecorded. Excludes are
    applied by the same entry-rooted matcher the manifest walk uses, so the
@@ -253,9 +253,12 @@ Deleting is opt-in and confirmed:
   never a substitute for a real push.
 - **`--data-only`** transfers data but does not rewrite the manifest or apply
   local metadata. Uploading a file the manifest does not record therefore
-  leaves an [unrecorded object](storage.md#unrecorded-objects) behind — a
-  directory sync counts those uploads and warns (exit 2); a later push
-  without `--data-only` records them.
+  leaves an [unrecorded object](storage.md#unrecorded-objects) behind. A
+  directory sync counts those uploads and warns (exit 2) — and since the
+  default compare re-uploads a manifest-unknown key every run, the warning
+  repeats on each later `--data-only` push until a push without
+  `--data-only` records the file. A single-file entry or a file sub-path
+  push uploads without this warning.
 - **`--dry-run`** reports what would happen and changes nothing; planned actions
   print with a `(dry-run)` marker. With `--delete` it lists every deletion
   candidate without prompting. Applies to pull too (see below).

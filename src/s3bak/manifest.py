@@ -660,6 +660,11 @@ class ManifestFilter:
         self._records = iter(records)
         self.window_ns = window_ns
         self._head: tuple[str, ManifestEntry] | None = next(self._records, None)
+        # Upload pairs copied because the manifest holds no owning file record:
+        # the re-upload face of an unrecorded object (a create-lane upload is
+        # its birth). Read by push --data-only's warning, so the warning
+        # repeats on every push while the object stays unrecorded.
+        self.unknown_uploads = 0
 
     def close(self) -> None:
         """Release the manifest file handle the record stream holds open. The
@@ -702,7 +707,10 @@ class ManifestFilter:
             # dir/symlink at this key: a push re-uploads it (local is the source
             # of truth); a pull re-downloads an unknown key but leaves a recorded
             # non-file to apply_manifest, which recreates it with no data object.
-            return m is None if direction == "download" else True
+            if direction == "download":
+                return m is None
+            self.unknown_uploads += 1
+            return True
         if remote.size != m.size:
             return True  # the remote drifted from the record; size is free evidence
         try:
