@@ -119,10 +119,11 @@ files is exactly what its machinery is for.
 
 ## Concurrency
 
-- `--all` runs entries through a thread pool, one thread per entry by default,
-  capped at `entry_concurrency`. Each entry's own `cp` / `sync` then spawns
-  s3transfer's transfer threads (`max_concurrency`), and `--checksum` its
-  compare workers (`compare_workers`).
+- Multi-entry commands run entries through a thread pool, one thread per entry
+  by default, capped at `entry_concurrency`. This includes explicit target
+  lists and `--all`. For push and pull, each entry's own `cp` / `sync` then
+  spawns s3transfer's transfer threads (`max_concurrency`), and `--checksum`
+  its compare workers (`compare_workers`).
 
 All workers share the client constructed before the entry pool starts. See
 [architecture.md](architecture.md#s3-client-lifetime) for its lifetime and
@@ -221,5 +222,5 @@ limit the operation to the data or manifest side respectively.
   they are removed deepest-first so directories empty out before their `rmdir`.
   A failed removal makes the command fail instead of reporting a successful
   mirror while an extra remains.
-- **`-o/--output`** restores to an alternative path instead of the entry's
-  configured path.
+- **`-o/--output`** restores one target to an alternative path instead of the
+  entry's configured path. It is not available for multi-target pulls.

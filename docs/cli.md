@@ -22,6 +22,26 @@ A positional `<entry|path>` argument is resolved by shape:
 The rules are shared by commands that accept entries or paths, so the same
 argument denotes the same stored object or subtree across commands.
 
+## Multiple pull targets
+
+`pull <entry|path>...` resolves every argument before starting any restore and
+runs distinct entries through the shared entry worker pool. Multiple arguments
+that resolve to the same entry are rejected, even when they select different
+subpaths, because parallel restores must not mutate the same entry tree.
+
+The resolved restore destinations for a multi-target pull must be disjoint.
+Equal destinations and ancestor/descendant pairs are rejected before S3 work;
+the same check applies to `pull --all`. Existing symlinks in each destination's
+parent chain are resolved for this comparison, while the final component is not
+followed because pull may replace it. Case-only and Unicode-normalization-only
+variants are conservatively treated as the same path on every platform; on a
+case-sensitive filesystem, restore such entries separately. This prevents one
+restore, especially a `--delete` restore, from writing or removing another
+restore's files.
+
+`-o/--output` names the exact destination for one target and is therefore
+rejected with multiple explicit targets as well as with `--all`.
+
 ## Explicit input handling
 
 Unknown options, invalid combinations, and options that do not apply to the

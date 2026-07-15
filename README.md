@@ -81,7 +81,7 @@ Usage: s3bak <command> [options] [args]
 
 Commands:
   push <entry|path>...     Back up entries or sub-paths to S3
-  pull <entry|path>        Restore an entry or sub-path (use --all for every entry)
+  pull <entry|path>...     Restore entries or sub-paths (use --all for every entry)
   show <entry|path>        Print a single file from the backup to stdout
   status <entry|path>...   Compare local vs backup (metadata only)
   diff <entry|path>        Show content diff between backup and local
@@ -91,8 +91,8 @@ Commands:
 
 Common options: `--all`, `--dry-run` (push), `--delete` (pull and sub-path
 push), `--meta-only`, `--data-only`, `--checksum` (push/pull),
-`--mtime-window <seconds>`, `-o/--output <path>` (pull), `-v/--verbose`,
-`--color[=WHEN]`.
+`--mtime-window <seconds>`, `-o/--output <path>` (single-target pull),
+`-v/--verbose`, `--color[=WHEN]`.
 
 Run `s3bak --help` for the full option list and worked examples.
 
@@ -102,6 +102,7 @@ Run `s3bak --help` for the full option list and worked examples.
 s3bak push --all              # back up every configured entry
 s3bak push --all --dry-run    # preview without uploading
 s3bak status bin              # M/A/D summary for one entry
+s3bak pull bin home-docs      # restore selected entries in parallel
 s3bak pull bin -o /tmp/out    # restore the bin entry to /tmp/out
 s3bak push bin/subdir         # entry-rooted syntax; independent of CWD
 s3bak ls-remote               # list entries stored on S3

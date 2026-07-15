@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 
 from s3bak.cli import _resolve_use_color
 
@@ -123,6 +124,53 @@ def test_pull_all_restores_every_entry(ws):
 
     assert (ws.root / "d1" / "a.txt").read_text() == "a"
     assert (ws.root / "d2" / "b.txt").read_text() == "b"
+
+
+def test_pull_restores_multiple_explicit_entries(ws):
+    ws.write("d1/a.txt", "a")
+    ws.write("d2/b.txt", "b")
+    ws.config({"d1": {"path": str(ws.root / "d1")}, "d2": {"path": str(ws.root / "d2")}})
+    ws.run("push", "--all", expect_rc=0)
+
+    (ws.root / "d1" / "a.txt").unlink()
+    (ws.root / "d2" / "b.txt").unlink()
+    ws.run("pull", "d1", "d2", expect_rc=0)
+
+    assert (ws.root / "d1" / "a.txt").read_text() == "a"
+    assert (ws.root / "d2" / "b.txt").read_text() == "b"
+
+
+def test_pull_restores_multiple_explicit_subpaths(ws):
+    ws.write("d1/a.txt", "a")
+    ws.write("d2/b.txt", "b")
+    ws.config({"d1": {"path": str(ws.root / "d1")}, "d2": {"path": str(ws.root / "d2")}})
+    ws.run("push", "--all", expect_rc=0)
+
+    (ws.root / "d1" / "a.txt").unlink()
+    (ws.root / "d2" / "b.txt").unlink()
+    ws.run("pull", "d1/a.txt", "d2/b.txt", expect_rc=0)
+
+    assert (ws.root / "d1" / "a.txt").read_text() == "a"
+    assert (ws.root / "d2" / "b.txt").read_text() == "b"
+
+
+def test_pull_allows_disjoint_destinations_from_trailing_slash(ws):
+    restore_root = ws.root / "restore"
+    ws.write("restore/source-a.txt", "a")
+    ws.write("restore/b/source-b.txt", "b")
+    ws.config(
+        {
+            "a": {"path": f"{restore_root}/"},
+            "b": {"path": str(restore_root / "b")},
+        }
+    )
+    ws.run("push", "--all", expect_rc=0)
+    shutil.rmtree(restore_root)
+
+    ws.run("pull", "a", "b", expect_rc=0)
+
+    assert (restore_root / "a" / "source-a.txt").read_text() == "a"
+    assert (restore_root / "b" / "source-b.txt").read_text() == "b"
 
 
 def test_pull_meta_only_restores_mode_without_download(ws):

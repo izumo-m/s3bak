@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import shutil
 import stat as stat_mod
+import unicodedata
 
 from s3bak import manifest
 from s3bak.console import err, write_output
@@ -20,6 +21,40 @@ from s3bak.manifest import ManifestEntry
 # =============================================================================
 # Manifest target resolution (restore paths)
 # =============================================================================
+
+
+def resolve_pull_destination(
+    entry: str,
+    configured_path: str | None,
+    sub: str | None,
+    output: str | None,
+) -> str | None:
+    """Resolve one pull selector to the filesystem path it will restore."""
+    if output is not None:
+        outpath = output
+    elif configured_path is not None:
+        outpath = os.path.join(configured_path, sub) if sub else configured_path
+    else:
+        return None
+
+    if outpath.endswith("/"):
+        tail = sub if sub else entry
+        outpath = os.path.join(outpath, tail)
+    return outpath
+
+
+def canonical_restore_path(path: str) -> str:
+    """Canonicalize a restore path without following its final component."""
+    absolute = os.path.abspath(path)
+    parent_real = os.path.realpath(os.path.dirname(absolute) or ".")
+    resolved = os.path.normpath(os.path.join(parent_real, os.path.basename(absolute)))
+    return os.path.normcase(resolved)
+
+
+def canonical_restore_comparison_path(path: str) -> str:
+    """Conservative identity used to reject possibly overlapping restores."""
+    canonical = canonical_restore_path(path)
+    return unicodedata.normalize("NFD", canonical).casefold()
 
 
 def resolve_manifest_rel(rel_field: str, sub: str | None) -> str | None:
@@ -57,8 +92,7 @@ def within_root(root_real: str, target: str) -> bool:
     restore root). Resolves symlinks in the parent chain, so a write *through*
     a symlinked ancestor is caught, while the final component may still be
     absent (about to be created) or a symlink we intend to replace."""
-    parent_real = os.path.realpath(os.path.dirname(target) or ".")
-    resolved = os.path.normpath(os.path.join(parent_real, os.path.basename(target)))
+    resolved = canonical_restore_path(target)
     try:
         return os.path.commonpath((root_real, resolved)) == root_real
     except ValueError:  # different Windows drives
@@ -146,8 +180,7 @@ def apply_manifest(outpath: str, is_dir: bool, manifest_path: str, sub: str | No
     # component may itself be a hostile symlink that a directory/symlink record
     # is about to replace; following it would both bless the outside target and
     # make later children look spuriously outside the newly created root.
-    root_parent_real = os.path.realpath(os.path.dirname(outpath) or ".")
-    root_real = os.path.normpath(os.path.join(root_parent_real, os.path.basename(outpath)))
+    root_real = canonical_restore_path(outpath)
 
     for m_entry in manifest.iter_manifest(manifest_path):
         res = manifest_target(m_entry, outpath, is_dir, sub)

@@ -33,8 +33,8 @@ class Config:
     bucket: str
     path_prefix: str
     entries: dict[str, dict[str, Any]]
-    # Max entries processed at once under --all (None = one thread per entry,
-    # i.e. all at once). Consumed by run_entries, not the store.
+    # Max entries processed at once by a multi-entry command (None = one thread
+    # per entry, i.e. all at once). Consumed by run_entries, not the store.
     entry_concurrency: int | None = None
     # Top-level mtime tolerance for the size+mtime check, in seconds (0 = exact st_mtime_ns
     # match). An entry may override it with a per-entry `mtime_window`, and the
@@ -172,7 +172,7 @@ def load_config(*, create_store: bool = True) -> Config:
     # Optional knobs (see config.example.py):
     #   max_concurrency   - parallel S3 transfer threads for cp / sync
     #   compare_workers   - parallel ETag comparisons under --checksum
-    #   entry_concurrency - entries processed at once under --all
+    #   entry_concurrency - entries processed at once by multi-entry commands
     #   mtime_window      - mtime tolerance for the size+mtime check, seconds (0 = exact),
     #                       top-level default; overridable per entry
     max_concurrency = _config_int(ns, "max_concurrency", config_path, minimum=1)

@@ -41,6 +41,7 @@ from s3bak.restore import (
     manifest_target,
     remove_extras,
     resolve_manifest_rel,
+    resolve_pull_destination,
     windows_collect_writable_prep,
     windows_restore_modes,
 )
@@ -463,19 +464,13 @@ def _manifest_matches_local(
 
 
 def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int:
-    outpath: str | None = opts.outpath
     entry_cfg = cfg.entries.get(entry)
+    configured_path: str | None = entry_cfg["path"] if entry_cfg else None
+    outpath = resolve_pull_destination(entry, configured_path, sub, opts.outpath)
     if outpath is None:
-        if not entry_cfg:
-            err(f"no such entry in config: {entry}")
-            err("use -o <path> to specify the output path")
-            return 1
-        base_path: str = entry_cfg["path"]
-        outpath = os.path.join(base_path, sub) if sub else base_path
-
-    if outpath.endswith("/"):
-        tail = sub if sub else entry
-        outpath = os.path.join(outpath, tail)
+        err(f"no such entry in config: {entry}")
+        err("use -o <path> to specify the output path")
+        return 1
 
     fd, manifest_path = tempfile.mkstemp(suffix=".jsonl")
     os.close(fd)

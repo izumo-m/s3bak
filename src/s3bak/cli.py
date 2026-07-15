@@ -6,7 +6,7 @@ Backs up and restores configured directories or files to/from S3.
 Config: ~/.config/s3bak/config.py (override: $S3BAK_CONFIG)
 
 This module is the entry point: it parses argv, resolves entry/path arguments,
-runs entries (optionally in parallel under --all), and dispatches to the
+runs selected entries (optionally in parallel), and dispatches to the
 ``cmd_*`` functions in ``commands``. The console-script ``s3bak`` calls ``run``.
 The implementation is split across sibling modules:
 
@@ -31,7 +31,7 @@ import shlex
 import signal
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from importlib.metadata import version
 from typing import NoReturn
 
@@ -55,6 +55,7 @@ from s3bak.console import (
     reset_warnings,
     warning_count,
 )
+from s3bak.restore import canonical_restore_comparison_path, resolve_pull_destination
 from s3bak.store import Boto3S3Store
 from s3bak.syncops import download_from_s3
 
@@ -113,6 +114,32 @@ def run_entries(
     return next((status for status in statuses if status), 0)
 
 
+def _validate_distinct_entries(resolved: Sequence[tuple[str, str | None]], command: str) -> None:
+    seen: set[str] = set()
+    for entry, _sub in resolved:
+        if entry in seen:
+            die(
+                f"duplicate entry in {command}: {entry} "
+                f"(parallel {command} of the same entry is not supported)"
+            )
+        seen.add(entry)
+
+
+def _run_resolved_entries(
+    fn: Callable[[Config, str, Opts, str | None], int],
+    cfg: Config,
+    resolved: Sequence[tuple[str, str | None]],
+    opts: Opts,
+) -> int:
+    entries = [entry for entry, _sub in resolved]
+    sub_by_entry = {entry: sub for entry, sub in resolved}
+
+    def _run_one(cfg_: Config, entry_: str, opts_: Opts) -> int:
+        return fn(cfg_, entry_, opts_, sub_by_entry.get(entry_))
+
+    return run_entries(_run_one, cfg, entries, opts)
+
+
 # =============================================================================
 # Usage
 # =============================================================================
@@ -125,7 +152,7 @@ Usage: s3bak <command> [options] [args]
 
 Commands:
   push <entry|path>...         Back up entries or sub-paths to S3
-  pull <entry|path>            Restore an entry or sub-path (use --all for every entry)
+  pull <entry|path>...         Restore entries or sub-paths (use --all for every entry)
   show <entry|path>            Print a single file from the backup to stdout
   status <entry|path>...       Compare local vs backup (metadata only)
   diff <entry|path>            Show content diff between backup and local
@@ -144,7 +171,8 @@ Options:
                    check; reads every candidate file (push/pull)
   --mtime-window <seconds>  Override config's size+mtime-check tolerance for
                    this run (fractional ok, 0 = exact); affects push/pull/status
-  -o, --output <path>  Restore destination for pull (default: entry's configured path)
+  -o, --output <path>  Restore destination for a single pull target
+                       (default: the entry's configured path)
   -v, --verbose    Verbose output (details per field in status)
   --color[=WHEN]   Colorize status (verbose) and diff output
                    (WHEN: auto|always|never; default auto).
@@ -172,8 +200,9 @@ Examples:
   s3bak push ~/bin/s3bak               # same, via ~ expansion
   s3bak push bin/subdir                # only the sub-directory
 
-  # pull: restore from the backup (single entry/path; use --all for every entry)
+  # pull: restore one or more entries/sub-paths (use --all for every entry)
   s3bak pull bin                       # restore to the configured path
+  s3bak pull bin home-docs             # restore selected entries in parallel
   s3bak pull bin -o /tmp/restore       # restore to an alternative path
   s3bak pull bin --delete              # also remove local files not in backup
   s3bak pull --all                     # restore every entry in parallel
@@ -276,6 +305,29 @@ def resolve_entry_files(
     if not positional:
         die(f"{cmd} requires at least one entry or path")
     return [_resolve_one_arg(cfg, arg) for arg in positional]
+
+
+def _validate_pull_destinations(cfg: Config, resolved: Sequence[tuple[str, str | None]]) -> None:
+    destinations: list[tuple[str, str, str]] = []
+    for entry, sub in resolved:
+        base_path: str = cfg.entries[entry]["path"]
+        target = resolve_pull_destination(entry, base_path, sub, None)
+        assert target is not None
+        destinations.append(
+            (entry, os.path.abspath(target), canonical_restore_comparison_path(target))
+        )
+
+    for index, (left_entry, left_path, left_cmp) in enumerate(destinations):
+        for right_entry, right_path, right_cmp in destinations[index + 1 :]:
+            try:
+                common = os.path.commonpath((left_cmp, right_cmp))
+            except ValueError:  # different Windows drives
+                continue
+            if common in (left_cmp, right_cmp):
+                die(
+                    "pull restore destinations overlap: "
+                    f"{left_entry} ({left_path}) and {right_entry} ({right_path})"
+                )
 
 
 # =============================================================================
@@ -418,6 +470,11 @@ def main(argv: list[str] | None = None) -> int:
         die("-o/--output only applies to pull")
     if opt_outpath == "":
         die("-o/--output requires a non-empty path")
+    if subcmd == "pull" and opt_outpath is not None:
+        if opt_all:
+            die("--all cannot be combined with -o/--output")
+        if len(positional) > 1:
+            die("-o/--output cannot be combined with multiple pull targets")
 
     # Parsing and option validation deliberately precede config/S3 setup, so a
     # typo reports the typo even when the user's AWS profile is unavailable.
@@ -432,35 +489,22 @@ def main(argv: list[str] | None = None) -> int:
 
     if subcmd == "push":
         if opt_all:
-            entries = sorted(cfg.entries.keys())
-            sub_by_entry: dict[str, str | None] = {e: None for e in entries}
+            resolved = [(entry, None) for entry in sorted(cfg.entries.keys())]
         else:
             resolved = resolve_entry_files(cfg, positional, "push")
             if opts.delete and any(sub is None for _entry, sub in resolved):
                 die("push --delete only controls sub-path pushes; whole-entry push always mirrors")
-            seen: set[str] = set()
-            for e, _s in resolved:
-                if e in seen:
-                    die(
-                        f"duplicate entry in push: {e} "
-                        f"(parallel push of the same entry is not supported)"
-                    )
-                seen.add(e)
-            entries = [e for e, _ in resolved]
-            sub_by_entry = {e: s for e, s in resolved}
-
-        def _push_one(cfg_: Config, entry_: str, opts_: Opts) -> int:
-            return cmd_push(cfg_, entry_, opts_, sub=sub_by_entry.get(entry_))
-
-        return run_entries(_push_one, cfg, entries, opts)
+        _validate_distinct_entries(resolved, "push")
+        return _run_resolved_entries(cmd_push, cfg, resolved, opts)
 
     elif subcmd == "pull":
         if opt_all:
-            if opts.outpath:
-                die("--all cannot be combined with -o/--output")
-            return run_entries(cmd_pull, cfg, sorted(cfg.entries.keys()), opts)
-        entry, sub = resolve_entry_file(cfg, positional, "pull")
-        return cmd_pull(cfg, entry, opts, sub=sub)
+            resolved = [(entry, None) for entry in sorted(cfg.entries.keys())]
+        else:
+            resolved = resolve_entry_files(cfg, positional, "pull")
+        _validate_distinct_entries(resolved, "pull")
+        _validate_pull_destinations(cfg, resolved)
+        return _run_resolved_entries(cmd_pull, cfg, resolved, opts)
 
     elif subcmd == "status":
         if opt_all:

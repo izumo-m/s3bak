@@ -28,10 +28,10 @@ prefix = "s3://my-bucket/backup"
 #                      lower it to cap CPU/IO. Defaults to max_concurrency,
 #                      else 10. The default (non-checksum) compare is
 #                      stat-only and needs no workers.
-#   entry_concurrency  how many entries run at once under --all (default: all
-#                      of them, one thread each). Each entry also opens its own
-#                      transfer pool, so cap this when you have many entries
-#                      to bound the total thread count.
+#   entry_concurrency  how many entries run at once in a multi-entry command
+#                      (default: all of them, one thread each). Each entry also
+#                      opens its own transfer pool, so cap this when you have
+#                      many entries to bound the total thread count.
 #   mtime_window       size+mtime-check tolerance in seconds (fractional ok,
 #                      default 0.01 = 10ms, 0 = exact st_mtime_ns match). The
 #                      default absorbs the rounding of NTFS (100ns) and exFAT
