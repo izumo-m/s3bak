@@ -59,10 +59,10 @@ def test_status_rejects_delete(cfg_ws):
     assert "delete" in res.err.lower()
 
 
-def test_pull_rejects_dry_run(cfg_ws):
-    # --dry-run is push-only; silently ignoring it would perform a REAL
-    # restore the user believed was a preview.
-    res = cfg_ws.run("pull", "--dry-run", "data")
+def test_status_rejects_dry_run(cfg_ws):
+    # --dry-run applies to push and pull only; silently ignoring it elsewhere
+    # would blur the "reject, don't ignore" contract for preview-like flags.
+    res = cfg_ws.run("status", "--dry-run", "data")
     assert res.rc == 1
     assert "--dry-run" in res.err
 

@@ -84,6 +84,70 @@ def test_push_dryrun_uploads_nothing(ws):
     assert "a.txt" in res.out  # the planned upload is reported
 
 
+def test_pull_dryrun_changes_nothing(ws):
+    ws.write("data/a.txt", "one")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "a.txt").write_text("drifted")
+    res = ws.run("pull", "--dry-run", "data", expect_rc=0)
+
+    assert (ws.root / "data" / "a.txt").read_text() == "drifted"  # not overwritten
+    assert "(dry-run) download:" in res.out
+    assert "would apply manifest metadata" in res.out
+
+
+def test_pull_dryrun_clean_tree_prints_nothing(ws):
+    ws.write("data/a.txt", "one")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    res = ws.run("pull", "--dry-run", "data", expect_rc=0)
+    assert res.out == ""
+
+
+def test_pull_delete_dryrun_keeps_extras(ws):
+    ws.write("data/a.txt", "one")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    extra = ws.write("data/extra.txt", "keep me")
+    res = ws.run("pull", "--delete", "--dry-run", "data", expect_rc=0)
+
+    assert extra.exists()  # the extra was reported, not removed
+    assert "(dry-run) delete:" in res.out
+    assert "extra.txt" in res.out
+
+
+def test_pull_dryrun_missing_destination_creates_nothing(ws):
+    # S3.sync creates a missing local destination even on a dry run (aws-cli
+    # parity); pull --dry-run must clean that up to keep its no-changes promise.
+    ws.write("data/sub/a.txt", "one")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    shutil.rmtree(ws.root / "data")
+    res = ws.run("pull", "--dry-run", "data", expect_rc=0)
+
+    assert not (ws.root / "data").exists()  # no directories left behind
+    assert "(dry-run) download:" in res.out
+
+
+def test_pull_dryrun_conflicting_root_reports_replacement(ws):
+    # A restore root of the wrong type is replaced by a real pull; a dry run
+    # must report the conflict and leave it alone.
+    ws.write("data/a.txt", "one")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    shutil.rmtree(ws.root / "data")
+    ws.write("data", "now a file")
+    res = ws.run("pull", "--dry-run", "data", expect_rc=0)
+
+    assert (ws.root / "data").read_text() == "now a file"  # untouched
+    assert "would replace" in res.out
+
+
 def test_resolve_use_color_modes(monkeypatch):
     monkeypatch.delenv("NO_COLOR", raising=False)
     assert _resolve_use_color("always") is True
@@ -208,6 +272,19 @@ def test_push_single_file_dryrun_uploads_nothing(ws):
 
     ws.run("push", "--dry-run", "solo.txt", expect_rc=0)
     assert ws.keys() == set()
+
+
+def test_pull_single_file_dryrun_downloads_nothing(ws):
+    f = ws.write("solo.txt", "original")
+    ws.config({"solo.txt": {"path": str(f)}})
+    ws.run("push", "solo.txt", expect_rc=0)
+
+    f.write_text("drifted")
+    res = ws.run("pull", "--dry-run", "solo.txt", expect_rc=0)
+
+    assert f.read_text() == "drifted"  # not overwritten
+    assert "(dry-run) download:" in res.out
+    assert "would apply manifest metadata" in res.out
 
 
 def test_push_single_file_dryrun_prints_upload_once(ws):

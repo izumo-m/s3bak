@@ -148,12 +148,35 @@ def download_from_s3(
     sub: str | None = None,
     compare: Any = None,
     size: int | None = None,
+    dryrun: bool = False,
 ) -> tuple[int, bool]:
     assert cfg.store is not None
     rel = f"{entry}/{sub}" if sub else entry
 
     if is_dir:
-        result = cfg.store.sync_down(rel, outpath, compare=compare, verbose=verbose)
+        # S3.sync creates a missing local destination before it lists anything
+        # (aws-cli parity), even on a dry run. pull --dry-run promises to change
+        # nothing, so note what is missing now and rmdir it afterwards - rmdir
+        # only removes empty directories, so anything real is left alone.
+        created: list[str] = []
+        if dryrun:
+            probe = os.path.abspath(outpath)
+            while not os.path.exists(probe):
+                created.append(probe)
+                parent = os.path.dirname(probe)
+                if parent == probe:
+                    break
+                probe = parent
+        try:
+            result = cfg.store.sync_down(
+                rel, outpath, compare=compare, dryrun=dryrun, verbose=verbose
+            )
+        finally:
+            for path in created:  # leaf-first, so each rmdir empties its parent
+                try:
+                    os.rmdir(path)
+                except OSError:
+                    break
         if result.returncode != 0:
             if result.stderr:
                 write_stderr(result.stderr)
@@ -165,6 +188,9 @@ def download_from_s3(
     # runs and restores mode/mtime. Matters on Windows, where apply_manifest is
     # skipped when nothing changed. `size` (from the manifest record) routes a
     # large file through multipart download; a small one is a direct GetObject.
+    if dryrun:
+        write_output(f"(dry-run) download: {cfg.prefix}/{rel} -> {outpath}\n")
+        return 0, True
     if not cfg.store.get_object(rel, outpath, size=size, verbose=verbose):
         return 1, False
     return 0, True

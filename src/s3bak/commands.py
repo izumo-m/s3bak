@@ -511,20 +511,28 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         if manifest_matches and not opts.checksum:
             if not opts.meta_only and opts.delete and is_dir:
                 excludes: list[str] = entry_cfg.get("excludes", []) if entry_cfg else []
-                return _delete_extras(manifest_path, outpath, sub, excludes)
+                return _delete_extras(manifest_path, outpath, sub, excludes, dryrun=opts.dryrun)
             return 0
 
         # Make the restore root's type agree before any transfer. In particular,
         # never let a directory sync walk through a symlink root, and never let
         # a single-file write follow one. s3transfer/direct downloads replace
         # inner leaves atomically; this handles the operation root itself.
+        # A dry run reports the conflict instead of touching the root; the
+        # dry-run sync then runs against the uncorrected root, so its transfer
+        # report may differ from what the real (post-replacement) pull does.
         if has_data and not opts.meta_only and os.path.lexists(outpath):
             if is_dir:
                 if os.path.islink(outpath) or not os.path.isdir(outpath):
-                    os.remove(outpath)
-                    os.makedirs(outpath, exist_ok=True)
+                    if opts.dryrun:
+                        write_output(f"(dry-run) would replace {outpath} (conflicting type)\n")
+                    else:
+                        os.remove(outpath)
+                        os.makedirs(outpath, exist_ok=True)
             elif not stat_mod.S_ISREG(os.lstat(outpath).st_mode):
-                if os.path.islink(outpath) or not os.path.isdir(outpath):
+                if opts.dryrun:
+                    write_output(f"(dry-run) would replace {outpath} (conflicting type)\n")
+                elif os.path.islink(outpath) or not os.path.isdir(outpath):
                     os.remove(outpath)
                 else:
                     shutil.rmtree(outpath)
@@ -533,7 +541,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         # must precede the Windows writable pass so that pass cannot traverse a
         # symlinked restore root and chmod a file outside the destination.
         prep: list[tuple[str, int]] = []
-        if IS_WINDOWS and not opts.meta_only:
+        if IS_WINDOWS and not opts.meta_only and not opts.dryrun:
             prep = windows_collect_writable_prep(outpath, is_dir, manifest_path, sub)
 
         changed = False
@@ -553,6 +561,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                     sub=sub,
                     compare=compare,
                     size=file_size,
+                    dryrun=opts.dryrun,
                 )
             finally:
                 # The streaming ManifestFilter holds the temp manifest open; close
@@ -579,12 +588,19 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             if IS_WINDOWS and not opts.meta_only:
                 windows_restore_modes(prep)
             st = 0
+        elif opts.dryrun:
+            # The same gate as the real apply: report that metadata (mode /
+            # mtime / symlinks) would be applied, without mutating anything.
+            write_output(f"(dry-run) would apply manifest metadata: {outpath}\n")
+            st = 0
         else:
             st = apply_manifest(outpath, is_dir, manifest_path, sub=sub)
 
         if not opts.meta_only and opts.delete and is_dir:
             excludes = entry_cfg.get("excludes", []) if entry_cfg else []
-            delete_status = _delete_extras(manifest_path, outpath, sub, excludes)
+            delete_status = _delete_extras(
+                manifest_path, outpath, sub, excludes, dryrun=opts.dryrun
+            )
             if st == 0:
                 st = delete_status
 
@@ -636,7 +652,9 @@ def _local_keyed(
         yield manifest.entry_sort_key(rel, stat_mod.S_ISDIR(st.st_mode)), (norm, st, sym)
 
 
-def _delete_extras(manifest_path: str, outpath: str, sub: str | None, excludes: list[str]) -> int:
+def _delete_extras(
+    manifest_path: str, outpath: str, sub: str | None, excludes: list[str], *, dryrun: bool = False
+) -> int:
     """Remove local paths the manifest does not record (pull ``--delete``).
 
     The local-only lane of the merge-join; only the extras themselves are
@@ -650,7 +668,7 @@ def _delete_extras(manifest_path: str, outpath: str, sub: str | None, excludes: 
             rel, st, _sym = loc
             if rel != ".":
                 extras.append((os.path.join(outpath, rel), stat_mod.S_ISDIR(st.st_mode)))
-    return 1 if remove_extras(extras) else 0
+    return 1 if remove_extras(extras, dryrun=dryrun) else 0
 
 
 def cmd_show(cfg: Config, entry: str, opts: Opts, file: str | None = None) -> int:

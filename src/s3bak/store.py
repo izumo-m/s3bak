@@ -467,6 +467,7 @@ class Boto3S3Store:
         dest_dir: str,
         *,
         compare: Any = None,
+        dryrun: bool = False,
         verbose: bool = False,
     ) -> TransferResult:
         from boto3_s3 import LocalStorage
@@ -483,6 +484,7 @@ class Boto3S3Store:
                 lambda cb: self._s3.sync(
                     src,
                     dest,
+                    dryrun=dryrun,
                     update_filter=update_filter,
                     on_result=cb,
                 ),

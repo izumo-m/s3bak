@@ -89,7 +89,7 @@ Commands:
   ls-remote [entry|path]   List S3 entries, or files under an entry/sub-path
 ```
 
-Common options: `--all`, `--dry-run` (push), `--delete` (pull and sub-path
+Common options: `--all`, `--dry-run` (push/pull), `--delete` (pull and sub-path
 push), `--meta-only`, `--data-only`, `--checksum` (push/pull),
 `--mtime-window <seconds>`, `-o/--output <path>` (single-target pull),
 `-v/--verbose`, `--color[=WHEN]`.
@@ -104,6 +104,7 @@ s3bak push --all --dry-run    # preview without uploading
 s3bak status bin              # M/A/D summary for one entry
 s3bak pull bin home-docs      # restore selected entries in parallel
 s3bak pull bin -o /tmp/out    # restore the bin entry to /tmp/out
+s3bak pull bin --delete --dry-run  # preview a mirror restore
 s3bak push bin/subdir         # entry-rooted syntax; independent of CWD
 s3bak ls-remote               # list entries stored on S3
 ```

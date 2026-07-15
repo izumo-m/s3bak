@@ -161,7 +161,7 @@ Commands:
 
 Options:
   --all            Apply the command to all configured entries
-  --dry-run        Show what would happen without changing anything (push)
+  --dry-run        Show what would happen without changing anything (push/pull)
   --delete         Delete extras: pull removes local files not in the backup;
                    a sub-path push removes S3 orphans under the sub-path
                    (a whole-entry push always mirrors)
@@ -205,6 +205,7 @@ Examples:
   s3bak pull bin home-docs             # restore selected entries in parallel
   s3bak pull bin -o /tmp/restore       # restore to an alternative path
   s3bak pull bin --delete              # also remove local files not in backup
+  s3bak pull bin --delete --dry-run    # preview a mirror restore
   s3bak pull --all                     # restore every entry in parallel
   s3bak pull --meta-only bin           # restore metadata only (no file download)
   s3bak pull --data-only bin           # restore file data only (no mode/mtime applied)
@@ -432,8 +433,8 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     # Global option/command compatibility. Rejecting an inapplicable flag here
-    # (rather than silently ignoring it) matters most for --dry-run: `pull
-    # --dry-run` would otherwise perform a REAL restore the user believed was
+    # (rather than silently ignoring it) matters most for --dry-run: a command
+    # that ignored it would perform the REAL operation the user believed was
     # a preview.
     if opt_all and positional:
         die("--all cannot be combined with explicit entries")
@@ -446,8 +447,8 @@ def main(argv: list[str] | None = None) -> int:
         flag = "--meta-only" if opt_meta_only else "--data-only"
         die(f"{flag} only applies to push and pull")
 
-    if opt_dryrun and subcmd != "push":
-        die("--dry-run only applies to push")
+    if opt_dryrun and subcmd not in ("push", "pull"):
+        die("--dry-run only applies to push and pull")
 
     if opt_delete and subcmd not in ("push", "pull"):
         die("--delete only applies to pull and sub-path push")

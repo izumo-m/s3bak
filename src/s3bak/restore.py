@@ -254,7 +254,7 @@ def apply_manifest(outpath: str, is_dir: bool, manifest_path: str, sub: str | No
 # =============================================================================
 
 
-def remove_extras(extras: list[tuple[str, bool]]) -> int:
+def remove_extras(extras: list[tuple[str, bool]], *, dryrun: bool = False) -> int:
     """Remove local extras (pull ``--delete``): ``(path, is_dir)`` pairs the
     status/--delete merge-join found on the local side only. ``is_dir`` is the
     lstat kind, so a symlink - even one pointing at a directory - is unlinked,
@@ -262,10 +262,14 @@ def remove_extras(extras: list[tuple[str, bool]]) -> int:
     children go before the rmdir that needs them gone; a failure (e.g. a
     non-empty directory that lost a child to an exclude) is reported so a
     requested mirror restore cannot return success while extras remain.
+    ``dryrun`` reports each candidate in the same order without removing it.
     Returns the number of failed removals."""
     errors = 0
     extras.sort(key=lambda x: x[0], reverse=True)
     for path, is_dir_entry in extras:
+        if dryrun:
+            write_output(f"(dry-run) delete: {path}\n")
+            continue
         try:
             if is_dir_entry:
                 os.rmdir(path)

@@ -187,7 +187,7 @@ limit the operation to the data or manifest side respectively.
 - **`--data-only`** transfers data but does not rewrite the manifest or apply
   local metadata.
 - **`--dry-run`** reports what would happen and changes nothing; planned actions
-  print with a `(dry-run)` marker.
+  print with a `(dry-run)` marker. Applies to pull too (see below).
 
 ## The pull pipeline
 
@@ -222,5 +222,11 @@ limit the operation to the data or manifest side respectively.
   they are removed deepest-first so directories empty out before their `rmdir`.
   A failed removal makes the command fail instead of reporting a successful
   mirror while an extra remains.
+- **`--dry-run`** reports what a pull would do and changes nothing: planned
+  downloads and `--delete` removals print with a `(dry-run)` marker, and a
+  single `would apply manifest metadata` line stands in for the metadata
+  apply (mode / mtime / symlinks) when it would run. The transfer report
+  comes from the same sync decisions as a real pull, only with the actions
+  suppressed.
 - **`-o/--output`** restores one target to an alternative path instead of the
   entry's configured path. It is not available for multi-target pulls.
