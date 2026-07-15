@@ -79,5 +79,32 @@ into the backup, materialize it locally (a pull downloads it) and push. To
 retire it, answer y or run the `--yes` mirror. To keep it long-term without
 adopting it, move it outside the entry prefix.
 
+## Restore fidelity
+
+A pull reproduces what the manifest and data objects represent — no more. The
+known limits, as input for choosing what to back up:
+
+- **Hard links are not detected.** Each linked path is walked, uploaded, and
+  restored as an independent regular file; the link relationship is lost.
+- **Mode and mtime are the only attributes restored.** Owner and group are
+  recorded for reporting but never applied — a root-owned file such as
+  `/etc/wsl.conf` comes back owned by whoever ran the pull. Extended
+  attributes, ACLs, and file sparseness are not recorded at all.
+- **Special files are not recreated.** A device node, FIFO, or socket is
+  recorded (type, mode, mtime), and a pull applies mode and mtime where one
+  already exists with the recorded type — but a missing one is reported as an
+  error (exit 1), never created.
+- **A file written during a push can upload torn.** s3bak takes no filesystem
+  snapshot, so a live database file may be captured mid-write and restore
+  corrupt. Dump such files with a `pre_hook` and back up the dump.
+- **A tree may not restore across platforms.** A filename that is legal where
+  it was pushed can be impossible where it is pulled: Windows rejects
+  characters such as `:` and reserved names such as `aux`, and creating a
+  recorded symlink there may require Developer Mode or elevation — the pull
+  fails on such records. On a case-insensitive filesystem, two recorded paths
+  that differ only by case land in one local file, the last download winning
+  silently (the destination-overlap check guards distinct pull targets, not
+  paths within one entry).
+
 See [manifest.md](manifest.md) for the exact record format and invariants, and
 [sync.md](sync.md) for the commands that read or update it.

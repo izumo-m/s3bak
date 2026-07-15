@@ -283,6 +283,11 @@ Deleting is opt-in and confirmed:
    object placed is reported missing (exit 1), rather than silently created as
    a directory. Recorded owner and group names are not applied.
 
+What a pull can reproduce is bounded by what the backup records — see
+[storage.md](storage.md#restore-fidelity) for the limits (hard links,
+ownership and other attributes, special files, torn files, cross-platform
+names).
+
 ### Mode flags
 
 - **`--meta-only`** applies recorded metadata without downloading data.
