@@ -9,7 +9,10 @@
 
 import os
 
-HOME = os.environ.get("HOME", "")
+# Fail loudly when HOME is unset: a silent "" fallback would turn f"{HOME}/bin"
+# into "/bin" and aim the backup at a system directory. On Windows build from
+# USERPROFILE instead: HOME = os.environ["USERPROFILE"]
+HOME = os.environ["HOME"]
 
 # AWS profile used for S3 access (required); read by boto3 / boto3-s3.
 profile = "default"
@@ -47,7 +50,8 @@ prefix = "s3://my-bucket/backup"
 # Directories / files to back up (required), keyed by entry name.
 #
 # Per-entry keys:
-#   path          (required) local path to back up (build from HOME or absolute)
+#   path          (required) absolute local path to back up ("~" is not
+#                 expanded; build from HOME as above)
 #   excludes      (optional) glob patterns excluded from the sync (aws s3-style)
 #   pre_hook      (optional) argument list run before the entry is pushed
 #   post_hook     (optional) argument list run after a push that did work

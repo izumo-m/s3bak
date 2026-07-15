@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from importlib.metadata import version
 
 import pytest
@@ -85,6 +86,25 @@ def test_entry_without_path_dies_cleanly(ws):
     res = ws.run("list")
     assert res.rc == 1
     assert "path" in res.err
+
+
+@pytest.mark.parametrize("bad_path", ["~/data", "data", "./data"])
+def test_relative_entry_path_is_rejected(ws, bad_path):
+    # "~" is not expanded, so "~/data" is a relative path too; a relative path
+    # would silently depend on the working directory.
+    ws.config({"data": {"path": bad_path}})
+    res = ws.run("list")
+    assert res.rc == 1
+    assert "absolute" in res.err
+
+
+def test_root_entry_path_is_rejected(ws):
+    # The typo'd-f-string guard: an empty HOME turns f"{HOME}/" into "/".
+    root = "C:\\" if os.name == "nt" else "/"
+    ws.config({"data": {"path": root}})
+    res = ws.run("list")
+    assert res.rc == 1
+    assert "filesystem root" in res.err
 
 
 def test_entry_with_non_list_excludes_dies_cleanly(ws):
