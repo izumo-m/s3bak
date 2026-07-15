@@ -398,6 +398,42 @@ class KeptKeys:
 KeepOld = bool | KeptKeys
 
 
+class RecordedFiles:
+    """Streaming membership test over a manifest's regular-file records - the
+    records that own an S3 object. Queries must arrive in ascending key order
+    (they do: the delete lane decides serially in S3 key order, and a file's
+    sort key is its bare rel), so a one-record lookahead answers every query.
+    ``path=None`` means no manifest is on S3: nothing is recorded."""
+
+    def __init__(self, path: str | None) -> None:
+        self._records: Iterator[ManifestEntry] | None = (
+            iter_manifest(path) if path is not None else None
+        )
+        self._head: str | None = None
+        self._advance()
+
+    def _advance(self) -> None:
+        if self._records is not None:
+            for e in self._records:
+                if e.is_file:
+                    self._head = e.path.removeprefix("./")
+                    return
+        self._head = None
+
+    def contains(self, rel: str) -> bool:
+        while self._head is not None and self._head < rel:
+            self._advance()
+        return self._head == rel
+
+    def close(self) -> None:
+        """Release the manifest file handle the record stream holds open (an
+        open file cannot be removed on Windows). Idempotent."""
+        closer = getattr(self._records, "close", None)
+        if callable(closer):
+            closer()
+        self._head = None
+
+
 def write_merged(
     out: IO[str],
     old_manifest: str | None,

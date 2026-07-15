@@ -110,7 +110,17 @@ class _PushDeletePlan:
     lane: Any  # sync_up delete=: False | True | per-orphan callable
     confirmer: DeleteConfirmer | None  # --delete without --yes (asked or auto-n)
     mirror: bool  # --delete --yes: every record follows its object; pure walk
+    old_manifest: str | None = None  # set by the caller once downloaded
     _kept: list[manifest.KeptKeys] = field(default_factory=list)
+    _files: manifest.RecordedFiles | None = None
+
+    def recorded(self, rel: str) -> bool:
+        """Whether the old manifest holds a regular-file record for this delete
+        candidate. Lazy: the manifest is downloaded after the plan is built, so
+        the stream opens on the first candidate, once ``old_manifest`` is set."""
+        if self._files is None:
+            self._files = manifest.RecordedFiles(self.old_manifest)
+        return self._files.contains(rel)
 
     def keep_old(self) -> manifest.KeepOld:
         """A fresh view of the manifest keep policy (KeptKeys streams, so each
@@ -128,6 +138,8 @@ class _PushDeletePlan:
         for kept in self._kept:
             kept.close()
         self._kept.clear()
+        if self._files is not None:
+            self._files.close()
         if self.confirmer is not None:
             self.confirmer.close()
 
@@ -153,9 +165,13 @@ def _plan_push_deletes(cfg: Config, entry: str, sub: str | None, opts: Opts) -> 
         # sub on a sub-path push; the kept key must be entry-rooted to match
         # the manifest merge.
         rel = info.compare_key if sub is None else f"{sub}/{info.compare_key}"
-        return confirmer.confirm(f"{cfg.prefix}/{entry}/{rel}", kept_key=rel)
+        # A candidate the manifest never recorded is outside the backup: n
+        # keeps its object for this run only, so the prompt says so.
+        note = "" if plan.recorded(rel) else " (not in manifest)"
+        return confirmer.confirm(f"{cfg.prefix}/{entry}/{rel}{note}", kept_key=rel)
 
-    return _PushDeletePlan(lane=decide, confirmer=confirmer, mirror=False)
+    plan = _PushDeletePlan(lane=decide, confirmer=confirmer, mirror=False)
+    return plan
 
 
 def _push_sub(
@@ -223,10 +239,14 @@ def _push_sub(
             os.close(fd)
             compare = None
             try:
-                # --checksum ignores the manifest entirely; skip the download.
-                have_manifest = not opts.checksum and download_manifest(
+                # --checksum ignores the manifest for its compare, but --delete
+                # still needs it: the prompt flags candidates it does not
+                # record, and the patch reuses it as the old side.
+                have_manifest = (not opts.checksum or opts.delete) and download_manifest(
                     cfg, entry, manifest_path, opts.verbose
                 )
+                if have_manifest:
+                    plan.old_manifest = manifest_path
                 compare = sync_compare(
                     cfg, opts, entry, manifest_path if have_manifest else None, sub=sub
                 )
@@ -479,6 +499,8 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 have_manifest = not (opts.checksum and opts.data_only) and download_manifest(
                     cfg, entry, manifest_path, opts.verbose
                 )
+                if have_manifest:
+                    plan.old_manifest = manifest_path
                 compare = sync_compare(cfg, opts, entry, manifest_path if have_manifest else None)
                 result = cfg.store.sync_up(
                     target,

@@ -478,6 +478,43 @@ def test_write_merged_empty_kept_stream_drops_every_unkept_file_record(tmp_path)
     assert rels == [".", "./link"]
 
 
+# --- RecordedFiles -------------------------------------------------------------
+
+
+def test_recorded_files_matches_only_regular_file_records(tmp_path):
+    # Only regular files own S3 objects: dir and symlink records never match,
+    # and the ascending one-record cursor skips over them.
+    path = tmp_path / "m.jsonl"
+    path.write_text(
+        _manifest_text(
+            [
+                '{"path":".","mode":"40755","mtime_ns":0}',
+                '{"path":"./a.txt","mode":"100644","size":1,"mtime_ns":0}',
+                '{"path":"./link","mode":"120777","mtime_ns":0,"link":"a.txt"}',
+                '{"path":"./sub","mode":"40755","mtime_ns":0}',
+                '{"path":"./sub/b.txt","mode":"100644","size":1,"mtime_ns":0}',
+            ]
+        )
+    )
+    files = manifest.RecordedFiles(str(path))
+    try:
+        assert files.contains("a.txt") is True
+        assert files.contains("link") is False
+        assert files.contains("other.txt") is False
+        assert files.contains("sub/b.txt") is True
+        assert files.contains("zz") is False
+    finally:
+        files.close()
+
+
+def test_recorded_files_none_path_records_nothing():
+    files = manifest.RecordedFiles(None)
+    try:
+        assert files.contains("anything") is False
+    finally:
+        files.close()
+
+
 # --- on-the-wire format --------------------------------------------------------
 
 

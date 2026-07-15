@@ -551,6 +551,51 @@ def test_push_delete_heals_stale_record_whose_object_is_gone(ws):
     assert (dest / "keep.txt").read_text() == "k"
 
 
+def test_push_delete_flags_candidates_missing_from_the_manifest(ws, answers):
+    # An object the manifest never recorded (an out-of-band upload, or the
+    # residue of an interrupted push) is offered like any orphan but flagged:
+    # n keeps its object for this run only - nothing can be recorded for it,
+    # so the manifest stays unchanged and a later --delete asks again.
+    ws.write("data/keep.txt", "k")
+    ws.write("data/gone.txt", "g")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    (ws.root / "data" / "gone.txt").unlink()
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/rogue.bin", Body=b"r")
+
+    answers.feed("n", "n")
+    ws.run("push", "--delete", "data", expect_rc=0)
+
+    assert len(answers.prompts) == 2
+    recorded = next(p for p in answers.prompts if "gone.txt" in p)
+    rogue = next(p for p in answers.prompts if "rogue.bin" in p)
+    assert "(not in manifest)" not in recorded
+    assert "(not in manifest)" in rogue
+    assert "data/rogue.bin" in ws.keys()
+    assert "./rogue.bin" not in _manifest_paths(ws)
+
+
+def test_subpath_push_delete_checksum_still_flags_unrecorded_candidates(ws, answers):
+    # The sub-relative candidate key is joined back to the entry-rooted rel
+    # for the manifest lookup. --checksum ignores the manifest for its compare,
+    # but --delete still downloads it so the prompt can flag unrecorded
+    # objects instead of flagging everything.
+    ws.write("data/sub/x.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    (ws.root / "data" / "sub" / "x.txt").unlink()
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/sub/rogue.bin", Body=b"r")
+
+    answers.feed("n", "n")
+    ws.run("push", "--delete", "--checksum", "data/sub", expect_rc=0)
+
+    assert len(answers.prompts) == 2
+    x = next(p for p in answers.prompts if "x.txt" in p)
+    rogue = next(p for p in answers.prompts if "rogue.bin" in p)
+    assert "(not in manifest)" not in x
+    assert "(not in manifest)" in rogue
+
+
 def test_file_subpath_push_delete_keeps_former_directory_records(ws, answers):
     # A file-typed sub-path has no S3 listing, so --delete has nothing to
     # confirm there: records under the same-named former directory survive
