@@ -3,10 +3,18 @@
 from __future__ import annotations
 
 import os
-import shlex
 import shutil
+import sys
 
 import pytest
+
+
+def _marker_hook(ws, marker) -> list[str]:
+    hook = ws.write(
+        "write-marker.py",
+        "from pathlib import Path\nimport sys\nPath(sys.argv[1]).touch()\n",
+    )
+    return [sys.executable, str(hook), str(marker)]
 
 
 def test_single_file_entry_roundtrip(ws):
@@ -185,7 +193,14 @@ def test_empty_directory_subpath_pull_restores_a_directory(ws):
 
 def test_post_hook_failure_propagates(ws):
     ws.write("data/a.txt", "x")
-    ws.config({"data": {"path": str(ws.root / "data"), "post_hook": "exit 3"}})
+    ws.config(
+        {
+            "data": {
+                "path": str(ws.root / "data"),
+                "post_hook": [sys.executable, "-c", "raise SystemExit(3)"],
+            }
+        }
+    )
     res = ws.run("push", "data")
     assert res.rc == 3
 
@@ -193,9 +208,38 @@ def test_post_hook_failure_propagates(ws):
 def test_post_hook_runs_on_success(ws):
     marker = ws.root / "hook-ran"
     ws.write("data/a.txt", "x")
-    ws.config({"data": {"path": str(ws.root / "data"), "post_hook": f"touch {marker}"}})
+    ws.config(
+        {
+            "data": {
+                "path": str(ws.root / "data"),
+                "post_hook": _marker_hook(ws, marker),
+            }
+        }
+    )
     ws.run("push", "data", expect_rc=0)
     assert marker.exists()
+
+
+def test_hook_arguments_are_passed_without_shell_expansion(ws):
+    recorded = ws.root / "hook-argument"
+    hook = ws.write(
+        "record-argument.py",
+        "from pathlib import Path\nimport sys\nPath(sys.argv[1]).write_text(sys.argv[2])\n",
+    )
+    literal = "~/backup/*.txt; exit 9"
+    ws.write("data/a.txt", "x")
+    ws.config(
+        {
+            "data": {
+                "path": str(ws.root / "data"),
+                "post_hook": [sys.executable, str(hook), str(recorded), literal],
+            }
+        }
+    )
+
+    ws.run("push", "data", expect_rc=0)
+
+    assert recorded.read_text() == literal
 
 
 def test_windows_pull_applies_manifest_without_downloads(ws, monkeypatch):
@@ -308,8 +352,18 @@ def test_subpath_push_is_rejected_for_single_file_entry(ws):
 
 def test_pre_hook_can_create_entry_target(ws):
     target = ws.root / "generated.txt"
-    command = f"printf generated > {shlex.quote(str(target))}"
-    ws.config({"generated": {"path": str(target), "pre_hook": command}})
+    hook = ws.write(
+        "generate.py",
+        "from pathlib import Path\nimport sys\nPath(sys.argv[1]).write_text('generated')\n",
+    )
+    ws.config(
+        {
+            "generated": {
+                "path": str(target),
+                "pre_hook": [sys.executable, str(hook), str(target)],
+            }
+        }
+    )
 
     ws.run("push", "generated", expect_rc=0)
 
@@ -334,7 +388,12 @@ def test_noop_subpath_data_only_push_does_not_run_post_hook(ws):
     marker = ws.root / "hook-ran"
     ws.write("data/sub/a.txt", "a")
     ws.config(
-        {"data": {"path": str(ws.root / "data"), "post_hook": f"touch {shlex.quote(str(marker))}"}}
+        {
+            "data": {
+                "path": str(ws.root / "data"),
+                "post_hook": _marker_hook(ws, marker),
+            }
+        }
     )
     ws.run("push", "data", expect_rc=0)
     marker.unlink()
@@ -342,6 +401,16 @@ def test_noop_subpath_data_only_push_does_not_run_post_hook(ws):
     ws.run("push", "--data-only", "data/sub", expect_rc=0)
 
     assert not marker.exists()
+
+
+def test_hook_string_is_rejected(ws):
+    ws.write("data/a.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data"), "pre_hook": "do-something"}})
+
+    res = ws.run("list")
+
+    assert res.rc == 1
+    assert "pre_hook must be a non-empty list of strings" in res.err
 
 
 def test_local_path_resolution_handles_an_entry_at_filesystem_root(tmp_path):

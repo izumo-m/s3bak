@@ -53,39 +53,38 @@ from s3bak.syncops import (
 )
 
 
-def _run_post_hook(post_hook: str | None, opts: Opts) -> int:
-    if not post_hook:
+def _run_hook(name: str, hook: list[str] | None, opts: Opts) -> int:
+    """Run one configured hook directly, without a command shell."""
+    if not hook:
         return 0
     if opts.dryrun:
-        print(f"(dry-run) would run post_hook: {post_hook}")
+        print(f"(dry-run) would run {name}: {hook!r}")
         return 0
     if opts.verbose:
-        write_stderr(f"+ {post_hook}\n")
-    rc = subprocess.run(["bash", "-c", post_hook]).returncode
+        write_stderr(f"+ {name}: {hook!r}\n")
+    rc = subprocess.run(hook, shell=False).returncode
     if rc != 0:
-        err(f"post_hook failed (exit {rc}): {post_hook}")
+        err(f"{name} failed (exit {rc}): {hook!r}")
     return rc
 
 
 def upload_manifest(cfg: Config, entry: str, target: str, excludes: list[str], opts: Opts) -> int:
     """Write the manifest to S3, then run the entry's post_hook."""
-    post_hook: str | None = cfg.entries[entry].get("post_hook")
+    post_hook: list[str] | None = cfg.entries[entry].get("post_hook")
 
     if opts.dryrun:
         print(f"(dry-run) would update manifest: {manifest.manifest_key(entry)}")
-        if post_hook:
-            print(f"(dry-run) would run post_hook: {post_hook}")
-        return 0
+        return _run_hook("post_hook", post_hook, opts)
 
     write_manifest_to_aws(cfg, entry, target, excludes, opts.verbose)
 
-    return _run_post_hook(post_hook, opts)
+    return _run_hook("post_hook", post_hook, opts)
 
 
 def _push_sub(
     cfg: Config,
     entry: str,
-    post_hook: str | None,
+    post_hook: list[str] | None,
     target_root: str,
     sub: str,
     excludes: list[str],
@@ -101,7 +100,7 @@ def _push_sub(
             return 1
         if opts.meta_only:
             did_work = patch_manifest_subtree(cfg, entry, target_root, sub, excludes, opts)
-            return _run_post_hook(post_hook, opts) if did_work else 0
+            return _run_hook("post_hook", post_hook, opts) if did_work else 0
 
         assert cfg.store is not None
         result = cfg.store.delete_subtree(sub_rel, dryrun=opts.dryrun, verbose=opts.verbose)
@@ -116,11 +115,11 @@ def _push_sub(
             did_work = (
                 patch_manifest_subtree(cfg, entry, target_root, sub, excludes, opts) or did_work
             )
-        return _run_post_hook(post_hook, opts) if did_work else 0
+        return _run_hook("post_hook", post_hook, opts) if did_work else 0
 
     if opts.meta_only:
         did_work = patch_manifest_subtree(cfg, entry, target_root, sub, excludes, opts)
-        return _run_post_hook(post_hook, opts) if did_work else 0
+        return _run_hook("post_hook", post_hook, opts) if did_work else 0
 
     assert cfg.store is not None
     st = os.lstat(local_sub)
@@ -185,7 +184,7 @@ def _push_sub(
 
     if not opts.data_only:
         did_work = patch_manifest_subtree(cfg, entry, target_root, sub, excludes, opts) or did_work
-    return _run_post_hook(post_hook, opts) if did_work else 0
+    return _run_hook("post_hook", post_hook, opts) if did_work else 0
 
 
 def _single_file_needs_upload(cfg: Config, entry: str, target: str, opts: Opts) -> bool:
@@ -279,16 +278,11 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
     # no-op push runs no post_hook on purpose, so side-effecting hooks (e.g.
     # rclone) do not fire when nothing changed; use --meta-only to run the hook
     # on demand. By design, not a bug.
-    pre_hook: str | None = entry_cfg.get("pre_hook")
+    pre_hook: list[str] | None = entry_cfg.get("pre_hook")
     if pre_hook:
-        if opts.dryrun:
-            print(f"(dry-run) would run pre_hook: {pre_hook}")
-        else:
-            if opts.verbose:
-                write_stderr(f"+ {pre_hook}\n")
-            st = subprocess.run(["bash", "-c", pre_hook]).returncode
-            if st != 0:
-                return st
+        st = _run_hook("pre_hook", pre_hook, opts)
+        if st != 0:
+            return st
 
     # Validate after pre_hook: hooks commonly generate the file/tree being
     # backed up, and the documented pipeline promises they run first. A missing
@@ -311,7 +305,7 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         if os.path.lexists(target_root) and not os.path.isdir(target_root):
             err(f"sub path not allowed for single-file entry: {entry}")
             return 1
-        post_hook_sub: str | None = entry_cfg.get("post_hook")
+        post_hook_sub: list[str] | None = entry_cfg.get("post_hook")
         return _push_sub(cfg, entry, post_hook_sub, target_root, sub, excludes, opts)
 
     # --meta-only refreshes the manifest and runs the post_hook even with no data
@@ -412,8 +406,8 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             return st
 
     if results and opts.data_only:
-        post_hook: str | None = entry_cfg.get("post_hook")
-        return _run_post_hook(post_hook, opts)
+        post_hook: list[str] | None = entry_cfg.get("post_hook")
+        return _run_hook("post_hook", post_hook, opts)
 
     return 0
 

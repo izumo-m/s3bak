@@ -13,7 +13,6 @@ pull would change.
 - Python **3.10+**
 - An AWS profile name in `config.py`, with usable credentials for that profile
 - A `diff` executable for the `s3bak diff` command (GNU diff enables color)
-- Bash only when an entry configures `pre_hook` or `post_hook`
 
 s3bak depends on [boto3-s3](https://pypi.org/project/boto3-s3/) (installed
 automatically), which brings in boto3. No separate AWS CLI install is required.
@@ -70,6 +69,11 @@ entries = {
 Per-entry keys: `path` (required), `excludes`, `pre_hook`, `post_hook`,
 `mtime_window`.
 
+Hooks are non-empty argument lists whose first item is the executable. s3bak
+runs them directly without a command shell, so shell parsing, expansion,
+pipelines, and redirection are unavailable. Put complex work in a standalone
+executable or script instead.
+
 ## Usage
 
 ```
@@ -109,11 +113,16 @@ The `status` letters are push-oriented (what a push would change on the backup):
 
 ## Design
 
-- [`docs/overview.md`](docs/overview.md) — architecture, module layering, and
-  what s3bak stores on S3.
-- [`docs/manifest.md`](docs/manifest.md) — the v3 JSONL manifest format.
-- [`docs/sync.md`](docs/sync.md) — the compare model, transfer path, and the
+- [`docs/overview.md`](docs/overview.md) — project goals and the design document
+  index.
+- [`docs/storage.md`](docs/storage.md) — the S3 key layout and storage model.
+- [`docs/manifest.md`](docs/manifest.md) — the JSONL manifest format and its
+  streaming invariants.
+- [`docs/sync.md`](docs/sync.md) — comparison, transfer, concurrency, and the
   push / pull pipelines.
+- [`docs/cli.md`](docs/cli.md) — argument resolution, results, and exit codes.
+- [`docs/architecture.md`](docs/architecture.md) — module boundaries,
+  dependency direction, and S3 client lifetime.
 
 ## License
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from importlib.metadata import version
+
 import pytest
 
 
@@ -39,6 +41,16 @@ def test_unknown_option_errors(cfg_ws):
 def test_no_args_shows_usage(cfg_ws):
     res = cfg_ws.run()
     assert res.rc != 0
+
+
+def test_version_is_reported_without_loading_config(monkeypatch, capfd):
+    monkeypatch.setenv("S3BAK_CONFIG", "/definitely/missing/config.py")
+    from s3bak import cli
+
+    assert cli.main(["--version"]) == 0
+    captured = capfd.readouterr()
+    assert captured.out == f"s3bak {version('s3bak')}\n"
+    assert captured.err == ""
 
 
 def test_status_rejects_delete(cfg_ws):

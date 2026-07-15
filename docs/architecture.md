@@ -1,0 +1,59 @@
+# Internal architecture
+
+s3bak is divided into single-responsibility modules with a one-directional
+dependency graph. Lower layers do not import orchestration layers, and the
+graph contains no import cycles.
+
+```text
+higher-level orchestration
+
+    cli
+    commands
+    compare | restore | syncops
+    config | localwalk
+    store
+    manifest | console
+
+lower-level foundations
+```
+
+Dependencies flow down the diagram and may skip rows. `manifest` and `console`
+are foundational modules used from several layers.
+
+## Module responsibilities
+
+- **console** owns terminal output, warning accounting, and small path helpers.
+  It imports no other s3bak module.
+- **manifest** owns the JSONL format, validation, streaming subtree patches,
+  sorted-stream joins, and the stat-based manifest comparison. It uses only the
+  standard library.
+- **localwalk** enumerates local trees in the same key order as the data sync
+  and prunes excluded subtrees.
+- **store** is the S3 boundary. `Boto3S3Store` wraps transfers, listing, and
+  object inspection.
+- **config** loads and validates executable `config.py`, constructs the store
+  when a command needs S3, and defines the `Config` and `Opts` values passed
+  through the command layers.
+- **compare** compares manifest records with local state and presents status
+  and content diff output.
+- **restore** owns pull-side filesystem mutation: target resolution, metadata
+  application, conflict handling, and deletion of local extras.
+- **syncops** connects manifests and local trees to the S3 store. It writes and
+  downloads manifests, orchestrates downloads, and builds sync comparison
+  strategies.
+- **commands** implements one `cmd_*` function per subcommand and composes the
+  lower layers into complete operations.
+- **cli** parses and validates arguments, resolves entries and paths, dispatches
+  commands, coordinates entry-level concurrency, and maps outcomes to process
+  exit codes.
+
+## S3 client lifetime
+
+An S3 command constructs one `Boto3S3Store` while loading configuration, before
+entry worker threads start. The store creates one boto3-s3 `S3` object and one
+boto3 client, then binds every S3 location to that shared client.
+
+This structure avoids constructing boto3 clients concurrently while allowing
+the completed client to be shared by entry workers and transfer workers. The
+local-only `list` command does not construct the store. Runtime concurrency and
+its configuration are described in [sync.md](sync.md#concurrency).

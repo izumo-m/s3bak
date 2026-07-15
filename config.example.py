@@ -49,23 +49,27 @@ prefix = "s3://my-bucket/backup"
 # Per-entry keys:
 #   path          (required) local path to back up (build from HOME or absolute)
 #   excludes      (optional) glob patterns excluded from the sync (aws s3-style)
-#   pre_hook      (optional) shell command run before the entry is pushed
-#   post_hook     (optional) shell command run after a push that did work
+#   pre_hook      (optional) argument list run before the entry is pushed
+#   post_hook     (optional) argument list run after a push that did work
 #   mtime_window  (optional) overrides the top-level mtime_window for this entry
 #                 (0 = exact); the CLI --mtime-window overrides both
+#
+# Hooks are executed directly without a command shell. The first item names the
+# executable and each remaining item is passed as one argument. Shell syntax
+# such as globbing, pipelines, and redirection is not interpreted; put complex
+# work in a standalone executable or script.
 entries = {
     ".ssh": {"path": f"{HOME}/.ssh", "excludes": ["agent/*"]},
     "bin": {"path": f"{HOME}/bin", "excludes": ["__pycache__/*"], "mtime_window": 0},
     ".emacs.d": {
         "path": f"{HOME}/.emacs.d",
         "excludes": ["*.elc", "elpa/*", "eln-cache/*"],
-        "pre_hook": "rm -f ~/.emacs.d/elpa/gnupg/S.*",
     },
     # Absolute paths work too (no HOME needed):
     "wsl.conf": {"path": "/etc/wsl.conf"},
     "vault": {
         "path": "/mnt/data/vault",
-        "post_hook": "rclone copy /mnt/data/vault remote:vault",
+        "post_hook": ["rclone", "copy", "/mnt/data/vault", "remote:vault"],
     },
 }
 
