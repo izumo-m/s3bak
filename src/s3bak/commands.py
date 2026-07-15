@@ -33,6 +33,7 @@ from s3bak.confirm import (
     AnswerMode,
     DeleteConfirmer,
     DeletionAbortedError,
+    confirm_subtree_delete,
     resolve_answer_mode,
 )
 from s3bak.console import (
@@ -173,10 +174,14 @@ def _push_sub(
         if not opts.delete:
             err(f"local path does not exist (use --delete to remove its backup): {local_sub}")
             return 1
-        if opts.meta_only:
-            did_work = patch_manifest_subtree(cfg, entry, target_root, sub, excludes, opts)
-            return _run_hook("post_hook", post_hook, opts) if did_work else 0
-
+        # --delete cannot combine with --meta-only/--data-only (rejected at the
+        # CLI), so this is always the full deletion: one confirmation covers
+        # the subtree's objects and manifest records together.
+        if not opts.dryrun and not confirm_subtree_delete(
+            resolve_answer_mode(yes=opts.yes), entry, s3_sub_path
+        ):
+            err(f"backup subtree not deleted (answer y, or use --yes): {s3_sub_path}")
+            return 1
         assert cfg.store is not None
         result = cfg.store.delete_subtree(sub_rel, dryrun=opts.dryrun, verbose=opts.verbose)
         if result.stdout:
@@ -186,15 +191,13 @@ def _push_sub(
                 write_stderr(f"{result.stderr}\n")
             return result.returncode
         did_work = bool(result.stdout)
-        if not opts.data_only:
-            did_work = (
-                patch_manifest_subtree(cfg, entry, target_root, sub, excludes, opts) or did_work
-            )
+        did_work = patch_manifest_subtree(cfg, entry, target_root, sub, excludes, opts) or did_work
         return _run_hook("post_hook", post_hook, opts) if did_work else 0
 
     if opts.meta_only:
+        # --meta-only --delete is rejected at the CLI: always the keep policy.
         did_work = patch_manifest_subtree(
-            cfg, entry, target_root, sub, excludes, opts, keep_old=not opts.delete
+            cfg, entry, target_root, sub, excludes, opts, keep_old=True
         )
         return _run_hook("post_hook", post_hook, opts) if did_work else 0
 
@@ -202,51 +205,38 @@ def _push_sub(
     st = os.lstat(local_sub)
     did_work = False
 
-    if stat_mod.S_ISLNK(st.st_mode):
-        # symlink: upload nothing, just update manifest line.
-        pass
-    elif os.path.isdir(local_sub):
-        fd, manifest_path = tempfile.mkstemp(suffix=".jsonl")
-        os.close(fd)
-        compare = None
-        try:
-            # --checksum ignores the manifest entirely; skip the download.
-            have_manifest = not opts.checksum and download_manifest(
-                cfg, entry, manifest_path, opts.verbose
-            )
-            compare = sync_compare(
-                cfg, opts, entry, manifest_path if have_manifest else None, sub=sub
-            )
-            result = cfg.store.sync_up(
-                local_sub,
-                sub_rel,
-                file_filter=manifest.exclude_filter(excludes, sub=sub) if excludes else None,
-                compare=compare,
-                delete=opts.delete,
-                dryrun=opts.dryrun,
-                verbose=opts.verbose,
-            )
-        finally:
-            # The streaming ManifestFilter holds the temp manifest open; close it
-            # before unlink (an open file cannot be removed on Windows).
-            if isinstance(compare, manifest.ManifestFilter):
-                compare.close()
-            os.unlink(manifest_path)
-        if result.returncode != 0:
-            write_output(result.stdout)
-            if result.stderr:
-                write_stderr(result.stderr)
-            return result.returncode
-        if result.stdout:
-            write_output(f"{result.stdout}\n")
-            did_work = True
-    elif stat_mod.S_ISREG(st.st_mode):
-        # Regular file: an explicit sub-path push always uploads.
-        if opts.dryrun:
-            print(f"(dry-run) upload: {local_sub} -> {s3_sub_path}")
-            did_work = True
-        else:
-            result = cfg.store.put_object(sub_rel, local_sub, verbose=opts.verbose)
+    plan = _plan_push_deletes(cfg, entry, sub, opts)
+    try:
+        if stat_mod.S_ISLNK(st.st_mode):
+            # symlink: upload nothing, just update manifest line.
+            pass
+        elif os.path.isdir(local_sub):
+            fd, manifest_path = tempfile.mkstemp(suffix=".jsonl")
+            os.close(fd)
+            compare = None
+            try:
+                # --checksum ignores the manifest entirely; skip the download.
+                have_manifest = not opts.checksum and download_manifest(
+                    cfg, entry, manifest_path, opts.verbose
+                )
+                compare = sync_compare(
+                    cfg, opts, entry, manifest_path if have_manifest else None, sub=sub
+                )
+                result = cfg.store.sync_up(
+                    local_sub,
+                    sub_rel,
+                    file_filter=manifest.exclude_filter(excludes, sub=sub) if excludes else None,
+                    compare=compare,
+                    delete=plan.lane,
+                    dryrun=opts.dryrun,
+                    verbose=opts.verbose,
+                )
+            finally:
+                # The streaming ManifestFilter holds the temp manifest open; close it
+                # before unlink (an open file cannot be removed on Windows).
+                if isinstance(compare, manifest.ManifestFilter):
+                    compare.close()
+                os.unlink(manifest_path)
             if result.returncode != 0:
                 write_output(result.stdout)
                 if result.stderr:
@@ -255,18 +245,38 @@ def _push_sub(
             if result.stdout:
                 write_output(f"{result.stdout}\n")
                 did_work = True
-    else:
-        err(f"sub path must be a regular file, directory, or symlink: {local_sub}")
-        return 1
+        elif stat_mod.S_ISREG(st.st_mode):
+            # Regular file: an explicit sub-path push always uploads. There is
+            # no S3 listing here, so --delete cannot offer orphans under a
+            # same-named former directory; their records still fall out of the
+            # manifest patch below (the objects stay until a directory push).
+            if opts.dryrun:
+                print(f"(dry-run) upload: {local_sub} -> {s3_sub_path}")
+                did_work = True
+            else:
+                result = cfg.store.put_object(sub_rel, local_sub, verbose=opts.verbose)
+                if result.returncode != 0:
+                    write_output(result.stdout)
+                    if result.stderr:
+                        write_stderr(result.stderr)
+                    return result.returncode
+                if result.stdout:
+                    write_output(f"{result.stdout}\n")
+                    did_work = True
+        else:
+            err(f"sub path must be a regular file, directory, or symlink: {local_sub}")
+            return 1
 
-    if not opts.data_only:
-        did_work = (
-            patch_manifest_subtree(
-                cfg, entry, target_root, sub, excludes, opts, keep_old=not opts.delete
+        if not opts.data_only:
+            did_work = (
+                patch_manifest_subtree(
+                    cfg, entry, target_root, sub, excludes, opts, keep_old=plan.keep_old()
+                )
+                or did_work
             )
-            or did_work
-        )
-    return _run_hook("post_hook", post_hook, opts) if did_work else 0
+        return _run_hook("post_hook", post_hook, opts) if did_work else 0
+    finally:
+        plan.close()
 
 
 def _single_file_needs_upload(cfg: Config, entry: str, target: str, opts: Opts) -> bool:
@@ -397,7 +407,11 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             err(f"sub path not allowed for single-file entry: {entry}")
             return 1
         post_hook_sub: list[str] | None = entry_cfg.get("post_hook")
-        return _push_sub(cfg, entry, post_hook_sub, target_root, sub, excludes, opts)
+        try:
+            return _push_sub(cfg, entry, post_hook_sub, target_root, sub, excludes, opts)
+        except DeletionAbortedError:
+            err(f"{entry}: aborted")
+            return 1
 
     # --meta-only refreshes the manifest and runs the post_hook even with no data
     # change: the supported way to re-run the post_hook on demand (intended).

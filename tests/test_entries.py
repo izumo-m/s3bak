@@ -351,7 +351,7 @@ def test_missing_subpath_push_delete_removes_only_that_s3_subtree(ws):
     ws.run("push", "data", expect_rc=0)
     shutil.rmtree(ws.root / "data" / "sub")
 
-    ws.run("push", "--delete", "data/sub", expect_rc=0)
+    ws.run("push", "--delete", "--yes", "data/sub", expect_rc=0)
 
     keys = ws.keys()
     assert not any(key == "data/sub" or key.startswith("data/sub/") for key in keys)
@@ -361,6 +361,88 @@ def test_missing_subpath_push_delete_removes_only_that_s3_subtree(ws):
         "Body"
     ].read()
     assert b'"path":"./sub"' not in manifest_body
+
+
+def test_missing_subpath_push_delete_without_tty_deletes_nothing(ws):
+    ws.write("data/sub/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    shutil.rmtree(ws.root / "data" / "sub")
+
+    res = ws.run("push", "--delete", "data/sub")
+
+    assert res.rc == 1
+    assert "--yes" in res.err
+    assert "data/sub/a.txt" in ws.keys()
+    manifest_body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl")[
+        "Body"
+    ].read()
+    assert b'"path":"./sub/a.txt"' in manifest_body
+
+
+def test_missing_subpath_push_delete_asks_one_subtree_question(ws, answers):
+    ws.write("data/sub/a.txt", "a")
+    ws.write("data/sub/b.txt", "b")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    shutil.rmtree(ws.root / "data" / "sub")
+
+    answers.feed("n")
+    res = ws.run("push", "--delete", "data/sub")
+    assert res.rc == 1
+    assert "data/sub/a.txt" in ws.keys()
+
+    answers.feed("y")
+    ws.run("push", "--delete", "data/sub", expect_rc=0)
+    assert len(answers.prompts) == 2  # one subtree question per run, not per key
+    assert not any(key.startswith("data/sub/") for key in ws.keys())
+
+
+def test_dir_subpath_push_delete_yes_mirrors_only_inside_the_sub(ws):
+    ws.write("data/keep.txt", "k")
+    ws.write("data/sub.txt", "sibling")
+    ws.write("data/sub/x.txt", "x")
+    ws.write("data/sub/y.txt", "y")
+    ws.write("data/submarine/z.txt", "z")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "sub" / "y.txt").unlink()
+    res = ws.run("push", "--delete", "--yes", "data/sub", expect_rc=0)
+
+    assert "delete:" in res.out
+    keys = ws.keys()
+    assert "data/sub/y.txt" not in keys
+    assert "data/sub/x.txt" in keys
+    assert "data/sub.txt" in keys
+    assert "data/submarine/z.txt" in keys
+    res = ws.run("status", "data", expect_rc=0)
+    assert res.out.strip() == ""
+
+
+def test_dir_subpath_push_delete_interactive_keeps_answered_records(ws, answers):
+    # Kept records inside the replaced range survive with their ancestor dir;
+    # records outside the sub are copied verbatim as always.
+    ws.write("data/keep.txt", "k")
+    ws.write("data/sub/inner/x.txt", "x")
+    ws.write("data/sub/inner/y.txt", "y")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    shutil.rmtree(ws.root / "data" / "sub" / "inner")
+    answers.feed("y", "n")  # delete inner/x.txt, keep inner/y.txt
+    ws.run("push", "--delete", "data/sub", expect_rc=0)
+
+    keys = ws.keys()
+    assert "data/sub/inner/x.txt" not in keys
+    assert "data/sub/inner/y.txt" in keys
+    manifest_body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl")[
+        "Body"
+    ].read()
+    assert b'"path":"./sub/inner/y.txt"' in manifest_body
+    assert b'"path":"./sub/inner/x.txt"' not in manifest_body
+    assert b'"path":"./sub/inner"' in manifest_body  # the kept file's parent dir
+    assert b'"path":"./keep.txt"' in manifest_body
 
 
 def test_subpath_push_is_rejected_for_single_file_entry(ws):
