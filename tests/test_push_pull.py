@@ -236,7 +236,7 @@ def test_pull_delete_removes_extra_symlink_to_dir(ws):
     (dest / "realtarget").mkdir()
     os.symlink("realtarget", dest / "extralink")  # an extra symlink-to-dir
 
-    ws.run("pull", "data", "-o", str(dest), "--delete", expect_rc=0)
+    ws.run("pull", "data", "-o", str(dest), "--delete", "--yes", expect_rc=0)
     assert not os.path.lexists(dest / "extralink")  # unlinked, not rmdir-skipped
     assert (dest / "keep.txt").read_text() == "k"
 
@@ -343,7 +343,7 @@ def test_pull_delete_removes_local_extras(ws):
     dest = ws.root / "restore"
     dest.mkdir()
     (dest / "extra.txt").write_text("e")
-    ws.run("pull", "data", "-o", str(dest), "--delete", expect_rc=0)
+    ws.run("pull", "data", "-o", str(dest), "--delete", "--yes", expect_rc=0)
 
     assert (dest / "keep.txt").read_text() == "k"
     assert not (dest / "extra.txt").exists()
@@ -362,7 +362,86 @@ def test_pull_delete_removes_extra_directory_tree(ws):
     (dest / "emptydir").mkdir()
     (dest / "keep.txt").write_text("k")
 
-    ws.run("pull", "data", "-o", str(dest), "--delete", expect_rc=0)
+    ws.run("pull", "data", "-o", str(dest), "--delete", "--yes", expect_rc=0)
     assert not (dest / "extradir").exists()
     assert not (dest / "emptydir").exists()
     assert (dest / "keep.txt").read_text() == "k"
+
+
+# --- pull --delete (confirmed removals) ----------------------------------------
+
+
+def test_pull_delete_without_tty_keeps_extras_and_succeeds(ws):
+    ws.write("data/keep.txt", "k")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    extra = ws.write("data/extra.txt", "extra")
+
+    res = ws.run("pull", "--delete", "data", expect_rc=0)
+
+    assert "delete:" not in res.out
+    assert "warning" not in res.err.lower()
+    assert extra.exists()
+
+
+def test_pull_delete_interactive_keeps_ancestors_of_kept_items(ws, answers):
+    # Deepest-first prompting: the nested file is asked first; keeping it makes
+    # its ancestor extra dir unremovable, so the dir is kept without a prompt.
+    ws.write("data/keep.txt", "k")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.write("data/extradir/inner.txt", "i")
+    ws.write("data/extra.txt", "e")
+
+    answers.feed("n", "y")  # keep extradir/inner.txt, delete extra.txt
+    ws.run("pull", "--delete", "data", expect_rc=0)
+
+    assert len(answers.prompts) == 2
+    assert "extradir" in answers.prompts[0] and "inner.txt" in answers.prompts[0]
+    assert "extra.txt" in answers.prompts[1]
+    assert (ws.root / "data" / "extradir" / "inner.txt").exists()
+    assert not (ws.root / "data" / "extra.txt").exists()
+
+
+def test_pull_delete_interactive_prompts_for_empty_extra_dir(ws, answers):
+    ws.write("data/keep.txt", "k")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    (ws.root / "data" / "emptydir").mkdir()
+
+    answers.feed("y")
+    ws.run("pull", "--delete", "data", expect_rc=0)
+
+    assert len(answers.prompts) == 1
+    assert not (ws.root / "data" / "emptydir").exists()
+
+
+def test_pull_delete_interactive_q_aborts(ws, answers):
+    ws.write("data/keep.txt", "k")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.write("data/extra1.txt", "1")
+    ws.write("data/extra2.txt", "2")
+
+    answers.feed("y", "q")  # extras prompt deepest-first: extra2 then extra1
+    res = ws.run("pull", "--delete", "data")
+
+    assert res.rc == 1
+    assert "aborted" in res.err
+    assert not (ws.root / "data" / "extra2.txt").exists()
+    assert (ws.root / "data" / "extra1.txt").exists()
+
+
+def test_pull_delete_confirms_on_the_clean_tree_short_circuit_too(ws, answers):
+    # A tree whose manifest already matches takes the pull short-circuit; its
+    # --delete pass must run behind the same confirmation.
+    ws.write("data/keep.txt", "k")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.write("data/extra.txt", "e")
+
+    answers.feed("n")
+    ws.run("pull", "--delete", "data", expect_rc=0)
+
+    assert len(answers.prompts) == 1
+    assert (ws.root / "data" / "extra.txt").exists()

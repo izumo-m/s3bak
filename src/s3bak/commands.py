@@ -662,7 +662,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         if manifest_matches and not opts.checksum:
             if not opts.meta_only and opts.delete and is_dir:
                 excludes: list[str] = entry_cfg.get("excludes", []) if entry_cfg else []
-                return _delete_extras(manifest_path, outpath, sub, excludes, dryrun=opts.dryrun)
+                return _delete_extras(manifest_path, outpath, sub, excludes, opts=opts, entry=entry)
             return 0
 
         # Make the restore root's type agree before any transfer. In particular,
@@ -750,12 +750,15 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         if not opts.meta_only and opts.delete and is_dir:
             excludes = entry_cfg.get("excludes", []) if entry_cfg else []
             delete_status = _delete_extras(
-                manifest_path, outpath, sub, excludes, dryrun=opts.dryrun
+                manifest_path, outpath, sub, excludes, opts=opts, entry=entry
             )
             if st == 0:
                 st = delete_status
 
         return st
+    except DeletionAbortedError:
+        err(f"{entry}: aborted")
+        return 1
     finally:
         os.unlink(manifest_path)
 
@@ -804,13 +807,28 @@ def _local_keyed(
 
 
 def _delete_extras(
-    manifest_path: str, outpath: str, sub: str | None, excludes: list[str], *, dryrun: bool = False
+    manifest_path: str,
+    outpath: str,
+    sub: str | None,
+    excludes: list[str],
+    *,
+    opts: Opts,
+    entry: str,
 ) -> int:
-    """Remove local paths the manifest does not record (pull ``--delete``).
+    """Remove local paths the manifest does not record (pull ``--delete``),
+    behind the per-item confirmation (--yes answers every question yes; a
+    non-interactive run without --yes answers no, i.e. removes nothing).
 
     The local-only lane of the merge-join; only the extras themselves are
     collected (never the whole key set) so the deepest-first removal order
     costs memory proportional to what is actually deleted."""
+    confirmer: DeleteConfirmer | None = None
+    if not opts.dryrun:
+        mode = resolve_answer_mode(yes=opts.yes)
+        if mode is AnswerMode.ALL_NO:
+            return 0  # every answer is no: keep every extra, successfully
+        if mode is AnswerMode.ASK:
+            confirmer = DeleteConfirmer(mode, entry)
     extras: list[tuple[str, bool]] = []
     for _key, m, loc in manifest.merge_join(
         _manifest_keyed(manifest_path, sub), _local_keyed(outpath, excludes)
@@ -819,7 +837,11 @@ def _delete_extras(
             rel, st, _sym = loc
             if rel != ".":
                 extras.append((os.path.join(outpath, rel), stat_mod.S_ISDIR(st.st_mode)))
-    return 1 if remove_extras(extras, dryrun=dryrun) else 0
+    try:
+        return 1 if remove_extras(extras, dryrun=opts.dryrun, confirm=confirmer) else 0
+    finally:
+        if confirmer is not None:
+            confirmer.close()
 
 
 def cmd_show(cfg: Config, entry: str, opts: Opts, file: str | None = None) -> int:
