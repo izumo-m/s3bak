@@ -66,6 +66,25 @@ def warning_count() -> int:
     return _warning_count
 
 
+def prompt_is_interactive() -> bool:
+    """Whether a confirmation prompt can actually be asked and seen: both the
+    answer channel (stdin) and the question channel (stderr) must be TTYs."""
+    return sys.stdin.isatty() and sys.stderr.isatty()
+
+
+def read_prompt_answer(prompt: str) -> str:
+    """Write ``prompt`` to stderr and read one answer line from stdin.
+
+    The write holds the output lock so a transfer worker's line cannot split
+    the prompt, but the read happens outside it - blocking on the keyboard
+    while holding the lock would deadlock worker-thread result reporting.
+    Returns the stripped lowercased answer, or "" on EOF."""
+    with _output_lock:
+        sys.stderr.write(prompt)
+        sys.stderr.flush()
+    return sys.stdin.readline().strip().lower()
+
+
 def echo_command(verbose: bool, args: list[str]) -> None:
     if verbose:
         write_stderr(f"+ {shlex.join(args)}\n")

@@ -63,6 +63,7 @@ class Config:
 class Opts:
     dryrun: bool = False
     delete: bool = False
+    yes: bool = False
     meta_only: bool = False
     data_only: bool = False
     verbose: bool = False
