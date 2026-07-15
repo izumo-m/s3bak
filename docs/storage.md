@@ -49,5 +49,29 @@ refresh it; `push --data-only` deliberately leaves it unchanged. Consequently,
 an out-of-band S3 change or a data-only push can leave the manifest stale until
 a later push refreshes it.
 
+## Unrecorded objects
+
+Push maintains a correspondence: every regular-file record has its data
+object, and every data object has its record. The pair is created, kept, and
+deleted together — a `--delete` answer covers both, and a record whose object
+is already gone (an interrupted deletion) is dropped by the next
+`push --delete` merge. Directory, symlink, and special-file records stand
+alone by design, as described above.
+
+The correspondence has one gap s3bak cannot close: a data object the manifest
+never recorded — uploaded out-of-band with other S3 tooling, or the fresh
+upload of a push that was interrupted before it wrote the manifest, where the
+local file has since been deleted. Such an object is outside the backup:
+`status` cannot see it (it diffs the manifest against the local tree), and
+pull applies no metadata to it, although pull's listing-driven download does
+fetch its bytes. `push --delete` offers its deletion like any other orphan,
+flagging the prompt with `(not in manifest)`; answering n keeps the object
+for this run only. A manifest record is a stat snapshot of a local file, and
+with no local file there is nothing truthful to record, so the object stays
+unrecorded and is asked about again on every later `--delete`. To adopt it
+into the backup, materialize it locally (a pull downloads it) and push. To
+retire it, answer y or run the `--yes` mirror. To keep it long-term without
+adopting it, move it outside the entry prefix.
+
 See [manifest.md](manifest.md) for the exact record format and invariants, and
 [sync.md](sync.md) for the commands that read or update it.

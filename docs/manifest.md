@@ -119,6 +119,9 @@ memory bounded by one directory level rather than the whole tree:
   every record with constant memory. The stream governs regular-file records
   only: directory, symlink, and special records have no S3 object to confirm,
   always survive it, and thereby keep every kept file's ancestor chain valid.
+  A kept key with no old record (an
+  [unrecorded object](storage.md#unrecorded-objects)) is skipped — a record
+  cannot be fabricated for it.
 - **The default update strategy** (`ManifestFilter`) reads the manifest once,
   front to back, merge-joining its records against `S3.sync`'s ascending
   compare-key pairs (`iter_compare_records` keys a directory as `name/` to match

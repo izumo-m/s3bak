@@ -215,6 +215,13 @@ Deleting is opt-in and confirmed:
   object and no question, so no confirmation can drop them: they survive
   every `--delete` short of the `--yes` mirror. (For a locally deleted
   symlink or empty directory, the record IS the backup.)
+- **A candidate the manifest does not record** — an out-of-band upload, or
+  the residue of a push interrupted before its manifest write — is flagged
+  `(not in manifest)` in the prompt. Answering n keeps the object but cannot
+  record it (a record describes a local file, and there is none), so the same
+  question returns on every later `--delete`. See
+  [storage.md](storage.md#unrecorded-objects) for what such an object is and
+  how to adopt or retire it.
 - **`--yes`** answers yes to every confirmation: the unattended mirror for
   cron. Without a TTY (stdin/stderr), `--delete` without `--yes` answers no
   to everything — nothing is deleted and the run still succeeds (rc 0).
