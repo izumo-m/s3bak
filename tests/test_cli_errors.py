@@ -188,6 +188,32 @@ def test_unknown_command_is_reported_before_loading_config(monkeypatch, capfd):
     assert "config file not found" not in captured.err.lower()
 
 
+@pytest.mark.parametrize("argument", ["help", "-h"])
+def test_unsupported_help_forms_are_rejected(monkeypatch, capfd, argument):
+    monkeypatch.setenv("S3BAK_CONFIG", "/definitely/missing/config.py")
+    from s3bak import cli
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main([argument])
+    assert exc.value.code == 1
+    captured = capfd.readouterr()
+    assert f"unknown command: {argument}" in captured.err.lower()
+    assert "config file not found" not in captured.err.lower()
+
+
+def test_help_option_succeeds_without_loading_config(monkeypatch, capfd):
+    monkeypatch.setenv("S3BAK_CONFIG", "/definitely/missing/config.py")
+    from s3bak import cli
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--help"])
+    assert exc.value.code == 0
+    captured = capfd.readouterr()
+    assert captured.out == ""
+    assert "Usage: s3bak" in captured.err
+    assert "config file not found" not in captured.err.lower()
+
+
 @pytest.mark.parametrize(
     "bad_name",
     ["", ".", "..", "nested/name", "windows\\name", "x-manifest.jsonl", "line\nbreak"],

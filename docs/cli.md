@@ -3,7 +3,7 @@
 The CLI turns command-line input into an entry and an optional entry-relative
 subpath, rejects ambiguous or inapplicable input before doing work, and maps
 command outcomes to stable process exit codes. The complete command and option
-reference is emitted by `s3bak help`; this document records the design
+reference is emitted by `s3bak --help`; this document records the design
 contracts behind that interface.
 
 ## Entry and path resolution

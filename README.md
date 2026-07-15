@@ -26,7 +26,7 @@ With [uv](https://docs.astral.sh/uv/):
 uv tool install git+https://github.com/izumo-m/s3bak
 
 # ...or run it without installing
-uvx --from git+https://github.com/izumo-m/s3bak s3bak help
+uvx --from git+https://github.com/izumo-m/s3bak s3bak --help
 ```
 
 For local development:
@@ -35,7 +35,7 @@ For local development:
 git clone git@github.com:izumo-m/s3bak.git
 cd s3bak
 uv sync
-uv run s3bak help
+uv run s3bak --help
 uv run pytest        # hermetic test suite (uses moto; no AWS/Docker needed)
 ```
 
@@ -87,7 +87,6 @@ Commands:
   diff <entry|path>        Show content diff between backup and local
   list                     List locally configured entries
   ls-remote [entry|path]   List S3 entries, or files under an entry/sub-path
-  help                     Show this help
 ```
 
 Common options: `--all`, `--dry-run` (push), `--delete` (pull and sub-path
@@ -95,7 +94,7 @@ push), `--meta-only`, `--data-only`, `--checksum` (push/pull),
 `--mtime-window <seconds>`, `-o/--output <path>` (pull), `-v/--verbose`,
 `--color[=WHEN]`.
 
-Run `s3bak help` for the full option list and worked examples.
+Run `s3bak --help` for the full option list and worked examples.
 
 ### Examples
 

@@ -131,7 +131,6 @@ Commands:
   diff <entry|path>            Show content diff between backup and local
   list                         List locally configured entries
   ls-remote [entry|path]       List S3 entries, or files under an entry/sub-path
-  help                         Show this help
 
 Options:
   --all            Apply the command to all configured entries
@@ -152,7 +151,7 @@ Options:
                    --color alone == --color=always. Honors NO_COLOR env var.
   --no-color       Disable color (same as --color=never)
   --version        Show the program version and exit
-  -h, --help       Show this help
+  --help           Show this help
 
 status letters (push-oriented: what would change on the backup):
   M <path>         modified (metadata differs between local and backup)
@@ -290,7 +289,7 @@ def main(argv: list[str] | None = None) -> int:
         print_usage()
 
     subcmd = args[0]
-    if subcmd in ("help", "-h", "--help"):
+    if subcmd == "--help":
         print_usage(0)
     if subcmd == "--version":
         sys.stdout.write(f"s3bak {version('s3bak')}\n")
@@ -358,7 +357,7 @@ def main(argv: list[str] | None = None) -> int:
             opt_color = val
         elif a == "--no-color":
             opt_color = "never"
-        elif a in ("-h", "--help"):
+        elif a == "--help":
             print_usage(0)
         elif a == "--":
             positional.extend(args[i + 1 :])
