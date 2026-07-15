@@ -7,7 +7,7 @@ import os
 
 import pytest
 
-from s3bak import confirm, console
+from s3bak import confirm
 from s3bak.confirm import AnswerMode, DeleteConfirmer, DeletionAbortedError
 
 
@@ -16,33 +16,6 @@ def _fresh_abort_state():
     confirm.reset_confirmations()
     yield
     confirm.reset_confirmations()
-
-
-@pytest.fixture
-def answers(monkeypatch):
-    """Feed scripted prompt answers; records every prompt that was shown."""
-    queue: list[str] = []
-    prompts: list[str] = []
-
-    def fake_read(prompt: str) -> str:
-        prompts.append(prompt)
-        return queue.pop(0) if queue else ""
-
-    monkeypatch.setattr(console, "prompt_is_interactive", lambda: True)
-    monkeypatch.setattr(console, "read_prompt_answer", fake_read)
-    # confirm.py imported the names directly; patch them there too.
-    monkeypatch.setattr(confirm, "prompt_is_interactive", lambda: True)
-    monkeypatch.setattr(confirm, "read_prompt_answer", fake_read)
-
-    class Answers:
-        def feed(self, *values: str) -> None:
-            queue.extend(values)
-
-        @property
-        def prompts(self) -> list[str]:
-            return prompts
-
-    return Answers()
 
 
 def _kept_lines(confirmer: DeleteConfirmer) -> list[str]:

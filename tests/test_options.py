@@ -304,3 +304,184 @@ def test_push_git_entry_meta_only_writes_manifest_like_any_other_entry(ws):
 
     ws.run("push", "--meta-only", "repo.git", expect_rc=0)
     assert "repo.git-manifest.jsonl" in ws.keys()
+
+
+# --- push --delete (confirmed deletions) ---------------------------------------
+
+
+def _manifest_paths(ws) -> list[str]:
+    import json
+
+    body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl")["Body"].read()
+    return [json.loads(ln)["path"] for ln in body.decode().splitlines()[1:]]
+
+
+def _orphan_tree(ws) -> None:
+    """Push a tree, then delete `sub/` locally: sub/x.txt and sub/y.txt become
+    S3 orphans (delete candidates in that key order) while keep.txt stays."""
+    ws.write("data/keep.txt", "k")
+    ws.write("data/sub/x.txt", "x")
+    ws.write("data/sub/y.txt", "y")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    shutil.rmtree(ws.root / "data" / "sub")
+
+
+def test_push_delete_yes_mirrors_unattended(ws, answers):
+    _orphan_tree(ws)
+
+    res = ws.run("push", "--delete", "--yes", "data", expect_rc=0)
+
+    assert answers.prompts == []
+    assert "delete:" in res.out
+    keys = ws.keys()
+    assert "data/sub/x.txt" not in keys
+    assert "data/sub/y.txt" not in keys
+    assert "data/keep.txt" in keys
+    assert _manifest_paths(ws) == [".", "./keep.txt"]
+
+
+def test_push_delete_without_tty_answers_no_to_everything(ws):
+    # pytest's stdin is not a TTY: --delete without --yes keeps everything,
+    # succeeds (rc 0), and neither warns nor prompts.
+    _orphan_tree(ws)
+
+    res = ws.run("push", "--delete", "data", expect_rc=0)
+
+    assert "delete:" not in res.out
+    assert "warning" not in res.err.lower()
+    keys = ws.keys()
+    assert "data/sub/x.txt" in keys
+    assert "data/sub/y.txt" in keys
+    assert "./sub/x.txt" in _manifest_paths(ws)
+    assert "./sub/y.txt" in _manifest_paths(ws)
+
+
+def test_push_delete_interactive_y_n_mix_keeps_answered_records(ws, answers):
+    # Candidates arrive in key order: sub/x.txt then sub/y.txt. Deleting x and
+    # keeping y must keep y's record AND its ancestor dir record ./sub.
+    _orphan_tree(ws)
+    answers.feed("y", "n")
+
+    res = ws.run("push", "--delete", "data", expect_rc=0)
+
+    assert len(answers.prompts) == 2
+    assert "sub/x.txt" in answers.prompts[0]
+    keys = ws.keys()
+    assert "data/sub/x.txt" not in keys
+    assert "data/sub/y.txt" in keys
+    assert _manifest_paths(ws) == [".", "./keep.txt", "./sub", "./sub/y.txt"]
+    assert "delete:" in res.out
+
+
+def test_push_delete_interactive_a_deletes_the_rest(ws, answers):
+    _orphan_tree(ws)
+    answers.feed("a")
+
+    ws.run("push", "--delete", "data", expect_rc=0)
+
+    assert len(answers.prompts) == 1
+    assert ws.keys() == {"data/keep.txt", "data-manifest.jsonl"}
+    assert _manifest_paths(ws) == [".", "./keep.txt"]
+
+
+def test_push_delete_interactive_d_keeps_the_rest(ws, answers):
+    _orphan_tree(ws)
+    answers.feed("d")
+
+    ws.run("push", "--delete", "data", expect_rc=0)
+
+    assert len(answers.prompts) == 1
+    keys = ws.keys()
+    assert "data/sub/x.txt" in keys
+    assert "data/sub/y.txt" in keys
+    assert _manifest_paths(ws) == [".", "./keep.txt", "./sub", "./sub/x.txt", "./sub/y.txt"]
+
+
+def test_push_delete_interactive_q_aborts_without_manifest_update(ws, answers):
+    hook_sentinel = ws.root / "hook-ran"
+    ws.write("data/keep.txt", "k")
+    ws.write("data/sub/x.txt", "x")
+    ws.write("data/sub/y.txt", "y")
+    ws.config(
+        {
+            "data": {
+                "path": str(ws.root / "data"),
+                "post_hook": ["python3", "-c", f"open({str(hook_sentinel)!r}, 'w').close()"],
+            }
+        }
+    )
+    ws.run("push", "data", expect_rc=0)
+    assert hook_sentinel.exists()
+    hook_sentinel.unlink()
+    shutil.rmtree(ws.root / "data" / "sub")
+    before = _manifest_paths(ws)
+
+    answers.feed("q")
+    res = ws.run("push", "--delete", "data")
+
+    assert res.rc == 1
+    assert "aborted" in res.err
+    assert _manifest_paths(ws) == before
+    assert not hook_sentinel.exists()
+    assert "data/sub/y.txt" in ws.keys()  # never asked, never deleted
+
+
+def test_push_delete_dry_run_reports_all_candidates_without_prompting(ws, answers):
+    _orphan_tree(ws)
+    before = _manifest_paths(ws)
+
+    res = ws.run("push", "--delete", "--dry-run", "data", expect_rc=0)
+
+    assert answers.prompts == []
+    assert "(dry-run) delete:" in res.out
+    assert "sub/x.txt" in res.out
+    assert "sub/y.txt" in res.out
+    assert "(dry-run) would update manifest" in res.out
+    keys = ws.keys()
+    assert "data/sub/x.txt" in keys
+    assert "data/sub/y.txt" in keys
+    assert _manifest_paths(ws) == before
+
+
+def test_push_dry_run_without_delete_prints_no_delete_lines(ws):
+    _orphan_tree(ws)
+
+    res = ws.run("push", "--dry-run", "data", expect_rc=0)
+
+    assert "delete:" not in res.out
+
+
+def test_push_delete_on_single_file_entry_deletes_nothing(ws, answers):
+    target = ws.write("single.txt", "x")
+    ws.config({"single": {"path": str(target)}})
+    ws.run("push", "single", expect_rc=0)
+
+    ws.run("push", "--delete", "--yes", "single", expect_rc=0)
+
+    assert "single" in ws.keys()
+    assert answers.prompts == []
+
+
+def test_push_all_delete_yes_mirrors_every_entry(ws):
+    ws.write("d1/a.txt", "a")
+    ws.write("d1/gone.txt", "g")
+    ws.write("d2/b.txt", "b")
+    ws.write("d2/gone.txt", "g")
+    ws.config(
+        {
+            "d1": {"path": str(ws.root / "d1")},
+            "d2": {"path": str(ws.root / "d2")},
+        }
+    )
+    ws.run("push", "--all", expect_rc=0)
+    (ws.root / "d1" / "gone.txt").unlink()
+    (ws.root / "d2" / "gone.txt").unlink()
+
+    ws.run("push", "--all", "--delete", "--yes", expect_rc=0)
+
+    keys = ws.keys()
+    assert "d1/gone.txt" not in keys
+    assert "d2/gone.txt" not in keys
+    assert "d1/a.txt" in keys
+    assert "d2/b.txt" in keys

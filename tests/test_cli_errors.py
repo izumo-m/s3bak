@@ -235,7 +235,10 @@ def test_mtime_window_flag_requires_value(cfg_ws):
         ("push", "--checksum", "--meta-only", "data"),
         ("push", "--checksum", "--mtime-window", "0", "data"),
         ("pull", "--delete", "--meta-only", "data"),
-        ("push", "--delete", "data"),
+        ("push", "--meta-only", "--delete", "data"),
+        ("push", "--data-only", "--delete", "data"),
+        ("push", "--yes", "data"),
+        ("pull", "--yes", "data"),
     ],
 )
 def test_ignored_option_combinations_are_rejected(cfg_ws, args):

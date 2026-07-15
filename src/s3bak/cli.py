@@ -47,6 +47,7 @@ from s3bak.commands import (
 )
 from s3bak.compare import _resolve_use_color
 from s3bak.config import Config, Opts, load_config
+from s3bak.confirm import reset_confirmations
 from s3bak.console import (
     die,
     err,
@@ -162,9 +163,10 @@ Commands:
 Options:
   --all            Apply the command to all configured entries
   --dry-run        Show what would happen without changing anything (push/pull)
-  --delete         Delete extras: pull removes local files not in the backup
-                   (push always mirrors; a sub-path push needs --delete only
-                   to confirm deleting a missing local sub-path's backup)
+  --delete         Delete extras, confirming each one (y/n/a/d/q): push removes
+                   S3 objects with no local counterpart, pull removes local
+                   files not in the backup. Without a TTY every answer is no
+  --yes            Answer yes to every --delete confirmation (unattended mirror)
   --meta-only      Sync only metadata (the manifest), skip file data (push/pull)
   --data-only      Sync only file data, leave manifest/local-meta untouched (push/pull)
   --checksum       Compare by content (ETag) instead of the manifest size+mtime
@@ -184,7 +186,7 @@ Options:
 status letters (push-oriented: what would change on the backup):
   M <path>         modified (metadata differs between local and backup)
   A <path>         only locally, not in backup   (push would add)
-  D <path>         only in backup, not locally   (push would delete)
+  D <path>         only in backup, not locally   (push --delete would remove)
 
 Config file: {config_path}
 
@@ -196,6 +198,8 @@ Examples:
   s3bak push --meta-only bin           # upload metadata (the manifest) only
   s3bak push --meta-only --all         # upload metadata for all entries
   s3bak push --data-only bin           # upload data only, leave manifest unchanged
+  s3bak push bin --delete              # remove S3 orphans, confirming each
+  s3bak push --all --delete --yes      # unattended mirror (e.g. cron)
   s3bak push bin/s3bak                 # single file inside the bin entry
   s3bak push ~/bin/s3bak               # same, via ~ expansion
   s3bak push bin/subdir                # only the sub-directory
@@ -337,6 +341,10 @@ def _validate_pull_destinations(cfg: Config, resolved: Sequence[tuple[str, str |
 
 
 def main(argv: list[str] | None = None) -> int:
+    # A q answer to a --delete confirmation aborts via module state; clear it
+    # here so in-process callers (the test suite) start every run fresh.
+    reset_confirmations()
+
     args = sys.argv[1:] if argv is None else argv
     if not args:
         print_usage()
@@ -355,6 +363,7 @@ def main(argv: list[str] | None = None) -> int:
     opt_all = False
     opt_dryrun = False
     opt_delete = False
+    opt_yes = False
     opt_meta_only = False
     opt_data_only = False
     opt_verbose = False
@@ -381,6 +390,8 @@ def main(argv: list[str] | None = None) -> int:
             opt_dryrun = True
         elif a == "--delete":
             opt_delete = True
+        elif a == "--yes":
+            opt_yes = True
         elif a == "--meta-only":
             opt_meta_only = True
         elif a == "--data-only":
@@ -424,6 +435,7 @@ def main(argv: list[str] | None = None) -> int:
     opts = Opts(
         dryrun=opt_dryrun,
         delete=opt_delete,
+        yes=opt_yes,
         meta_only=opt_meta_only,
         data_only=opt_data_only,
         verbose=opt_verbose,
@@ -451,9 +463,13 @@ def main(argv: list[str] | None = None) -> int:
         die("--dry-run only applies to push and pull")
 
     if opt_delete and subcmd not in ("push", "pull"):
-        die("--delete only applies to pull and sub-path push")
-    if subcmd == "push" and opt_all and opt_delete:
-        die("push always mirrors; --delete only confirms deleting missing sub-path backups")
+        die("--delete only applies to push and pull")
+    if opt_yes and not opt_delete:
+        die("--yes requires --delete (it answers deletion confirmations)")
+    if subcmd == "push" and opt_delete and opt_meta_only:
+        die("push --delete cannot be combined with --meta-only (a deletion drops the object too)")
+    if subcmd == "push" and opt_delete and opt_data_only:
+        die("push --delete cannot be combined with --data-only (a deletion drops the record too)")
 
     if opt_checksum and subcmd not in ("push", "pull"):
         die("--checksum only applies to push and pull")
@@ -493,8 +509,6 @@ def main(argv: list[str] | None = None) -> int:
             resolved = [(entry, None) for entry in sorted(cfg.entries.keys())]
         else:
             resolved = resolve_entry_files(cfg, positional, "push")
-            if opts.delete and any(sub is None for _entry, sub in resolved):
-                die("push always mirrors; --delete only confirms deleting missing sub-path backups")
         _validate_distinct_entries(resolved, "push")
         return _run_resolved_entries(cmd_push, cfg, resolved, opts)
 
