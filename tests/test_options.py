@@ -75,6 +75,80 @@ def test_push_data_only_skips_manifest_refresh(ws):
     assert before == after  # but the manifest was not rewritten
 
 
+def test_push_data_only_warns_about_unrecorded_uploads(ws):
+    # A --data-only upload of a file the manifest never recorded leaves an
+    # unrecorded object (storage.md); the push must say so. cli.run maps the
+    # warning to exit 2; in-process main() reports it on stderr only.
+    ws.write("data/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "a.txt").write_text("a-changed")  # recorded: update lane
+    ws.write("data/new.txt", "n")  # unrecorded: create lane
+
+    res = ws.run("push", "--data-only", "data", expect_rc=0)
+    assert "1 object(s) the manifest does not record" in res.err
+    assert "./new.txt" not in _manifest_paths(ws)
+
+
+def test_push_data_only_of_recorded_files_does_not_warn(ws):
+    ws.write("data/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "a.txt").write_text("a-changed")
+    res = ws.run("push", "--data-only", "data", expect_rc=0)
+    assert "does not record" not in res.err
+
+
+def test_first_push_data_only_warns_for_every_upload(ws):
+    # No manifest on S3 at all: every upload is unrecorded.
+    ws.write("data/a.txt", "a")
+    ws.write("data/b.txt", "b")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+
+    res = ws.run("push", "--data-only", "data", expect_rc=0)
+    assert "2 object(s) the manifest does not record" in res.err
+
+
+def test_push_checksum_data_only_still_warns(ws):
+    # --checksum --data-only used to skip the manifest download entirely; the
+    # unrecorded-upload warning is why every dir push now fetches it.
+    ws.write("data/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    ws.write("data/new.txt", "n")
+    res = ws.run("push", "--checksum", "--data-only", "data", expect_rc=0)
+    assert "1 object(s) the manifest does not record" in res.err
+
+
+def test_push_data_only_dry_run_does_not_warn(ws):
+    # A dry run uploads nothing, so there is nothing to warn about; the
+    # planned upload is still reported.
+    ws.write("data/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    ws.write("data/new.txt", "n")
+    res = ws.run("push", "--data-only", "--dry-run", "data", expect_rc=0)
+    assert "does not record" not in res.err
+    assert "new.txt" in res.out
+
+
+def test_subpath_push_data_only_warns_about_unrecorded_uploads(ws):
+    # The sub-relative compare key must be entry-rooted before the manifest
+    # lookup, or a recorded sub file would be miscounted as unrecorded.
+    ws.write("data/sub/x.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "sub" / "x.txt").write_text("x-changed")
+    ws.write("data/sub/new.txt", "n")
+    res = ws.run("push", "--data-only", "data/sub", expect_rc=0)
+    assert "1 object(s) the manifest does not record" in res.err
+
+
 def test_push_dryrun_uploads_nothing(ws):
     ws.write("data/a.txt", "a")
     ws.config({"data": {"path": str(ws.root / "data")}})

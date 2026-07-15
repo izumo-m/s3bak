@@ -41,6 +41,7 @@ from s3bak.console import (
     echo_command,
     err,
     normalize_local_path,
+    note_warning,
     write_output,
     write_stderr,
 )
@@ -174,6 +175,38 @@ def _plan_push_deletes(cfg: Config, entry: str, sub: str | None, opts: Opts) -> 
     return plan
 
 
+def _plan_data_only_creates(
+    plan: _PushDeletePlan, sub: str | None, opts: Opts
+) -> tuple[Any, list[int]]:
+    """Create-lane hook for --data-only: count uploads of files the manifest
+    does not record - the unrecorded objects this push leaves behind (see
+    storage.md). The count feeds _warn_unrecorded_creates after the sync.
+    Everything still copies (the hook always returns True). Outside
+    --data-only the lane is the plain default; a dry run transfers nothing,
+    so it has nothing to count. The manifest lookup reuses plan.recorded():
+    --delete cannot combine with --data-only, so the delete lane never
+    queries the same stream."""
+    count = [0]
+    if not opts.data_only or opts.dryrun:
+        return True, count
+
+    def note(info: Any) -> bool:
+        rel = info.compare_key if sub is None else f"{sub}/{info.compare_key}"
+        if not plan.recorded(rel):
+            count[0] += 1
+        return True
+
+    return note, count
+
+
+def _warn_unrecorded_creates(entry: str, count: list[int]) -> None:
+    if count[0]:
+        note_warning(
+            f"warning: {entry}: --data-only uploaded {count[0]} object(s) the manifest"
+            f" does not record; run a push without --data-only to record them"
+        )
+
+
 def _push_sub(
     cfg: Config,
     entry: str,
@@ -240,21 +273,25 @@ def _push_sub(
             compare = None
             try:
                 # --checksum ignores the manifest for its compare, but --delete
-                # still needs it: the prompt flags candidates it does not
-                # record, and the patch reuses it as the old side.
-                have_manifest = (not opts.checksum or opts.delete) and download_manifest(
-                    cfg, entry, manifest_path, opts.verbose
-                )
+                # still needs it (the prompt flags candidates it does not
+                # record, and the patch reuses it as the old side), and
+                # --data-only reads it to warn about the uploads it leaves
+                # unrecorded.
+                have_manifest = (
+                    not opts.checksum or opts.delete or opts.data_only
+                ) and download_manifest(cfg, entry, manifest_path, opts.verbose)
                 if have_manifest:
                     plan.old_manifest = manifest_path
                 compare = sync_compare(
                     cfg, opts, entry, manifest_path if have_manifest else None, sub=sub
                 )
+                create_lane, unrecorded = _plan_data_only_creates(plan, sub, opts)
                 result = cfg.store.sync_up(
                     local_sub,
                     sub_rel,
                     file_filter=manifest.exclude_filter(excludes, sub=sub) if excludes else None,
                     compare=compare,
+                    create=create_lane,
                     delete=plan.lane,
                     dryrun=opts.dryrun,
                     verbose=opts.verbose,
@@ -273,6 +310,7 @@ def _push_sub(
             if result.stdout:
                 write_output(f"{result.stdout}\n")
                 did_work = True
+            _warn_unrecorded_creates(entry, unrecorded)
             patch_keep = plan.keep_old()
         elif stat_mod.S_ISREG(st.st_mode):
             # Regular file: an explicit sub-path push always uploads.
@@ -492,21 +530,22 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             compare = None
             structure_changed = False
             try:
-                # A checksum compare does not use manifest file stats, but an
-                # ordinary push still needs the manifest to notice objectless tree
-                # changes (empty directories and symlinks) and validate its source
-                # of truth. --data-only is the one mode that can skip it.
-                have_manifest = not (opts.checksum and opts.data_only) and download_manifest(
-                    cfg, entry, manifest_path, opts.verbose
-                )
+                # A checksum compare does not use manifest file stats, but every
+                # dir push still downloads the manifest: an ordinary push
+                # compares against it, any push uses it to notice objectless
+                # tree changes, and --data-only reads it to warn about the
+                # uploads it leaves unrecorded.
+                have_manifest = download_manifest(cfg, entry, manifest_path, opts.verbose)
                 if have_manifest:
                     plan.old_manifest = manifest_path
                 compare = sync_compare(cfg, opts, entry, manifest_path if have_manifest else None)
+                create_lane, unrecorded = _plan_data_only_creates(plan, None, opts)
                 result = cfg.store.sync_up(
                     target,
                     entry,
                     file_filter=manifest.exclude_filter(excludes) if excludes else None,
                     compare=compare,
+                    create=create_lane,
                     delete=plan.lane,
                     dryrun=opts.dryrun,
                     verbose=opts.verbose,
@@ -531,6 +570,7 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 if result.stderr:
                     write_stderr(result.stderr)
                 return result.returncode
+            _warn_unrecorded_creates(entry, unrecorded)
             results = result.stdout
             refresh_manifest = bool(results)
             if not refresh_manifest and not opts.data_only:
