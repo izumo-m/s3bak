@@ -136,29 +136,27 @@ def test_push_dir_subpath_uploads_new_file(ws):
     assert res.out.strip() == ""
 
 
-def test_dir_subpath_push_mirrors_without_delete_flag(ws):
-    # A sub-path push is a whole-entry push scoped to the sub-path: it must
-    # delete the S3 object of a removed local file even without --delete, so
-    # no orphan outlives the manifest record write_patched unconditionally
-    # drops. Anything outside the sub-path stays untouched.
+def test_dir_subpath_push_keeps_backup_by_default(ws):
+    # A sub-path push is a whole-entry push scoped to the sub-path, and like a
+    # whole-entry push it never deletes by default: the removed file's object
+    # AND its manifest record both survive the patch.
     ws.write("data/keep.txt", "k")
     ws.write("data/sub/x.txt", "x")
     ws.write("data/sub/y.txt", "y")
-    ws.write("data/submarine/z.txt", "z")
     ws.config({"data": {"path": str(ws.root / "data")}})
     ws.run("push", "data", expect_rc=0)
 
     (ws.root / "data" / "sub" / "y.txt").unlink()
     res = ws.run("push", "data/sub", expect_rc=0)
 
-    assert "delete" in res.out
+    assert "delete:" not in res.out
     keys = ws.keys()
-    assert "data/sub/y.txt" not in keys
+    assert "data/sub/y.txt" in keys
     assert "data/sub/x.txt" in keys
-    assert "data/keep.txt" in keys
-    assert "data/submarine/z.txt" in keys
-    res = ws.run("status", "data", expect_rc=0)
-    assert res.out.strip() == ""
+    manifest_body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl")[
+        "Body"
+    ].read()
+    assert b'"path":"./sub/y.txt"' in manifest_body
 
 
 def test_symlinks_are_recorded_in_manifest_not_uploaded_as_data(ws):

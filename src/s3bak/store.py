@@ -533,12 +533,16 @@ class Boto3S3Store:
         *,
         file_filter: Any = None,
         compare: Any = None,
+        delete: Any = False,
         dryrun: bool = False,
         verbose: bool = False,
     ) -> TransferResult:
         """`file_filter` is the excludes predicate (manifest.exclude_filter):
         the same entry-rooted semantics the manifest walk applies, so the data
-        sync and the manifest can never disagree on what an exclude means."""
+        sync and the manifest can never disagree on what an exclude means.
+        `delete` is the delete-lane value: False keeps every S3 orphan (the
+        default), True prunes them all, and a callable decides per orphan
+        (the --delete confirmation; called serially in ascending key order)."""
         from boto3_s3 import LocalStorage
 
         # follow_symlinks moved onto the Storage in 0.5: symlinks are not
@@ -550,13 +554,13 @@ class Boto3S3Store:
             return self._transfer(
                 verbose,
                 f"sync {src_dir} {dst}",
-                # Every push mirrors: delete_filter=True prunes S3 orphans; new
-                # local files take the default create lane, both-sides pairs the
-                # update_filter (the ManifestFilter, or EtagComparison pool).
+                # New local files take the default create lane, both-sides
+                # pairs the update_filter (the ManifestFilter, or the
+                # EtagComparison pool), orphans the delete lane above.
                 lambda cb: self._s3.sync(
                     src,
                     dst,
-                    delete_filter=True,
+                    delete_filter=delete,
                     dryrun=dryrun,
                     filter=file_filter,
                     update_filter=update_filter,

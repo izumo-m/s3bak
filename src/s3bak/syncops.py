@@ -23,10 +23,20 @@ from s3bak.manifest import ManifestEntry
 
 
 def write_manifest_to_aws(
-    cfg: Config, entry: str, target: str, excludes: list[str], verbose: bool
+    cfg: Config,
+    entry: str,
+    target: str,
+    excludes: list[str],
+    verbose: bool,
+    *,
+    old_manifest: str | None = None,
+    keep_old: manifest.KeepOld = False,
 ) -> None:
     """Walk `target` in S3 key order, stream the v3 manifest to a temp file,
-    and upload it."""
+    and upload it. For a directory entry the walk is merged with
+    `old_manifest` under the `keep_old` policy, so records of kept-but-
+    locally-vanished files survive the rewrite (see manifest.write_merged).
+    A single-file entry has one record and no merge."""
     key = manifest.manifest_key(entry)
     write_stderr(f"Updating {cfg.prefix}/{key}\n")
 
@@ -34,7 +44,14 @@ def write_manifest_to_aws(
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             if os.path.isdir(target):
-                manifest.write_manifest(f, localwalk.walk_tree(target, excludes))
+                manifest.write_merged(
+                    f,
+                    old_manifest,
+                    None,
+                    localwalk.walk_tree(target, excludes),
+                    keep_old=keep_old,
+                    warn=note_warning,
+                )
             else:
                 st = os.lstat(target)
                 sym = os.readlink(target) if stat_mod.S_ISLNK(st.st_mode) else None
@@ -52,6 +69,8 @@ def patch_manifest_subtree(
     sub: str,
     excludes: list[str],
     opts: Opts,
+    *,
+    keep_old: manifest.KeepOld = False,
 ) -> bool:
     """Download the manifest, replace the records under `sub`, and re-upload.
 
@@ -88,7 +107,12 @@ def patch_manifest_subtree(
             new_entries = itertools.chain([root_record], new_entries)
         with open(new_path, "w", encoding="utf-8") as out:
             manifest.write_merged(
-                out, old_path if have_old else None, sub, new_entries, warn=note_warning
+                out,
+                old_path if have_old else None,
+                sub,
+                new_entries,
+                keep_old=keep_old,
+                warn=note_warning,
             )
         write_stderr(f"Updating {cfg.prefix}/{key}\n")
         assert cfg.store is not None
