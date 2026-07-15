@@ -355,13 +355,15 @@ class KeptKeys:
     in delete-lane decide order, which the sync guarantees is ascending key
     order, so a one-line lookahead answers every query - but queries must also
     arrive in ascending order (they do: old-only records are examined in
-    manifest order)."""
+    manifest order). ``path=None`` is the empty stream (nothing was kept)."""
 
-    def __init__(self, path: str) -> None:
-        self._f = open(path, encoding="utf-8")
+    def __init__(self, path: str | None) -> None:
+        self._f = open(path, encoding="utf-8") if path is not None else None
         self._head = self._read()
 
     def _read(self) -> str | None:
+        if self._f is None:
+            return None
         line = self._f.readline()
         if not line:
             return None
@@ -380,23 +382,19 @@ class KeptKeys:
             return True
         return False
 
-    def keeps_dir(self, rel: str) -> bool:
-        """True iff some kept key lives under the directory ``rel``. In sort
-        order a directory's descendant range is contiguous and starts right at
-        ``rel + "/"``, so peeking one key suffices (nothing is consumed)."""
-        prefix = rel + "/"
-        while self._head is not None and self._head < prefix:
-            self._head = self._read()
-        return self._head is not None and self._head.startswith(prefix)
-
     def close(self) -> None:
-        self._f.close()
+        if self._f is not None:
+            self._f.close()
 
 
-# The keep policy for old-only records in write_merged's replaced range:
-# False drops them all (mirror), True keeps them all (no deletions were made),
-# a KeptKeys stream keeps the files the user answered "keep" plus the
-# directories above them. Mirrors the shape of S3.sync's bool|filter lanes.
+# The keep policy for old-only records in write_merged's replaced range.
+# Only a regular file's record can be confirmed away - its S3 object is the
+# delete candidate; directories, symlinks, and specials have no object, hence
+# no question, and their records survive everything short of the mirror. So:
+# True keeps every old-only record (no deletions were made), False drops them
+# all (--yes, the mirror), and a KeptKeys stream drops exactly the FILE
+# records whose key it does not hold (their objects were deleted - or were
+# already gone, which is how stale records self-heal).
 KeepOld = bool | KeptKeys
 
 
@@ -414,11 +412,11 @@ def write_merged(
     Old records outside the replaced range (everything when ``sub`` is None,
     the records at/under ``sub`` otherwise) are copied verbatim (preserving
     any unknown keys). Inside the range, a walked path always wins over its
-    old record; an old-only record survives per ``keep_old``, except symlink /
-    special / empty-dir records, which have no S3 object and therefore no
-    delete prompt - they survive only under ``keep_old=True``. Everything
-    streams in sort-key order: one pending walk item, one old line, one
-    kept-key lookahead.
+    old record and old-only records survive per ``keep_old`` (see its
+    comment); keeping only file records that were explicitly kept never
+    orphans them, because their ancestor directory records are objectless and
+    always survive. Everything streams in sort-key order: one record of
+    lookahead per input (merge_join) plus one kept-key line.
 
     ``warn`` is called once per subtree that the merge leaves unrestorable:
     records surviving under a path that another record says is not a
@@ -426,8 +424,6 @@ def write_merged(
     versa). Such records stay backed up but ``pull`` cannot materialize both.
     """
     out.write(_header_line() + "\n")
-    new_iter = iter(new_entries)
-    pending = next(new_iter, None)
 
     # Restorability check: every emitted record passes through emit(), which
     # tracks the most recent non-directory records whose descendant key range
@@ -456,54 +452,36 @@ def write_merged(
             blockers.append([rel, False])
         out.write(text)
 
-    def pending_key() -> str:
-        assert pending is not None
-        path, st, _sym = pending
-        return entry_sort_key(path, stat_mod.S_ISDIR(st.st_mode))
-
-    def emit_pending() -> None:
-        nonlocal pending
-        assert pending is not None
-        path, st, sym_target = pending
-        rel = "." if path == "." else path.removeprefix("./")
-        emit(rel, stat_mod.S_ISDIR(st.st_mode), format_entry(path, st, sym_target) + "\n")
-        pending = next(new_iter, None)
-
-    def flush_new_below(limit: str | None) -> None:
-        while pending is not None:
-            if limit is not None and pending_key() >= limit:
-                return
-            emit_pending()
-
-    def keeps(rel: str, e: ManifestEntry) -> bool:
-        if keep_old is True:
-            return True
-        if keep_old is False:
-            return False
-        if e.is_dir:
-            return keep_old.keeps_dir(rel)
-        if e.is_file:
-            return keep_old.consume_file(rel)
-        return False  # objectless (symlink/special): never a delete candidate
-
-    if old_manifest is not None:
+    def old_items() -> Iterator[tuple[str, tuple[str, ManifestEntry, str]]]:
+        if old_manifest is None:
+            return
         with open(old_manifest, encoding="utf-8") as f:
             _check_header(f.readline())
             for line in f:
                 e = parse_entry(line)
                 if e is None:
                     raise ManifestError("invalid record in manifest being merged")
-                rel = e.path.removeprefix("./")
-                key = entry_sort_key(e.path, e.is_dir)
-                flush_new_below(key)
-                if pending is not None and pending_key() == key:
-                    emit_pending()  # both sides: the fresh walk record wins
-                    continue
-                in_range = sub is None or rel == sub or rel.startswith(sub + "/")
-                if in_range and not keeps(rel, e):
-                    continue
-                emit(rel, e.is_dir, line if line.endswith("\n") else line + "\n")
-    flush_new_below(None)
+                yield entry_sort_key(e.path, e.is_dir), (e.path.removeprefix("./"), e, line)
+
+    def walk_items() -> Iterator[tuple[str, tuple[str, os.stat_result, str | None]]]:
+        for item in new_entries:
+            path, st, _sym = item
+            yield entry_sort_key(path, stat_mod.S_ISDIR(st.st_mode)), item
+
+    for _key, old, new in merge_join(old_items(), walk_items()):
+        if new is not None:  # the fresh walk record wins over any old record
+            path, st, sym_target = new
+            rel = "." if path == "." else path.removeprefix("./")
+            emit(rel, stat_mod.S_ISDIR(st.st_mode), format_entry(path, st, sym_target) + "\n")
+            continue
+        assert old is not None
+        rel, e, line = old
+        if sub is None or rel == sub or rel.startswith(sub + "/"):  # the replaced range
+            if keep_old is False:
+                continue
+            if keep_old is not True and e.is_file and not keep_old.consume_file(rel):
+                continue
+        emit(rel, e.is_dir, line if line.endswith("\n") else line + "\n")
 
 
 # =============================================================================

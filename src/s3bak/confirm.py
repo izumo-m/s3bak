@@ -107,7 +107,7 @@ class DeleteConfirmer:
                 if answer == "d":
                     self._mode = AnswerMode.ALL_NO
                     return self._note_kept(kept_key)
-                if answer in ("q", ""):
+                if answer == "q" or answer is None:  # None = EOF; bare Enter re-asks
                     _abort.set()
                     raise DeletionAbortedError()
 
@@ -144,5 +144,5 @@ def confirm_subtree_delete(mode: AnswerMode, entry: str, display: str) -> bool:
             )
             if answer == "y":
                 return True
-            if answer in ("n", ""):
+            if answer == "n" or answer is None:  # None = EOF; bare Enter re-asks
                 return False

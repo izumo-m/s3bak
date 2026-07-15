@@ -72,17 +72,21 @@ def prompt_is_interactive() -> bool:
     return sys.stdin.isatty() and sys.stderr.isatty()
 
 
-def read_prompt_answer(prompt: str) -> str:
+def read_prompt_answer(prompt: str) -> str | None:
     """Write ``prompt`` to stderr and read one answer line from stdin.
 
     The write holds the output lock so a transfer worker's line cannot split
     the prompt, but the read happens outside it - blocking on the keyboard
     while holding the lock would deadlock worker-thread result reporting.
-    Returns the stripped lowercased answer, or "" on EOF."""
+    Returns the stripped lowercased answer, or None on EOF - an empty answer
+    (bare Enter) and a closed stdin must not be conflated."""
     with _output_lock:
         sys.stderr.write(prompt)
         sys.stderr.flush()
-    return sys.stdin.readline().strip().lower()
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    return line.strip().lower()
 
 
 def echo_command(verbose: bool, args: list[str]) -> None:

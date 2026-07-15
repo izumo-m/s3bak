@@ -161,11 +161,13 @@ environment.
    structure or a symlink target changed, on `--meta-only`, or when no
    manifest exists yet.** The refresh merges the fresh local walk into the
    old manifest (`write_merged`): a walked path always wins, and old-only
-   records — the backups of locally vanished files — are kept, except those
-   whose object a confirmed `--delete` removed. A record kept under a path
-   that is no longer a directory (the local tree replaced a directory with a
-   same-named file) makes the entry unrestorable as a tree; the merge detects
-   this and warns (exit 2), and a `push --delete` prunes such records. The
+   records — the backups of locally vanished files — are kept, except file
+   records dropped by a `--delete` run: those whose object the confirmation
+   removed, and stale ones whose object was already gone (how an interrupted
+   deletion self-heals). A record kept under a path that is no longer a
+   directory (the local tree replaced a directory with a same-named file)
+   makes the entry unrestorable as a tree; the merge detects this and warns
+   (exit 2), and a `push --delete --yes` prunes such records. The
    structural check makes empty and symlink-only changes restorable even
    though they have no data objects. A mode-only change or an mtime drift inside
    the window transfers nothing and does not refresh an existing manifest;
@@ -185,9 +187,9 @@ patch also writes the `.` root record so the manifest keeps its directory-entry
 shape. A sub-path push is a whole-entry push scoped to the sub-path: the same
 keep-by-default and `--delete` confirmation rules apply within the range, and
 records outside it are copied verbatim. A file-typed sub-path has no S3
-listing, so `--delete` there cannot offer orphans under a same-named former
-directory: their records fall out of the patch while the objects stay until a
-directory-level `push --delete`.
+listing, so `--delete` there has nothing to confirm: records under a
+same-named former directory are kept (with the restorability warning), and
+pruning them takes a directory-level `push --delete`.
 
 If the local sub-path no longer exists, the push fails unless `--delete` is
 present — the guard that keeps a typo from silently erasing a backup — and the
@@ -202,11 +204,17 @@ Deleting is opt-in and confirmed:
 - **`--delete`** enables the delete lane behind a per-orphan prompt
   (`y/n/a/d/q`): y deletes this object, n keeps it, a deletes this and every
   later candidate, d keeps this and every later candidate, q aborts the whole
-  command. Candidates arrive in ascending key order (the sync decides the
-  delete lane serially). An object answered n keeps its manifest record too —
-  the record and the object always travel together — and shows up as `D` in
-  `status` until a later `--delete` removes it. Prompts of parallel `--all`
-  entries are serialized and carry the entry name.
+  command (a bare Enter re-asks; EOF aborts). Candidates arrive in ascending
+  key order (the sync decides the delete lane serially). An object answered n
+  keeps its manifest record too — the record and the object always travel
+  together — and shows up as `D` in `status` until a later `--delete` removes
+  it. Prompts of parallel `--all` entries are serialized and carry the entry
+  name.
+- **Only regular files are ever asked** — theirs are the S3 objects the
+  delete lane sees. Directory, symlink, and special-file records have no
+  object and no question, so no confirmation can drop them: they survive
+  every `--delete` short of the `--yes` mirror. (For a locally deleted
+  symlink or empty directory, the record IS the backup.)
 - **`--yes`** answers yes to every confirmation: the unattended mirror for
   cron. Without a TTY (stdin/stderr), `--delete` without `--yes` answers no
   to everything — nothing is deleted and the run still succeeds (rc 0).

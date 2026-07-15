@@ -115,8 +115,10 @@ memory bounded by one directory level rather than the whole tree:
   deleting is opt-in), all dropped (`--delete --yes`, the mirror), or decided
   by the kept-keys stream (`KeptKeys`) that the `--delete` confirmation wrote —
   one JSON-encoded key per line, in ascending key order because the sync's
-  delete lane decides serially in that order, so one line of lookahead keeps a
-  kept file's record and its ancestor directory records with constant memory.
+  delete lane decides serially in that order, so one line of lookahead decides
+  every record with constant memory. The stream governs regular-file records
+  only: directory, symlink, and special records have no S3 object to confirm,
+  always survive it, and thereby keep every kept file's ancestor chain valid.
 - **The default update strategy** (`ManifestFilter`) reads the manifest once,
   front to back, merge-joining its records against `S3.sync`'s ascending
   compare-key pairs (`iter_compare_records` keys a directory as `name/` to match

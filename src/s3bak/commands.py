@@ -15,7 +15,7 @@ import stat as stat_mod
 import subprocess
 import tempfile
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from s3bak import localwalk, manifest
@@ -108,27 +108,26 @@ class _PushDeletePlan:
     the manifest merge must do about old-only records afterwards."""
 
     lane: Any  # sync_up delete=: False | True | per-orphan callable
-    confirmer: DeleteConfirmer | None  # interactive mode only
-    mirror: bool  # --delete with every answer yes: the manifest is a pure walk
-    _kept: manifest.KeptKeys | None = None
+    confirmer: DeleteConfirmer | None  # --delete without --yes (asked or auto-n)
+    mirror: bool  # --delete --yes: every record follows its object; pure walk
+    _kept: list[manifest.KeptKeys] = field(default_factory=list)
 
     def keep_old(self) -> manifest.KeepOld:
-        """The manifest merge policy. Call after the sync: an interactive run's
-        kept-keys file is complete only once every orphan was decided."""
+        """A fresh view of the manifest keep policy (KeptKeys streams, so each
+        consumer opens its own). Call after the sync: the kept-keys file is
+        complete only once every orphan was decided."""
         if self.mirror:
             return False
         if self.confirmer is not None:
-            path = self.confirmer.kept_keys_path()
-            if path is None:  # every answer deleted its object
-                return False
-            self._kept = manifest.KeptKeys(path)
-            return self._kept
+            kept = manifest.KeptKeys(self.confirmer.kept_keys_path())
+            self._kept.append(kept)
+            return kept
         return True  # no deletions were made: keep every old-only record
 
     def close(self) -> None:
-        if self._kept is not None:
-            self._kept.close()
-            self._kept = None
+        for kept in self._kept:
+            kept.close()
+        self._kept.clear()
         if self.confirmer is not None:
             self.confirmer.close()
 
@@ -139,12 +138,14 @@ def _plan_push_deletes(cfg: Config, entry: str, sub: str | None, opts: Opts) -> 
     if opts.dryrun:
         # Report every candidate. The lane must be the plain True: the library
         # invokes a callable under dryrun too, and a dry run never prompts.
-        return _PushDeletePlan(lane=True, confirmer=None, mirror=False)
+        return _PushDeletePlan(lane=True, confirmer=None, mirror=opts.yes)
     mode = resolve_answer_mode(yes=opts.yes)
     if mode is AnswerMode.ALL_YES:
         return _PushDeletePlan(lane=True, confirmer=None, mirror=True)
-    if mode is AnswerMode.ALL_NO:
-        return _PushDeletePlan(lane=False, confirmer=None, mirror=False)
+    # ASK and ALL_NO both run the lane through a confirmer. ALL_NO never
+    # prompts, but its auto-n answers still record every existing orphan -
+    # which is what lets the merge keep exactly those file records and drop
+    # stale ones (records whose object is already gone).
     confirmer = DeleteConfirmer(mode, entry)
 
     def decide(info: Any) -> bool:
@@ -206,6 +207,13 @@ def _push_sub(
     did_work = False
 
     plan = _plan_push_deletes(cfg, entry, sub, opts)
+    # A non-directory sub-path has no S3 listing, so --delete has no candidates
+    # to confirm there: old records under a same-named former directory are
+    # kept (with the restorability warning); pruning them takes a directory-
+    # level push --delete. The dir branch replaces this with the plan's policy.
+    patch_keep: manifest.KeepOld = True
+    manifest_path: str | None = None
+    have_manifest = False
     try:
         if stat_mod.S_ISLNK(st.st_mode):
             # symlink: upload nothing, just update manifest line.
@@ -232,11 +240,11 @@ def _push_sub(
                     verbose=opts.verbose,
                 )
             finally:
-                # The streaming ManifestFilter holds the temp manifest open; close it
-                # before unlink (an open file cannot be removed on Windows).
+                # The streaming ManifestFilter holds the temp manifest open;
+                # close it early (an open file cannot be removed on Windows).
+                # The temp manifest lives on: the patch reads it as the old side.
                 if isinstance(compare, manifest.ManifestFilter):
                     compare.close()
-                os.unlink(manifest_path)
             if result.returncode != 0:
                 write_output(result.stdout)
                 if result.stderr:
@@ -245,11 +253,9 @@ def _push_sub(
             if result.stdout:
                 write_output(f"{result.stdout}\n")
                 did_work = True
+            patch_keep = plan.keep_old()
         elif stat_mod.S_ISREG(st.st_mode):
-            # Regular file: an explicit sub-path push always uploads. There is
-            # no S3 listing here, so --delete cannot offer orphans under a
-            # same-named former directory; their records still fall out of the
-            # manifest patch below (the objects stay until a directory push).
+            # Regular file: an explicit sub-path push always uploads.
             if opts.dryrun:
                 print(f"(dry-run) upload: {local_sub} -> {s3_sub_path}")
                 did_work = True
@@ -270,13 +276,22 @@ def _push_sub(
         if not opts.data_only:
             did_work = (
                 patch_manifest_subtree(
-                    cfg, entry, target_root, sub, excludes, opts, keep_old=plan.keep_old()
+                    cfg,
+                    entry,
+                    target_root,
+                    sub,
+                    excludes,
+                    opts,
+                    keep_old=patch_keep,
+                    old_manifest=manifest_path if have_manifest else None,
                 )
                 or did_work
             )
         return _run_hook("post_hook", post_hook, opts) if did_work else 0
     finally:
         plan.close()
+        if manifest_path is not None:
+            os.unlink(manifest_path)
 
 
 def _single_file_needs_upload(cfg: Config, entry: str, target: str, opts: Opts) -> bool:
@@ -324,17 +339,20 @@ def _single_file_manifest_matches(cfg: Config, entry: str, target: str, opts: Op
 
 
 def _manifest_structure_matches_local(
-    manifest_path: str, target: str, excludes: list[str], *, ignore_manifest_only: bool
+    manifest_path: str, target: str, excludes: list[str], *, keep_old: manifest.KeepOld
 ) -> bool:
     """Compare manifest-visible tree structure without treating metadata drift
     as a reason to rewrite an existing manifest.
 
     Data transfer output normally drives refresh, but empty directories and
     symlinks have no S3 object. Their add/remove/type/target changes must still
-    make an ordinary push rewrite the manifest. Under the default keep policy
-    (`ignore_manifest_only`), manifest-only records are the expected shape of a
-    kept deletion, not a change; under --delete they demand a rewrite that
-    settles them. The merge remains streaming.
+    make an ordinary push rewrite the manifest. Manifest-only records are
+    judged by the same ``keep_old`` policy the merge would apply: a record the
+    merge would keep is the expected shape of a kept deletion, not a change;
+    one it would drop (the mirror, or a file record with no delete candidate
+    behind it) demands the rewrite that settles it - anything else would
+    either rewrite an identical manifest forever or never heal a stale
+    record. The merge remains streaming and returns at the first mismatch.
     """
     manifest_items = (
         (manifest.entry_sort_key(entry.path, entry.is_dir), entry)
@@ -344,21 +362,24 @@ def _manifest_structure_matches_local(
         (manifest.entry_sort_key(path, stat_mod.S_ISDIR(st.st_mode)), (st, sym))
         for path, st, sym in localwalk.walk_tree(target, excludes)
     )
-    matches = True
     for _key, record, local in manifest.merge_join(manifest_items, local_items):
         if local is None:
-            if not ignore_manifest_only:
-                matches = False
+            assert record is not None
+            if keep_old is True:
+                continue
+            if keep_old is False:
+                return False
+            if record.is_file and not keep_old.consume_file(record.path.removeprefix("./")):
+                return False
             continue
         if record is None:
-            matches = False
-            continue
+            return False
         st, sym = local
         if stat_mod.S_IFMT(record.mode) != stat_mod.S_IFMT(st.st_mode):
-            matches = False
+            return False
         if record.sym_target != sym:
-            matches = False
-    return matches
+            return False
+    return True
 
 
 def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int:
@@ -475,7 +496,7 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                     and have_manifest
                 ):
                     structure_changed = not _manifest_structure_matches_local(
-                        manifest_path, target, excludes, ignore_manifest_only=not opts.delete
+                        manifest_path, target, excludes, keep_old=plan.keep_old()
                     )
             finally:
                 # The streaming ManifestFilter holds the temp manifest open; close

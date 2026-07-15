@@ -71,25 +71,36 @@ def patch_manifest_subtree(
     opts: Opts,
     *,
     keep_old: manifest.KeepOld = False,
+    old_manifest: str | None = None,
 ) -> bool:
-    """Download the manifest, replace the records under `sub`, and re-upload.
+    """Replace the manifest records under `sub` and re-upload.
 
     target_root/sub may be a file, a symlink, or a directory. If it does not
     exist locally, the records under `sub` are simply removed. Old and new
     records are both in sort-key order, so this is a streaming merge
-    (manifest.write_merged), not a read-all + sort.
+    (manifest.write_merged), not a read-all + sort. `old_manifest` is a
+    caller-owned copy of the current manifest (the sub-path sync already
+    downloaded one); without it, this downloads its own.
     """
     key = manifest.manifest_key(entry)
     if opts.dryrun:
         print(f"(dry-run) would patch manifest: {key} (sub={sub})")
         return True
 
-    fd_old, old_path = tempfile.mkstemp(suffix=".jsonl")
-    os.close(fd_old)
+    own_old: str | None = None
+    if old_manifest is None:
+        fd_old, own_old = tempfile.mkstemp(suffix=".jsonl")
+        os.close(fd_old)
     fd_new, new_path = tempfile.mkstemp(suffix=".jsonl")
     os.close(fd_new)  # reopened by name below; closing now avoids an fd leak on error
     try:
-        have_old = download_manifest(cfg, entry, old_path, opts.verbose)
+        if old_manifest is not None:
+            old_path = old_manifest
+            have_old = True
+        else:
+            assert own_old is not None
+            old_path = own_old
+            have_old = download_manifest(cfg, entry, old_path, opts.verbose)
         if not have_old and not os.path.lexists(target_root):
             # Deleting a never-backed sub-path beneath a root that is gone has
             # no manifest state to update (and no root metadata from which to
@@ -119,7 +130,8 @@ def patch_manifest_subtree(
         cfg.store.put_file(key, new_path, verbose=opts.verbose)
         return True
     finally:
-        os.unlink(old_path)
+        if own_old is not None:
+            os.unlink(own_old)
         os.unlink(new_path)
 
 

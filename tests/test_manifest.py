@@ -336,10 +336,11 @@ def test_write_merged_keep_all_retains_old_only_records_verbatim(tmp_path):
     assert entries[3]["mtime_ns"] != 7  # both sides: the fresh walk record won
 
 
-def test_write_merged_selective_keeps_kept_files_and_ancestor_dirs(tmp_path):
-    # A kept-keys stream retains exactly the files the user kept, plus the
-    # directory records above them; other old-only records - files answered
-    # "delete" and objectless symlinks - are dropped.
+def test_write_merged_selective_drops_only_unkept_file_records(tmp_path):
+    # Only a regular file's record can be confirmed away (its object is the
+    # delete candidate): a.txt was answered "delete" and its record falls out.
+    # Directory, symlink, and other objectless records were never asked and
+    # survive - which also keeps every kept file's ancestor chain intact.
     old = tmp_path / "old.jsonl"
     old.write_text(
         _manifest_text(
@@ -370,7 +371,14 @@ def test_write_merged_selective_keeps_kept_files_and_ancestor_dirs(tmp_path):
     finally:
         kept_keys.close()
     rels = [json.loads(ln)["path"] for ln in out_path.read_text().splitlines()[1:]]
-    assert rels == [".", "./gone", "./gone/sub", "./gone/sub/x.txt", "./keep.txt"]
+    assert rels == [
+        ".",
+        "./gone",
+        "./gone/link",
+        "./gone/sub",
+        "./gone/sub/x.txt",
+        "./keep.txt",
+    ]
     assert manifest.validate_manifest(str(out_path)) == "dir"
 
 
@@ -441,23 +449,25 @@ def test_write_merged_warns_once_when_records_survive_under_a_file(tmp_path):
     assert "./d" in warnings[0]
 
 
-def test_write_merged_empty_kept_stream_equals_mirror(tmp_path):
+def test_write_merged_empty_kept_stream_drops_every_unkept_file_record(tmp_path):
+    # KeptKeys(None) is the empty stream: every old-only FILE record falls out
+    # (its object was deleted, or was already gone - the stale-record heal),
+    # while objectless records still survive.
     old = tmp_path / "old.jsonl"
     old.write_text(
         _manifest_text(
             [
                 '{"path":".","mode":"40755","mtime_ns":0}',
                 '{"path":"./gone.txt","mode":"100644","size":1,"mtime_ns":0}',
+                '{"path":"./link","mode":"120777","mtime_ns":0,"link":"gone.txt"}',
             ]
         )
     )
-    kept = tmp_path / "kept.jsonl"
-    kept.write_text("")
     root = tmp_path / "root"
     root.mkdir()
 
     out = io.StringIO()
-    kept_keys = manifest.KeptKeys(str(kept))
+    kept_keys = manifest.KeptKeys(None)
     try:
         manifest.write_merged(
             out, str(old), None, localwalk.walk_tree(str(root), []), keep_old=kept_keys
@@ -465,7 +475,7 @@ def test_write_merged_empty_kept_stream_equals_mirror(tmp_path):
     finally:
         kept_keys.close()
     rels = [json.loads(ln)["path"] for ln in out.getvalue().splitlines()[1:]]
-    assert rels == ["."]
+    assert rels == [".", "./link"]
 
 
 # --- on-the-wire format --------------------------------------------------------

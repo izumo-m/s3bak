@@ -147,15 +147,15 @@ def answers(monkeypatch: Any) -> Answers:
     """Make the run interactive and feed scripted prompt answers.
 
     Patches the confirm module's seam (prompt_is_interactive / \
-read_prompt_answer); an empty queue answers "" (EOF)."""
+read_prompt_answer); an empty queue answers None (EOF)."""
     from s3bak import confirm
 
     queue: list[str] = []
     prompts: list[str] = []
 
-    def fake_read(prompt: str) -> str:
+    def fake_read(prompt: str) -> str | None:
         prompts.append(prompt)
-        return queue.pop(0) if queue else ""
+        return queue.pop(0) if queue else None
 
     monkeypatch.setattr(confirm, "prompt_is_interactive", lambda: True)
     monkeypatch.setattr(confirm, "read_prompt_answer", fake_read)

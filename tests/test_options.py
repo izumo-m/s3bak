@@ -382,7 +382,9 @@ def test_push_delete_interactive_a_deletes_the_rest(ws, answers):
 
     assert len(answers.prompts) == 1
     assert ws.keys() == {"data/keep.txt", "data-manifest.jsonl"}
-    assert _manifest_paths(ws) == [".", "./keep.txt"]
+    # ./sub survives: a directory record has no object, so no confirmation can
+    # drop it - only the --yes mirror prunes objectless records.
+    assert _manifest_paths(ws) == [".", "./keep.txt", "./sub"]
 
 
 def test_push_delete_interactive_d_keeps_the_rest(ws, answers):
@@ -485,3 +487,84 @@ def test_push_all_delete_yes_mirrors_every_entry(ws):
     assert "d2/gone.txt" not in keys
     assert "d1/a.txt" in keys
     assert "d2/b.txt" in keys
+
+
+def test_push_delete_interactive_never_drops_objectless_records(ws, answers):
+    # Symlinks and empty dirs have no S3 object, hence no delete question:
+    # their records must survive an interactive --delete whatever the answers.
+    ws.write("data/keep.txt", "k")
+    ws.write("data/gone.txt", "g")
+    (ws.root / "data" / "emptydir").mkdir()
+    os.symlink("keep.txt", ws.root / "data" / "link")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "gone.txt").unlink()
+    (ws.root / "data" / "link").unlink()
+    (ws.root / "data" / "emptydir").rmdir()
+    answers.feed("n")  # the only question: gone.txt's object
+    ws.run("push", "--delete", "data", expect_rc=0)
+
+    assert len(answers.prompts) == 1
+    paths = _manifest_paths(ws)
+    assert "./gone.txt" in paths
+    assert "./link" in paths
+    assert "./emptydir" in paths
+
+
+def test_push_delete_with_all_answers_no_converges(ws):
+    # A kept record must not read as "structure changed": the same non-TTY
+    # push --delete run twice may not rewrite the manifest or produce output,
+    # or a cron mirror would re-upload and fire post_hook forever.
+    ws.write("data/keep.txt", "k")
+    ws.write("data/gone.txt", "g")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    (ws.root / "data" / "gone.txt").unlink()
+
+    first = ws.run("push", "--delete", "data", expect_rc=0)
+    second = ws.run("push", "--delete", "data", expect_rc=0)
+
+    for res in (first, second):
+        assert res.out == ""
+        assert "Updating" not in res.err
+
+
+def test_push_delete_heals_stale_record_whose_object_is_gone(ws):
+    # A record whose object vanished (interrupted deletion, q after y, ...)
+    # is not a delete candidate, so no answer covers it: any --delete push -
+    # including the unattended all-no run - drops it from the manifest.
+    ws.write("data/keep.txt", "k")
+    ws.write("data/stale.txt", "s")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    (ws.root / "data" / "stale.txt").unlink()
+    ws.s3.delete_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/stale.txt")
+
+    res = ws.run("push", "--delete", "data", expect_rc=0)
+
+    assert "Updating" in res.err
+    assert "./stale.txt" not in _manifest_paths(ws)
+
+    dest = ws.root / "restore"
+    ws.run("pull", "data", "-o", str(dest), expect_rc=0)
+    assert (dest / "keep.txt").read_text() == "k"
+
+
+def test_file_subpath_push_delete_keeps_former_directory_records(ws, answers):
+    # A file-typed sub-path has no S3 listing, so --delete has nothing to
+    # confirm there: records under the same-named former directory survive
+    # (with the restorability warning) whether or not a TTY is attached.
+    ws.write("data/sub/x.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    shutil.rmtree(ws.root / "data" / "sub")
+    (ws.root / "data" / "sub").write_text("now a file")
+    res = ws.run("push", "--delete", "data/sub", expect_rc=0)
+
+    assert answers.prompts == []
+    assert "non-directory" in res.err
+    paths = _manifest_paths(ws)
+    assert "./sub/x.txt" in paths
+    assert "data/sub/x.txt" in ws.keys()

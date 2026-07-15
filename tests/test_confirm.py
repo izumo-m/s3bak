@@ -98,12 +98,13 @@ def test_answer_d_keeps_everything_after(answers):
         confirmer.close()
 
 
-def test_invalid_answers_reprompt(answers):
-    answers.feed("maybe", "y")
+def test_invalid_and_empty_answers_reprompt(answers):
+    # A bare Enter must re-ask, never abort: only EOF (None) counts as q.
+    answers.feed("", "maybe", "y")
     confirmer = DeleteConfirmer(AnswerMode.ASK, "data")
     try:
         assert confirmer.confirm("a.txt") is True
-        assert len(answers.prompts) == 2
+        assert len(answers.prompts) == 3
     finally:
         confirmer.close()
 
