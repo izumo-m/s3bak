@@ -149,8 +149,9 @@ environment.
    deleted file keeps its S3 object AND its manifest record — **push never
    deletes a backup unless `--delete` was given and the deletion confirmed**
    (see "Deleting backups" below). `--checksum` ignores manifest file stats
-   for its content decision, but the manifest still detects objectless tree
-   changes; only `--checksum --data-only` can skip the download. Excludes are
+   for its content decision, but every directory push still downloads the
+   manifest: it detects objectless tree changes, and `--data-only` reads it
+   to warn about the uploads it leaves unrecorded. Excludes are
    applied by the same entry-rooted matcher the manifest walk uses, so the
    data sync and the manifest can never disagree on what an exclude means.
    **Single-file entry:** upload iff the size+mtime check fails — the manifest holds
@@ -178,6 +179,14 @@ environment.
    and/or refreshed the manifest), so a side-effecting hook does not fire on a
    pure no-op. `--meta-only` always refreshes and runs the hook, which is the
    supported way to run the hook on demand.
+
+A push is not atomic: the data sync runs first and the manifest write last,
+so a push interrupted between them leaves its new uploads as
+[unrecorded objects](storage.md#unrecorded-objects). **Re-run the push after
+any failure or interruption** — the re-run uploads whatever the manifest does
+not know (or, under `--checksum`, just detects the structural difference) and
+writes the manifest that records it. An interrupted `--delete` heals the same
+way (see "Deleting backups" below).
 
 A **sub-path push** (`push entry/sub` or a local path inside an entry) syncs or
 uploads just that sub-tree and patches the manifest sub-tree in place
@@ -243,7 +252,10 @@ Deleting is opt-in and confirmed:
   becomes invisible to the later size+mtime check. It is a metadata refresh,
   never a substitute for a real push.
 - **`--data-only`** transfers data but does not rewrite the manifest or apply
-  local metadata.
+  local metadata. Uploading a file the manifest does not record therefore
+  leaves an [unrecorded object](storage.md#unrecorded-objects) behind — a
+  directory sync counts those uploads and warns (exit 2); a later push
+  without `--data-only` records them.
 - **`--dry-run`** reports what would happen and changes nothing; planned actions
   print with a `(dry-run)` marker. With `--delete` it lists every deletion
   candidate without prompting. Applies to pull too (see below).
@@ -285,7 +297,13 @@ Deleting is opt-in and confirmed:
   merge-join `status` runs; only the extras themselves are held in memory, and
   they are removed deepest-first so directories empty out before their `rmdir`.
   A failed removal makes the command fail instead of reporting a successful
-  mirror while an extra remains.
+  mirror while an extra remains. An extra is judged solely by the manifest,
+  so **an extra can be the only copy of real data**: a file never pushed, or
+  one pushed by `--data-only` or by a push interrupted before its manifest
+  write — its object then sits [unrecorded](storage.md#unrecorded-objects)
+  on S3, or nowhere at all. Confirming its removal (or running the unattended
+  `--yes` mirror over it) deletes local work the backup does not hold; the
+  per-item prompt exists for exactly this.
 - **`--dry-run`** reports what a pull would do and changes nothing: planned
   downloads and `--delete` removals print with a `(dry-run)` marker, and a
   single `would apply manifest metadata` line stands in for the metadata

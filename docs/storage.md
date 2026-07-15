@@ -64,7 +64,13 @@ upload of a push that was interrupted before it wrote the manifest, where the
 local file has since been deleted. Such an object is outside the backup:
 `status` cannot see it (it diffs the manifest against the local tree), and
 pull applies no metadata to it, although pull's listing-driven download does
-fetch its bytes. `push --delete` offers its deletion like any other orphan,
+fetch its bytes. Its local counterpart, when one exists (a `--data-only` push
+uploaded it), is invisible the same way: `pull --delete` sees a file the
+manifest does not record — a local extra — and offers to remove it. Those two
+confirmations, `pull --delete`'s and a later `push --delete`'s, are all that
+stand between such a file and total loss, which is why both prompt per item
+and why a `--data-only` push warns as it creates one.
+`push --delete` offers its deletion like any other orphan,
 flagging the prompt with `(not in manifest)`; answering n keeps the object
 for this run only. A manifest record is a stat snapshot of a local file, and
 with no local file there is nothing truthful to record, so the object stays
