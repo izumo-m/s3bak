@@ -533,7 +533,6 @@ class Boto3S3Store:
         *,
         file_filter: Any = None,
         compare: Any = None,
-        delete: bool = False,
         dryrun: bool = False,
         verbose: bool = False,
     ) -> TransferResult:
@@ -551,13 +550,13 @@ class Boto3S3Store:
             return self._transfer(
                 verbose,
                 f"sync {src_dir} {dst}",
-                # delete_filter=True (from --delete) prunes S3 orphans; new local
-                # files take the default create lane, both-sides pairs the
+                # Every push mirrors: delete_filter=True prunes S3 orphans; new
+                # local files take the default create lane, both-sides pairs the
                 # update_filter (the ManifestFilter, or EtagComparison pool).
                 lambda cb: self._s3.sync(
                     src,
                     dst,
-                    delete_filter=delete,
+                    delete_filter=True,
                     dryrun=dryrun,
                     filter=file_filter,
                     update_filter=update_filter,

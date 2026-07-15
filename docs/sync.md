@@ -11,8 +11,9 @@ Every sync needs an **update-lane** strategy (`S3.sync`'s `update_filter`):
 given a pair present on *both* sides (a local side and its S3 side for one key),
 does it need re-copying? New entries and orphans are separate lanes —
 `create_filter` copies every new local/S3 file (the default), `delete_filter`
-prunes orphans under `--delete` — so the strategy below only judges the
-intersection. s3bak has two.
+prunes orphans (every push enables it; pull prunes local extras itself, see
+`--delete` below) — so the strategy below only judges the intersection. s3bak
+has two.
 
 ### Default: `ManifestFilter` (size+mtime check)
 
@@ -143,8 +144,8 @@ environment.
 1. Run `pre_hook` (always, before target validation or any backup work), so a
    hook may generate the file or tree being backed up.
 2. **Directory entry:** download and validate the manifest, build the compare
-   strategy, and `sync_up` with `--delete` so removed local files are also
-   removed on S3. `--checksum` ignores manifest file stats for its content
+   strategy, and `sync_up` with the delete lane enabled so removed local files
+   are also removed on S3. `--checksum` ignores manifest file stats for its content
    decision, but the manifest still detects objectless tree changes; only
    `--checksum --data-only` can skip the download. Excludes are applied by the
    same entry-rooted matcher the manifest walk uses, so the data sync and the
@@ -170,13 +171,16 @@ A **sub-path push** (`push entry/sub` or a local path inside an entry) syncs or
 uploads just that sub-tree and patches the manifest sub-tree in place
 (`write_patched`). A symlink sub-path uploads no data — only its manifest record
 is updated. If the entry has no manifest yet, the patch also writes the `.` root
-record so the manifest keeps its directory-entry shape. Unlike a whole-entry
-push (which always mirrors), a sub-path push deletes S3 orphans under the
-sub-path only with `--delete`. If the local sub-path no longer exists, the push
-fails unless `--delete` is present; with it, s3bak deletes the exact data key and
-keys below `<sub>/` (without touching a similarly prefixed sibling) and removes
-that subtree from the manifest. `--data-only` and `--meta-only` continue to
-limit the operation to the data or manifest side respectively.
+record so the manifest keeps its directory-entry shape. A sub-path push is a
+whole-entry push scoped to the sub-path, so it mirrors too: S3 objects under
+the sub-path with no local counterpart are deleted, matching the manifest
+patch, which drops the sub-tree's old records unconditionally. If the local
+sub-path no longer exists, the push fails unless `--delete` is present — the
+guard that keeps a typo from silently erasing a backup; with it, s3bak deletes
+the exact data key and keys below `<sub>/` (without touching a similarly
+prefixed sibling) and removes that subtree from the manifest. `--data-only`
+and `--meta-only` continue to limit the operation to the data or manifest side
+respectively.
 
 ### Mode flags
 

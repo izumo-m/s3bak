@@ -146,7 +146,6 @@ def _push_sub(
                 sub_rel,
                 file_filter=manifest.exclude_filter(excludes, sub=sub) if excludes else None,
                 compare=compare,
-                delete=opts.delete,
                 dryrun=opts.dryrun,
                 verbose=opts.verbose,
             )
@@ -337,7 +336,6 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 entry,
                 file_filter=manifest.exclude_filter(excludes) if excludes else None,
                 compare=compare,
-                delete=True,
                 dryrun=opts.dryrun,
                 verbose=opts.verbose,
             )
@@ -865,8 +863,9 @@ def diff_backup(
             return result.returncode
 
         # The manifest, not every object that happens to remain under the S3
-        # prefix, defines the backup. A sub-path push without --delete may leave
-        # an orphan object; diff must ignore it just as pull/status do.
+        # prefix, defines the backup. Orphan objects can still exist (e.g. a
+        # --meta-only push after a local delete, or an exclude added later);
+        # diff must ignore them just as pull/status do.
         backup_files: set[str] = set()
         backup_symlinks: dict[str, str] = {}
         backup_special: dict[str, int] = {}

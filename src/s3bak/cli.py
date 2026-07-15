@@ -162,9 +162,9 @@ Commands:
 Options:
   --all            Apply the command to all configured entries
   --dry-run        Show what would happen without changing anything (push/pull)
-  --delete         Delete extras: pull removes local files not in the backup;
-                   a sub-path push removes S3 orphans under the sub-path
-                   (a whole-entry push always mirrors)
+  --delete         Delete extras: pull removes local files not in the backup
+                   (push always mirrors; a sub-path push needs --delete only
+                   to confirm deleting a missing local sub-path's backup)
   --meta-only      Sync only metadata (the manifest), skip file data (push/pull)
   --data-only      Sync only file data, leave manifest/local-meta untouched (push/pull)
   --checksum       Compare by content (ETag) instead of the manifest size+mtime
@@ -453,7 +453,7 @@ def main(argv: list[str] | None = None) -> int:
     if opt_delete and subcmd not in ("push", "pull"):
         die("--delete only applies to pull and sub-path push")
     if subcmd == "push" and opt_all and opt_delete:
-        die("push --delete only controls sub-path pushes; whole-entry push always mirrors")
+        die("push always mirrors; --delete only confirms deleting missing sub-path backups")
 
     if opt_checksum and subcmd not in ("push", "pull"):
         die("--checksum only applies to push and pull")
@@ -494,7 +494,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             resolved = resolve_entry_files(cfg, positional, "push")
             if opts.delete and any(sub is None for _entry, sub in resolved):
-                die("push --delete only controls sub-path pushes; whole-entry push always mirrors")
+                die("push always mirrors; --delete only confirms deleting missing sub-path backups")
         _validate_distinct_entries(resolved, "push")
         return _run_resolved_entries(cmd_push, cfg, resolved, opts)
 
