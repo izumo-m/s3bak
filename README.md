@@ -80,22 +80,21 @@ executable or script instead.
 Usage: s3bak <command> [options] [args]
 
 Commands:
-  push <entry|path>...     Back up entries or sub-paths to S3
-  pull <entry|path>...     Restore entries or sub-paths (use --all for every entry)
-  show <entry|path>        Print a single file from the backup to stdout
-  status <entry|path>...   Compare local vs backup (metadata only)
-  diff <entry|path>        Show content diff between backup and local
-  list                     List locally configured entries
-  ls-remote [entry|path]   List S3 entries, or files under an entry/sub-path
+  push        Back up entries or sub-paths to S3
+  pull        Restore entries or sub-paths from S3
+  show        Print a backed-up file
+  status      Compare local files with the backup
+  diff        Show content differences
+  list        List locally configured entries
+  ls-remote   List entries or files stored on S3
+
+Global options:
+  --help      Show this help
+  --version   Show the program version
 ```
 
-Common options: `--all`, `--dry-run` (push/pull), `--delete` (confirmed
-deletions: push removes S3 orphans, pull removes local extras — never the
-default), `--yes` (answer yes to every `--delete` confirmation), `--meta-only`,
-`--data-only`, `--checksum` (push/pull), `--mtime-window <seconds>`,
-`-o/--output <path>` (single-target pull), `-v/--verbose`, `--color[=WHEN]`.
-
-Run `s3bak --help` for the full option list and worked examples.
+Run `s3bak <command> --help` for the selected command's arguments, options, and
+examples.
 
 ### Examples
 

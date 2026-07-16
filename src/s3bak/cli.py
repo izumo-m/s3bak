@@ -32,6 +32,7 @@ import signal
 import subprocess
 import sys
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from importlib.metadata import version
 from typing import NoReturn
 
@@ -146,103 +147,250 @@ def _run_resolved_entries(
 # =============================================================================
 
 
+@dataclass(frozen=True)
+class _OptionSpec:
+    display: str
+    description: str
+    error_label: str
+
+
+@dataclass(frozen=True)
+class _CommandSpec:
+    overview: str
+    summary: str
+    usage: tuple[str, ...]
+    arguments: tuple[tuple[str, str], ...]
+    options: tuple[str, ...]
+    sections: tuple[tuple[str, tuple[str, ...]], ...]
+    examples: tuple[str, ...]
+
+
+_OPTION_SPECS = {
+    "all": _OptionSpec("--all", "Apply to all configured entries", "--all"),
+    "dry_run": _OptionSpec("--dry-run", "Show changes without applying them", "--dry-run"),
+    "delete": _OptionSpec(
+        "--delete", "Delete destination items absent from the source", "--delete"
+    ),
+    "yes": _OptionSpec("--yes", "Confirm every deletion", "--yes"),
+    "meta_only": _OptionSpec("--meta-only", "Sync only metadata; skip file data", "--meta-only"),
+    "data_only": _OptionSpec(
+        "--data-only", "Sync only file data; leave metadata unchanged", "--data-only"
+    ),
+    "checksum": _OptionSpec(
+        "--checksum", "Compare file contents instead of size and mtime", "--checksum"
+    ),
+    "mtime_window": _OptionSpec(
+        "--mtime-window <seconds>", "Override the mtime tolerance", "--mtime-window"
+    ),
+    "output": _OptionSpec(
+        "-o, --output <path>", "Restore one target to this exact path", "-o/--output"
+    ),
+    "verbose": _OptionSpec("-v, --verbose", "Show detailed operations", "-v/--verbose"),
+    "color": _OptionSpec("--color[=WHEN]", "Colorize output (auto, always, or never)", "--color"),
+    "no_color": _OptionSpec("--no-color", "Disable color", "--no-color"),
+    "help": _OptionSpec("--help", "Show this help", "--help"),
+}
+
+_DELETE_CONFIRMATION = (
+    (
+        "Deletion confirmation",
+        (
+            "--delete prompts with y/n/a/d/q: delete, keep, delete all, keep all, or quit.",
+            "Without a TTY, every answer is no unless --yes is set.",
+        ),
+    ),
+)
+
+_COMMAND_SPECS = {
+    "push": _CommandSpec(
+        overview="Back up entries or sub-paths to S3",
+        summary="Back up configured entries or selected sub-paths to S3.",
+        usage=(
+            "s3bak push [options] <entry|path>...",
+            "s3bak push [options] --all",
+        ),
+        arguments=(("<entry|path>...", "Entries or paths to back up"),),
+        options=(
+            "all",
+            "dry_run",
+            "delete",
+            "yes",
+            "meta_only",
+            "data_only",
+            "checksum",
+            "mtime_window",
+            "verbose",
+            "help",
+        ),
+        sections=_DELETE_CONFIRMATION,
+        examples=(
+            "s3bak push bin",
+            "s3bak push bin/subdir",
+            "s3bak push --all --dry-run",
+            "s3bak push bin --delete",
+        ),
+    ),
+    "pull": _CommandSpec(
+        overview="Restore entries or sub-paths from S3",
+        summary="Restore configured entries or selected sub-paths from S3.",
+        usage=(
+            "s3bak pull [options] <entry|path>...",
+            "s3bak pull [options] --all",
+        ),
+        arguments=(("<entry|path>...", "Entries or paths to restore"),),
+        options=(
+            "all",
+            "dry_run",
+            "delete",
+            "yes",
+            "meta_only",
+            "data_only",
+            "checksum",
+            "mtime_window",
+            "output",
+            "verbose",
+            "help",
+        ),
+        sections=_DELETE_CONFIRMATION,
+        examples=(
+            "s3bak pull bin",
+            "s3bak pull bin home-docs",
+            "s3bak pull bin -o /tmp/restore",
+            "s3bak pull bin --delete --dry-run",
+        ),
+    ),
+    "show": _CommandSpec(
+        overview="Print a backed-up file",
+        summary="Print a single backed-up file to stdout.",
+        usage=("s3bak show [options] <entry|path>",),
+        arguments=(("<entry|path>", "Backed-up file to print"),),
+        options=("verbose", "help"),
+        sections=(),
+        examples=(
+            "s3bak show wsl.conf",
+            "s3bak show bin/s3bak",
+            "s3bak show /home/me/bin/s3bak",
+        ),
+    ),
+    "status": _CommandSpec(
+        overview="Compare local files with the backup",
+        summary="Compare local files with the backup using metadata.",
+        usage=(
+            "s3bak status [options] <entry|path>...",
+            "s3bak status [options] --all",
+        ),
+        arguments=(("<entry|path>...", "Entries or paths to compare"),),
+        options=("all", "mtime_window", "verbose", "color", "no_color", "help"),
+        sections=(
+            (
+                "Status letters",
+                (
+                    "These are push-oriented: they show what would change on the backup.",
+                    "M <path>  Metadata differs between local and backup",
+                    "A <path>  Only local; push would add it",
+                    "D <path>  Only in backup; push --delete would remove it",
+                ),
+            ),
+        ),
+        examples=(
+            "s3bak status bin",
+            "s3bak status --all",
+            "s3bak status -v bin",
+            "s3bak status bin/s3bak",
+        ),
+    ),
+    "diff": _CommandSpec(
+        overview="Show content differences",
+        summary="Show content differences between the backup and local files.",
+        usage=("s3bak diff [options] <entry|path>",),
+        arguments=(("<entry|path>", "Entry or path to compare"),),
+        options=("verbose", "color", "no_color", "help"),
+        sections=(),
+        examples=(
+            "s3bak diff bin",
+            "s3bak diff bin/s3bak",
+            "s3bak diff ~/bin/s3bak",
+        ),
+    ),
+    "list": _CommandSpec(
+        overview="List locally configured entries",
+        summary="List locally configured entries. This command does not access S3.",
+        usage=("s3bak list",),
+        arguments=(),
+        options=("help",),
+        sections=(),
+        examples=("s3bak list",),
+    ),
+    "ls-remote": _CommandSpec(
+        overview="List entries or files stored on S3",
+        summary="List configured entries or backed-up paths stored on S3.",
+        usage=("s3bak ls-remote [options] [entry|path]",),
+        arguments=(("[entry|path]", "Entry or sub-path to list"),),
+        options=("verbose", "help"),
+        sections=(),
+        examples=(
+            "s3bak ls-remote",
+            "s3bak ls-remote bin",
+            "s3bak ls-remote bin/subdir",
+        ),
+    ),
+}
+
+
+def _format_help_rows(rows: Sequence[tuple[str, str]]) -> list[str]:
+    return [f"  {label:<28}{description}" for label, description in rows]
+
+
+def _command_help_text(command: str) -> str:
+    spec = _COMMAND_SPECS[command]
+    lines = ["Usage:", *(f"  {usage}" for usage in spec.usage), "", spec.summary]
+    if spec.arguments:
+        lines.extend(("", "Arguments:"))
+        lines.extend(_format_help_rows(spec.arguments))
+    lines.extend(("", "Options:"))
+    lines.extend(
+        _format_help_rows(
+            tuple(
+                (_OPTION_SPECS[option].display, _OPTION_SPECS[option].description)
+                for option in spec.options
+            )
+        )
+    )
+    for heading, section_lines in spec.sections:
+        lines.extend(("", f"{heading}:", *(f"  {line}" for line in section_lines)))
+    example_heading = "Example:" if len(spec.examples) == 1 else "Examples:"
+    lines.extend(("", example_heading, *(f"  {example}" for example in spec.examples)))
+    return "\n".join(lines) + "\n"
+
+
 def print_usage(status: int = 1) -> NoReturn:
     config_path = os.environ.get("S3BAK_CONFIG") or expand_home("~/.config/s3bak/config.py")
+    command_lines = "\n".join(
+        f"  {command:<12}{spec.overview}" for command, spec in _COMMAND_SPECS.items()
+    )
     text = f"""\
 Usage: s3bak <command> [options] [args]
 
+Back up and restore configured files and directories using S3.
+
 Commands:
-  push <entry|path>...         Back up entries or sub-paths to S3
-  pull <entry|path>...         Restore entries or sub-paths (use --all for every entry)
-  show <entry|path>            Print a single file from the backup to stdout
-  status <entry|path>...       Compare local vs backup (metadata only)
-  diff <entry|path>            Show content diff between backup and local
-  list                         List locally configured entries
-  ls-remote [entry|path]       List S3 entries, or files under an entry/sub-path
+{command_lines}
 
-Options:
-  --all            Apply the command to all configured entries
-  --dry-run        Show what would happen without changing anything (push/pull)
-  --delete         Delete extras, confirming each one (y/n/a/d/q): push removes
-                   S3 objects with no local counterpart, pull removes local
-                   files not in the backup. Without a TTY every answer is no
-  --yes            Answer yes to every --delete confirmation (unattended mirror)
-  --meta-only      Sync only metadata (the manifest), skip file data (push/pull)
-  --data-only      Sync only file data, leave manifest/local-meta untouched (push/pull)
-  --checksum       Compare by content (ETag) instead of the manifest size+mtime
-                   check; reads every candidate file (push/pull)
-  --mtime-window <seconds>  Override config's size+mtime-check tolerance for
-                   this run (fractional ok, 0 = exact); affects push/pull/status
-  -o, --output <path>  Restore destination for a single pull target
-                       (default: the entry's configured path)
-  -v, --verbose    Verbose output (details per field in status)
-  --color[=WHEN]   Colorize status (verbose) and diff output
-                   (WHEN: auto|always|never; default auto).
-                   --color alone == --color=always. Honors NO_COLOR env var.
-  --no-color       Disable color (same as --color=never)
-  --version        Show the program version and exit
-  --help           Show this help
+Global options:
+  --help      Show this help
+  --version   Show the program version
 
-status letters (push-oriented: what would change on the backup):
-  M <path>         modified (metadata differs between local and backup)
-  A <path>         only locally, not in backup   (push would add)
-  D <path>         only in backup, not locally   (push --delete would remove)
+Run 's3bak <command> --help' for command-specific help.
 
 Config file: {config_path}
-
-Examples:
-  # push: back up one or more entries (or sub-paths)
-  s3bak push bin .bash.d               # push selected entries
-  s3bak push --all                     # push every configured entry
-  s3bak push --all --dry-run           # preview without uploading
-  s3bak push --meta-only bin           # upload metadata (the manifest) only
-  s3bak push --meta-only --all         # upload metadata for all entries
-  s3bak push --data-only bin           # upload data only, leave manifest unchanged
-  s3bak push bin --delete              # remove S3 orphans, confirming each
-  s3bak push --all --delete --yes      # unattended mirror (e.g. cron)
-  s3bak push bin/s3bak                 # single file inside the bin entry
-  s3bak push ~/bin/s3bak               # same, via ~ expansion
-  s3bak push bin/subdir                # only the sub-directory
-
-  # pull: restore one or more entries/sub-paths (use --all for every entry)
-  s3bak pull bin                       # restore to the configured path
-  s3bak pull bin home-docs             # restore selected entries in parallel
-  s3bak pull bin -o /tmp/restore       # restore to an alternative path
-  s3bak pull bin --delete              # also remove local files not in backup
-  s3bak pull bin --delete --dry-run    # preview a mirror restore
-  s3bak pull --all                     # restore every entry in parallel
-  s3bak pull --meta-only bin           # restore metadata only (no file download)
-  s3bak pull --data-only bin           # restore file data only (no mode/mtime applied)
-  s3bak pull bin/s3bak                 # restore a single file
-  s3bak pull bin/subdir -o /tmp/restore # restore a sub-tree elsewhere
-
-  # show: print a single backed-up file to stdout
-  s3bak show wsl.conf                  # single-file entry (no slash = entry name)
-  s3bak show bin/s3bak                 # entry-rooted path, independent of CWD
-  s3bak show ~/bin/s3bak               # local path with ~ expansion
-  s3bak show /home/me/bin/s3bak | less # absolute local path
-
-  # status: compare local vs backup (metadata only, both directions)
-  s3bak status bin                     # M/A/D summary for one entry
-  s3bak status --all                   # status of every entry
-  s3bak status -v bin                  # verbose per-field differences
-  s3bak status bin/s3bak               # status of a single sub-path
-
-  # diff: content diff between backup and local
-  s3bak diff bin                       # diff the whole entry
-  s3bak diff bin/s3bak                 # entry-rooted path, independent of CWD
-  s3bak diff ~/bin/s3bak               # single-file diff with ~ expansion
-
-  # list: locally configured entries (no S3 access)
-  s3bak list
-
-  # ls-remote: what is on S3
-  s3bak ls-remote                      # list entries stored on S3
-  s3bak ls-remote bin                  # list files recorded in bin's manifest
-  s3bak ls-remote bin/subdir           # list manifest lines under a sub-path
 """
-    sys.stderr.write(text)
+    (sys.stdout if status == 0 else sys.stderr).write(text)
     sys.exit(status)
+
+
+def print_command_help(command: str) -> NoReturn:
+    sys.stdout.write(_command_help_text(command))
+    sys.exit(0)
 
 
 # =============================================================================
@@ -335,6 +483,26 @@ def _validate_pull_destinations(cfg: Config, resolved: Sequence[tuple[str, str |
                 )
 
 
+def _join_command_names(commands: list[str]) -> str:
+    if len(commands) == 1:
+        return commands[0]
+    if len(commands) == 2:
+        return f"{commands[0]} and {commands[1]}"
+    return f"{', '.join(commands[:-1])}, and {commands[-1]}"
+
+
+def _validate_command_options(command: str, used_options: Sequence[str]) -> None:
+    allowed = _COMMAND_SPECS[command].options
+    for option in used_options:
+        if option in allowed:
+            continue
+        applicable_commands = [
+            name for name, spec in _COMMAND_SPECS.items() if option in spec.options
+        ]
+        label = _OPTION_SPECS[option].error_label
+        die(f"{label} only applies to {_join_command_names(applicable_commands)}")
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -355,8 +523,7 @@ def main(argv: list[str] | None = None) -> int:
     if subcmd == "--version":
         sys.stdout.write(f"s3bak {version('s3bak')}\n")
         return 0
-    commands = {"push", "pull", "show", "status", "diff", "list", "ls-remote"}
-    if subcmd not in commands:
+    if subcmd not in _COMMAND_SPECS:
         err(f"unknown command: {subcmd}")
         print_usage()
 
@@ -371,7 +538,9 @@ def main(argv: list[str] | None = None) -> int:
     opt_mtime_window: float | None = None
     opt_outpath: str | None = None
     opt_color: str = "auto"
+    help_requested = False
     positional: list[str] = []
+    used_options: list[str] = []
 
     def take_value(flag: str, idx: int) -> tuple[str, int]:
         # Support both --flag=value and --flag value
@@ -386,21 +555,30 @@ def main(argv: list[str] | None = None) -> int:
         a = args[i]
         if a == "--all":
             opt_all = True
+            used_options.append("all")
         elif a == "--dry-run":
             opt_dryrun = True
+            used_options.append("dry_run")
         elif a == "--delete":
             opt_delete = True
+            used_options.append("delete")
         elif a == "--yes":
             opt_yes = True
+            used_options.append("yes")
         elif a == "--meta-only":
             opt_meta_only = True
+            used_options.append("meta_only")
         elif a == "--data-only":
             opt_data_only = True
+            used_options.append("data_only")
         elif a in ("-v", "--verbose"):
             opt_verbose = True
+            used_options.append("verbose")
         elif a == "--checksum":
             opt_checksum = True
+            used_options.append("checksum")
         elif a == "--mtime-window" or a.startswith("--mtime-window="):
+            used_options.append("mtime_window")
             val, i = take_value(a, i)
             try:
                 opt_mtime_window = float(val)
@@ -408,21 +586,26 @@ def main(argv: list[str] | None = None) -> int:
                 die(f"--mtime-window requires a non-negative number of seconds (got {val!r})")
             if not math.isfinite(opt_mtime_window) or opt_mtime_window < 0:
                 die(f"--mtime-window must be >= 0 (got {opt_mtime_window})")
-        elif a in ("-o", "--output", "--outpath") or a.startswith(("--output=", "--outpath=")):
+        elif a in ("-o", "--output") or a.startswith("--output="):
+            used_options.append("output")
             opt_outpath, i = take_value(a, i)
             if "=" not in a and opt_outpath.startswith("-"):
                 die(f"{a} requires a path value (use --output=<path> for a path starting with '-')")
         elif a == "--color":
             opt_color = "always"
+            used_options.append("color")
         elif a.startswith("--color="):
+            used_options.append("color")
             val = a.split("=", 1)[1]
             if val not in ("auto", "always", "never"):
                 die(f"invalid --color value: {val} (use auto|always|never)")
             opt_color = val
         elif a == "--no-color":
             opt_color = "never"
+            used_options.append("no_color")
         elif a == "--help":
-            print_usage(0)
+            help_requested = True
+            used_options.append("help")
         elif a == "--":
             positional.extend(args[i + 1 :])
             break
@@ -431,6 +614,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             positional.append(a)
         i += 1
+
+    _validate_command_options(subcmd, used_options)
 
     opts = Opts(
         dryrun=opt_dryrun,
@@ -450,20 +635,9 @@ def main(argv: list[str] | None = None) -> int:
     # a preview.
     if opt_all and positional:
         die("--all cannot be combined with explicit entries")
-    if opt_all and subcmd not in ("push", "pull", "status"):
-        die(f"{subcmd} does not support --all")
-
     if opt_meta_only and opt_data_only:
         die("--meta-only and --data-only are mutually exclusive")
-    if (opt_meta_only or opt_data_only) and subcmd not in ("push", "pull"):
-        flag = "--meta-only" if opt_meta_only else "--data-only"
-        die(f"{flag} only applies to push and pull")
 
-    if opt_dryrun and subcmd not in ("push", "pull"):
-        die("--dry-run only applies to push and pull")
-
-    if opt_delete and subcmd not in ("push", "pull"):
-        die("--delete only applies to push and pull")
     if opt_yes and not opt_delete:
         die("--yes requires --delete (it answers deletion confirmations)")
     if subcmd == "push" and opt_delete and opt_meta_only:
@@ -471,8 +645,6 @@ def main(argv: list[str] | None = None) -> int:
     if subcmd == "push" and opt_delete and opt_data_only:
         die("push --delete cannot be combined with --data-only (a deletion drops the record too)")
 
-    if opt_checksum and subcmd not in ("push", "pull"):
-        die("--checksum only applies to push and pull")
     if opt_checksum and opt_meta_only:
         die("--checksum cannot be combined with --meta-only (no file data is compared)")
     if opt_checksum and opt_mtime_window is not None:
@@ -480,11 +652,6 @@ def main(argv: list[str] | None = None) -> int:
     if subcmd == "pull" and opt_delete and opt_meta_only:
         die("pull --delete cannot be combined with --meta-only")
 
-    if opt_mtime_window is not None and subcmd not in ("push", "pull", "status"):
-        die("--mtime-window only applies to push, pull, and status")
-
-    if opt_outpath is not None and subcmd != "pull":
-        die("-o/--output only applies to pull")
     if opt_outpath == "":
         die("-o/--output requires a non-empty path")
     if subcmd == "pull" and opt_outpath is not None:
@@ -492,6 +659,9 @@ def main(argv: list[str] | None = None) -> int:
             die("--all cannot be combined with -o/--output")
         if len(positional) > 1:
             die("-o/--output cannot be combined with multiple pull targets")
+
+    if help_requested:
+        print_command_help(subcmd)
 
     # Parsing and option validation deliberately precede config/S3 setup, so a
     # typo reports the typo even when the user's AWS profile is unavailable.

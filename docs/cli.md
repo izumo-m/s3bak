@@ -3,8 +3,23 @@
 The CLI turns command-line input into an entry and an optional entry-relative
 subpath, rejects ambiguous or inapplicable input before doing work, and maps
 command outcomes to stable process exit codes. The complete command and option
-reference is emitted by `s3bak --help`; this document records the design
-contracts behind that interface.
+reference is split between `s3bak --help` and `s3bak <command> --help`; this
+document records the design contracts behind that interface.
+
+## Help output
+
+`s3bak --help` is an overview for choosing a command. It lists the commands,
+the global `--help` and `--version` options, and the active configuration path.
+It does not include command-specific options or examples.
+
+`s3bak <command> --help` is the reference for one command. It shows that
+command's exact usage, arguments, applicable options, and examples. Status
+letters are documented only by `s3bak status --help`.
+
+Explicit help is written to standard output and exits with status 0. Usage
+shown because of missing input or an unknown command is written to standard
+error and exits with status 1. Help never loads configuration or creates an S3
+client.
 
 ## Entry and path resolution
 
