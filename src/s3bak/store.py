@@ -578,16 +578,19 @@ class Boto3S3Store:
         src_dir: str,
         rel_prefix: str,
         *,
-        file_filter: Any = None,
+        walker: Any = None,
         compare: Any = None,
         create: Any = True,
         delete: Any = False,
         dryrun: bool = False,
         verbose: bool = False,
     ) -> TransferResult:
-        """`file_filter` is the excludes predicate (manifest.exclude_filter):
-        the same entry-rooted semantics the manifest walk applies, so the data
-        sync and the manifest can never disagree on what an exclude means.
+        """`walker` is the excludes-pruning local walk (localwalk.sync_walker):
+        excludes prune the LOCAL side only, through the same walker the
+        manifest walk uses, so the data sync and the manifest can never
+        disagree on what an exclude means. The S3 listing stays complete, so
+        an object under an excluded path is an ordinary delete-lane orphan
+        rather than invisible (see sync_walker).
         `delete` is the delete-lane value: False keeps every S3 orphan (the
         default), True prunes them all, and a callable decides per orphan
         (the --delete confirmation; called serially in ascending key order).
@@ -600,7 +603,7 @@ class Boto3S3Store:
         # follow_symlinks moved onto the Storage in 0.5: symlinks are not
         # uploaded as data; the manifest records them and apply_manifest
         # recreates them on restore.
-        src = LocalStorage(src_dir, follow_symlinks=False)
+        src = LocalStorage(src_dir, walker=walker, follow_symlinks=False)
         dst = self._s3_loc(rel_prefix, is_dir=True)
         with self._update_lane(compare) as update_filter:
             return self._transfer(
@@ -616,7 +619,6 @@ class Boto3S3Store:
                     create_filter=create,
                     delete_filter=delete,
                     dryrun=dryrun,
-                    filter=file_filter,
                     update_filter=update_filter,
                     on_result=cb,
                 ),

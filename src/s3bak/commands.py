@@ -319,7 +319,7 @@ def _push_sub(
                 result = cfg.store.sync_up(
                     local_sub,
                     sub_rel,
-                    file_filter=manifest.exclude_filter(excludes, sub=sub) if excludes else None,
+                    walker=localwalk.sync_walker(excludes, sub=sub),
                     compare=compare,
                     create=create_lane,
                     delete=plan.lane,
@@ -577,7 +577,7 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 result = cfg.store.sync_up(
                     target,
                     entry,
-                    file_filter=manifest.exclude_filter(excludes) if excludes else None,
+                    walker=localwalk.sync_walker(excludes),
                     compare=compare,
                     create=create_lane,
                     delete=plan.lane,

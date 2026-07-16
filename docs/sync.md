@@ -86,8 +86,10 @@ key order: both-sides pairs run the shared predicate (M), manifest-only records
 report D, local-only paths report A — every line in key order, holding one pair
 in memory, so a manifest far larger than RAM still works. Excluded paths are
 invisible on the local side of the diff: never compared, never an A — so a
-record left in the manifest by a later-added exclude reads D until the next
-push drops it.
+record left in the manifest by a later-added exclude reads D until a
+`push --delete` retires it together with its object. The excluded
+directory's own record is objectless, so it outlives that cleanup and keeps
+reading D — like every directory record, only the `--yes` mirror prunes it.
 
 ## The transfer path: direct client call vs. `S3.cp`
 
@@ -153,9 +155,14 @@ environment.
    (see "Deleting backups" below). `--checksum` ignores manifest file stats
    for its content decision, but a whole-entry push still downloads the
    manifest: it detects objectless tree changes, and `--data-only` reads it
-   to warn about the uploads it leaves unrecorded. Excludes are
-   applied by the same entry-rooted matcher the manifest walk uses, so the
-   data sync and the manifest can never disagree on what an exclude means.
+   to warn about the uploads it leaves unrecorded. Excludes prune the
+   sync's **local side only**, through the same walker the manifest walk
+   uses (`localwalk.sync_walker`), so the data sync and the manifest can
+   never disagree on what an exclude means. The S3 listing is never
+   filtered: an object under an excluded path — pushed before the exclude
+   was added — is an ordinary delete-lane orphan, so `push --delete` can
+   retire it (see "Deleting backups" below) instead of the exclude hiding
+   it from every lane forever.
    **Single-file entry:** upload iff the size+mtime check fails — the manifest holds
    no matching-basename record, the local stat differs, or the S3 object is
    missing (a HeadObject confirms existence, since a single file has no listing
@@ -193,7 +200,11 @@ way (see "Deleting backups" below).
 A **sub-path push** (`push entry/sub` or a local path inside an entry) syncs or
 uploads just that sub-tree and patches the manifest sub-tree in place
 (`write_merged` over the replaced range). A symlink sub-path uploads no data —
-only its manifest record is updated. If the entry has no manifest yet, the
+only its manifest record is updated. Excludes keep their entry-rooted meaning
+inside the range (the sub walk re-anchors them), with one deliberate edge: a
+sub-path that is itself covered by an exclude is still walked, uploaded, and
+recorded — naming a path explicitly wins over the exclude, and the data and
+the manifest agree on the result. If the entry has no manifest yet, the
 patch also writes the `.` root record so the manifest keeps its directory-entry
 shape. A sub-path push is a whole-entry push scoped to the sub-path: the same
 keep-by-default and `--delete` confirmation rules apply within the range, and
@@ -233,6 +244,15 @@ Deleting is opt-in and confirmed:
   question returns on every later `--delete`. See
   [storage.md](storage.md#unrecorded-objects) for what such an object is and
   how to adopt or retire it.
+- **An object under an excluded path is a candidate like any other**, because
+  excludes prune only the local side of the sync. This is how the backup of a
+  path excluded *after* it was pushed (an accidentally uploaded `node_modules`,
+  a log file excluded later) is cleaned up: `push --delete` offers the
+  leftovers, and a confirmed deletion drops each object and its file record
+  together. Answering n keeps both, and the local file — excluded, so
+  invisible to the walk — stays untouched either way. The excluded
+  directory's own record follows the rule above: objectless, never asked,
+  kept until a `--yes` mirror.
 - **`--yes`** answers yes to every confirmation: the unattended mirror for
   cron. Without a TTY (stdin/stderr), `--delete` without `--yes` answers no
   to everything — nothing is deleted and the run still succeeds (rc 0).

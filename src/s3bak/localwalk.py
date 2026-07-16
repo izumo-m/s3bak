@@ -73,6 +73,24 @@ class ManifestWalker(LocalFileGenerator):
         return self.normalize_sort(kept)
 
 
+def sync_walker(excludes: list[str], sub: str | None = None) -> ManifestWalker | None:
+    """The data sync's local-side walk: the manifest walk's exclude pruning.
+
+    Sharing ``ManifestWalker`` is what makes the sync and the manifest agree
+    on what an exclude means - one predicate, one anchor. The pruning applies
+    to the LOCAL side only (the S3 listing is never filtered), so an object
+    under an excluded path - uploaded before the exclude was added - surfaces
+    to the sync as an ordinary orphan and ``push --delete`` can retire it,
+    instead of the exclude hiding it from every lane forever. ``sub``
+    re-roots a sub-path sync's rels at ``./{sub}/`` so the entry's patterns
+    keep their entry-rooted meaning. Returns None (boto3-s3's stock walk)
+    when there is nothing to exclude."""
+    if not excludes:
+        return None
+    prune, skip = split_excludes(excludes)
+    return ManifestWalker(prune, skip, f"./{sub}/" if sub else "./")
+
+
 def walk_tree(
     root: str, excludes: list[str], *, root_rel: str = ".", rel_prefix: str = "./"
 ) -> Iterator[tuple[str, os.stat_result, str | None]]:

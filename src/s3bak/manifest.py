@@ -581,39 +581,6 @@ def merge_join(
             hb = next(itb, None)
 
 
-def _excluded(rel: str, prune: list[str], skip: list[str]) -> bool:
-    """Whether an entry-rooted ``./...`` rel is excluded: a skip pattern
-    matches it, or a prune pattern matches it or any of its ancestors (a
-    pruned directory excludes its whole subtree)."""
-    if any(path_match(rel, p) for p in skip):
-        return True
-    anc = rel
-    while True:
-        if any(path_match(anc, p) for p in prune):
-            return True
-        i = anc.rfind("/")
-        if i <= 1:  # reached "./"
-            return False
-        anc = anc[:i]
-
-
-def exclude_filter(excludes: list[str], sub: str | None = None) -> Any:
-    """The sync ``filter=`` for an entry's excludes (True = keep).
-
-    Matches each side's compare_key against the entry-rooted patterns - the
-    same semantics the manifest walk applies - re-rooting a sub-path
-    sync's keys with ``./{sub}/`` so the entry's patterns keep their meaning.
-    Applies to both sides of the sync, so an excluded key is neither
-    transferred nor treated as a delete candidate."""
-    prune, skip = split_excludes(excludes)
-    prefix = f"./{sub}/" if sub else "./"
-
-    def keep(info: Any) -> bool:
-        return not _excluded(prefix + (info.compare_key or ""), prune, skip)
-
-    return keep
-
-
 # =============================================================================
 # ManifestFilter (the default sync compare)
 # =============================================================================
