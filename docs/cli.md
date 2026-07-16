@@ -3,8 +3,23 @@
 The CLI turns command-line input into an entry and an optional entry-relative
 subpath, rejects ambiguous or inapplicable input before doing work, and maps
 command outcomes to stable process exit codes. The complete command and option
-reference is emitted by `s3bak help`; this document records the design
-contracts behind that interface.
+reference is split between `s3bak --help` and `s3bak <command> --help`; this
+document records the design contracts behind that interface.
+
+## Help output
+
+`s3bak --help` is an overview for choosing a command. It lists the commands,
+the global `--help` and `--version` options, and the active configuration path.
+It does not include command-specific options or examples.
+
+`s3bak <command> --help` is the reference for one command. It shows that
+command's exact usage, arguments, applicable options, and examples. Status
+letters are documented only by `s3bak status --help`.
+
+Explicit help is written to standard output and exits with status 0. Usage
+shown because of missing input or an unknown command is written to standard
+error and exits with status 1. Help never loads configuration or creates an S3
+client.
 
 ## Entry and path resolution
 
@@ -21,6 +36,26 @@ A positional `<entry|path>` argument is resolved by shape:
 
 The rules are shared by commands that accept entries or paths, so the same
 argument denotes the same stored object or subtree across commands.
+
+## Multiple pull targets
+
+`pull <entry|path>...` resolves every argument before starting any restore and
+runs distinct entries through the shared entry worker pool. Multiple arguments
+that resolve to the same entry are rejected, even when they select different
+subpaths, because parallel restores must not mutate the same entry tree.
+
+The resolved restore destinations for a multi-target pull must be disjoint.
+Equal destinations and ancestor/descendant pairs are rejected before S3 work;
+the same check applies to `pull --all`. Existing symlinks in each destination's
+parent chain are resolved for this comparison, while the final component is not
+followed because pull may replace it. Case-only and Unicode-normalization-only
+variants are conservatively treated as the same path on every platform; on a
+case-sensitive filesystem, restore such entries separately. This prevents one
+restore, especially a `--delete` restore, from writing or removing another
+restore's files.
+
+`-o/--output` names the exact destination for one target and is therefore
+rejected with multiple explicit targets as well as with `--all`.
 
 ## Explicit input handling
 
@@ -61,3 +96,10 @@ exit codes:
 Status 2 distinguishes retained but incomplete work from both success and a
 hard failure, allowing scripts to require inspection without discarding work
 that did complete.
+
+A `--delete` confirmation answered no — including the automatic no of a
+non-interactive run without `--yes` — is a successful outcome (status 0), not
+a warning: keeping a backup is a valid answer. Answering q aborts the command
+with status 1. The exception is the explicit backup-subtree deletion
+(`push --delete entry/gone-sub`): declining its one confirmation exits 1,
+because the deletion was the command's entire purpose.

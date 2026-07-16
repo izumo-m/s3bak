@@ -467,6 +467,7 @@ class Boto3S3Store:
         dest_dir: str,
         *,
         compare: Any = None,
+        dryrun: bool = False,
         verbose: bool = False,
     ) -> TransferResult:
         from boto3_s3 import LocalStorage
@@ -483,6 +484,7 @@ class Boto3S3Store:
                 lambda cb: self._s3.sync(
                     src,
                     dest,
+                    dryrun=dryrun,
                     update_filter=update_filter,
                     on_result=cb,
                 ),
@@ -531,13 +533,21 @@ class Boto3S3Store:
         *,
         file_filter: Any = None,
         compare: Any = None,
-        delete: bool = False,
+        create: Any = True,
+        delete: Any = False,
         dryrun: bool = False,
         verbose: bool = False,
     ) -> TransferResult:
         """`file_filter` is the excludes predicate (manifest.exclude_filter):
         the same entry-rooted semantics the manifest walk applies, so the data
-        sync and the manifest can never disagree on what an exclude means."""
+        sync and the manifest can never disagree on what an exclude means.
+        `delete` is the delete-lane value: False keeps every S3 orphan (the
+        default), True prunes them all, and a callable decides per orphan
+        (the --delete confirmation; called serially in ascending key order).
+        `create` is the create-lane value with the same shapes and the same
+        serial ascending-order guarantee for a callable; s3bak always copies
+        (returns True) and uses the hook only to observe new uploads (the
+        --data-only unrecorded-upload warning)."""
         from boto3_s3 import LocalStorage
 
         # follow_symlinks moved onto the Storage in 0.5: symlinks are not
@@ -549,12 +559,14 @@ class Boto3S3Store:
             return self._transfer(
                 verbose,
                 f"sync {src_dir} {dst}",
-                # delete_filter=True (from --delete) prunes S3 orphans; new local
-                # files take the default create lane, both-sides pairs the
-                # update_filter (the ManifestFilter, or EtagComparison pool).
+                # New local files take the caller's create lane (default:
+                # copy them all), both-sides pairs the update_filter (the
+                # ManifestFilter, or the EtagComparison pool), orphans the
+                # delete lane above.
                 lambda cb: self._s3.sync(
                     src,
                     dst,
+                    create_filter=create,
                     delete_filter=delete,
                     dryrun=dryrun,
                     filter=file_filter,

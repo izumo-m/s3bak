@@ -106,12 +106,22 @@ memory bounded by one directory level rather than the whole tree:
   lookahead per side — both-sides pairs are compared (M), manifest-only
   records report D, local-only paths report A / become delete candidates — so
   a manifest far larger than RAM still diffs in one pass.
-- **The sub-tree patch** (`write_patched`, used by a sub-path push) is a
-  streaming merge of two already-sorted inputs — the old manifest and the newly
-  walked sub-tree — instead of a read-all-then-sort. It copies old records
-  outside the patched sub-path verbatim (preserving any unknown keys), drops
-  old records at/under it, and splices the fresh records in at their sorted
-  position.
+- **The manifest rewrite** (`write_merged`, used by every push) is a streaming
+  merge of already-sorted inputs — the old manifest, the newly walked tree (or
+  sub-tree: records outside the replaced range are copied verbatim, preserving
+  any unknown keys), and optionally the kept-keys stream — instead of a
+  read-all-then-sort. A walked path always wins over its old record. Old-only
+  records in the range follow the keep policy: all kept (the default push —
+  deleting is opt-in), all dropped (`--delete --yes`, the mirror), or decided
+  by the kept-keys stream (`KeptKeys`) that the `--delete` confirmation wrote —
+  one JSON-encoded key per line, in ascending key order because the sync's
+  delete lane decides serially in that order, so one line of lookahead decides
+  every record with constant memory. The stream governs regular-file records
+  only: directory, symlink, and special records have no S3 object to confirm,
+  always survive it, and thereby keep every kept file's ancestor chain valid.
+  A kept key with no old record (an
+  [unrecorded object](storage.md#unrecorded-objects)) is skipped — a record
+  cannot be fabricated for it.
 - **The default update strategy** (`ManifestFilter`) reads the manifest once,
   front to back, merge-joining its records against `S3.sync`'s ascending
   compare-key pairs (`iter_compare_records` keys a directory as `name/` to match
@@ -135,6 +145,10 @@ against either side of a sync without materializing it.
   record aborts with `ManifestError` before manifest-driven mutation starts.
   Treating a damaged record as absent would be unsafe: `pull --delete` could
   otherwise classify the corresponding local path as an extra and remove it.
+  A directory push reads the manifest at some stage in every mode, so a
+  damaged one blocks pushes too; to recover, remove the manifest object with
+  `aws s3 rm` and push the entry again — with no manifest on S3 the push
+  transfers every pair and writes a fresh one, like a first push.
 - Unknown record keys remain accepted and are preserved by sub-tree patches,
   so additive metadata does not require a version bump.
 

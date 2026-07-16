@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 
 from s3bak.cli import _resolve_use_color
 
@@ -55,6 +56,21 @@ def test_meta_only_records_mode_change_and_clears_status(ws):
     assert res.out.strip() == ""
 
 
+def test_push_meta_only_dry_run_validates_the_manifest(ws):
+    # A dry run performs the read-only work for real: the --meta-only refresh
+    # downloads and validates the old manifest, so a damaged one fails the
+    # rehearsal exactly like the real push.
+    ws.write("data/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    ws.s3.put_object(
+        Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl", Body=b"not a manifest\n"
+    )
+    res = ws.run("push", "--meta-only", "--dry-run", "data")
+    assert res.rc == 1
+
+
 def test_push_data_only_skips_manifest_refresh(ws):
     ws.write("data/a.txt", "a")
     ws.config({"data": {"path": str(ws.root / "data")}})
@@ -74,6 +90,101 @@ def test_push_data_only_skips_manifest_refresh(ws):
     assert before == after  # but the manifest was not rewritten
 
 
+def test_push_data_only_warns_about_unrecorded_uploads(ws):
+    # A --data-only upload of a file the manifest never recorded leaves an
+    # unrecorded object (storage.md); the push must say so. cli.run maps the
+    # warning to exit 2; in-process main() reports it on stderr only.
+    ws.write("data/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "a.txt").write_text("a-changed")  # recorded: update lane
+    ws.write("data/new.txt", "n")  # unrecorded: create lane
+
+    res = ws.run("push", "--data-only", "data", expect_rc=0)
+    assert "1 object(s) the manifest does not record" in res.err
+    assert "./new.txt" not in _manifest_paths(ws)
+
+
+def test_push_data_only_warns_again_for_an_object_it_left_unrecorded(ws):
+    # The creating run counts the upload on the create lane; the object then
+    # exists on S3, so the next --data-only run meets it as an update pair -
+    # ManifestFilter re-uploads the manifest-unknown key and the warning must
+    # repeat, not go silent after the first run (the cron case). A push
+    # without --data-only then records it and ends the warnings.
+    ws.write("data/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.write("data/new.txt", "n")
+
+    for _ in range(2):
+        res = ws.run("push", "--data-only", "data", expect_rc=0)
+        assert "1 object(s) the manifest does not record" in res.err
+
+    res = ws.run("push", "data", expect_rc=0)
+    assert "does not record" not in res.err
+    assert "./new.txt" in _manifest_paths(ws)
+
+
+def test_push_data_only_of_recorded_files_does_not_warn(ws):
+    ws.write("data/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "a.txt").write_text("a-changed")
+    res = ws.run("push", "--data-only", "data", expect_rc=0)
+    assert "does not record" not in res.err
+
+
+def test_first_push_data_only_warns_for_every_upload(ws):
+    # No manifest on S3 at all: every upload is unrecorded.
+    ws.write("data/a.txt", "a")
+    ws.write("data/b.txt", "b")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+
+    res = ws.run("push", "--data-only", "data", expect_rc=0)
+    assert "2 object(s) the manifest does not record" in res.err
+
+
+def test_push_checksum_data_only_still_warns(ws):
+    # --checksum --data-only used to skip the manifest download entirely; the
+    # unrecorded-upload warning is why every dir push now fetches it.
+    ws.write("data/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    ws.write("data/new.txt", "n")
+    res = ws.run("push", "--checksum", "--data-only", "data", expect_rc=0)
+    assert "1 object(s) the manifest does not record" in res.err
+
+
+def test_push_data_only_dry_run_previews_the_warning(ws):
+    # The dry run makes the same lane decisions as the real push, so it
+    # previews the warning ("would upload") while transferring nothing.
+    ws.write("data/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    ws.write("data/new.txt", "n")
+    res = ws.run("push", "--data-only", "--dry-run", "data", expect_rc=0)
+    assert "would upload 1 object(s) the manifest does not record" in res.err
+    assert "new.txt" in res.out
+    assert "data/new.txt" not in ws.keys()  # nothing was actually uploaded
+
+
+def test_subpath_push_data_only_warns_about_unrecorded_uploads(ws):
+    # The sub-relative compare key must be entry-rooted before the manifest
+    # lookup, or a recorded sub file would be miscounted as unrecorded.
+    ws.write("data/sub/x.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "sub" / "x.txt").write_text("x-changed")
+    ws.write("data/sub/new.txt", "n")
+    res = ws.run("push", "--data-only", "data/sub", expect_rc=0)
+    assert "1 object(s) the manifest does not record" in res.err
+
+
 def test_push_dryrun_uploads_nothing(ws):
     ws.write("data/a.txt", "a")
     ws.config({"data": {"path": str(ws.root / "data")}})
@@ -81,6 +192,70 @@ def test_push_dryrun_uploads_nothing(ws):
     res = ws.run("push", "--dry-run", "data", expect_rc=0)
     assert ws.keys() == set()  # nothing was actually uploaded
     assert "a.txt" in res.out  # the planned upload is reported
+
+
+def test_pull_dryrun_changes_nothing(ws):
+    ws.write("data/a.txt", "one")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "a.txt").write_text("drifted")
+    res = ws.run("pull", "--dry-run", "data", expect_rc=0)
+
+    assert (ws.root / "data" / "a.txt").read_text() == "drifted"  # not overwritten
+    assert "(dry-run) download:" in res.out
+    assert "would apply manifest metadata" in res.out
+
+
+def test_pull_dryrun_clean_tree_prints_nothing(ws):
+    ws.write("data/a.txt", "one")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    res = ws.run("pull", "--dry-run", "data", expect_rc=0)
+    assert res.out == ""
+
+
+def test_pull_delete_dryrun_keeps_extras(ws):
+    ws.write("data/a.txt", "one")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    extra = ws.write("data/extra.txt", "keep me")
+    res = ws.run("pull", "--delete", "--dry-run", "data", expect_rc=0)
+
+    assert extra.exists()  # the extra was reported, not removed
+    assert "(dry-run) delete:" in res.out
+    assert "extra.txt" in res.out
+
+
+def test_pull_dryrun_missing_destination_creates_nothing(ws):
+    # S3.sync creates a missing local destination even on a dry run (aws-cli
+    # parity); pull --dry-run must clean that up to keep its no-changes promise.
+    ws.write("data/sub/a.txt", "one")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    shutil.rmtree(ws.root / "data")
+    res = ws.run("pull", "--dry-run", "data", expect_rc=0)
+
+    assert not (ws.root / "data").exists()  # no directories left behind
+    assert "(dry-run) download:" in res.out
+
+
+def test_pull_dryrun_conflicting_root_reports_replacement(ws):
+    # A restore root of the wrong type is replaced by a real pull; a dry run
+    # must report the conflict and leave it alone.
+    ws.write("data/a.txt", "one")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    shutil.rmtree(ws.root / "data")
+    ws.write("data", "now a file")
+    res = ws.run("pull", "--dry-run", "data", expect_rc=0)
+
+    assert (ws.root / "data").read_text() == "now a file"  # untouched
+    assert "would replace" in res.out
 
 
 def test_resolve_use_color_modes(monkeypatch):
@@ -125,6 +300,53 @@ def test_pull_all_restores_every_entry(ws):
     assert (ws.root / "d2" / "b.txt").read_text() == "b"
 
 
+def test_pull_restores_multiple_explicit_entries(ws):
+    ws.write("d1/a.txt", "a")
+    ws.write("d2/b.txt", "b")
+    ws.config({"d1": {"path": str(ws.root / "d1")}, "d2": {"path": str(ws.root / "d2")}})
+    ws.run("push", "--all", expect_rc=0)
+
+    (ws.root / "d1" / "a.txt").unlink()
+    (ws.root / "d2" / "b.txt").unlink()
+    ws.run("pull", "d1", "d2", expect_rc=0)
+
+    assert (ws.root / "d1" / "a.txt").read_text() == "a"
+    assert (ws.root / "d2" / "b.txt").read_text() == "b"
+
+
+def test_pull_restores_multiple_explicit_subpaths(ws):
+    ws.write("d1/a.txt", "a")
+    ws.write("d2/b.txt", "b")
+    ws.config({"d1": {"path": str(ws.root / "d1")}, "d2": {"path": str(ws.root / "d2")}})
+    ws.run("push", "--all", expect_rc=0)
+
+    (ws.root / "d1" / "a.txt").unlink()
+    (ws.root / "d2" / "b.txt").unlink()
+    ws.run("pull", "d1/a.txt", "d2/b.txt", expect_rc=0)
+
+    assert (ws.root / "d1" / "a.txt").read_text() == "a"
+    assert (ws.root / "d2" / "b.txt").read_text() == "b"
+
+
+def test_pull_allows_disjoint_destinations_from_trailing_slash(ws):
+    restore_root = ws.root / "restore"
+    ws.write("restore/source-a.txt", "a")
+    ws.write("restore/b/source-b.txt", "b")
+    ws.config(
+        {
+            "a": {"path": f"{restore_root}/"},
+            "b": {"path": str(restore_root / "b")},
+        }
+    )
+    ws.run("push", "--all", expect_rc=0)
+    shutil.rmtree(restore_root)
+
+    ws.run("pull", "a", "b", expect_rc=0)
+
+    assert (restore_root / "a" / "source-a.txt").read_text() == "a"
+    assert (restore_root / "b" / "source-b.txt").read_text() == "b"
+
+
 def test_pull_meta_only_restores_mode_without_download(ws):
     f = ws.write("data/a.txt", "a")
     ws.config({"data": {"path": str(ws.root / "data")}})
@@ -162,6 +384,19 @@ def test_push_single_file_dryrun_uploads_nothing(ws):
     assert ws.keys() == set()
 
 
+def test_pull_single_file_dryrun_downloads_nothing(ws):
+    f = ws.write("solo.txt", "original")
+    ws.config({"solo.txt": {"path": str(f)}})
+    ws.run("push", "solo.txt", expect_rc=0)
+
+    f.write_text("drifted")
+    res = ws.run("pull", "--dry-run", "solo.txt", expect_rc=0)
+
+    assert f.read_text() == "drifted"  # not overwritten
+    assert "(dry-run) download:" in res.out
+    assert "would apply manifest metadata" in res.out
+
+
 def test_push_single_file_dryrun_prints_upload_once(ws):
     # Regression: the single-file dryrun path printed the upload line twice -
     # once directly and once via the shared results writer.
@@ -179,3 +414,312 @@ def test_push_git_entry_meta_only_writes_manifest_like_any_other_entry(ws):
 
     ws.run("push", "--meta-only", "repo.git", expect_rc=0)
     assert "repo.git-manifest.jsonl" in ws.keys()
+
+
+# --- push --delete (confirmed deletions) ---------------------------------------
+
+
+def _manifest_paths(ws) -> list[str]:
+    import json
+
+    body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl")["Body"].read()
+    return [json.loads(ln)["path"] for ln in body.decode().splitlines()[1:]]
+
+
+def _orphan_tree(ws) -> None:
+    """Push a tree, then delete `sub/` locally: sub/x.txt and sub/y.txt become
+    S3 orphans (delete candidates in that key order) while keep.txt stays."""
+    ws.write("data/keep.txt", "k")
+    ws.write("data/sub/x.txt", "x")
+    ws.write("data/sub/y.txt", "y")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    shutil.rmtree(ws.root / "data" / "sub")
+
+
+def test_push_delete_yes_mirrors_unattended(ws, answers):
+    _orphan_tree(ws)
+
+    res = ws.run("push", "--delete", "--yes", "data", expect_rc=0)
+
+    assert answers.prompts == []
+    assert "delete:" in res.out
+    keys = ws.keys()
+    assert "data/sub/x.txt" not in keys
+    assert "data/sub/y.txt" not in keys
+    assert "data/keep.txt" in keys
+    assert _manifest_paths(ws) == [".", "./keep.txt"]
+
+
+def test_push_delete_without_tty_answers_no_to_everything(ws):
+    # pytest's stdin is not a TTY: --delete without --yes keeps everything,
+    # succeeds (rc 0), and neither warns nor prompts.
+    _orphan_tree(ws)
+
+    res = ws.run("push", "--delete", "data", expect_rc=0)
+
+    assert "delete:" not in res.out
+    assert "warning" not in res.err.lower()
+    keys = ws.keys()
+    assert "data/sub/x.txt" in keys
+    assert "data/sub/y.txt" in keys
+    assert "./sub/x.txt" in _manifest_paths(ws)
+    assert "./sub/y.txt" in _manifest_paths(ws)
+
+
+def test_push_delete_interactive_y_n_mix_keeps_answered_records(ws, answers):
+    # Candidates arrive in key order: sub/x.txt then sub/y.txt. Deleting x and
+    # keeping y must keep y's record AND its ancestor dir record ./sub.
+    _orphan_tree(ws)
+    answers.feed("y", "n")
+
+    res = ws.run("push", "--delete", "data", expect_rc=0)
+
+    assert len(answers.prompts) == 2
+    assert "sub/x.txt" in answers.prompts[0]
+    keys = ws.keys()
+    assert "data/sub/x.txt" not in keys
+    assert "data/sub/y.txt" in keys
+    assert _manifest_paths(ws) == [".", "./keep.txt", "./sub", "./sub/y.txt"]
+    assert "delete:" in res.out
+
+
+def test_push_delete_interactive_a_deletes_the_rest(ws, answers):
+    _orphan_tree(ws)
+    answers.feed("a")
+
+    ws.run("push", "--delete", "data", expect_rc=0)
+
+    assert len(answers.prompts) == 1
+    assert ws.keys() == {"data/keep.txt", "data-manifest.jsonl"}
+    # ./sub survives: a directory record has no object, so no confirmation can
+    # drop it - only the --yes mirror prunes objectless records.
+    assert _manifest_paths(ws) == [".", "./keep.txt", "./sub"]
+
+
+def test_push_delete_interactive_d_keeps_the_rest(ws, answers):
+    _orphan_tree(ws)
+    answers.feed("d")
+
+    ws.run("push", "--delete", "data", expect_rc=0)
+
+    assert len(answers.prompts) == 1
+    keys = ws.keys()
+    assert "data/sub/x.txt" in keys
+    assert "data/sub/y.txt" in keys
+    assert _manifest_paths(ws) == [".", "./keep.txt", "./sub", "./sub/x.txt", "./sub/y.txt"]
+
+
+def test_push_delete_interactive_q_aborts_without_manifest_update(ws, answers):
+    hook_sentinel = ws.root / "hook-ran"
+    ws.write("data/keep.txt", "k")
+    ws.write("data/sub/x.txt", "x")
+    ws.write("data/sub/y.txt", "y")
+    ws.config(
+        {
+            "data": {
+                "path": str(ws.root / "data"),
+                "post_hook": ["python3", "-c", f"open({str(hook_sentinel)!r}, 'w').close()"],
+            }
+        }
+    )
+    ws.run("push", "data", expect_rc=0)
+    assert hook_sentinel.exists()
+    hook_sentinel.unlink()
+    shutil.rmtree(ws.root / "data" / "sub")
+    before = _manifest_paths(ws)
+
+    answers.feed("q")
+    res = ws.run("push", "--delete", "data")
+
+    assert res.rc == 1
+    assert "aborted" in res.err
+    assert _manifest_paths(ws) == before
+    assert not hook_sentinel.exists()
+    assert "data/sub/y.txt" in ws.keys()  # never asked, never deleted
+
+
+def test_push_delete_dry_run_reports_all_candidates_without_prompting(ws, answers):
+    _orphan_tree(ws)
+    before = _manifest_paths(ws)
+
+    res = ws.run("push", "--delete", "--dry-run", "data", expect_rc=0)
+
+    assert answers.prompts == []
+    assert "(dry-run) delete:" in res.out
+    assert "sub/x.txt" in res.out
+    assert "sub/y.txt" in res.out
+    assert "(dry-run) would update manifest" in res.out
+    keys = ws.keys()
+    assert "data/sub/x.txt" in keys
+    assert "data/sub/y.txt" in keys
+    assert _manifest_paths(ws) == before
+
+
+def test_push_dry_run_without_delete_prints_no_delete_lines(ws):
+    _orphan_tree(ws)
+
+    res = ws.run("push", "--dry-run", "data", expect_rc=0)
+
+    assert "delete:" not in res.out
+
+
+def test_push_delete_on_single_file_entry_deletes_nothing(ws, answers):
+    target = ws.write("single.txt", "x")
+    ws.config({"single": {"path": str(target)}})
+    ws.run("push", "single", expect_rc=0)
+
+    ws.run("push", "--delete", "--yes", "single", expect_rc=0)
+
+    assert "single" in ws.keys()
+    assert answers.prompts == []
+
+
+def test_push_all_delete_yes_mirrors_every_entry(ws):
+    ws.write("d1/a.txt", "a")
+    ws.write("d1/gone.txt", "g")
+    ws.write("d2/b.txt", "b")
+    ws.write("d2/gone.txt", "g")
+    ws.config(
+        {
+            "d1": {"path": str(ws.root / "d1")},
+            "d2": {"path": str(ws.root / "d2")},
+        }
+    )
+    ws.run("push", "--all", expect_rc=0)
+    (ws.root / "d1" / "gone.txt").unlink()
+    (ws.root / "d2" / "gone.txt").unlink()
+
+    ws.run("push", "--all", "--delete", "--yes", expect_rc=0)
+
+    keys = ws.keys()
+    assert "d1/gone.txt" not in keys
+    assert "d2/gone.txt" not in keys
+    assert "d1/a.txt" in keys
+    assert "d2/b.txt" in keys
+
+
+def test_push_delete_interactive_never_drops_objectless_records(ws, answers):
+    # Symlinks and empty dirs have no S3 object, hence no delete question:
+    # their records must survive an interactive --delete whatever the answers.
+    ws.write("data/keep.txt", "k")
+    ws.write("data/gone.txt", "g")
+    (ws.root / "data" / "emptydir").mkdir()
+    os.symlink("keep.txt", ws.root / "data" / "link")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "gone.txt").unlink()
+    (ws.root / "data" / "link").unlink()
+    (ws.root / "data" / "emptydir").rmdir()
+    answers.feed("n")  # the only question: gone.txt's object
+    ws.run("push", "--delete", "data", expect_rc=0)
+
+    assert len(answers.prompts) == 1
+    paths = _manifest_paths(ws)
+    assert "./gone.txt" in paths
+    assert "./link" in paths
+    assert "./emptydir" in paths
+
+
+def test_push_delete_with_all_answers_no_converges(ws):
+    # A kept record must not read as "structure changed": the same non-TTY
+    # push --delete run twice may not rewrite the manifest or produce output,
+    # or a cron mirror would re-upload and fire post_hook forever.
+    ws.write("data/keep.txt", "k")
+    ws.write("data/gone.txt", "g")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    (ws.root / "data" / "gone.txt").unlink()
+
+    first = ws.run("push", "--delete", "data", expect_rc=0)
+    second = ws.run("push", "--delete", "data", expect_rc=0)
+
+    for res in (first, second):
+        assert res.out == ""
+        assert "Updating" not in res.err
+
+
+def test_push_delete_heals_stale_record_whose_object_is_gone(ws):
+    # A record whose object vanished (interrupted deletion, q after y, ...)
+    # is not a delete candidate, so no answer covers it: any --delete push -
+    # including the unattended all-no run - drops it from the manifest.
+    ws.write("data/keep.txt", "k")
+    ws.write("data/stale.txt", "s")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    (ws.root / "data" / "stale.txt").unlink()
+    ws.s3.delete_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/stale.txt")
+
+    res = ws.run("push", "--delete", "data", expect_rc=0)
+
+    assert "Updating" in res.err
+    assert "./stale.txt" not in _manifest_paths(ws)
+
+    dest = ws.root / "restore"
+    ws.run("pull", "data", "-o", str(dest), expect_rc=0)
+    assert (dest / "keep.txt").read_text() == "k"
+
+
+def test_push_delete_flags_candidates_missing_from_the_manifest(ws, answers):
+    # An object the manifest never recorded (an out-of-band upload, or the
+    # residue of an interrupted push) is offered like any orphan but flagged:
+    # n keeps its object for this run only - nothing can be recorded for it,
+    # so the manifest stays unchanged and a later --delete asks again.
+    ws.write("data/keep.txt", "k")
+    ws.write("data/gone.txt", "g")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    (ws.root / "data" / "gone.txt").unlink()
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/rogue.bin", Body=b"r")
+
+    answers.feed("n", "n")
+    ws.run("push", "--delete", "data", expect_rc=0)
+
+    assert len(answers.prompts) == 2
+    recorded = next(p for p in answers.prompts if "gone.txt" in p)
+    rogue = next(p for p in answers.prompts if "rogue.bin" in p)
+    assert "(not in manifest)" not in recorded
+    assert "(not in manifest)" in rogue
+    assert "data/rogue.bin" in ws.keys()
+    assert "./rogue.bin" not in _manifest_paths(ws)
+
+
+def test_subpath_push_delete_checksum_still_flags_unrecorded_candidates(ws, answers):
+    # The sub-relative candidate key is joined back to the entry-rooted rel
+    # for the manifest lookup. --checksum ignores the manifest for its compare,
+    # but --delete still downloads it so the prompt can flag unrecorded
+    # objects instead of flagging everything.
+    ws.write("data/sub/x.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    (ws.root / "data" / "sub" / "x.txt").unlink()
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/sub/rogue.bin", Body=b"r")
+
+    answers.feed("n", "n")
+    ws.run("push", "--delete", "--checksum", "data/sub", expect_rc=0)
+
+    assert len(answers.prompts) == 2
+    x = next(p for p in answers.prompts if "x.txt" in p)
+    rogue = next(p for p in answers.prompts if "rogue.bin" in p)
+    assert "(not in manifest)" not in x
+    assert "(not in manifest)" in rogue
+
+
+def test_file_subpath_push_delete_keeps_former_directory_records(ws, answers):
+    # A file-typed sub-path has no S3 listing, so --delete has nothing to
+    # confirm there: records under the same-named former directory survive
+    # (with the restorability warning) whether or not a TTY is attached.
+    ws.write("data/sub/x.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    shutil.rmtree(ws.root / "data" / "sub")
+    (ws.root / "data" / "sub").write_text("now a file")
+    res = ws.run("push", "--delete", "data/sub", expect_rc=0)
+
+    assert answers.prompts == []
+    assert "non-directory" in res.err
+    paths = _manifest_paths(ws)
+    assert "./sub/x.txt" in paths
+    assert "data/sub/x.txt" in ws.keys()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from importlib.metadata import version
 
 import pytest
@@ -59,10 +60,10 @@ def test_status_rejects_delete(cfg_ws):
     assert "delete" in res.err.lower()
 
 
-def test_pull_rejects_dry_run(cfg_ws):
-    # --dry-run is push-only; silently ignoring it would perform a REAL
-    # restore the user believed was a preview.
-    res = cfg_ws.run("pull", "--dry-run", "data")
+def test_status_rejects_dry_run(cfg_ws):
+    # --dry-run applies to push and pull only; silently ignoring it elsewhere
+    # would blur the "reject, don't ignore" contract for preview-like flags.
+    res = cfg_ws.run("status", "--dry-run", "data")
     assert res.rc == 1
     assert "--dry-run" in res.err
 
@@ -85,6 +86,25 @@ def test_entry_without_path_dies_cleanly(ws):
     res = ws.run("list")
     assert res.rc == 1
     assert "path" in res.err
+
+
+@pytest.mark.parametrize("bad_path", ["~/data", "data", "./data"])
+def test_relative_entry_path_is_rejected(ws, bad_path):
+    # "~" is not expanded, so "~/data" is a relative path too; a relative path
+    # would silently depend on the working directory.
+    ws.config({"data": {"path": bad_path}})
+    res = ws.run("list")
+    assert res.rc == 1
+    assert "absolute" in res.err
+
+
+def test_root_entry_path_is_rejected(ws):
+    # The typo'd-f-string guard: an empty HOME turns f"{HOME}/" into "/".
+    root = "C:\\" if os.name == "nt" else "/"
+    ws.config({"data": {"path": root}})
+    res = ws.run("list")
+    assert res.rc == 1
+    assert "filesystem root" in res.err
 
 
 def test_entry_with_non_list_excludes_dies_cleanly(ws):
@@ -128,6 +148,87 @@ def test_output_flag_does_not_consume_the_next_option(cfg_ws):
     assert "requires a path" in res.err.lower()
 
 
+def test_removed_outpath_alias_is_rejected(cfg_ws):
+    res = cfg_ws.run("pull", "data", "--outpath", "/tmp/x")
+
+    assert res.rc == 1
+    assert "unknown option: --outpath" in res.err.lower()
+
+
+def test_pull_rejects_output_with_multiple_entries_before_loading_config(monkeypatch, capfd):
+    monkeypatch.setenv("S3BAK_CONFIG", "/definitely/missing/config.py")
+    from s3bak import cli
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["pull", "d1", "d2", "-o", "/tmp/out"])
+
+    assert exc.value.code == 1
+    captured = capfd.readouterr()
+    assert "multiple" in captured.err.lower()
+    assert "--output" in captured.err
+    assert "config file not found" not in captured.err.lower()
+
+
+def test_pull_rejects_multiple_paths_from_same_entry(cfg_ws):
+    res = cfg_ws.run("pull", "data/a.txt", "data/b.txt")
+
+    assert res.rc == 1
+    assert "duplicate entry in pull: data" in res.err.lower()
+
+
+@pytest.mark.parametrize("args", [("outer", "inner"), ("--all",)])
+def test_pull_rejects_overlapping_restore_destinations(ws, args):
+    ws.config(
+        {
+            "outer": {"path": str(ws.root / "data")},
+            "inner": {"path": str(ws.root / "data" / "sub")},
+        }
+    )
+
+    res = ws.run("pull", *args)
+
+    assert res.rc == 1
+    assert "restore destinations overlap" in res.err.lower()
+    assert "outer" in res.err
+    assert "inner" in res.err
+
+
+def test_pull_rejects_destinations_overlapping_through_parent_symlink(ws):
+    real = ws.root / "real"
+    real.mkdir()
+    alias = ws.root / "alias"
+    alias.symlink_to(real, target_is_directory=True)
+    ws.config(
+        {
+            "outer": {"path": str(real)},
+            "inner": {"path": str(alias / "sub")},
+        }
+    )
+
+    res = ws.run("pull", "outer", "inner")
+
+    assert res.rc == 1
+    assert "restore destinations overlap" in res.err.lower()
+    assert "outer" in res.err
+    assert "inner" in res.err
+
+
+def test_pull_rejects_destinations_that_differ_only_by_case(ws):
+    ws.config(
+        {
+            "outer": {"path": str(ws.root / "Data")},
+            "inner": {"path": str(ws.root / "data" / "sub")},
+        }
+    )
+
+    res = ws.run("pull", "outer", "inner")
+
+    assert res.rc == 1
+    assert "restore destinations overlap" in res.err.lower()
+    assert "outer" in res.err
+    assert "inner" in res.err
+
+
 def test_ls_remote_rejects_data_only(cfg_ws):
     res = cfg_ws.run("ls-remote", "--data-only")
     assert res.rc == 1
@@ -161,7 +262,10 @@ def test_mtime_window_flag_requires_value(cfg_ws):
         ("push", "--checksum", "--meta-only", "data"),
         ("push", "--checksum", "--mtime-window", "0", "data"),
         ("pull", "--delete", "--meta-only", "data"),
-        ("push", "--delete", "data"),
+        ("push", "--meta-only", "--delete", "data"),
+        ("push", "--data-only", "--delete", "data"),
+        ("push", "--yes", "data"),
+        ("pull", "--yes", "data"),
     ],
 )
 def test_ignored_option_combinations_are_rejected(cfg_ws, args):
@@ -185,6 +289,129 @@ def test_unknown_command_is_reported_before_loading_config(monkeypatch, capfd):
     assert exc.value.code == 1
     captured = capfd.readouterr()
     assert "unknown command" in captured.err.lower()
+    assert "config file not found" not in captured.err.lower()
+
+
+@pytest.mark.parametrize("argument", ["help", "-h"])
+def test_unsupported_help_forms_are_rejected(monkeypatch, capfd, argument):
+    monkeypatch.setenv("S3BAK_CONFIG", "/definitely/missing/config.py")
+    from s3bak import cli
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main([argument])
+    assert exc.value.code == 1
+    captured = capfd.readouterr()
+    assert f"unknown command: {argument}" in captured.err.lower()
+    assert "config file not found" not in captured.err.lower()
+
+
+def test_global_help_succeeds_without_loading_config(monkeypatch, capfd):
+    monkeypatch.setenv("S3BAK_CONFIG", "/definitely/missing/config.py")
+    from s3bak import cli
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--help"])
+    assert exc.value.code == 0
+    captured = capfd.readouterr()
+    assert "Usage: s3bak <command> [options] [args]" in captured.out
+    assert "Global options:" in captured.out
+    assert "s3bak <command> --help" in captured.out
+    assert "--dry-run" not in captured.out
+    assert "Examples:" not in captured.out
+    assert captured.err == ""
+
+
+def test_push_help_shows_only_push_reference_without_loading_config(monkeypatch, capfd):
+    monkeypatch.setenv("S3BAK_CONFIG", "/definitely/missing/config.py")
+    from s3bak import cli
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["push", "--help"])
+
+    assert exc.value.code == 0
+    captured = capfd.readouterr()
+    assert "s3bak push [options] <entry|path>..." in captured.out
+    assert "Back up configured entries or selected sub-paths to S3." in captured.out
+    assert "--dry-run" in captured.out
+    assert "--delete" in captured.out
+    assert "Examples:" in captured.out
+    assert "--output" not in captured.out
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize("command", ["push", "pull"])
+def test_delete_command_help_explains_confirmation_behavior(capfd, command):
+    from s3bak import cli
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main([command, "--help"])
+
+    assert exc.value.code == 0
+    captured = capfd.readouterr()
+    assert "y/n/a/d/q" in captured.out
+    assert "Without a TTY, every answer is no unless --yes is set." in captured.out
+
+
+@pytest.mark.parametrize(
+    ("command", "usage", "command_detail"),
+    [
+        ("pull", "s3bak pull [options] <entry|path>...", "--output <path>"),
+        ("show", "s3bak show [options] <entry|path>", "Print a single backed-up file"),
+        ("status", "s3bak status [options] <entry|path>...", "Status letters:"),
+        ("diff", "s3bak diff [options] <entry|path>", "--color[=WHEN]"),
+        ("list", "s3bak list", "List locally configured entries."),
+        ("ls-remote", "s3bak ls-remote [options] [entry|path]", "stored on S3"),
+    ],
+)
+def test_each_command_has_its_own_help(monkeypatch, capfd, command, usage, command_detail):
+    monkeypatch.setenv("S3BAK_CONFIG", "/definitely/missing/config.py")
+    from s3bak import cli
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main([command, "--help"])
+
+    assert exc.value.code == 0
+    captured = capfd.readouterr()
+    assert usage in captured.out
+    assert command_detail in captured.out
+    assert "Global options:" not in captured.out
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("push", "--color=always", "data"),
+        ("pull", "--no-color", "data"),
+        ("show", "--color", "data/a.txt"),
+        ("list", "--verbose"),
+        ("ls-remote", "--color=never"),
+    ],
+)
+def test_options_omitted_from_command_help_are_rejected(cfg_ws, args):
+    res = cfg_ws.run(*args)
+
+    assert res.rc == 1
+    assert "only applies" in res.err.lower()
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        (("push", "--help", "--frobnicate"), "unknown option: --frobnicate"),
+        (("list", "--verbose", "--help"), "--verbose only applies"),
+    ],
+)
+def test_help_does_not_hide_invalid_options(monkeypatch, capfd, args, message):
+    monkeypatch.setenv("S3BAK_CONFIG", "/definitely/missing/config.py")
+    from s3bak import cli
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(list(args))
+
+    assert exc.value.code == 1
+    captured = capfd.readouterr()
+    assert message in captured.err.lower()
     assert "config file not found" not in captured.err.lower()
 
 

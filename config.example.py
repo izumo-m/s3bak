@@ -9,7 +9,10 @@
 
 import os
 
-HOME = os.environ.get("HOME", "")
+# Fail loudly when HOME is unset: a silent "" fallback would turn f"{HOME}/bin"
+# into "/bin" and aim the backup at a system directory. On Windows build from
+# USERPROFILE instead: HOME = os.environ["USERPROFILE"]
+HOME = os.environ["HOME"]
 
 # AWS profile used for S3 access (required); read by boto3 / boto3-s3.
 profile = "default"
@@ -28,10 +31,10 @@ prefix = "s3://my-bucket/backup"
 #                      lower it to cap CPU/IO. Defaults to max_concurrency,
 #                      else 10. The default (non-checksum) compare is
 #                      stat-only and needs no workers.
-#   entry_concurrency  how many entries run at once under --all (default: all
-#                      of them, one thread each). Each entry also opens its own
-#                      transfer pool, so cap this when you have many entries
-#                      to bound the total thread count.
+#   entry_concurrency  how many entries run at once in a multi-entry command
+#                      (default: all of them, one thread each). Each entry also
+#                      opens its own transfer pool, so cap this when you have
+#                      many entries to bound the total thread count.
 #   mtime_window       size+mtime-check tolerance in seconds (fractional ok,
 #                      default 0.01 = 10ms, 0 = exact st_mtime_ns match). The
 #                      default absorbs the rounding of NTFS (100ns) and exFAT
@@ -47,7 +50,8 @@ prefix = "s3://my-bucket/backup"
 # Directories / files to back up (required), keyed by entry name.
 #
 # Per-entry keys:
-#   path          (required) local path to back up (build from HOME or absolute)
+#   path          (required) absolute local path to back up ("~" is not
+#                 expanded; build from HOME as above)
 #   excludes      (optional) glob patterns excluded from the sync (aws s3-style)
 #   pre_hook      (optional) argument list run before the entry is pushed
 #   post_hook     (optional) argument list run after a push that did work

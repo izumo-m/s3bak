@@ -12,14 +12,50 @@ from __future__ import annotations
 import os
 import shutil
 import stat as stat_mod
+import unicodedata
 
 from s3bak import manifest
+from s3bak.confirm import DeleteConfirmer
 from s3bak.console import err, write_output
 from s3bak.manifest import ManifestEntry
 
 # =============================================================================
 # Manifest target resolution (restore paths)
 # =============================================================================
+
+
+def resolve_pull_destination(
+    entry: str,
+    configured_path: str | None,
+    sub: str | None,
+    output: str | None,
+) -> str | None:
+    """Resolve one pull selector to the filesystem path it will restore."""
+    if output is not None:
+        outpath = output
+    elif configured_path is not None:
+        outpath = os.path.join(configured_path, sub) if sub else configured_path
+    else:
+        return None
+
+    if outpath.endswith("/"):
+        tail = sub if sub else entry
+        outpath = os.path.join(outpath, tail)
+    return outpath
+
+
+def canonical_restore_path(path: str) -> str:
+    """Canonicalize a restore path without following its final component."""
+    absolute = os.path.abspath(path)
+    parent_real = os.path.realpath(os.path.dirname(absolute) or ".")
+    resolved = os.path.normpath(os.path.join(parent_real, os.path.basename(absolute)))
+    return os.path.normcase(resolved)
+
+
+def canonical_restore_comparison_path(path: str) -> str:
+    """Conservative identity used to reject possibly overlapping restores."""
+    canonical = canonical_restore_path(path)
+    return unicodedata.normalize("NFD", canonical).casefold()
 
 
 def resolve_manifest_rel(rel_field: str, sub: str | None) -> str | None:
@@ -57,8 +93,7 @@ def within_root(root_real: str, target: str) -> bool:
     restore root). Resolves symlinks in the parent chain, so a write *through*
     a symlinked ancestor is caught, while the final component may still be
     absent (about to be created) or a symlink we intend to replace."""
-    parent_real = os.path.realpath(os.path.dirname(target) or ".")
-    resolved = os.path.normpath(os.path.join(parent_real, os.path.basename(target)))
+    resolved = canonical_restore_path(target)
     try:
         return os.path.commonpath((root_real, resolved)) == root_real
     except ValueError:  # different Windows drives
@@ -146,8 +181,7 @@ def apply_manifest(outpath: str, is_dir: bool, manifest_path: str, sub: str | No
     # component may itself be a hostile symlink that a directory/symlink record
     # is about to replace; following it would both bless the outside target and
     # make later children look spuriously outside the newly created root.
-    root_parent_real = os.path.realpath(os.path.dirname(outpath) or ".")
-    root_real = os.path.normpath(os.path.join(root_parent_real, os.path.basename(outpath)))
+    root_real = canonical_restore_path(outpath)
 
     for m_entry in manifest.iter_manifest(manifest_path):
         res = manifest_target(m_entry, outpath, is_dir, sub)
@@ -221,7 +255,9 @@ def apply_manifest(outpath: str, is_dir: bool, manifest_path: str, sub: str | No
 # =============================================================================
 
 
-def remove_extras(extras: list[tuple[str, bool]]) -> int:
+def remove_extras(
+    extras: list[tuple[str, bool]], *, dryrun: bool = False, confirm: DeleteConfirmer | None = None
+) -> int:
     """Remove local extras (pull ``--delete``): ``(path, is_dir)`` pairs the
     status/--delete merge-join found on the local side only. ``is_dir`` is the
     lstat kind, so a symlink - even one pointing at a directory - is unlinked,
@@ -229,10 +265,30 @@ def remove_extras(extras: list[tuple[str, bool]]) -> int:
     children go before the rmdir that needs them gone; a failure (e.g. a
     non-empty directory that lost a child to an exclude) is reported so a
     requested mirror restore cannot return success while extras remain.
-    Returns the number of failed removals."""
+    ``dryrun`` reports each candidate in the same order without removing it.
+    ``confirm`` asks per extra, in the same deepest-first order; keeping an
+    item silently keeps its ancestor directories too (their rmdir could only
+    fail), and a kept item is a choice, not a failure. Returns the number of
+    failed removals."""
     errors = 0
     extras.sort(key=lambda x: x[0], reverse=True)
+    # A set rather than a "last kept path" cursor: on Windows the reverse path
+    # order can interleave siblings between a directory and its descendants
+    # (`\` sorts above many printable characters).
+    kept_ancestors: set[str] = set()
     for path, is_dir_entry in extras:
+        if dryrun:
+            write_output(f"(dry-run) delete: {path}\n")
+            continue
+        if confirm is not None:
+            if is_dir_entry and path in kept_ancestors:
+                continue  # keeping the child forces keeping the directory
+            if not confirm.confirm(path):
+                parent = os.path.dirname(path)
+                while parent and parent not in kept_ancestors:
+                    kept_ancestors.add(parent)
+                    parent = os.path.dirname(parent)
+                continue
         try:
             if is_dir_entry:
                 os.rmdir(path)

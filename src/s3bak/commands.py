@@ -15,6 +15,8 @@ import stat as stat_mod
 import subprocess
 import tempfile
 from collections.abc import Iterator
+from dataclasses import dataclass, field
+from typing import Any
 
 from s3bak import localwalk, manifest
 from s3bak.compare import (
@@ -27,11 +29,19 @@ from s3bak.compare import (
     format_diff_block,
 )
 from s3bak.config import Config, Opts
+from s3bak.confirm import (
+    AnswerMode,
+    DeleteConfirmer,
+    DeletionAbortedError,
+    confirm_subtree_delete,
+    resolve_answer_mode,
+)
 from s3bak.console import (
     IS_WINDOWS,
     echo_command,
     err,
     normalize_local_path,
+    note_warning,
     write_output,
     write_stderr,
 )
@@ -41,6 +51,7 @@ from s3bak.restore import (
     manifest_target,
     remove_extras,
     resolve_manifest_rel,
+    resolve_pull_destination,
     windows_collect_writable_prep,
     windows_restore_modes,
 )
@@ -68,17 +79,158 @@ def _run_hook(name: str, hook: list[str] | None, opts: Opts) -> int:
     return rc
 
 
-def upload_manifest(cfg: Config, entry: str, target: str, excludes: list[str], opts: Opts) -> int:
+def upload_manifest(
+    cfg: Config,
+    entry: str,
+    target: str,
+    excludes: list[str],
+    opts: Opts,
+    *,
+    old_manifest: str | None = None,
+    keep_old: manifest.KeepOld = False,
+) -> int:
     """Write the manifest to S3, then run the entry's post_hook."""
     post_hook: list[str] | None = cfg.entries[entry].get("post_hook")
 
     if opts.dryrun:
         print(f"(dry-run) would update manifest: {manifest.manifest_key(entry)}")
+        # The walk and merge write only a local temp file: run them so the
+        # rehearsal emits the same structural warnings as the real push,
+        # skipping only the upload.
+        write_manifest_to_aws(
+            cfg,
+            entry,
+            target,
+            excludes,
+            opts.verbose,
+            old_manifest=old_manifest,
+            keep_old=keep_old,
+            upload=False,
+        )
         return _run_hook("post_hook", post_hook, opts)
 
-    write_manifest_to_aws(cfg, entry, target, excludes, opts.verbose)
+    write_manifest_to_aws(
+        cfg, entry, target, excludes, opts.verbose, old_manifest=old_manifest, keep_old=keep_old
+    )
 
     return _run_hook("post_hook", post_hook, opts)
+
+
+@dataclass
+class _PushDeletePlan:
+    """How this push treats S3 orphans: the sync's delete-lane value, plus what
+    the manifest merge must do about old-only records afterwards."""
+
+    lane: Any  # sync_up delete=: False | True | per-orphan callable
+    confirmer: DeleteConfirmer | None  # --delete without --yes (asked or auto-n)
+    mirror: bool  # --delete --yes: every record follows its object; pure walk
+    old_manifest: str | None = None  # set by the caller once downloaded
+    _kept: list[manifest.KeptKeys] = field(default_factory=list)
+    _files: manifest.RecordedFiles | None = None
+
+    def recorded(self, rel: str) -> bool:
+        """Whether the old manifest holds a regular-file record for this delete
+        candidate. Lazy: the manifest is downloaded after the plan is built, so
+        the stream opens on the first candidate, once ``old_manifest`` is set."""
+        if self._files is None:
+            self._files = manifest.RecordedFiles(self.old_manifest)
+        return self._files.contains(rel)
+
+    def keep_old(self) -> manifest.KeepOld:
+        """A fresh view of the manifest keep policy (KeptKeys streams, so each
+        consumer opens its own). Call after the sync: the kept-keys file is
+        complete only once every orphan was decided."""
+        if self.mirror:
+            return False
+        if self.confirmer is not None:
+            kept = manifest.KeptKeys(self.confirmer.kept_keys_path())
+            self._kept.append(kept)
+            return kept
+        return True  # no deletions were made: keep every old-only record
+
+    def close(self) -> None:
+        for kept in self._kept:
+            kept.close()
+        self._kept.clear()
+        if self._files is not None:
+            self._files.close()
+        if self.confirmer is not None:
+            self.confirmer.close()
+
+
+def _plan_push_deletes(cfg: Config, entry: str, sub: str | None, opts: Opts) -> _PushDeletePlan:
+    if not opts.delete:
+        return _PushDeletePlan(lane=False, confirmer=None, mirror=False)
+    if opts.dryrun:
+        # Report every candidate. The lane must be the plain True: the library
+        # invokes a callable under dryrun too, and a dry run never prompts.
+        return _PushDeletePlan(lane=True, confirmer=None, mirror=opts.yes)
+    mode = resolve_answer_mode(yes=opts.yes)
+    if mode is AnswerMode.ALL_YES:
+        return _PushDeletePlan(lane=True, confirmer=None, mirror=True)
+    # ASK and ALL_NO both run the lane through a confirmer. ALL_NO never
+    # prompts, but its auto-n answers still record every existing orphan -
+    # which is what lets the merge keep exactly those file records and drop
+    # stale ones (records whose object is already gone).
+    confirmer = DeleteConfirmer(mode, entry)
+
+    def decide(info: Any) -> bool:
+        # compare_key is relative to the sync's S3 listing prefix, i.e. to the
+        # sub on a sub-path push; the kept key must be entry-rooted to match
+        # the manifest merge.
+        rel = info.compare_key if sub is None else f"{sub}/{info.compare_key}"
+        # A candidate the manifest never recorded is outside the backup: n
+        # keeps its object for this run only, so the prompt says so.
+        note = "" if plan.recorded(rel) else " (not in manifest)"
+        return confirmer.confirm(f"{cfg.prefix}/{entry}/{rel}{note}", kept_key=rel)
+
+    plan = _PushDeletePlan(lane=decide, confirmer=confirmer, mirror=False)
+    return plan
+
+
+def _plan_data_only_creates(
+    plan: _PushDeletePlan, sub: str | None, opts: Opts
+) -> tuple[Any, list[int]]:
+    """Create-lane hook for --data-only: count uploads of files the manifest
+    does not record - the unrecorded objects this push creates (see
+    storage.md). The count feeds _warn_unrecorded_uploads after the sync.
+    Everything still copies (the hook always returns True), and the tally is
+    taken at decision time: a file that vanishes before its transfer
+    completes still counts (the sync reports that as its own warning). The
+    lane decides under --dry-run too, so a dry run previews the warning the
+    real push would emit. Outside --data-only the lane is the plain default.
+    The manifest lookup reuses plan.recorded(): --delete cannot combine with
+    --data-only, so the delete lane never queries the same stream."""
+    count = [0]
+    if not opts.data_only:
+        return True, count
+
+    def note(info: Any) -> bool:
+        rel = info.compare_key if sub is None else f"{sub}/{info.compare_key}"
+        if not plan.recorded(rel):
+            count[0] += 1
+        return True
+
+    return note, count
+
+
+def _warn_unrecorded_uploads(entry: str, opts: Opts, count: list[int], compare: Any) -> None:
+    """Emit the --data-only unrecorded-upload warning after a successful sync.
+    `count` is the create-lane tally (the run that creates the object); a
+    later --data-only push meets the same object as an update pair instead,
+    which ManifestFilter re-uploads and counts, so the warning repeats on
+    every push while the object stays unrecorded. A dry run makes the same
+    decisions without transferring, so it previews the warning (and its
+    exit 2) with "would upload" wording."""
+    total = count[0]
+    if opts.data_only and isinstance(compare, manifest.ManifestFilter):
+        total += compare.unknown_uploads
+    if total:
+        verb = "would upload" if opts.dryrun else "uploaded"
+        note_warning(
+            f"warning: {entry}: --data-only {verb} {total} object(s) the manifest"
+            f" does not record; run a push without --data-only to record them"
+        )
 
 
 def _push_sub(
@@ -98,10 +250,14 @@ def _push_sub(
         if not opts.delete:
             err(f"local path does not exist (use --delete to remove its backup): {local_sub}")
             return 1
-        if opts.meta_only:
-            did_work = patch_manifest_subtree(cfg, entry, target_root, sub, excludes, opts)
-            return _run_hook("post_hook", post_hook, opts) if did_work else 0
-
+        # --delete cannot combine with --meta-only/--data-only (rejected at the
+        # CLI), so this is always the full deletion: one confirmation covers
+        # the subtree's objects and manifest records together.
+        if not opts.dryrun and not confirm_subtree_delete(
+            resolve_answer_mode(yes=opts.yes), entry, s3_sub_path
+        ):
+            err(f"backup subtree not deleted (answer y, or use --yes): {s3_sub_path}")
+            return 1
         assert cfg.store is not None
         result = cfg.store.delete_subtree(sub_rel, dryrun=opts.dryrun, verbose=opts.verbose)
         if result.stdout:
@@ -111,65 +267,68 @@ def _push_sub(
                 write_stderr(f"{result.stderr}\n")
             return result.returncode
         did_work = bool(result.stdout)
-        if not opts.data_only:
-            did_work = (
-                patch_manifest_subtree(cfg, entry, target_root, sub, excludes, opts) or did_work
-            )
+        did_work = patch_manifest_subtree(cfg, entry, target_root, sub, excludes, opts) or did_work
         return _run_hook("post_hook", post_hook, opts) if did_work else 0
 
     if opts.meta_only:
-        did_work = patch_manifest_subtree(cfg, entry, target_root, sub, excludes, opts)
+        # --meta-only --delete is rejected at the CLI: always the keep policy.
+        did_work = patch_manifest_subtree(
+            cfg, entry, target_root, sub, excludes, opts, keep_old=True
+        )
         return _run_hook("post_hook", post_hook, opts) if did_work else 0
 
     assert cfg.store is not None
     st = os.lstat(local_sub)
     did_work = False
 
-    if stat_mod.S_ISLNK(st.st_mode):
-        # symlink: upload nothing, just update manifest line.
-        pass
-    elif os.path.isdir(local_sub):
-        fd, manifest_path = tempfile.mkstemp(suffix=".jsonl")
-        os.close(fd)
-        compare = None
-        try:
-            # --checksum ignores the manifest entirely; skip the download.
-            have_manifest = not opts.checksum and download_manifest(
-                cfg, entry, manifest_path, opts.verbose
-            )
-            compare = sync_compare(
-                cfg, opts, entry, manifest_path if have_manifest else None, sub=sub
-            )
-            result = cfg.store.sync_up(
-                local_sub,
-                sub_rel,
-                file_filter=manifest.exclude_filter(excludes, sub=sub) if excludes else None,
-                compare=compare,
-                delete=opts.delete,
-                dryrun=opts.dryrun,
-                verbose=opts.verbose,
-            )
-        finally:
-            # The streaming ManifestFilter holds the temp manifest open; close it
-            # before unlink (an open file cannot be removed on Windows).
-            if isinstance(compare, manifest.ManifestFilter):
-                compare.close()
-            os.unlink(manifest_path)
-        if result.returncode != 0:
-            write_output(result.stdout)
-            if result.stderr:
-                write_stderr(result.stderr)
-            return result.returncode
-        if result.stdout:
-            write_output(f"{result.stdout}\n")
-            did_work = True
-    elif stat_mod.S_ISREG(st.st_mode):
-        # Regular file: an explicit sub-path push always uploads.
-        if opts.dryrun:
-            print(f"(dry-run) upload: {local_sub} -> {s3_sub_path}")
-            did_work = True
-        else:
-            result = cfg.store.put_object(sub_rel, local_sub, verbose=opts.verbose)
+    plan = _plan_push_deletes(cfg, entry, sub, opts)
+    # A non-directory sub-path has no S3 listing, so --delete has no candidates
+    # to confirm there: old records under a same-named former directory are
+    # kept (with the restorability warning); pruning them takes a directory-
+    # level push --delete. The dir branch replaces this with the plan's policy.
+    patch_keep: manifest.KeepOld = True
+    manifest_path: str | None = None
+    have_manifest = False
+    try:
+        if stat_mod.S_ISLNK(st.st_mode):
+            # symlink: upload nothing, just update manifest line.
+            pass
+        elif os.path.isdir(local_sub):
+            fd, manifest_path = tempfile.mkstemp(suffix=".jsonl")
+            os.close(fd)
+            compare = None
+            try:
+                # --checksum ignores the manifest for its compare, but --delete
+                # still needs it (the prompt flags candidates it does not
+                # record, and the patch reuses it as the old side), and
+                # --data-only reads it to warn about the uploads it leaves
+                # unrecorded. As in cmd_push, the download is read-only and
+                # runs under --dry-run too.
+                have_manifest = (
+                    not opts.checksum or opts.delete or opts.data_only
+                ) and download_manifest(cfg, entry, manifest_path, opts.verbose)
+                if have_manifest:
+                    plan.old_manifest = manifest_path
+                compare = sync_compare(
+                    cfg, opts, entry, manifest_path if have_manifest else None, sub=sub
+                )
+                create_lane, unrecorded = _plan_data_only_creates(plan, sub, opts)
+                result = cfg.store.sync_up(
+                    local_sub,
+                    sub_rel,
+                    file_filter=manifest.exclude_filter(excludes, sub=sub) if excludes else None,
+                    compare=compare,
+                    create=create_lane,
+                    delete=plan.lane,
+                    dryrun=opts.dryrun,
+                    verbose=opts.verbose,
+                )
+            finally:
+                # The streaming ManifestFilter holds the temp manifest open;
+                # close it early (an open file cannot be removed on Windows).
+                # The temp manifest lives on: the patch reads it as the old side.
+                if isinstance(compare, manifest.ManifestFilter):
+                    compare.close()
             if result.returncode != 0:
                 write_output(result.stdout)
                 if result.stderr:
@@ -178,13 +337,46 @@ def _push_sub(
             if result.stdout:
                 write_output(f"{result.stdout}\n")
                 did_work = True
-    else:
-        err(f"sub path must be a regular file, directory, or symlink: {local_sub}")
-        return 1
+            _warn_unrecorded_uploads(entry, opts, unrecorded, compare)
+            patch_keep = plan.keep_old()
+        elif stat_mod.S_ISREG(st.st_mode):
+            # Regular file: an explicit sub-path push always uploads.
+            if opts.dryrun:
+                print(f"(dry-run) upload: {local_sub} -> {s3_sub_path}")
+                did_work = True
+            else:
+                result = cfg.store.put_object(sub_rel, local_sub, verbose=opts.verbose)
+                if result.returncode != 0:
+                    write_output(result.stdout)
+                    if result.stderr:
+                        write_stderr(result.stderr)
+                    return result.returncode
+                if result.stdout:
+                    write_output(f"{result.stdout}\n")
+                    did_work = True
+        else:
+            err(f"sub path must be a regular file, directory, or symlink: {local_sub}")
+            return 1
 
-    if not opts.data_only:
-        did_work = patch_manifest_subtree(cfg, entry, target_root, sub, excludes, opts) or did_work
-    return _run_hook("post_hook", post_hook, opts) if did_work else 0
+        if not opts.data_only:
+            did_work = (
+                patch_manifest_subtree(
+                    cfg,
+                    entry,
+                    target_root,
+                    sub,
+                    excludes,
+                    opts,
+                    keep_old=patch_keep,
+                    old_manifest=manifest_path if have_manifest else None,
+                )
+                or did_work
+            )
+        return _run_hook("post_hook", post_hook, opts) if did_work else 0
+    finally:
+        plan.close()
+        if manifest_path is not None:
+            os.unlink(manifest_path)
 
 
 def _single_file_needs_upload(cfg: Config, entry: str, target: str, opts: Opts) -> bool:
@@ -231,13 +423,21 @@ def _single_file_manifest_matches(cfg: Config, entry: str, target: str, opts: Op
         os.unlink(manifest_path)
 
 
-def _manifest_structure_matches_local(manifest_path: str, target: str, excludes: list[str]) -> bool:
+def _manifest_structure_matches_local(
+    manifest_path: str, target: str, excludes: list[str], *, keep_old: manifest.KeepOld
+) -> bool:
     """Compare manifest-visible tree structure without treating metadata drift
     as a reason to rewrite an existing manifest.
 
     Data transfer output normally drives refresh, but empty directories and
     symlinks have no S3 object. Their add/remove/type/target changes must still
-    make an ordinary push rewrite the manifest. The merge remains streaming.
+    make an ordinary push rewrite the manifest. Manifest-only records are
+    judged by the same ``keep_old`` policy the merge would apply: a record the
+    merge would keep is the expected shape of a kept deletion, not a change;
+    one it would drop (the mirror, or a file record with no delete candidate
+    behind it) demands the rewrite that settles it - anything else would
+    either rewrite an identical manifest forever or never heal a stale
+    record. The merge remains streaming and returns at the first mismatch.
     """
     manifest_items = (
         (manifest.entry_sort_key(entry.path, entry.is_dir), entry)
@@ -247,17 +447,24 @@ def _manifest_structure_matches_local(manifest_path: str, target: str, excludes:
         (manifest.entry_sort_key(path, stat_mod.S_ISDIR(st.st_mode)), (st, sym))
         for path, st, sym in localwalk.walk_tree(target, excludes)
     )
-    matches = True
     for _key, record, local in manifest.merge_join(manifest_items, local_items):
-        if record is None or local is None:
-            matches = False
+        if local is None:
+            assert record is not None
+            if keep_old is True:
+                continue
+            if keep_old is False:
+                return False
+            if record.is_file and not keep_old.consume_file(record.path.removeprefix("./")):
+                return False
             continue
+        if record is None:
+            return False
         st, sym = local
         if stat_mod.S_IFMT(record.mode) != stat_mod.S_IFMT(st.st_mode):
-            matches = False
+            return False
         if record.sym_target != sym:
-            matches = False
-    return matches
+            return False
+    return True
 
 
 def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int:
@@ -306,110 +513,169 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             err(f"sub path not allowed for single-file entry: {entry}")
             return 1
         post_hook_sub: list[str] | None = entry_cfg.get("post_hook")
-        return _push_sub(cfg, entry, post_hook_sub, target_root, sub, excludes, opts)
+        try:
+            return _push_sub(cfg, entry, post_hook_sub, target_root, sub, excludes, opts)
+        except DeletionAbortedError:
+            err(f"{entry}: aborted")
+            return 1
 
     # --meta-only refreshes the manifest and runs the post_hook even with no data
     # change: the supported way to re-run the post_hook on demand (intended).
+    # A directory refresh merges against the old manifest with every old-only
+    # record kept: --meta-only moves no data, so it must not drop the records
+    # of objects that are still on S3 (--meta-only --delete is rejected).
     if opts.meta_only:
-        return upload_manifest(cfg, entry, target, excludes, opts)
+        if not os.path.isdir(target):
+            return upload_manifest(cfg, entry, target, excludes, opts)
+        fd, old_path = tempfile.mkstemp(suffix=".jsonl")
+        os.close(fd)
+        try:
+            # The download runs under --dry-run too (read-only), so the
+            # rehearsal validates the manifest and previews the real merge.
+            have_old = download_manifest(cfg, entry, old_path, opts.verbose)
+            return upload_manifest(
+                cfg,
+                entry,
+                target,
+                excludes,
+                opts,
+                old_manifest=old_path if have_old else None,
+                keep_old=True,
+            )
+        finally:
+            os.unlink(old_path)
 
     results = ""
     refresh_manifest = False
     assert cfg.store is not None
 
-    if os.path.isdir(target):
-        fd, manifest_path = tempfile.mkstemp(suffix=".jsonl")
-        os.close(fd)
-        compare = None
-        structure_changed = False
-        try:
-            # A checksum compare does not use manifest file stats, but an
-            # ordinary push still needs the manifest to notice objectless tree
-            # changes (empty directories and symlinks) and validate its source
-            # of truth. --data-only is the one mode that can skip it.
-            have_manifest = not (opts.checksum and opts.data_only) and download_manifest(
-                cfg, entry, manifest_path, opts.verbose
-            )
-            compare = sync_compare(cfg, opts, entry, manifest_path if have_manifest else None)
-            result = cfg.store.sync_up(
-                target,
-                entry,
-                file_filter=manifest.exclude_filter(excludes) if excludes else None,
-                compare=compare,
-                delete=True,
-                dryrun=opts.dryrun,
-                verbose=opts.verbose,
-            )
-            if (
-                result.returncode == 0
-                and not result.stdout
-                and not opts.data_only
-                and have_manifest
-            ):
-                structure_changed = not _manifest_structure_matches_local(
-                    manifest_path, target, excludes
+    manifest_path: str | None = None
+    have_manifest = False
+    plan = _plan_push_deletes(cfg, entry, None, opts)
+    try:
+        if os.path.isdir(target):
+            fd, manifest_path = tempfile.mkstemp(suffix=".jsonl")
+            os.close(fd)
+            compare = None
+            structure_changed = False
+            try:
+                # A checksum compare does not use manifest file stats, but a
+                # whole-entry dir push always downloads the manifest: an
+                # ordinary push compares against it, any push uses it to notice
+                # objectless tree changes, and --data-only reads it to warn
+                # about the uploads it leaves unrecorded. All of that is
+                # read-only, so it runs under --dry-run too - a rehearsal
+                # surfaces problems (e.g. a damaged manifest) here.
+                have_manifest = download_manifest(cfg, entry, manifest_path, opts.verbose)
+                if have_manifest:
+                    plan.old_manifest = manifest_path
+                compare = sync_compare(cfg, opts, entry, manifest_path if have_manifest else None)
+                create_lane, unrecorded = _plan_data_only_creates(plan, None, opts)
+                result = cfg.store.sync_up(
+                    target,
+                    entry,
+                    file_filter=manifest.exclude_filter(excludes) if excludes else None,
+                    compare=compare,
+                    create=create_lane,
+                    delete=plan.lane,
+                    dryrun=opts.dryrun,
+                    verbose=opts.verbose,
                 )
-        finally:
-            # The streaming ManifestFilter holds the temp manifest open; close it
-            # before unlink (an open file cannot be removed on Windows).
-            if isinstance(compare, manifest.ManifestFilter):
-                compare.close()
-            os.unlink(manifest_path)
-        if result.returncode != 0:
-            write_output(result.stdout)
-            if result.stderr:
-                write_stderr(result.stderr)
-            return result.returncode
-        results = result.stdout
-        refresh_manifest = bool(results)
-        if not refresh_manifest and not opts.data_only:
-            refresh_manifest = not have_manifest or structure_changed
-    elif _single_file_needs_upload(cfg, entry, target, opts):
-        # Single-file entry that fails the size+mtime check against its manifest
-        # (or the --checksum ETag comparison), or was never pushed: upload it.
-        if opts.dryrun:
-            # Set results only; the shared writer below emits it (and the truthy
-            # results drives the dryrun manifest line). Printing here too would
-            # double the line.
-            results = f"(dry-run) upload: {target} -> {cfg.prefix}/{entry}"
-        else:
-            result = cfg.store.put_object(entry, target, verbose=opts.verbose)
+                if (
+                    result.returncode == 0
+                    and not result.stdout
+                    and not opts.data_only
+                    and have_manifest
+                ):
+                    structure_changed = not _manifest_structure_matches_local(
+                        manifest_path, target, excludes, keep_old=plan.keep_old()
+                    )
+            finally:
+                # The streaming ManifestFilter holds the temp manifest open; close
+                # it early (an open file cannot be removed on Windows). The temp
+                # manifest itself lives on: the merge reads it as the old side.
+                if isinstance(compare, manifest.ManifestFilter):
+                    compare.close()
             if result.returncode != 0:
                 write_output(result.stdout)
                 if result.stderr:
                     write_stderr(result.stderr)
                 return result.returncode
+            _warn_unrecorded_uploads(entry, opts, unrecorded, compare)
             results = result.stdout
-        refresh_manifest = bool(results)
+            refresh_manifest = bool(results)
+            if not refresh_manifest and not opts.data_only:
+                refresh_manifest = not have_manifest or structure_changed
+        elif _single_file_needs_upload(cfg, entry, target, opts):
+            # Single-file entry that fails the size+mtime check against its manifest
+            # (or the --checksum ETag comparison), or was never pushed: upload it.
+            if opts.dryrun:
+                # Set results only; the shared writer below emits it (and the truthy
+                # results drives the dryrun manifest line). Printing here too would
+                # double the line.
+                results = f"(dry-run) upload: {target} -> {cfg.prefix}/{entry}"
+            else:
+                result = cfg.store.put_object(entry, target, verbose=opts.verbose)
+                if result.returncode != 0:
+                    write_output(result.stdout)
+                    if result.stderr:
+                        write_stderr(result.stderr)
+                    return result.returncode
+                results = result.stdout
+            refresh_manifest = bool(results)
 
-    if opts.checksum and not refresh_manifest and not opts.data_only and not os.path.isdir(target):
-        # ETag equality can skip an already-present data object even when its
-        # manifest was deleted or still names an older configured basename.
-        refresh_manifest = not _single_file_manifest_matches(cfg, entry, target, opts)
+        if (
+            opts.checksum
+            and not refresh_manifest
+            and not opts.data_only
+            and not os.path.isdir(target)
+        ):
+            # ETag equality can skip an already-present data object even when its
+            # manifest was deleted or still names an older configured basename.
+            refresh_manifest = not _single_file_manifest_matches(cfg, entry, target, opts)
 
-    if results:
-        write_output(f"{results}\n")
+        if results:
+            write_output(f"{results}\n")
 
-    # Refresh after a data transfer, an objectless structural change, or the
-    # first push even when an empty tree produced no transfer lines. The default
-    # compare is the manifest size+mtime check (mtime within the window), so a
-    # mode-only change or an mtime drift inside the window does not refresh an
-    # existing manifest; `status` keeps showing that diff until `push
-    # --meta-only`. Owner/group are informational and not comparison inputs.
-    # Deliberate spec choice. Note
-    # --meta-only asserts "S3 matches local" without making it true: any
-    # never-pushed local edit becomes invisible to the size+mtime check afterwards,
-    # so it is a metadata refresh, never a substitute for a real push.
-    if refresh_manifest and not opts.data_only:
-        st = upload_manifest(cfg, entry, target, excludes, opts)
-        if st != 0:
-            return st
+        # Refresh after a data transfer or deletion, an objectless structural
+        # change, or the first push even when an empty tree produced no transfer
+        # lines. The default compare is the manifest size+mtime check (mtime
+        # within the window), so a mode-only change or an mtime drift inside the
+        # window does not refresh an existing manifest; `status` keeps showing
+        # that diff until `push --meta-only`. Owner/group are informational and
+        # not comparison inputs. Deliberate spec choice. Note
+        # --meta-only asserts "S3 matches local" without making it true: any
+        # never-pushed local edit becomes invisible to the size+mtime check
+        # afterwards, so it is a metadata refresh, never a substitute for a real
+        # push.
+        if refresh_manifest and not opts.data_only:
+            st = upload_manifest(
+                cfg,
+                entry,
+                target,
+                excludes,
+                opts,
+                old_manifest=manifest_path if have_manifest else None,
+                keep_old=plan.keep_old(),
+            )
+            if st != 0:
+                return st
 
-    if results and opts.data_only:
-        post_hook: list[str] | None = entry_cfg.get("post_hook")
-        return _run_hook("post_hook", post_hook, opts)
+        if results and opts.data_only:
+            post_hook: list[str] | None = entry_cfg.get("post_hook")
+            return _run_hook("post_hook", post_hook, opts)
 
-    return 0
+        return 0
+    except DeletionAbortedError:
+        # q mid-confirmation: already-confirmed deletions may have run, but the
+        # manifest was not rewritten and no hook fires. The next push --delete
+        # settles any records those deletions left behind.
+        err(f"{entry}: aborted")
+        return 1
+    finally:
+        plan.close()
+        if manifest_path is not None:
+            os.unlink(manifest_path)
 
 
 def _entry_kind_from_manifest(manifest_path: str) -> str:
@@ -463,19 +729,13 @@ def _manifest_matches_local(
 
 
 def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int:
-    outpath: str | None = opts.outpath
     entry_cfg = cfg.entries.get(entry)
+    configured_path: str | None = entry_cfg["path"] if entry_cfg else None
+    outpath = resolve_pull_destination(entry, configured_path, sub, opts.outpath)
     if outpath is None:
-        if not entry_cfg:
-            err(f"no such entry in config: {entry}")
-            err("use -o <path> to specify the output path")
-            return 1
-        base_path: str = entry_cfg["path"]
-        outpath = os.path.join(base_path, sub) if sub else base_path
-
-    if outpath.endswith("/"):
-        tail = sub if sub else entry
-        outpath = os.path.join(outpath, tail)
+        err(f"no such entry in config: {entry}")
+        err("use -o <path> to specify the output path")
+        return 1
 
     fd, manifest_path = tempfile.mkstemp(suffix=".jsonl")
     os.close(fd)
@@ -516,20 +776,28 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         if manifest_matches and not opts.checksum:
             if not opts.meta_only and opts.delete and is_dir:
                 excludes: list[str] = entry_cfg.get("excludes", []) if entry_cfg else []
-                return _delete_extras(manifest_path, outpath, sub, excludes)
+                return _delete_extras(manifest_path, outpath, sub, excludes, opts=opts, entry=entry)
             return 0
 
         # Make the restore root's type agree before any transfer. In particular,
         # never let a directory sync walk through a symlink root, and never let
         # a single-file write follow one. s3transfer/direct downloads replace
         # inner leaves atomically; this handles the operation root itself.
+        # A dry run reports the conflict instead of touching the root; the
+        # dry-run sync then runs against the uncorrected root, so its transfer
+        # report may differ from what the real (post-replacement) pull does.
         if has_data and not opts.meta_only and os.path.lexists(outpath):
             if is_dir:
                 if os.path.islink(outpath) or not os.path.isdir(outpath):
-                    os.remove(outpath)
-                    os.makedirs(outpath, exist_ok=True)
+                    if opts.dryrun:
+                        write_output(f"(dry-run) would replace {outpath} (conflicting type)\n")
+                    else:
+                        os.remove(outpath)
+                        os.makedirs(outpath, exist_ok=True)
             elif not stat_mod.S_ISREG(os.lstat(outpath).st_mode):
-                if os.path.islink(outpath) or not os.path.isdir(outpath):
+                if opts.dryrun:
+                    write_output(f"(dry-run) would replace {outpath} (conflicting type)\n")
+                elif os.path.islink(outpath) or not os.path.isdir(outpath):
                     os.remove(outpath)
                 else:
                     shutil.rmtree(outpath)
@@ -538,7 +806,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         # must precede the Windows writable pass so that pass cannot traverse a
         # symlinked restore root and chmod a file outside the destination.
         prep: list[tuple[str, int]] = []
-        if IS_WINDOWS and not opts.meta_only:
+        if IS_WINDOWS and not opts.meta_only and not opts.dryrun:
             prep = windows_collect_writable_prep(outpath, is_dir, manifest_path, sub)
 
         changed = False
@@ -558,6 +826,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                     sub=sub,
                     compare=compare,
                     size=file_size,
+                    dryrun=opts.dryrun,
                 )
             finally:
                 # The streaming ManifestFilter holds the temp manifest open; close
@@ -584,16 +853,26 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             if IS_WINDOWS and not opts.meta_only:
                 windows_restore_modes(prep)
             st = 0
+        elif opts.dryrun:
+            # The same gate as the real apply: report that metadata (mode /
+            # mtime / symlinks) would be applied, without mutating anything.
+            write_output(f"(dry-run) would apply manifest metadata: {outpath}\n")
+            st = 0
         else:
             st = apply_manifest(outpath, is_dir, manifest_path, sub=sub)
 
         if not opts.meta_only and opts.delete and is_dir:
             excludes = entry_cfg.get("excludes", []) if entry_cfg else []
-            delete_status = _delete_extras(manifest_path, outpath, sub, excludes)
+            delete_status = _delete_extras(
+                manifest_path, outpath, sub, excludes, opts=opts, entry=entry
+            )
             if st == 0:
                 st = delete_status
 
         return st
+    except DeletionAbortedError:
+        err(f"{entry}: aborted")
+        return 1
     finally:
         os.unlink(manifest_path)
 
@@ -641,12 +920,29 @@ def _local_keyed(
         yield manifest.entry_sort_key(rel, stat_mod.S_ISDIR(st.st_mode)), (norm, st, sym)
 
 
-def _delete_extras(manifest_path: str, outpath: str, sub: str | None, excludes: list[str]) -> int:
-    """Remove local paths the manifest does not record (pull ``--delete``).
+def _delete_extras(
+    manifest_path: str,
+    outpath: str,
+    sub: str | None,
+    excludes: list[str],
+    *,
+    opts: Opts,
+    entry: str,
+) -> int:
+    """Remove local paths the manifest does not record (pull ``--delete``),
+    behind the per-item confirmation (--yes answers every question yes; a
+    non-interactive run without --yes answers no, i.e. removes nothing).
 
     The local-only lane of the merge-join; only the extras themselves are
     collected (never the whole key set) so the deepest-first removal order
     costs memory proportional to what is actually deleted."""
+    confirmer: DeleteConfirmer | None = None
+    if not opts.dryrun:
+        mode = resolve_answer_mode(yes=opts.yes)
+        if mode is AnswerMode.ALL_NO:
+            return 0  # every answer is no: keep every extra, successfully
+        if mode is AnswerMode.ASK:
+            confirmer = DeleteConfirmer(mode, entry)
     extras: list[tuple[str, bool]] = []
     for _key, m, loc in manifest.merge_join(
         _manifest_keyed(manifest_path, sub), _local_keyed(outpath, excludes)
@@ -655,7 +951,11 @@ def _delete_extras(manifest_path: str, outpath: str, sub: str | None, excludes: 
             rel, st, _sym = loc
             if rel != ".":
                 extras.append((os.path.join(outpath, rel), stat_mod.S_ISDIR(st.st_mode)))
-    return 1 if remove_extras(extras) else 0
+    try:
+        return 1 if remove_extras(extras, dryrun=opts.dryrun, confirm=confirmer) else 0
+    finally:
+        if confirmer is not None:
+            confirmer.close()
 
 
 def cmd_show(cfg: Config, entry: str, opts: Opts, file: str | None = None) -> int:
@@ -852,8 +1152,9 @@ def diff_backup(
             return result.returncode
 
         # The manifest, not every object that happens to remain under the S3
-        # prefix, defines the backup. A sub-path push without --delete may leave
-        # an orphan object; diff must ignore it just as pull/status do.
+        # prefix, defines the backup. Orphan objects can still exist (e.g. a
+        # --meta-only push after a local delete, or an exclude added later);
+        # diff must ignore them just as pull/status do.
         backup_files: set[str] = set()
         backup_symlinks: dict[str, str] = {}
         backup_special: dict[str, int] = {}

@@ -35,7 +35,7 @@ import fnmatch
 import json
 import os
 import stat as stat_mod
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from typing import IO, Any, TypeVar
 
@@ -348,47 +348,176 @@ def entry_sort_key(path: str, is_dir: bool) -> str:
     return norm + "/" if is_dir else norm
 
 
-def write_patched(
+class KeptKeys:
+    """Streaming reader of a kept-keys file: the entry-relative keys of the S3
+    objects the user chose NOT to delete, one ``json.dumps(rel)`` per line
+    (JSON-encoded because filenames may contain newlines). The file is written
+    in delete-lane decide order, which the sync guarantees is ascending key
+    order, so a one-line lookahead answers every query - but queries must also
+    arrive in ascending order (they do: old-only records are examined in
+    manifest order). ``path=None`` is the empty stream (nothing was kept)."""
+
+    def __init__(self, path: str | None) -> None:
+        self._f = open(path, encoding="utf-8") if path is not None else None
+        self._head = self._read()
+
+    def _read(self) -> str | None:
+        if self._f is None:
+            return None
+        line = self._f.readline()
+        if not line:
+            return None
+        rel = json.loads(line)
+        if not isinstance(rel, str):
+            raise ManifestError("invalid kept-keys line")
+        return rel
+
+    def consume_file(self, rel: str) -> bool:
+        """True iff ``rel`` was kept. Keys skipped while advancing had no old
+        record (pre-existing orphan objects) and stay unrecorded."""
+        while self._head is not None and self._head < rel:
+            self._head = self._read()
+        if self._head == rel:
+            self._head = self._read()
+            return True
+        return False
+
+    def close(self) -> None:
+        if self._f is not None:
+            self._f.close()
+
+
+# The keep policy for old-only records in write_merged's replaced range.
+# Only a regular file's record can be confirmed away - its S3 object is the
+# delete candidate; directories, symlinks, and specials have no object, hence
+# no question, and their records survive everything short of the mirror. So:
+# True keeps every old-only record (no deletions were made), False drops them
+# all (--yes, the mirror), and a KeptKeys stream drops exactly the FILE
+# records whose key it does not hold (their objects were deleted - or were
+# already gone, which is how stale records self-heal).
+KeepOld = bool | KeptKeys
+
+
+class RecordedFiles:
+    """Streaming membership test over a manifest's regular-file records - the
+    records that own an S3 object. Queries must arrive in ascending key order
+    (they do: the delete lane decides serially in S3 key order, and a file's
+    sort key is its bare rel), so a one-record lookahead answers every query.
+    ``path=None`` means no manifest is on S3: nothing is recorded."""
+
+    def __init__(self, path: str | None) -> None:
+        self._records: Iterator[ManifestEntry] | None = (
+            iter_manifest(path) if path is not None else None
+        )
+        self._head: str | None = None
+        self._advance()
+
+    def _advance(self) -> None:
+        if self._records is not None:
+            for e in self._records:
+                if e.is_file:
+                    self._head = e.path.removeprefix("./")
+                    return
+        self._head = None
+
+    def contains(self, rel: str) -> bool:
+        while self._head is not None and self._head < rel:
+            self._advance()
+        return self._head == rel
+
+    def close(self) -> None:
+        """Release the manifest file handle the record stream holds open (an
+        open file cannot be removed on Windows). Idempotent."""
+        closer = getattr(self._records, "close", None)
+        if callable(closer):
+            closer()
+        self._head = None
+
+
+def write_merged(
     out: IO[str],
     old_manifest: str | None,
-    sub: str,
+    sub: str | None,
     new_entries: Iterable[tuple[str, os.stat_result, str | None]],
+    *,
+    keep_old: KeepOld = False,
+    warn: Callable[[str], None] | None = None,
 ) -> None:
-    """Rewrite a manifest with the records under ``sub`` replaced.
+    """Write a v3 manifest merging a fresh local walk into the old manifest.
 
-    Both inputs are in sort-key order, so this is a streaming merge: old lines
-    outside ``sub`` are copied verbatim (preserving any unknown keys), old
-    lines at/under ``sub`` are dropped, and the freshly walked ``new_entries``
-    are spliced in at their sorted position. ``new_entries`` may be empty (the
-    sub-path was deleted locally). ``old_manifest`` is the path of the previous
-    manifest file, or None when none exists yet."""
+    Old records outside the replaced range (everything when ``sub`` is None,
+    the records at/under ``sub`` otherwise) are copied verbatim (preserving
+    any unknown keys). Inside the range, a walked path always wins over its
+    old record and old-only records survive per ``keep_old`` (see its
+    comment); keeping only file records that were explicitly kept never
+    orphans them, because their ancestor directory records are objectless and
+    always survive. Everything streams in sort-key order: one record of
+    lookahead per input (merge_join) plus one kept-key line.
+
+    ``warn`` is called once per subtree that the merge leaves unrestorable:
+    records surviving under a path that another record says is not a
+    directory (a local change replaced a directory with a file, or vice
+    versa). Such records stay backed up but ``pull`` cannot materialize both.
+    """
     out.write(_header_line() + "\n")
-    new_iter = iter(new_entries)
-    pending = next(new_iter, None)
 
-    def flush_new_below(limit: str | None) -> None:
-        nonlocal pending
-        while pending is not None:
-            path, st, sym_target = pending
-            key = entry_sort_key(path, stat_mod.S_ISDIR(st.st_mode))
-            if limit is not None and key >= limit:
-                return
-            out.write(format_entry(path, st, sym_target) + "\n")
-            pending = next(new_iter, None)
+    # Restorability check: every emitted record passes through emit(), which
+    # tracks the most recent non-directory records whose descendant key range
+    # is still open ("blockers", a stack because siblings like `sub.txt` sort
+    # between a file `sub` and the `sub/...` range).
+    blockers: list[list[Any]] = []  # [rel, warned]
 
-    if old_manifest is not None:
+    def emit(rel: str, is_dir: bool, text: str) -> None:
+        key = rel + "/" if is_dir else rel
+        while blockers:
+            top_rel = blockers[-1][0]
+            if rel == top_rel or rel.startswith(top_rel + "/"):
+                if not blockers[-1][1] and warn is not None:
+                    warn(
+                        f"warning: manifest keeps records under non-directory"
+                        f" ./{top_rel}; pull cannot restore them"
+                        f" (push --delete prunes them)"
+                    )
+                    blockers[-1][1] = True
+                break
+            if key > top_rel + "/":
+                blockers.pop()
+                continue
+            break  # a sibling like `{top_rel}.x`: the blocker's range is still ahead
+        if not is_dir and rel != ".":
+            blockers.append([rel, False])
+        out.write(text)
+
+    def old_items() -> Iterator[tuple[str, tuple[str, ManifestEntry, str]]]:
+        if old_manifest is None:
+            return
         with open(old_manifest, encoding="utf-8") as f:
             _check_header(f.readline())
             for line in f:
                 e = parse_entry(line)
                 if e is None:
-                    raise ManifestError("invalid record in manifest being patched")
-                rel = e.path.removeprefix("./")
-                if rel == sub or rel.startswith(sub + "/"):
-                    continue  # the replaced range
-                flush_new_below(entry_sort_key(e.path, e.is_dir))
-                out.write(line if line.endswith("\n") else line + "\n")
-    flush_new_below(None)
+                    raise ManifestError("invalid record in manifest being merged")
+                yield entry_sort_key(e.path, e.is_dir), (e.path.removeprefix("./"), e, line)
+
+    def walk_items() -> Iterator[tuple[str, tuple[str, os.stat_result, str | None]]]:
+        for item in new_entries:
+            path, st, _sym = item
+            yield entry_sort_key(path, stat_mod.S_ISDIR(st.st_mode)), item
+
+    for _key, old, new in merge_join(old_items(), walk_items()):
+        if new is not None:  # the fresh walk record wins over any old record
+            path, st, sym_target = new
+            rel = "." if path == "." else path.removeprefix("./")
+            emit(rel, stat_mod.S_ISDIR(st.st_mode), format_entry(path, st, sym_target) + "\n")
+            continue
+        assert old is not None
+        rel, e, line = old
+        if sub is None or rel == sub or rel.startswith(sub + "/"):  # the replaced range
+            if keep_old is False:
+                continue
+            if keep_old is not True and e.is_file and not keep_old.consume_file(rel):
+                continue
+        emit(rel, e.is_dir, line if line.endswith("\n") else line + "\n")
 
 
 # =============================================================================
@@ -531,6 +660,11 @@ class ManifestFilter:
         self._records = iter(records)
         self.window_ns = window_ns
         self._head: tuple[str, ManifestEntry] | None = next(self._records, None)
+        # Upload pairs copied because the manifest holds no owning file record:
+        # the re-upload face of an unrecorded object (a create-lane upload is
+        # its birth). Read by push --data-only's warning, so the warning
+        # repeats on every push while the object stays unrecorded.
+        self.unknown_uploads = 0
 
     def close(self) -> None:
         """Release the manifest file handle the record stream holds open. The
@@ -573,7 +707,10 @@ class ManifestFilter:
             # dir/symlink at this key: a push re-uploads it (local is the source
             # of truth); a pull re-downloads an unknown key but leaves a recorded
             # non-file to apply_manifest, which recreates it with no data object.
-            return m is None if direction == "download" else True
+            if direction == "download":
+                return m is None
+            self.unknown_uploads += 1
+            return True
         if remote.size != m.size:
             return True  # the remote drifted from the record; size is free evidence
         try:

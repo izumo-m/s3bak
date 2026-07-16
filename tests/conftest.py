@@ -129,3 +129,34 @@ def ws(tmp_path: Path, monkeypatch: Any, s3: Any, capfd: Any) -> Any:
     root.mkdir()
     # No teardown: moto discards all state when the s3 fixture's mock exits.
     return Workspace(root, BUCKET, prefix, s3, monkeypatch, capfd)
+
+
+class Answers:
+    """Scripted --delete confirmation answers plus the prompts actually shown."""
+
+    def __init__(self, queue: list[str], prompts: list[str]):
+        self._queue = queue
+        self.prompts = prompts
+
+    def feed(self, *values: str) -> None:
+        self._queue.extend(values)
+
+
+@pytest.fixture
+def answers(monkeypatch: Any) -> Answers:
+    """Make the run interactive and feed scripted prompt answers.
+
+    Patches the confirm module's seam (prompt_is_interactive / \
+read_prompt_answer); an empty queue answers None (EOF)."""
+    from s3bak import confirm
+
+    queue: list[str] = []
+    prompts: list[str] = []
+
+    def fake_read(prompt: str) -> str | None:
+        prompts.append(prompt)
+        return queue.pop(0) if queue else None
+
+    monkeypatch.setattr(confirm, "prompt_is_interactive", lambda: True)
+    monkeypatch.setattr(confirm, "read_prompt_answer", fake_read)
+    return Answers(queue, prompts)

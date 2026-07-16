@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 
 from s3bak import cli
 
@@ -235,27 +236,133 @@ def test_pull_delete_removes_extra_symlink_to_dir(ws):
     (dest / "realtarget").mkdir()
     os.symlink("realtarget", dest / "extralink")  # an extra symlink-to-dir
 
-    ws.run("pull", "data", "-o", str(dest), "--delete", expect_rc=0)
+    ws.run("pull", "data", "-o", str(dest), "--delete", "--yes", expect_rc=0)
     assert not os.path.lexists(dest / "extralink")  # unlinked, not rmdir-skipped
     assert (dest / "keep.txt").read_text() == "k"
 
 
-def test_push_after_delete_removes_remote_and_reports_it(ws):
+def test_push_after_local_delete_keeps_backup_by_default(ws):
+    # Deleting is never the default: the object AND its manifest record both
+    # survive the next push, status reports the file as D, and a pull would
+    # still restore it. Only push --delete (confirmed) removes backups.
     ws.write("data/a.txt", "a")
     ws.write("data/b.txt", "b")
     ws.config({"data": {"path": str(ws.root / "data")}})
     ws.run("push", "data", expect_rc=0)
     assert "data/b.txt" in ws.keys()
 
-    # Remove a file locally; the next push deletes the remote object (sync
-    # --delete). The delete must render as a proper line, not 'download: None'.
+    (ws.root / "data" / "b.txt").unlink()
+    (ws.root / "data" / "a.txt").write_text("a-changed")  # forces a manifest rewrite
+    res = ws.run("push", "data", expect_rc=0)
+
+    assert "delete:" not in res.out
+    assert "data/b.txt" in ws.keys()
+    assert "data/a.txt" in ws.keys()
+    manifest_body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl")[
+        "Body"
+    ].read()
+    assert b'"path":"./b.txt"' in manifest_body
+    res = ws.run("status", "data", expect_rc=0)
+    assert f"D {ws.root / 'data' / 'b.txt'}" in res.out
+
+    dest = ws.root / "restore"
+    ws.run("pull", "data", "-o", str(dest), expect_rc=0)
+    assert (dest / "b.txt").read_text() == "b"
+
+
+def test_push_with_only_a_local_delete_does_not_touch_the_manifest(ws):
+    # Nothing to transfer and the kept record is not a structural change, so
+    # the push is a full no-op (no manifest re-upload, no output).
+    ws.write("data/a.txt", "a")
+    ws.write("data/b.txt", "b")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
     (ws.root / "data" / "b.txt").unlink()
     res = ws.run("push", "data", expect_rc=0)
 
-    assert "data/b.txt" not in ws.keys()
-    assert "data/a.txt" in ws.keys()
-    assert "None" not in res.out
-    assert "delete" in res.out
+    assert res.out == ""
+    assert "Updating" not in res.err
+
+
+def test_push_keeps_records_of_locally_deleted_symlink_and_empty_dir(ws):
+    ws.write("data/a.txt", "a")
+    (ws.root / "data" / "emptydir").mkdir()
+    os.symlink("a.txt", ws.root / "data" / "link")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "link").unlink()
+    (ws.root / "data" / "emptydir").rmdir()
+    (ws.root / "data" / "a.txt").write_text("changed")  # forces a manifest rewrite
+    ws.run("push", "data", expect_rc=0)
+
+    manifest_body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl")[
+        "Body"
+    ].read()
+    assert b'"path":"./link"' in manifest_body
+    assert b'"path":"./emptydir"' in manifest_body
+
+
+def test_push_meta_only_keeps_records_of_locally_deleted_files(ws):
+    ws.write("data/a.txt", "a")
+    ws.write("data/b.txt", "b")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "b.txt").unlink()
+    ws.run("push", "--meta-only", "data", expect_rc=0)
+
+    manifest_body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl")[
+        "Body"
+    ].read()
+    assert b'"path":"./b.txt"' in manifest_body
+
+
+def test_push_warns_when_a_kept_subtree_ends_up_under_a_file(ws):
+    # dir -> file replacement while the old records are kept: the manifest can
+    # no longer restore as a tree, which the default (no-prompt) push must
+    # surface as a warning.
+    ws.write("data/d/x.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    shutil.rmtree(ws.root / "data" / "d")
+    (ws.root / "data" / "d").write_text("now a file")
+    res = ws.run("push", "data", expect_rc=0)
+
+    assert "non-directory" in res.err
+    assert "./d" in res.err
+
+
+def test_push_dry_run_previews_the_kept_subtree_warning(ws):
+    # The dry run runs the manifest merge for real (upload skipped), so the
+    # same structural warning surfaces during the rehearsal.
+    ws.write("data/d/x.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    shutil.rmtree(ws.root / "data" / "d")
+    (ws.root / "data" / "d").write_text("now a file")
+    res = ws.run("push", "--dry-run", "data", expect_rc=0)
+
+    assert "non-directory" in res.err
+    assert "data/d" not in ws.keys()  # the conflicting file was not uploaded
+
+
+def test_pull_single_file_reports_missing_object(ws):
+    # A recorded single-file object deleted out-of-band: the pull must say
+    # what is missing, not just exit 1.
+    target = ws.write("solo.conf", "cfg")
+    ws.config({"solo.conf": {"path": str(target)}})
+    ws.run("push", "solo.conf", expect_rc=0)
+
+    ws.s3.delete_object(Bucket=ws.bucket, Key=f"{ws.prefix}/solo.conf")
+    target.write_text("locally changed")  # defeat the all-matching short-circuit
+    res = ws.run("pull", "solo.conf")
+
+    assert res.rc == 1
+    assert "object missing on S3" in res.err
 
 
 def test_pull_delete_removes_local_extras(ws):
@@ -266,7 +373,7 @@ def test_pull_delete_removes_local_extras(ws):
     dest = ws.root / "restore"
     dest.mkdir()
     (dest / "extra.txt").write_text("e")
-    ws.run("pull", "data", "-o", str(dest), "--delete", expect_rc=0)
+    ws.run("pull", "data", "-o", str(dest), "--delete", "--yes", expect_rc=0)
 
     assert (dest / "keep.txt").read_text() == "k"
     assert not (dest / "extra.txt").exists()
@@ -285,7 +392,86 @@ def test_pull_delete_removes_extra_directory_tree(ws):
     (dest / "emptydir").mkdir()
     (dest / "keep.txt").write_text("k")
 
-    ws.run("pull", "data", "-o", str(dest), "--delete", expect_rc=0)
+    ws.run("pull", "data", "-o", str(dest), "--delete", "--yes", expect_rc=0)
     assert not (dest / "extradir").exists()
     assert not (dest / "emptydir").exists()
     assert (dest / "keep.txt").read_text() == "k"
+
+
+# --- pull --delete (confirmed removals) ----------------------------------------
+
+
+def test_pull_delete_without_tty_keeps_extras_and_succeeds(ws):
+    ws.write("data/keep.txt", "k")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    extra = ws.write("data/extra.txt", "extra")
+
+    res = ws.run("pull", "--delete", "data", expect_rc=0)
+
+    assert "delete:" not in res.out
+    assert "warning" not in res.err.lower()
+    assert extra.exists()
+
+
+def test_pull_delete_interactive_keeps_ancestors_of_kept_items(ws, answers):
+    # Deepest-first prompting: the nested file is asked first; keeping it makes
+    # its ancestor extra dir unremovable, so the dir is kept without a prompt.
+    ws.write("data/keep.txt", "k")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.write("data/extradir/inner.txt", "i")
+    ws.write("data/extra.txt", "e")
+
+    answers.feed("n", "y")  # keep extradir/inner.txt, delete extra.txt
+    ws.run("pull", "--delete", "data", expect_rc=0)
+
+    assert len(answers.prompts) == 2
+    assert "extradir" in answers.prompts[0] and "inner.txt" in answers.prompts[0]
+    assert "extra.txt" in answers.prompts[1]
+    assert (ws.root / "data" / "extradir" / "inner.txt").exists()
+    assert not (ws.root / "data" / "extra.txt").exists()
+
+
+def test_pull_delete_interactive_prompts_for_empty_extra_dir(ws, answers):
+    ws.write("data/keep.txt", "k")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    (ws.root / "data" / "emptydir").mkdir()
+
+    answers.feed("y")
+    ws.run("pull", "--delete", "data", expect_rc=0)
+
+    assert len(answers.prompts) == 1
+    assert not (ws.root / "data" / "emptydir").exists()
+
+
+def test_pull_delete_interactive_q_aborts(ws, answers):
+    ws.write("data/keep.txt", "k")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.write("data/extra1.txt", "1")
+    ws.write("data/extra2.txt", "2")
+
+    answers.feed("y", "q")  # extras prompt deepest-first: extra2 then extra1
+    res = ws.run("pull", "--delete", "data")
+
+    assert res.rc == 1
+    assert "aborted" in res.err
+    assert not (ws.root / "data" / "extra2.txt").exists()
+    assert (ws.root / "data" / "extra1.txt").exists()
+
+
+def test_pull_delete_confirms_on_the_clean_tree_short_circuit_too(ws, answers):
+    # A tree whose manifest already matches takes the pull short-circuit; its
+    # --delete pass must run behind the same confirmation.
+    ws.write("data/keep.txt", "k")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.write("data/extra.txt", "e")
+
+    answers.feed("n")
+    ws.run("pull", "--delete", "data", expect_rc=0)
+
+    assert len(answers.prompts) == 1
+    assert (ws.root / "data" / "extra.txt").exists()

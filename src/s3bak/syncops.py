@@ -18,29 +18,51 @@ from typing import Any
 
 from s3bak import localwalk, manifest
 from s3bak.config import Config, Opts
-from s3bak.console import write_output, write_stderr
+from s3bak.console import err, note_warning, write_output, write_stderr
 from s3bak.manifest import ManifestEntry
 
 
 def write_manifest_to_aws(
-    cfg: Config, entry: str, target: str, excludes: list[str], verbose: bool
+    cfg: Config,
+    entry: str,
+    target: str,
+    excludes: list[str],
+    verbose: bool,
+    *,
+    old_manifest: str | None = None,
+    keep_old: manifest.KeepOld = False,
+    upload: bool = True,
 ) -> None:
     """Walk `target` in S3 key order, stream the v3 manifest to a temp file,
-    and upload it."""
+    and upload it. For a directory entry the walk is merged with
+    `old_manifest` under the `keep_old` policy, so records of kept-but-
+    locally-vanished files survive the rewrite (see manifest.write_merged).
+    A single-file entry has one record and no merge. ``upload=False`` is the
+    dry-run preview: the walk and merge run for real - emitting the same
+    warnings as a real push - and only the S3 write is skipped."""
     key = manifest.manifest_key(entry)
-    write_stderr(f"Updating {cfg.prefix}/{key}\n")
+    if upload:
+        write_stderr(f"Updating {cfg.prefix}/{key}\n")
 
     fd, tmp = tempfile.mkstemp(suffix=".jsonl")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             if os.path.isdir(target):
-                manifest.write_manifest(f, localwalk.walk_tree(target, excludes))
+                manifest.write_merged(
+                    f,
+                    old_manifest,
+                    None,
+                    localwalk.walk_tree(target, excludes),
+                    keep_old=keep_old,
+                    warn=note_warning,
+                )
             else:
                 st = os.lstat(target)
                 sym = os.readlink(target) if stat_mod.S_ISLNK(st.st_mode) else None
                 manifest.write_manifest(f, [(os.path.basename(target), st, sym)])
-        assert cfg.store is not None
-        cfg.store.put_file(key, tmp, verbose=verbose)
+        if upload:
+            assert cfg.store is not None
+            cfg.store.put_file(key, tmp, verbose=verbose)
     finally:
         os.unlink(tmp)
 
@@ -52,25 +74,36 @@ def patch_manifest_subtree(
     sub: str,
     excludes: list[str],
     opts: Opts,
+    *,
+    keep_old: manifest.KeepOld = False,
+    old_manifest: str | None = None,
 ) -> bool:
-    """Download the manifest, replace the records under `sub`, and re-upload.
+    """Replace the manifest records under `sub` and re-upload.
 
     target_root/sub may be a file, a symlink, or a directory. If it does not
     exist locally, the records under `sub` are simply removed. Old and new
     records are both in sort-key order, so this is a streaming merge
-    (manifest.write_patched), not a read-all + sort.
+    (manifest.write_merged), not a read-all + sort. `old_manifest` is a
+    caller-owned copy of the current manifest (the sub-path sync already
+    downloaded one); without it, this downloads its own. A dry run computes
+    the whole patch for real - the download, the walk, the merge and its
+    warnings - and skips only the S3 write.
     """
     key = manifest.manifest_key(entry)
-    if opts.dryrun:
-        print(f"(dry-run) would patch manifest: {key} (sub={sub})")
-        return True
-
-    fd_old, old_path = tempfile.mkstemp(suffix=".jsonl")
-    os.close(fd_old)
+    own_old: str | None = None
+    if old_manifest is None:
+        fd_old, own_old = tempfile.mkstemp(suffix=".jsonl")
+        os.close(fd_old)
     fd_new, new_path = tempfile.mkstemp(suffix=".jsonl")
     os.close(fd_new)  # reopened by name below; closing now avoids an fd leak on error
     try:
-        have_old = download_manifest(cfg, entry, old_path, opts.verbose)
+        if old_manifest is not None:
+            old_path = old_manifest
+            have_old = True
+        else:
+            assert own_old is not None
+            old_path = own_old
+            have_old = download_manifest(cfg, entry, old_path, opts.verbose)
         if not have_old and not os.path.lexists(target_root):
             # Deleting a never-backed sub-path beneath a root that is gone has
             # no manifest state to update (and no root metadata from which to
@@ -87,13 +120,24 @@ def patch_manifest_subtree(
             root_record = (".", os.lstat(target_root), None)
             new_entries = itertools.chain([root_record], new_entries)
         with open(new_path, "w", encoding="utf-8") as out:
-            manifest.write_patched(out, old_path if have_old else None, sub, new_entries)
-        write_stderr(f"Updating {cfg.prefix}/{key}\n")
-        assert cfg.store is not None
-        cfg.store.put_file(key, new_path, verbose=opts.verbose)
+            manifest.write_merged(
+                out,
+                old_path if have_old else None,
+                sub,
+                new_entries,
+                keep_old=keep_old,
+                warn=note_warning,
+            )
+        if opts.dryrun:
+            print(f"(dry-run) would patch manifest: {key} (sub={sub})")
+        else:
+            write_stderr(f"Updating {cfg.prefix}/{key}\n")
+            assert cfg.store is not None
+            cfg.store.put_file(key, new_path, verbose=opts.verbose)
         return True
     finally:
-        os.unlink(old_path)
+        if own_old is not None:
+            os.unlink(own_old)
         os.unlink(new_path)
 
 
@@ -148,12 +192,35 @@ def download_from_s3(
     sub: str | None = None,
     compare: Any = None,
     size: int | None = None,
+    dryrun: bool = False,
 ) -> tuple[int, bool]:
     assert cfg.store is not None
     rel = f"{entry}/{sub}" if sub else entry
 
     if is_dir:
-        result = cfg.store.sync_down(rel, outpath, compare=compare, verbose=verbose)
+        # S3.sync creates a missing local destination before it lists anything
+        # (aws-cli parity), even on a dry run. pull --dry-run promises to change
+        # nothing, so note what is missing now and rmdir it afterwards - rmdir
+        # only removes empty directories, so anything real is left alone.
+        created: list[str] = []
+        if dryrun:
+            probe = os.path.abspath(outpath)
+            while not os.path.exists(probe):
+                created.append(probe)
+                parent = os.path.dirname(probe)
+                if parent == probe:
+                    break
+                probe = parent
+        try:
+            result = cfg.store.sync_down(
+                rel, outpath, compare=compare, dryrun=dryrun, verbose=verbose
+            )
+        finally:
+            for path in created:  # leaf-first, so each rmdir empties its parent
+                try:
+                    os.rmdir(path)
+                except OSError:
+                    break
         if result.returncode != 0:
             if result.stderr:
                 write_stderr(result.stderr)
@@ -165,6 +232,14 @@ def download_from_s3(
     # runs and restores mode/mtime. Matters on Windows, where apply_manifest is
     # skipped when nothing changed. `size` (from the manifest record) routes a
     # large file through multipart download; a small one is a direct GetObject.
+    if dryrun:
+        # The download writes the local file, so it is a mutation and stays
+        # skipped. No substitute probe either: a HeadObject can succeed or
+        # fail under different IAM permissions than the real GetObject, and a
+        # dry run must only make the calls the real run would make.
+        write_output(f"(dry-run) download: {cfg.prefix}/{rel} -> {outpath}\n")
+        return 0, True
     if not cfg.store.get_object(rel, outpath, size=size, verbose=verbose):
+        err(f"object missing on S3: {cfg.prefix}/{rel}")
         return 1, False
     return 0, True

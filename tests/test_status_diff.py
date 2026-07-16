@@ -242,16 +242,14 @@ def test_diff_does_not_follow_symlink_replacing_regular_file(ws):
     assert "must not be disclosed" not in res.out
 
 
-def test_diff_ignores_s3_object_removed_from_manifest_by_subpath_push(ws):
-    ws.write("data/sub/orphan.txt", "old\n")
+def test_diff_ignores_s3_object_not_in_manifest(ws):
+    ws.write("data/a.txt", "a\n")
     ws.config({"data": {"path": str(ws.root / "data")}})
     ws.run("push", "data", expect_rc=0)
-    (ws.root / "data" / "sub" / "orphan.txt").unlink()
 
-    # Without --delete, the narrow push intentionally leaves the S3 object but
-    # patches it out of the source-of-truth manifest.
-    ws.run("push", "data/sub", expect_rc=0)
-    assert "data/sub/orphan.txt" in ws.keys()
+    # An orphan object (e.g. left by a --meta-only push after a local delete)
+    # is not part of the backup: the source-of-truth manifest defines it.
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/sub/orphan.txt", Body=b"old\n")
 
     res = ws.run("diff", "data", expect_rc=0)
     assert res.out == ""

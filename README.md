@@ -26,7 +26,7 @@ With [uv](https://docs.astral.sh/uv/):
 uv tool install git+https://github.com/izumo-m/s3bak
 
 # ...or run it without installing
-uvx --from git+https://github.com/izumo-m/s3bak s3bak help
+uvx --from git+https://github.com/izumo-m/s3bak s3bak --help
 ```
 
 For local development:
@@ -35,7 +35,7 @@ For local development:
 git clone git@github.com:izumo-m/s3bak.git
 cd s3bak
 uv sync
-uv run s3bak help
+uv run s3bak --help
 uv run pytest        # hermetic test suite (uses moto; no AWS/Docker needed)
 ```
 
@@ -80,22 +80,21 @@ executable or script instead.
 Usage: s3bak <command> [options] [args]
 
 Commands:
-  push <entry|path>...     Back up entries or sub-paths to S3
-  pull <entry|path>        Restore an entry or sub-path (use --all for every entry)
-  show <entry|path>        Print a single file from the backup to stdout
-  status <entry|path>...   Compare local vs backup (metadata only)
-  diff <entry|path>        Show content diff between backup and local
-  list                     List locally configured entries
-  ls-remote [entry|path]   List S3 entries, or files under an entry/sub-path
-  help                     Show this help
+  push        Back up entries or sub-paths to S3
+  pull        Restore entries or sub-paths from S3
+  show        Print a backed-up file
+  status      Compare local files with the backup
+  diff        Show content differences
+  list        List locally configured entries
+  ls-remote   List entries or files stored on S3
+
+Global options:
+  --help      Show this help
+  --version   Show the program version
 ```
 
-Common options: `--all`, `--dry-run` (push), `--delete` (pull and sub-path
-push), `--meta-only`, `--data-only`, `--checksum` (push/pull),
-`--mtime-window <seconds>`, `-o/--output <path>` (pull), `-v/--verbose`,
-`--color[=WHEN]`.
-
-Run `s3bak help` for the full option list and worked examples.
+Run `s3bak <command> --help` for the selected command's arguments, options, and
+examples.
 
 ### Examples
 
@@ -103,13 +102,17 @@ Run `s3bak help` for the full option list and worked examples.
 s3bak push --all              # back up every configured entry
 s3bak push --all --dry-run    # preview without uploading
 s3bak status bin              # M/A/D summary for one entry
+s3bak pull bin home-docs      # restore selected entries in parallel
 s3bak pull bin -o /tmp/out    # restore the bin entry to /tmp/out
+s3bak pull bin --delete --dry-run  # preview a mirror restore
+s3bak push --all --delete --yes    # unattended mirror (e.g. cron)
 s3bak push bin/subdir         # entry-rooted syntax; independent of CWD
 s3bak ls-remote               # list entries stored on S3
 ```
 
 The `status` letters are push-oriented (what a push would change on the backup):
-`M` modified, `A` only local (push would add), `D` only in backup (push would delete).
+`M` modified, `A` only local (push would add), `D` only in backup
+(`push --delete` would remove; a plain push keeps it).
 
 ## Design
 
