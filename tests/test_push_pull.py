@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 
 from s3bak import cli
+
+
+def _manifest_body(ws, entry: str) -> str:
+    key = f"{ws.prefix}/{entry}-manifest.jsonl"
+    return ws.s3.get_object(Bucket=ws.bucket, Key=key)["Body"].read().decode()
 
 
 def test_push_uploads_objects_and_manifest(ws):
@@ -60,6 +66,129 @@ def test_push_records_changed_symlink_target_without_data_transfer(ws):
     dest = ws.root / "restored"
     ws.run("pull", "data", "-o", str(dest), expect_rc=0)
     assert os.readlink(dest / "link") == "b.txt"
+
+
+def test_push_refreshes_manifest_on_file_mode_change(ws):
+    p = ws.write("data/a.txt", "alpha")
+    os.chmod(p, 0o644)
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    os.chmod(p, 0o600)
+
+    res = ws.run("push", "data", expect_rc=0)
+
+    assert "upload:" not in res.out  # a chmod re-transfers no data
+    assert "Updating" in res.err
+    assert '"mode":"100600"' in _manifest_body(ws, "data")
+    assert ws.run("status", "data", expect_rc=0).out.strip() == ""
+    # Settled: the next push rewrites nothing.
+    res = ws.run("push", "data", expect_rc=0)
+    assert "Updating" not in res.err
+
+
+def test_push_refreshes_manifest_on_directory_mode_change(ws):
+    ws.write("data/sub/b.txt", "beta")
+    os.chmod(ws.root / "data" / "sub", 0o755)
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    os.chmod(ws.root / "data" / "sub", 0o700)
+
+    res = ws.run("push", "data", expect_rc=0)
+
+    assert "upload:" not in res.out
+    assert '"mode":"40700"' in _manifest_body(ws, "data")
+    assert ws.run("status", "data", expect_rc=0).out.strip() == ""
+
+
+def test_push_ignores_symlink_permission_drift(ws):
+    ws.write("data/a.txt", "a")
+    os.symlink("a.txt", ws.root / "data" / "link")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    # Simulate a manifest written where symlinks carry different permission
+    # bits (e.g. macOS): flip the link record's perm bits on S3; the local
+    # lstat cannot drift here (Linux has no lchmod).
+    patched = []
+    for line in _manifest_body(ws, "data").splitlines():
+        obj = json.loads(line)
+        if obj.get("link") is not None:
+            obj["mode"] = "120700" if obj["mode"] != "120700" else "120755"
+        patched.append(json.dumps(obj, separators=(",", ":")))
+    key = f"{ws.prefix}/data-manifest.jsonl"
+    ws.s3.put_object(Bucket=ws.bucket, Key=key, Body=("\n".join(patched) + "\n").encode())
+
+    res = ws.run("push", "data", expect_rc=0)
+
+    assert "Updating" not in res.err  # symlink perm bits are never compared
+
+
+def test_single_file_push_refreshes_manifest_on_mode_change(ws):
+    local = ws.write("solo.txt", "content")
+    os.chmod(local, 0o644)
+    ws.config({"solo": {"path": str(local)}})
+    ws.run("push", "solo", expect_rc=0)
+    os.chmod(local, 0o600)
+
+    res = ws.run("push", "solo", expect_rc=0)
+
+    assert "upload:" not in res.out
+    assert '"mode":"100600"' in _manifest_body(ws, "solo")
+    assert ws.run("status", "solo", expect_rc=0).out.strip() == ""
+    res = ws.run("push", "solo", expect_rc=0)
+    assert "Updating" not in res.err
+
+
+def test_single_file_push_checksum_refreshes_manifest_on_mode_change(ws):
+    local = ws.write("solo.txt", "content")
+    os.chmod(local, 0o644)
+    ws.config({"solo": {"path": str(local)}})
+    ws.run("push", "solo", expect_rc=0)
+    os.chmod(local, 0o600)
+
+    res = ws.run("push", "--checksum", "solo", expect_rc=0)
+
+    assert "upload:" not in res.out  # manifest-only refresh, no re-upload
+    assert '"mode":"100600"' in _manifest_body(ws, "solo")
+
+
+def test_single_file_push_data_only_ignores_mode_change(ws):
+    local = ws.write("solo.txt", "content")
+    os.chmod(local, 0o644)
+    ws.config({"solo": {"path": str(local)}})
+    ws.run("push", "solo", expect_rc=0)
+    os.chmod(local, 0o600)
+
+    res = ws.run("push", "--data-only", "solo", expect_rc=0)
+
+    assert "Updating" not in res.err  # --data-only never touches the manifest
+    assert '"mode":"100644"' in _manifest_body(ws, "solo")
+
+
+def test_push_refreshes_manifest_on_entry_root_mode_change(ws):
+    ws.write("data/a.txt", "alpha")
+    os.chmod(ws.root / "data", 0o755)
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    os.chmod(ws.root / "data", 0o700)
+
+    ws.run("push", "data", expect_rc=0)
+
+    assert '"path":".","mode":"40700"' in _manifest_body(ws, "data")
+    assert ws.run("status", "data", expect_rc=0).out.strip() == ""
+
+
+def test_push_dry_run_previews_mode_only_manifest_refresh(ws):
+    p = ws.write("data/a.txt", "alpha")
+    os.chmod(p, 0o644)
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    os.chmod(p, 0o600)
+
+    res = ws.run("push", "--dry-run", "data", expect_rc=0)
+
+    assert "would update manifest" in res.out
+    assert "upload:" not in res.out
+    assert '"mode":"100600"' not in _manifest_body(ws, "data")  # changed nothing
 
 
 def test_checksum_push_writes_missing_manifest_for_existing_single_object(ws):

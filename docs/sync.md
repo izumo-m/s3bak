@@ -77,8 +77,9 @@ a push or pull would actually do. The window is resolved per entry:
 which overrides the top-level `mtime_window` in `config.py` (0 = exact
 everywhere). A per-entry window suits a tree whose filesystem needs a different
 tolerance than the rest. `status` additionally reports mode changes for the
-metadata view — but the sync never transfers over a mode change (that is a
-`--meta-only` refresh, below).
+metadata view — the sync never transfers over a mode change; a push refreshes
+just the manifest instead (step 3 of the push pipeline, below), through the
+same mode predicate `status` uses.
 
 For a directory entry, `status` is one streaming merge-join
 (`manifest.merge_join`) of the manifest against a fresh local walk, both in S3
@@ -168,22 +169,27 @@ environment.
    missing (a HeadObject confirms existence, since a single file has no listing
    to self-heal from). `--checksum` uses the ETag comparison instead.
 3. **Refresh the manifest if data was transferred or deleted, its tree
-   structure or a symlink target changed, on `--meta-only`, or when no
-   manifest exists yet.** The refresh merges the fresh local walk into the
-   old manifest (`write_merged`): a walked path always wins, and old-only
-   records — the backups of locally vanished files — are kept, except file
-   records dropped by a `--delete` run: those whose object the confirmation
-   removed, and stale ones whose object was already gone (how an interrupted
-   deletion self-heals). A record kept under a path that is no longer a
-   directory (the local tree replaced a directory with a same-named file)
-   makes the entry unrestorable as a tree; the merge detects this and warns
-   (exit 2), and a `push --delete --yes` prunes such records. The
-   structural check makes empty and symlink-only changes restorable even
-   though they have no data objects. A mode-only change or an mtime drift inside
-   the window transfers nothing and does not refresh an existing manifest;
-   `status` keeps showing the mode or mtime difference until a `--meta-only`
-   push. Owner and group are informational rather than comparison inputs, and
-   update whenever the manifest is rewritten.
+   structure, a symlink target, or a permission changed, on `--meta-only`,
+   or when no manifest exists yet.** The refresh merges the fresh local walk
+   into the old manifest (`write_merged`): a walked path always wins, and
+   old-only records — the backups of locally vanished files — are kept, except
+   file records dropped by a `--delete` run: those whose object the
+   confirmation removed, and stale ones whose object was already gone (how an
+   interrupted deletion self-heals). A record kept under a path that is no
+   longer a directory (the local tree replaced a directory with a same-named
+   file) makes the entry unrestorable as a tree; the merge detects this and
+   warns (exit 2), and a `push --delete --yes` prunes such records. The
+   no-transfer check makes empty-directory, symlink-only, and permission
+   changes restorable even though they move no data: a `chmod` refreshes the
+   manifest without re-uploading anything, settling exactly the mode
+   differences `status` reports — the two share one mode predicate, which
+   never compares symlink permission bits and on Windows reads only the
+   owner-write bit (`os.stat` modes there are synthetic). A single-file entry
+   runs the same permission check against its one record. An mtime drift
+   inside the window transfers nothing and does not refresh an existing
+   manifest — the window is a rounding tolerance. Owner and group are
+   informational rather than comparison inputs, and update whenever the
+   manifest is rewritten.
 4. Run `post_hook` — but only after a push that did work (transferred data
    and/or refreshed the manifest), so a side-effecting hook does not fire on a
    pure no-op. `--meta-only` always refreshes and runs the hook, which is the

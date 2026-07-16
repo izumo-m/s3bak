@@ -4,7 +4,8 @@ presentation helpers (color, humanized sizes/durations).
 
 ``compare_to_local`` shares its size+mtime check with the sync's
 ``ManifestFilter`` (see manifest.py), so ``status`` and push/pull agree on
-what counts as changed; mode is compared additionally for the metadata report.
+what counts as changed; ``mode_differs`` is the shared mode predicate, used
+here for the metadata report and by push's manifest-refresh check.
 """
 
 from __future__ import annotations
@@ -110,6 +111,23 @@ def _fmt_mtime(mtime_ns: int, *, subsecond: bool = False) -> str:
     return text
 
 
+def mode_differs(entry: ManifestEntry, st: os.stat_result) -> bool:
+    """Whether the record's permission bits differ from the local stat's.
+
+    The shared mode predicate: ``status``'s mode report and push's
+    manifest-refresh check both use it, so a push settles exactly the mode
+    differences ``status`` shows. Callers skip symlink records (their
+    permission bits are compared nowhere)."""
+    if stat_mod.S_IMODE(st.st_mode) == entry.perm_bits:
+        return False
+    if IS_WINDOWS:
+        # Windows-native Python (incl. msys2 UCRT64) reports synthetic modes
+        # via os.stat: 0o666 for writable files, 0o444 for read-only - not
+        # the Unix permission bits. Only the owner-write bit is meaningful.
+        return (entry.perm_bits & 0o200) != (st.st_mode & 0o200)
+    return True
+
+
 @dataclass
 class EntryDiff:
     status: str | None  # None=match, "M"=modified, "D"=missing/wrong-type
@@ -173,7 +191,8 @@ def compare_to_stat(
     The size + mtime part is the same check the sync's ManifestFilter
     applies (mtime within ``window_ns``), so `status` and push/pull agree on
     what counts as changed; mode is additionally compared here for the
-    metadata report (the sync never transfers over a mode change).
+    metadata report (a mode change never re-transfers data - push refreshes
+    the manifest instead, through the same ``mode_differs`` predicate).
     """
     diff = EntryDiff(status=None, tags=[], details=[])
 
@@ -216,15 +235,8 @@ def compare_to_stat(
             diff_str = _humanize_size_diff(loc_size - entry.size)
             diff.details.append(f"size: remote={remote_disp} {cmp} local={local_disp} ({diff_str})")
 
-    loc_mode = format(stat_mod.S_IMODE(st.st_mode), "o")
-    mode_differs = loc_mode != entry.perm_str
-    if mode_differs and IS_WINDOWS:
-        # Windows-native Python (incl. msys2 UCRT64) reports synthetic modes
-        # via os.stat: 0o666 for writable files, 0o444 for read-only - not
-        # the Unix permission bits. Only the owner-write bit is meaningful.
-        if (entry.perm_bits & 0o200) == (st.st_mode & 0o200):
-            mode_differs = False
-    if mode_differs:
+    if mode_differs(entry, st):
+        loc_mode = format(stat_mod.S_IMODE(st.st_mode), "o")
         diff.status = "M"
         diff.tags.append("mode")
         diff.details.append(f"mode: remote={entry.perm_str} local={loc_mode}")

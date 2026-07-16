@@ -49,7 +49,7 @@ def test_meta_only_records_mode_change_and_clears_status(ws):
 
     os.chmod(f, 0o600)
     res = ws.run("status", "data", expect_rc=0)
-    assert "mode" in res.out  # a plain push would not refresh this (sync ignores mode)
+    assert "mode" in res.out  # the sync transfers nothing over a mode change
 
     ws.run("push", "--meta-only", "data", expect_rc=0)
     res = ws.run("status", "data", expect_rc=0)

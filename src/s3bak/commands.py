@@ -28,6 +28,7 @@ from s3bak.compare import (
     compare_to_local,
     compare_to_stat,
     format_diff_block,
+    mode_differs,
 )
 from s3bak.config import Config, Opts
 from s3bak.confirm import (
@@ -383,9 +384,10 @@ def _push_sub(
             os.unlink(manifest_path)
 
 
-def _single_file_needs_upload(cfg: Config, entry: str, target: str, opts: Opts) -> bool:
+def _single_file_compare(cfg: Config, entry: str, target: str, opts: Opts) -> tuple[bool, bool]:
     """The single-file counterpart of the sync compare: size+mtime check against
     the entry's one-record manifest (or EtagComparison under --checksum).
+    Returns ``(needs_upload, mode_drifted)``.
 
     Upload unless the manifest holds a regular-file record for exactly this
     basename (a stale dir-shaped manifest, e.g. from an entry that used to be
@@ -393,49 +395,67 @@ def _single_file_needs_upload(cfg: Config, entry: str, target: str, opts: Opts) 
     the data object actually exists on S3 - a `--meta-only` push or an S3-side
     delete leaves a manifest with no object behind it, which only this
     head-object probe can see (a dir entry self-heals via the sync listing;
-    a single file has no listing)."""
+    a single file has no listing).
+
+    ``mode_drifted`` reports a permission-only drift against that record when
+    no upload is needed, so the caller refreshes just the manifest - the same
+    record is already in hand, costing no extra S3 call. The --checksum path
+    never sets it (its ETag decision reads no manifest here);
+    _single_file_manifest_matches covers mode there."""
     assert cfg.store is not None
     if opts.checksum:
-        return cfg.store.needs_upload(entry, target, verbose=opts.verbose)
+        return cfg.store.needs_upload(entry, target, verbose=opts.verbose), False
     fd, manifest_path = tempfile.mkstemp(suffix=".jsonl")
     os.close(fd)
     try:
         if not download_manifest(cfg, entry, manifest_path, opts.verbose):
-            return True
+            return True, False
         st = os.lstat(target)
         basename = os.path.basename(target)
         for m in manifest.iter_manifest(manifest_path):
             if m.path == basename and m.sym_target is None and m.is_file:
                 if not m.matches_stat(st, cfg.window_ns_for(entry)):
-                    return True
-                return cfg.store.head_object(entry, verbose=opts.verbose) is None
-        return True
+                    return True, False
+                if cfg.store.head_object(entry, verbose=opts.verbose) is None:
+                    return True, False
+                return False, mode_differs(m, st)
+        return True, False
     finally:
         os.unlink(manifest_path)
 
 
 def _single_file_manifest_matches(cfg: Config, entry: str, target: str, opts: Opts) -> bool:
-    """Whether a valid manifest already describes this single-file entry."""
+    """Whether a valid manifest already describes this single-file entry: the
+    record names the configured basename and its permission bits match the
+    local file."""
     fd, manifest_path = tempfile.mkstemp(suffix=".jsonl")
     os.close(fd)
     try:
         if not download_manifest(cfg, entry, manifest_path, opts.verbose):
             return False
         record = next(manifest.iter_manifest(manifest_path))
-        return record.path == os.path.basename(target)
+        if record.path != os.path.basename(target):
+            return False
+        return not mode_differs(record, os.lstat(target))
     finally:
         os.unlink(manifest_path)
 
 
-def _manifest_structure_matches_local(
+def _manifest_records_match_local(
     manifest_path: str, target: str, excludes: list[str], *, keep_old: manifest.KeepOld
 ) -> bool:
-    """Compare manifest-visible tree structure without treating metadata drift
-    as a reason to rewrite an existing manifest.
+    """Whether an existing manifest still describes the local tree: the
+    manifest-visible structure and the recorded permissions.
 
-    Data transfer output normally drives refresh, but empty directories and
-    symlinks have no S3 object. Their add/remove/type/target changes must still
-    make an ordinary push rewrite the manifest. Manifest-only records are
+    Data transfer output normally drives refresh, but structure changes
+    (add/remove/type/target of empty directories and symlinks, which have no
+    S3 object) and permission changes move no data and must still make an
+    ordinary push rewrite the manifest. Mode uses the shared ``mode_differs``
+    predicate and skips symlink records, so the refresh settles exactly the
+    mode differences `status` reports; mtime drift (a rounding tolerance
+    inside the window; outside it the default compare transfers upstream of
+    this check, and --checksum deliberately ignores stats) and
+    owner/group changes stay non-triggers. Manifest-only records are
     judged by the same ``keep_old`` policy the merge would apply: a record the
     merge would keep is the expected shape of a kept deletion, not a change;
     one it would drop (the mirror, or a file record with no delete candidate
@@ -467,6 +487,8 @@ def _manifest_structure_matches_local(
         if stat_mod.S_IFMT(record.mode) != stat_mod.S_IFMT(st.st_mode):
             return False
         if record.sym_target != sym:
+            return False
+        if record.sym_target is None and mode_differs(record, st):
             return False
     return True
 
@@ -561,7 +583,7 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             fd, manifest_path = tempfile.mkstemp(suffix=".jsonl")
             os.close(fd)
             compare = None
-            structure_changed = False
+            manifest_stale = False
             try:
                 # A checksum compare does not use manifest file stats, but a
                 # whole-entry dir push always downloads the manifest: an
@@ -591,7 +613,7 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                     and not opts.data_only
                     and have_manifest
                 ):
-                    structure_changed = not _manifest_structure_matches_local(
+                    manifest_stale = not _manifest_records_match_local(
                         manifest_path, target, excludes, keep_old=plan.keep_old()
                     )
             finally:
@@ -609,49 +631,48 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             results = result.stdout
             refresh_manifest = bool(results)
             if not refresh_manifest and not opts.data_only:
-                refresh_manifest = not have_manifest or structure_changed
-        elif _single_file_needs_upload(cfg, entry, target, opts):
-            # Single-file entry that fails the size+mtime check against its manifest
-            # (or the --checksum ETag comparison), or was never pushed: upload it.
-            if opts.dryrun:
-                # Set results only; the shared writer below emits it (and the truthy
-                # results drives the dryrun manifest line). Printing here too would
-                # double the line.
-                results = f"(dry-run) upload: {target} -> {cfg.prefix}/{entry}"
-            else:
-                result = cfg.store.put_object(entry, target, verbose=opts.verbose)
-                if result.returncode != 0:
-                    write_output(result.stdout)
-                    if result.stderr:
-                        write_stderr(result.stderr)
-                    return result.returncode
-                results = result.stdout
-            refresh_manifest = bool(results)
-
-        if (
-            opts.checksum
-            and not refresh_manifest
-            and not opts.data_only
-            and not os.path.isdir(target)
-        ):
-            # ETag equality can skip an already-present data object even when its
-            # manifest was deleted or still names an older configured basename.
-            refresh_manifest = not _single_file_manifest_matches(cfg, entry, target, opts)
+                refresh_manifest = not have_manifest or manifest_stale
+        else:
+            needs_upload, mode_drifted = _single_file_compare(cfg, entry, target, opts)
+            if needs_upload:
+                # Single-file entry that fails the size+mtime check against its
+                # manifest (or the --checksum ETag comparison), or was never
+                # pushed: upload it.
+                if opts.dryrun:
+                    # Set results only; the shared writer below emits it (and the
+                    # truthy results drives the dryrun manifest line). Printing
+                    # here too would double the line.
+                    results = f"(dry-run) upload: {target} -> {cfg.prefix}/{entry}"
+                else:
+                    result = cfg.store.put_object(entry, target, verbose=opts.verbose)
+                    if result.returncode != 0:
+                        write_output(result.stdout)
+                        if result.stderr:
+                            write_stderr(result.stderr)
+                        return result.returncode
+                    results = result.stdout
+                refresh_manifest = bool(results)
+            elif not opts.data_only:
+                if opts.checksum:
+                    # ETag equality can skip an already-present data object even
+                    # when its manifest was deleted, still names an older
+                    # configured basename, or records a stale mode.
+                    refresh_manifest = not _single_file_manifest_matches(cfg, entry, target, opts)
+                else:
+                    refresh_manifest = mode_drifted
 
         if results:
             write_output(f"{results}\n")
 
         # Refresh after a data transfer or deletion, an objectless structural
-        # change, or the first push even when an empty tree produced no transfer
-        # lines. The default compare is the manifest size+mtime check (mtime
-        # within the window), so a mode-only change or an mtime drift inside the
-        # window does not refresh an existing manifest; `status` keeps showing
-        # that diff until `push --meta-only`. Owner/group are informational and
-        # not comparison inputs. Deliberate spec choice. Note
-        # --meta-only asserts "S3 matches local" without making it true: any
-        # never-pushed local edit becomes invisible to the size+mtime check
-        # afterwards, so it is a metadata refresh, never a substitute for a real
-        # push.
+        # or permission change, or the first push even when an empty tree
+        # produced no transfer lines. An mtime drift inside the window does not
+        # refresh an existing manifest (the window is a rounding tolerance);
+        # owner/group are informational, not comparison inputs, and update
+        # whenever the manifest is rewritten. Note --meta-only asserts "S3
+        # matches local" without making it true: any never-pushed local edit
+        # becomes invisible to the size+mtime check afterwards, so it is a
+        # metadata refresh, never a substitute for a real push.
         if refresh_manifest and not opts.data_only:
             st = upload_manifest(
                 cfg,
