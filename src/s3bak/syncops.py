@@ -228,9 +228,9 @@ def download_from_s3(
         return 0, _print_transfer_lines(result.stdout)
 
     # Single file: a transfer always happens (we only reach here on a manifest
-    # mismatch), so a successful download counts as changed -> apply_manifest
-    # runs and restores mode/mtime. Matters on Windows, where apply_manifest is
-    # skipped when nothing changed. `size` (from the manifest record) routes a
+    # mismatch), so a successful download counts as changed - which keeps the
+    # dry-run stand-in line ("would apply manifest metadata") printed for it.
+    # `size` (from the manifest record) routes a
     # large file through multipart download; a small one is a direct GetObject.
     if dryrun:
         # The download writes the local file, so it is a mutation and stays

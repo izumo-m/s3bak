@@ -9,8 +9,8 @@ higher-level orchestration
 
     cli
     commands
-    compare | restore | syncops
-    config | localwalk
+    restore | syncops
+    compare | config | localwalk
     store
     manifest | console
 
@@ -36,9 +36,13 @@ are foundational modules used from several layers.
   when a command needs S3, and defines the `Config` and `Opts` values passed
   through the command layers.
 - **compare** compares manifest records with local state and presents status
-  and content diff output.
+  and content diff output. Its predicate is shared by `status`, the pull no-op
+  gate, and restore's gated metadata apply.
 - **restore** owns pull-side filesystem mutation: target resolution, metadata
-  application, conflict handling, and deletion of local extras.
+  application, conflict handling, and deletion of local extras. It also owns
+  the keyed manifest / local-walk streams (`manifest_keyed` / `local_keyed`)
+  whose merge-join drives both the metadata apply and, via commands, the
+  status and `pull --delete` diffs.
 - **syncops** connects manifests and local trees to the S3 store. It writes and
   downloads manifests, orchestrates downloads, and builds sync comparison
   strategies.

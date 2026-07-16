@@ -231,8 +231,9 @@ def compare_to_stat(
 
     # A directory's mtime changes whenever its children are added/removed, so
     # it is noise in `status` and is suppressed there (ignore_dir_mtime=True).
-    # The restore path (_manifest_matches_local) keeps the default and still
-    # detects dir mtime drift so apply_manifest can restore it.
+    # The restore paths (_manifest_matches_local and apply_manifest's gate)
+    # keep the default and still detect dir mtime drift so the apply can
+    # restore it.
     if ignore_dir_mtime and is_dir_local:
         return diff
 

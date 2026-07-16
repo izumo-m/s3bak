@@ -15,7 +15,6 @@ import stat as stat_mod
 import subprocess
 import tempfile
 from collections import deque
-from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
@@ -50,6 +49,8 @@ from s3bak.console import (
 from s3bak.manifest import ManifestEntry
 from s3bak.restore import (
     apply_manifest,
+    local_keyed,
+    manifest_keyed,
     manifest_target,
     remove_extras,
     resolve_manifest_rel,
@@ -773,12 +774,11 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         #    under --checksum: this gate is the same size+mtime check whose
         #    blind spot --checksum exists to cover, so it must not stand
         #    between the user and the content comparison.
-        manifest_matches = _manifest_matches_local(
-            manifest_path, outpath, is_dir, sub, cfg.window_ns_for(entry)
-        )
+        window_ns = cfg.window_ns_for(entry)
+        excludes: list[str] = entry_cfg.get("excludes", []) if entry_cfg else []
+        manifest_matches = _manifest_matches_local(manifest_path, outpath, is_dir, sub, window_ns)
         if manifest_matches and not opts.checksum:
             if not opts.meta_only and opts.delete and is_dir:
-                excludes: list[str] = entry_cfg.get("excludes", []) if entry_cfg else []
                 return _delete_extras(manifest_path, outpath, sub, excludes, opts=opts, entry=entry)
             return 0
 
@@ -844,28 +844,31 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
 
         # 4. Apply manifest metadata (mode, mtime, symlinks): objectless or
         #    metadata-only diffs (empty dirs, symlinks, mode/mtime) have nothing
-        #    to download yet still need applying. apply_manifest sets the modes
-        #    itself, so the writable prep needs no separate restore. Skipped
-        #    with --data-only, and after a --checksum pass over an
-        #    already-clean tree (nothing transferred, metadata matches).
+        #    to download yet still need applying. Only records whose local
+        #    state differs from the record are touched. A downloaded file
+        #    normally mismatches afterwards (the dir sync stamps the S3 upload
+        #    time onto it, the file lane leaves the write time) and gets its
+        #    recorded mtime back; a stamp landing inside the mtime window is a
+        #    match and stays, like any other within-window drift. The gate also
+        #    re-applies the recorded modes over the writable prep - no separate
+        #    restore needed. Skipped with --data-only.
         if opts.data_only:
             if IS_WINDOWS and not opts.meta_only:
                 windows_restore_modes(prep)
             st = 0
-        elif manifest_matches and not changed:
-            if IS_WINDOWS and not opts.meta_only:
-                windows_restore_modes(prep)
-            st = 0
         elif opts.dryrun:
-            # The same gate as the real apply: report that metadata (mode /
-            # mtime / symlinks) would be applied, without mutating anything.
-            write_output(f"(dry-run) would apply manifest metadata: {outpath}\n")
+            # One stand-in line for the metadata apply (mode / mtime /
+            # symlinks), printed only when the real apply could repair
+            # something: a stat-gate difference, or a planned transfer.
+            if not manifest_matches or changed:
+                write_output(f"(dry-run) would apply manifest metadata: {outpath}\n")
             st = 0
         else:
-            st = apply_manifest(outpath, is_dir, manifest_path, sub=sub)
+            st = apply_manifest(
+                outpath, is_dir, manifest_path, sub=sub, window_ns=window_ns, excludes=excludes
+            )
 
         if not opts.meta_only and opts.delete and is_dir:
-            excludes = entry_cfg.get("excludes", []) if entry_cfg else []
             delete_status = _delete_extras(
                 manifest_path, outpath, sub, excludes, opts=opts, entry=entry
             )
@@ -889,38 +892,9 @@ def _single_file_size(manifest_path: str) -> int | None:
     return None
 
 
-# The two sides of the status / pull --delete diff: the manifest and a fresh
-# local walk, each as an ascending (entry_sort_key, item) stream that
-# manifest.merge_join pairs up in one pass - constant memory, so a manifest
-# far larger than RAM still works. rels on both sides are sub-relative and
-# '.'-free ("." for the root itself, "x/y" below it).
-
-
-def _manifest_keyed(
-    manifest_path: str, sub: str | None
-) -> Iterator[tuple[str, tuple[str, ManifestEntry]]]:
-    """Stream ``(sort_key, (rel, record))`` for every record at/under ``sub``."""
-    for entry in manifest.iter_manifest(manifest_path):
-        rel = resolve_manifest_rel(entry.path, sub)
-        if rel is None:
-            continue
-        yield manifest.entry_sort_key(rel, entry.is_dir), (rel, entry)
-
-
-def _local_keyed(
-    outpath: str, excludes: list[str]
-) -> Iterator[tuple[str, tuple[str, os.stat_result, str | None]]]:
-    """Stream ``(sort_key, (rel, lstat, sym_target))`` for the local tree.
-
-    The manifest walk under ``outpath``, excludes applied outpath-relative -
-    an excluded path is invisible to the diff on both lanes (never compared,
-    never a local extra). A missing ``outpath`` yields nothing, so status
-    degrades to reporting every record D."""
-    if not os.path.lexists(outpath):
-        return
-    for rel, st, sym in localwalk.walk_tree(outpath, excludes):
-        norm = "." if rel == "." else rel.removeprefix("./")
-        yield manifest.entry_sort_key(rel, stat_mod.S_ISDIR(st.st_mode)), (norm, st, sym)
+# The status / pull --delete diff runs on the manifest-vs-local-walk merge-join
+# (restore.manifest_keyed / restore.local_keyed), the same streams the pull
+# metadata apply consumes.
 
 
 def _delete_extras(
@@ -948,7 +922,7 @@ def _delete_extras(
             confirmer = DeleteConfirmer(mode, entry)
     extras: list[tuple[str, bool]] = []
     for _key, m, loc in manifest.merge_join(
-        _manifest_keyed(manifest_path, sub), _local_keyed(outpath, excludes)
+        manifest_keyed(manifest_path, sub), local_keyed(outpath, excludes)
     ):
         if m is None and loc is not None:
             rel, st, _sym = loc
@@ -1033,7 +1007,7 @@ def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
         # current pair in memory. The walk's lstat/readlink feed the compare,
         # so no path is stat'd twice.
         for _key, m, loc in manifest.merge_join(
-            _manifest_keyed(manifest_path, sub), _local_keyed(outpath, excludes)
+            manifest_keyed(manifest_path, sub), local_keyed(outpath, excludes)
         ):
             if m is not None:
                 rel, entry_obj = m
