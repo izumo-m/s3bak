@@ -39,8 +39,11 @@ prefix = "s3://my-bucket/backup"
 #                      default 0.01 = 10ms, 0 = exact st_mtime_ns match). The
 #                      default absorbs the rounding of NTFS (100ns) and exFAT
 #                      (10ms) so a pull onto them cannot re-download an unchanged
-#                      file forever; a coarser filesystem (FAT32 2s, HFS+ 1s)
-#                      needs a larger value here. Overridable per entry.
+#                      file forever; a filesystem with coarser timestamps needs
+#                      a larger value here: FAT32 2s, HFS+ 1s, WSL2 drvfs
+#                      (/mnt/c) 1s (it truncates utime writes to whole seconds
+#                      even though it reads NTFS mtimes at 100ns). Overridable
+#                      per entry.
 #
 # max_concurrency = 10
 # compare_workers = 10

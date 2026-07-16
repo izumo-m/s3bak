@@ -21,8 +21,11 @@ from s3bak.store import Boto3S3Store
 # Default mtime window for the size+mtime check (seconds). 2s absorbs every common
 # restored mtime. 10 ms absorbs the rounding of the common modern filesystems -
 # NTFS's 100 ns and exFAT's 10 ms - so a pull onto them cannot loop re-downloading
-# an unchanged file. Coarser filesystems (FAT32 2 s, HFS+ 1 s) need a larger
-# value set in config.py. Seconds, fractional allowed (0 = exact st_mtime_ns).
+# an unchanged file. Filesystems that store or set coarser timestamps need a
+# larger value in config.py: FAT32 2 s, HFS+ 1 s, and WSL2 drvfs (/mnt/c),
+# which reads NTFS mtimes at 100 ns but truncates utime writes to whole
+# seconds, so a pull onto it needs >= 1 s. Seconds, fractional allowed
+# (0 = exact st_mtime_ns).
 DEFAULT_MTIME_WINDOW = 0.01
 
 

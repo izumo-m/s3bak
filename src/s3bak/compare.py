@@ -99,13 +99,15 @@ def _humanize_duration(diff_sec: int) -> str:
     return sign + " ".join(parts[:2])
 
 
-def _fmt_mtime(mtime_ns: int) -> str:
+def _fmt_mtime(mtime_ns: int, *, subsecond: bool = False) -> str:
+    secs, frac_ns = divmod(mtime_ns, 1_000_000_000)
     try:
-        return datetime.datetime.fromtimestamp(mtime_ns / 1_000_000_000).strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
+        text = datetime.datetime.fromtimestamp(secs).strftime("%Y-%m-%d %H:%M:%S")
     except (OSError, OverflowError, ValueError):
         return f"{mtime_ns}ns"
+    if subsecond:
+        text += "." + (f"{frac_ns:09d}".rstrip("0") or "0")
+    return text
 
 
 @dataclass
@@ -236,8 +238,13 @@ def compare_to_stat(
 
     if entry.mtime_ns is not None and abs(st.st_mtime_ns - entry.mtime_ns) > window_ns:
         loc_mtime_ns = st.st_mtime_ns
-        fmt_local = _fmt_mtime(loc_mtime_ns)
-        fmt_remote = _fmt_mtime(entry.mtime_ns)
+        diff_ns = loc_mtime_ns - entry.mtime_ns
+        # A sub-second drift (e.g. WSL2 drvfs truncates a restored mtime to
+        # whole seconds) renders as two identical second-precision timestamps,
+        # so show the fractional digits that actually differ.
+        subsecond = abs(diff_ns) < 1_000_000_000
+        fmt_local = _fmt_mtime(loc_mtime_ns, subsecond=subsecond)
+        fmt_remote = _fmt_mtime(entry.mtime_ns, subsecond=subsecond)
         diff.status = "M"
         diff.tags.append("mtime")
         if entry.mtime_ns < loc_mtime_ns:
@@ -248,7 +255,14 @@ def compare_to_stat(
             cmp = ">"
             remote_disp = _color_wrap(fmt_remote, use_color)
             local_disp = fmt_local
-        diff_str = _humanize_duration((loc_mtime_ns - entry.mtime_ns) // 1_000_000_000)
+        if subsecond:
+            diff_str = f"{diff_ns / 1_000_000_000:+.9f}".rstrip("0") + "s"
+        else:
+            # Difference of the displayed whole seconds, so the number always
+            # agrees with the two rendered timestamps.
+            diff_str = _humanize_duration(
+                loc_mtime_ns // 1_000_000_000 - entry.mtime_ns // 1_000_000_000
+            )
         diff.details.append(f"mtime: remote={remote_disp} {cmp} local={local_disp} ({diff_str})")
 
     return diff
