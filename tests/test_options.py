@@ -56,6 +56,21 @@ def test_meta_only_records_mode_change_and_clears_status(ws):
     assert res.out.strip() == ""
 
 
+def test_push_meta_only_dry_run_validates_the_manifest(ws):
+    # A dry run performs the read-only work for real: the --meta-only refresh
+    # downloads and validates the old manifest, so a damaged one fails the
+    # rehearsal exactly like the real push.
+    ws.write("data/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    ws.s3.put_object(
+        Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl", Body=b"not a manifest\n"
+    )
+    res = ws.run("push", "--meta-only", "--dry-run", "data")
+    assert res.rc == 1
+
+
 def test_push_data_only_skips_manifest_refresh(ws):
     ws.write("data/a.txt", "a")
     ws.config({"data": {"path": str(ws.root / "data")}})
@@ -143,17 +158,18 @@ def test_push_checksum_data_only_still_warns(ws):
     assert "1 object(s) the manifest does not record" in res.err
 
 
-def test_push_data_only_dry_run_does_not_warn(ws):
-    # A dry run uploads nothing, so there is nothing to warn about; the
-    # planned upload is still reported.
+def test_push_data_only_dry_run_previews_the_warning(ws):
+    # The dry run makes the same lane decisions as the real push, so it
+    # previews the warning ("would upload") while transferring nothing.
     ws.write("data/a.txt", "a")
     ws.config({"data": {"path": str(ws.root / "data")}})
     ws.run("push", "data", expect_rc=0)
 
     ws.write("data/new.txt", "n")
     res = ws.run("push", "--data-only", "--dry-run", "data", expect_rc=0)
-    assert "does not record" not in res.err
+    assert "would upload 1 object(s) the manifest does not record" in res.err
     assert "new.txt" in res.out
+    assert "data/new.txt" not in ws.keys()  # nothing was actually uploaded
 
 
 def test_subpath_push_data_only_warns_about_unrecorded_uploads(ws):

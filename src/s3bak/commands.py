@@ -94,6 +94,19 @@ def upload_manifest(
 
     if opts.dryrun:
         print(f"(dry-run) would update manifest: {manifest.manifest_key(entry)}")
+        # The walk and merge write only a local temp file: run them so the
+        # rehearsal emits the same structural warnings as the real push,
+        # skipping only the upload.
+        write_manifest_to_aws(
+            cfg,
+            entry,
+            target,
+            excludes,
+            opts.verbose,
+            old_manifest=old_manifest,
+            keep_old=keep_old,
+            upload=False,
+        )
         return _run_hook("post_hook", post_hook, opts)
 
     write_manifest_to_aws(
@@ -183,13 +196,13 @@ def _plan_data_only_creates(
     storage.md). The count feeds _warn_unrecorded_uploads after the sync.
     Everything still copies (the hook always returns True), and the tally is
     taken at decision time: a file that vanishes before its transfer
-    completes still counts (the sync reports that as its own warning).
-    Outside --data-only the lane is the plain default; a dry run transfers
-    nothing, so it has nothing to count. The manifest lookup reuses
-    plan.recorded(): --delete cannot combine with --data-only, so the delete
-    lane never queries the same stream."""
+    completes still counts (the sync reports that as its own warning). The
+    lane decides under --dry-run too, so a dry run previews the warning the
+    real push would emit. Outside --data-only the lane is the plain default.
+    The manifest lookup reuses plan.recorded(): --delete cannot combine with
+    --data-only, so the delete lane never queries the same stream."""
     count = [0]
-    if not opts.data_only or opts.dryrun:
+    if not opts.data_only:
         return True, count
 
     def note(info: Any) -> bool:
@@ -206,13 +219,16 @@ def _warn_unrecorded_uploads(entry: str, opts: Opts, count: list[int], compare: 
     `count` is the create-lane tally (the run that creates the object); a
     later --data-only push meets the same object as an update pair instead,
     which ManifestFilter re-uploads and counts, so the warning repeats on
-    every push while the object stays unrecorded."""
+    every push while the object stays unrecorded. A dry run makes the same
+    decisions without transferring, so it previews the warning (and its
+    exit 2) with "would upload" wording."""
     total = count[0]
-    if opts.data_only and not opts.dryrun and isinstance(compare, manifest.ManifestFilter):
+    if opts.data_only and isinstance(compare, manifest.ManifestFilter):
         total += compare.unknown_uploads
     if total:
+        verb = "would upload" if opts.dryrun else "uploaded"
         note_warning(
-            f"warning: {entry}: --data-only uploaded {total} object(s) the manifest"
+            f"warning: {entry}: --data-only {verb} {total} object(s) the manifest"
             f" does not record; run a push without --data-only to record them"
         )
 
@@ -286,9 +302,8 @@ def _push_sub(
                 # still needs it (the prompt flags candidates it does not
                 # record, and the patch reuses it as the old side), and
                 # --data-only reads it to warn about the uploads it leaves
-                # unrecorded. As in cmd_push, --dry-run keeps the download
-                # even when nothing will read it: read-only work runs for
-                # real in a dry run so problems surface.
+                # unrecorded. As in cmd_push, the download is read-only and
+                # runs under --dry-run too.
                 have_manifest = (
                     not opts.checksum or opts.delete or opts.data_only
                 ) and download_manifest(cfg, entry, manifest_path, opts.verbose)
@@ -515,7 +530,9 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         fd, old_path = tempfile.mkstemp(suffix=".jsonl")
         os.close(fd)
         try:
-            have_old = not opts.dryrun and download_manifest(cfg, entry, old_path, opts.verbose)
+            # The download runs under --dry-run too (read-only), so the
+            # rehearsal validates the manifest and previews the real merge.
+            have_old = download_manifest(cfg, entry, old_path, opts.verbose)
             return upload_manifest(
                 cfg,
                 entry,
@@ -546,10 +563,9 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 # whole-entry dir push always downloads the manifest: an
                 # ordinary push compares against it, any push uses it to notice
                 # objectless tree changes, and --data-only reads it to warn
-                # about the uploads it leaves unrecorded. --dry-run keeps the
-                # download even when nothing above will read it (--checksum
-                # --data-only): a dry run runs read-only work for real, so a
-                # problem like a damaged manifest surfaces here.
+                # about the uploads it leaves unrecorded. All of that is
+                # read-only, so it runs under --dry-run too - a rehearsal
+                # surfaces problems (e.g. a damaged manifest) here.
                 have_manifest = download_manifest(cfg, entry, manifest_path, opts.verbose)
                 if have_manifest:
                     plan.old_manifest = manifest_path

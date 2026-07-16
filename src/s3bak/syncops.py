@@ -18,7 +18,7 @@ from typing import Any
 
 from s3bak import localwalk, manifest
 from s3bak.config import Config, Opts
-from s3bak.console import note_warning, write_output, write_stderr
+from s3bak.console import err, note_warning, write_output, write_stderr
 from s3bak.manifest import ManifestEntry
 
 
@@ -31,14 +31,18 @@ def write_manifest_to_aws(
     *,
     old_manifest: str | None = None,
     keep_old: manifest.KeepOld = False,
+    upload: bool = True,
 ) -> None:
     """Walk `target` in S3 key order, stream the v3 manifest to a temp file,
     and upload it. For a directory entry the walk is merged with
     `old_manifest` under the `keep_old` policy, so records of kept-but-
     locally-vanished files survive the rewrite (see manifest.write_merged).
-    A single-file entry has one record and no merge."""
+    A single-file entry has one record and no merge. ``upload=False`` is the
+    dry-run preview: the walk and merge run for real - emitting the same
+    warnings as a real push - and only the S3 write is skipped."""
     key = manifest.manifest_key(entry)
-    write_stderr(f"Updating {cfg.prefix}/{key}\n")
+    if upload:
+        write_stderr(f"Updating {cfg.prefix}/{key}\n")
 
     fd, tmp = tempfile.mkstemp(suffix=".jsonl")
     try:
@@ -56,8 +60,9 @@ def write_manifest_to_aws(
                 st = os.lstat(target)
                 sym = os.readlink(target) if stat_mod.S_ISLNK(st.st_mode) else None
                 manifest.write_manifest(f, [(os.path.basename(target), st, sym)])
-        assert cfg.store is not None
-        cfg.store.put_file(key, tmp, verbose=verbose)
+        if upload:
+            assert cfg.store is not None
+            cfg.store.put_file(key, tmp, verbose=verbose)
     finally:
         os.unlink(tmp)
 
@@ -80,13 +85,11 @@ def patch_manifest_subtree(
     records are both in sort-key order, so this is a streaming merge
     (manifest.write_merged), not a read-all + sort. `old_manifest` is a
     caller-owned copy of the current manifest (the sub-path sync already
-    downloaded one); without it, this downloads its own.
+    downloaded one); without it, this downloads its own. A dry run computes
+    the whole patch for real - the download, the walk, the merge and its
+    warnings - and skips only the S3 write.
     """
     key = manifest.manifest_key(entry)
-    if opts.dryrun:
-        print(f"(dry-run) would patch manifest: {key} (sub={sub})")
-        return True
-
     own_old: str | None = None
     if old_manifest is None:
         fd_old, own_old = tempfile.mkstemp(suffix=".jsonl")
@@ -125,9 +128,12 @@ def patch_manifest_subtree(
                 keep_old=keep_old,
                 warn=note_warning,
             )
-        write_stderr(f"Updating {cfg.prefix}/{key}\n")
-        assert cfg.store is not None
-        cfg.store.put_file(key, new_path, verbose=opts.verbose)
+        if opts.dryrun:
+            print(f"(dry-run) would patch manifest: {key} (sub={sub})")
+        else:
+            write_stderr(f"Updating {cfg.prefix}/{key}\n")
+            assert cfg.store is not None
+            cfg.store.put_file(key, new_path, verbose=opts.verbose)
         return True
     finally:
         if own_old is not None:
@@ -227,8 +233,13 @@ def download_from_s3(
     # skipped when nothing changed. `size` (from the manifest record) routes a
     # large file through multipart download; a small one is a direct GetObject.
     if dryrun:
+        # The download writes the local file, so it is a mutation and stays
+        # skipped. No substitute probe either: a HeadObject can succeed or
+        # fail under different IAM permissions than the real GetObject, and a
+        # dry run must only make the calls the real run would make.
         write_output(f"(dry-run) download: {cfg.prefix}/{rel} -> {outpath}\n")
         return 0, True
     if not cfg.store.get_object(rel, outpath, size=size, verbose=verbose):
+        err(f"object missing on S3: {cfg.prefix}/{rel}")
         return 1, False
     return 0, True

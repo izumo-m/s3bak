@@ -335,6 +335,36 @@ def test_push_warns_when_a_kept_subtree_ends_up_under_a_file(ws):
     assert "./d" in res.err
 
 
+def test_push_dry_run_previews_the_kept_subtree_warning(ws):
+    # The dry run runs the manifest merge for real (upload skipped), so the
+    # same structural warning surfaces during the rehearsal.
+    ws.write("data/d/x.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    shutil.rmtree(ws.root / "data" / "d")
+    (ws.root / "data" / "d").write_text("now a file")
+    res = ws.run("push", "--dry-run", "data", expect_rc=0)
+
+    assert "non-directory" in res.err
+    assert "data/d" not in ws.keys()  # the conflicting file was not uploaded
+
+
+def test_pull_single_file_reports_missing_object(ws):
+    # A recorded single-file object deleted out-of-band: the pull must say
+    # what is missing, not just exit 1.
+    target = ws.write("solo.conf", "cfg")
+    ws.config({"solo.conf": {"path": str(target)}})
+    ws.run("push", "solo.conf", expect_rc=0)
+
+    ws.s3.delete_object(Bucket=ws.bucket, Key=f"{ws.prefix}/solo.conf")
+    target.write_text("locally changed")  # defeat the all-matching short-circuit
+    res = ws.run("pull", "solo.conf")
+
+    assert res.rc == 1
+    assert "object missing on S3" in res.err
+
+
 def test_pull_delete_removes_local_extras(ws):
     ws.write("data/keep.txt", "k")
     ws.config({"data": {"path": str(ws.root / "data")}})

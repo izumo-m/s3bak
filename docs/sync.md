@@ -260,8 +260,15 @@ Deleting is opt-in and confirmed:
   `--data-only` records the file. A single-file entry or a file sub-path
   push uploads without this warning.
 - **`--dry-run`** reports what would happen and changes nothing; planned actions
-  print with a `(dry-run)` marker. With `--delete` it lists every deletion
-  candidate without prompting. Applies to pull too (see below).
+  print with a `(dry-run)` marker. Only mutations, hooks, and prompts are
+  suppressed: every no-change step — listings, the manifest download and
+  validation, the compare decisions, the manifest merge (to a local temp
+  file, surfacing its warnings) — runs for real, making exactly the calls
+  the real run would make (never a substitute call, whose permissions could
+  differ), so a rehearsal fails or warns where the real command would. With
+  `--delete` it lists every deletion candidate without prompting; with
+  `--data-only` it previews the unrecorded-upload warning as "would upload".
+  Applies to pull too (see below).
 
 ## The pull pipeline
 
