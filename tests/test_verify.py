@@ -196,3 +196,16 @@ def test_verify_rejects_inapplicable_options(ws):
     assert res.rc == 1 and "--delete only applies to" in res.err
     res = ws.run("verify", "--mtime-window", "1", "data")
     assert res.rc == 1 and "--mtime-window requires --checksum" in res.err
+
+
+def test_verify_reports_strays_under_single_file_entry(ws):
+    # A file-shaped manifest records nothing below entry/; verify sweeps that
+    # listing so out-of-band uploads and type-change residue stay visible.
+    ws.write("data", "hello")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/rogue", Body=b"r")
+
+    res = ws.run("verify", "data", expect_rc=0)  # cli.main; cli.run maps warnings to 2
+    assert "unrecorded object" in res.err and "data/rogue" in res.err
+    assert "1 warning(s)" in res.out

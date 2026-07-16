@@ -230,26 +230,65 @@ def test_subpath_push_of_excluded_subtree_backs_it_up(ws):
     assert "data: OK" in res.out
 
 
-def test_entry_dir_replaced_by_same_stat_file_reuploads(ws):
-    # The entry path was a directory; it becomes a single file whose stat
-    # matches a record inside the stale dir manifest. The size+mtime check must
-    # match records by rel (the basename), not by stat coincidence.
+def test_entry_dir_replaced_by_file_refuses_without_delete(ws):
+    # The entry path was a directory; it becomes a single file. An ordinary
+    # push must refuse - recording the new kind would silently orphan the old
+    # tree's objects - and leave the backup untouched.
     import shutil
 
     ws.write("data/a.txt", "hello")
     ws.config({"data": {"path": str(ws.root / "data")}})
     ws.run("push", "data", expect_rc=0)
 
-    st = os.lstat(ws.root / "data" / "a.txt")
     shutil.rmtree(ws.root / "data")
-    f = ws.root / "data"
-    f.write_text("hello")  # same size as the old ./a.txt record
-    os.utime(f, ns=(st.st_mtime_ns, st.st_mtime_ns))  # and the same mtime
+    (ws.root / "data").write_text("bye")
 
-    res = ws.run("push", "data", expect_rc=0)
-    assert "upload:" in res.out
+    res = ws.run("push", "data", expect_rc=1)
+    assert "push --delete replaces the old backup" in res.err
+    assert "data/a.txt" in ws.keys()  # the refused push changed nothing
+
+
+def test_entry_dir_replaced_by_file_migrates_with_delete(ws):
+    # push --delete --yes migrates the entry kind: the old tree's objects are
+    # deleted and the single-file backup (object + file-shaped manifest)
+    # replaces them, so every later command sees a consistent backup.
+    import shutil
+
+    ws.write("data/a.txt", "hello")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    shutil.rmtree(ws.root / "data")
+    (ws.root / "data").write_text("bye")
+
+    res = ws.run("push", "--delete", "--yes", "data", expect_rc=0)
+    assert "delete:" in res.out and "upload:" in res.out
+    assert "data/a.txt" not in ws.keys()
     body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data")["Body"].read()
-    assert body == b"hello"
+    assert body == b"bye"
+    ws.run("verify", "data", expect_rc=0)
+
+
+def test_entry_file_replaced_by_dir_migrates_with_delete(ws):
+    # The reverse kind change: a single-file entry becomes a directory. The
+    # ordinary push refuses; --delete --yes deletes the old exact object and
+    # records the directory from scratch (a bare-basename record must never
+    # survive into a directory manifest).
+    ws.write("data", "hello")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    os.remove(ws.root / "data")
+    ws.write("data/b.txt", "b")
+
+    ws.run("push", "data", expect_rc=1)
+    ws.run("push", "--delete", "--yes", "data", expect_rc=0)
+    assert "data" not in ws.keys()
+    assert "data/b.txt" in ws.keys()
+    ws.run("verify", "data", expect_rc=0)
+    dest = ws.root / "out"
+    ws.run("pull", "data", "-o", str(dest), expect_rc=0)
+    assert (dest / "b.txt").read_text() == "b"
 
 
 def test_first_subpath_push_keeps_dir_entry_shape(ws):

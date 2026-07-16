@@ -22,6 +22,12 @@ from s3bak.console import err, note_warning, write_output, write_stderr
 from s3bak.manifest import ManifestEntry
 
 
+def _walk_warning(body: str) -> None:
+    """The manifest walk's warn hook: boto3-s3 message bodies -> one warning
+    line each (exit 2), aws-cli's own prefix included."""
+    note_warning(f"warning: {body}")
+
+
 def write_manifest_to_aws(
     cfg: Config,
     entry: str,
@@ -37,9 +43,12 @@ def write_manifest_to_aws(
     and upload it. For a directory entry the walk is merged with
     `old_manifest` under the `keep_old` policy, so records of kept-but-
     locally-vanished files survive the rewrite (see manifest.write_merged).
-    A single-file entry has one record and no merge. ``upload=False`` is the
-    dry-run preview: the walk and merge run for real - emitting the same
-    warnings as a real push - and only the S3 write is skipped."""
+    A single-file entry has one record and no merge. The walk itself warns
+    (exit 2) when it cannot see the whole tree - an unreadable directory, a
+    path racing away mid-walk - since the manifest it feeds is the record of
+    what the push saw. ``upload=False`` is the dry-run preview: the walk and
+    merge run for real - emitting the same warnings as a real push - and only
+    the S3 write is skipped."""
     key = manifest.manifest_key(entry)
     if upload:
         write_stderr(f"Updating {cfg.prefix}/{key}\n")
@@ -52,7 +61,7 @@ def write_manifest_to_aws(
                     f,
                     old_manifest,
                     None,
-                    localwalk.walk_tree(target, excludes),
+                    localwalk.walk_tree(target, excludes, warn=_walk_warning),
                     keep_old=keep_old,
                     warn=note_warning,
                 )
@@ -83,37 +92,26 @@ def patch_manifest_subtree(
     target_root/sub may be a file, a symlink, or a directory. If it does not
     exist locally, the records under `sub` are simply removed. Old and new
     records are both in sort-key order, so this is a streaming merge
-    (manifest.write_merged), not a read-all + sort. `old_manifest` is a
-    caller-owned copy of the current manifest (the sub-path sync already
-    downloaded one); without it, this downloads its own. A dry run computes
-    the whole patch for real - the download, the walk, the merge and its
-    warnings - and skips only the S3 write.
+    (manifest.write_merged), not a read-all + sort. `old_manifest` is the
+    caller's already-validated copy of the current manifest - every sub-path
+    push downloads it before mutating S3 - and None means the entry has no
+    manifest yet. A dry run computes the whole patch for real - the walk, the
+    merge and its warnings - and skips only the S3 write.
     """
     key = manifest.manifest_key(entry)
-    own_old: str | None = None
-    if old_manifest is None:
-        fd_old, own_old = tempfile.mkstemp(suffix=".jsonl")
-        os.close(fd_old)
+    if old_manifest is None and not os.path.lexists(target_root):
+        # Deleting a never-backed sub-path beneath a root that is gone has
+        # no manifest state to update (and no root metadata from which to
+        # create a valid directory manifest).
+        return False
     fd_new, new_path = tempfile.mkstemp(suffix=".jsonl")
     os.close(fd_new)  # reopened by name below; closing now avoids an fd leak on error
     try:
-        if old_manifest is not None:
-            old_path = old_manifest
-            have_old = True
-        else:
-            assert own_old is not None
-            old_path = own_old
-            have_old = download_manifest(cfg, entry, old_path, opts.verbose)
-        if not have_old and not os.path.lexists(target_root):
-            # Deleting a never-backed sub-path beneath a root that is gone has
-            # no manifest state to update (and no root metadata from which to
-            # create a valid directory manifest).
-            return False
         local_sub = os.path.join(target_root, sub)
         new_entries: Iterator[tuple[str, os.stat_result, str | None]] = iter(())
         if os.path.lexists(local_sub):
-            new_entries = localwalk.iter_subtree(local_sub, sub, excludes)
-        if not have_old:
+            new_entries = localwalk.iter_subtree(local_sub, sub, excludes, warn=_walk_warning)
+        if old_manifest is None:
             # First-ever manifest for this entry, born from a sub-path push:
             # record the entry root too, so the manifest keeps the dir-entry
             # shape ('.'-rooted) and the root's metadata restores on pull.
@@ -122,7 +120,7 @@ def patch_manifest_subtree(
         with open(new_path, "w", encoding="utf-8") as out:
             manifest.write_merged(
                 out,
-                old_path if have_old else None,
+                old_manifest,
                 sub,
                 new_entries,
                 keep_old=keep_old,
@@ -136,8 +134,6 @@ def patch_manifest_subtree(
             cfg.store.put_file(key, new_path, verbose=opts.verbose)
         return True
     finally:
-        if own_old is not None:
-            os.unlink(own_old)
         os.unlink(new_path)
 
 

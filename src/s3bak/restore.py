@@ -109,6 +109,43 @@ def within_root(root_real: str, target: str) -> bool:
 # =============================================================================
 
 
+def prepare_dir_conflicts(outpath: str, manifest_path: str, sub: str | None) -> int:
+    """Replace a local symlink sitting where the manifest records a directory,
+    BEFORE the data sync runs: the sync opens ``dir/file`` paths through
+    whatever is at ``dir``, so a pre-existing symlink there would route the
+    downloads outside the restore tree. The metadata apply would repair the
+    type anyway - this makes the repair happen before any bytes move. Other
+    conflicting types stay untouched here: a write through a regular file
+    fails loudly instead of escaping, and apply_manifest settles it after the
+    download. Symlinks are removed as links, never followed. Returns the
+    number of conflicts that could not be cleared (each reported)."""
+    errors = 0
+    root_real = canonical_restore_path(outpath)
+    for entry in manifest.iter_manifest(manifest_path):
+        if not entry.is_dir:
+            continue
+        rel = resolve_manifest_rel(entry.path, sub)
+        if rel is None or rel == ".":
+            continue  # the pull corrects the restore root itself
+        target = os.path.join(outpath, rel)
+        # Records arrive parents-first, so by the time a child is checked its
+        # ancestors are real directories and one islink test per record is
+        # enough (a link behind a fixed parent cannot survive to this point).
+        if not os.path.islink(target):
+            continue
+        if not within_root(root_real, target):
+            err(f"manifest path escapes restore root, skipped: {entry.path}")
+            errors += 1
+            continue
+        try:
+            os.remove(target)
+            os.makedirs(target, exist_ok=True)
+        except OSError as e:
+            err(f"cannot replace symlink with recorded directory: {target}: {e}")
+            errors += 1
+    return errors
+
+
 def windows_collect_writable_prep(
     outpath: str, is_dir: bool, manifest_path: str, sub: str | None
 ) -> list[tuple[str, int]]:
@@ -416,7 +453,7 @@ def apply_manifest(
 
 def remove_extras(
     extras: list[tuple[str, bool]], *, dryrun: bool = False, confirm: DeleteConfirmer | None = None
-) -> int:
+) -> tuple[int, int]:
     """Remove local extras (pull ``--delete``): ``(path, is_dir)`` pairs the
     status/--delete merge-join found on the local side only. ``is_dir`` is the
     lstat kind, so a symlink - even one pointing at a directory - is unlinked,
@@ -427,9 +464,12 @@ def remove_extras(
     ``dryrun`` reports each candidate in the same order without removing it.
     ``confirm`` asks per extra, in the same deepest-first order; keeping an
     item silently keeps its ancestor directories too (their rmdir could only
-    fail), and a kept item is a choice, not a failure. Returns the number of
-    failed removals."""
+    fail), and a kept item is a choice, not a failure. Returns
+    ``(failed_removals, removals)`` - the second drives the caller's
+    directory-metadata re-settle, since every removal bumps its parent
+    directory's mtime."""
     errors = 0
+    removed = 0
     extras.sort(key=lambda x: x[0], reverse=True)
     # A set rather than a "last kept path" cursor: on Windows the reverse path
     # order can interleave siblings between a directory and its descendants
@@ -453,8 +493,9 @@ def remove_extras(
                 os.rmdir(path)
             else:
                 os.remove(path)
+            removed += 1
             write_output(f"delete: {path}\n")
         except OSError as e:
             err(f"delete failed: {path}: {e}")
             errors += 1
-    return errors
+    return errors, removed

@@ -16,7 +16,7 @@ import stat as stat_mod
 import sys
 import tempfile
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
@@ -435,21 +435,15 @@ class Boto3S3Store:
                 raise
         return True
 
-    def delete_subtree(
-        self, rel_key: str, *, dryrun: bool = False, verbose: bool = False
+    def delete_objects(
+        self, rel_keys: Iterable[str], *, dryrun: bool = False, verbose: bool = False
     ) -> TransferResult:
-        """Delete the object at ``rel_key`` and objects below ``rel_key/``.
+        """Delete the objects at ``rel_keys`` (entry-relative), streaming.
 
-        Used by an explicit missing sub-path push with ``--delete``. Listing is
-        boundary-filtered so a request for ``docs`` can never remove a sibling
-        such as ``docs.txt``. DeleteObjects batches stay within S3's 1,000-key
-        limit; service-level per-key failures are returned as a failed result.
+        DeleteObjects batches stay within S3's 1,000-key limit; service-level
+        per-key failures are returned as a failed result. ``dryrun`` reports
+        the would-be deletions without calling S3.
         """
-        api_base = self._api_key(rel_key)
-        prefix = api_base + "/"
-        if verbose:
-            write_stderr(f"+ (boto3) delete subtree s3://{self.bucket}/{api_base}\n")
-
         lines: list[str] = []
         errors: list[str] = []
         pending: list[dict[str, str]] = []
@@ -458,6 +452,10 @@ class Boto3S3Store:
             if not pending or dryrun:
                 pending.clear()
                 return
+            if verbose:
+                write_stderr(
+                    f"+ (boto3) delete_objects s3://{self.bucket}/ ({len(pending)} key(s))\n"
+                )
             response = self._client.delete_objects(
                 Bucket=self.bucket,
                 Delete={"Objects": list(pending), "Quiet": True},
@@ -466,32 +464,40 @@ class Boto3S3Store:
                 errors.append(f"{item.get('Key', '?')}: {item.get('Code', 'delete failed')}")
             pending.clear()
 
-        def queue(key: str) -> None:
-            rel = key[len(self.path_prefix) + 1 :] if self.path_prefix else key
-            marker = "(dry-run) " if dryrun else ""
+        marker = "(dry-run) " if dryrun else ""
+        for rel in rel_keys:
             lines.append(f"{marker}delete: {self._s3_url(rel)}")
-            pending.append({"Key": key})
+            pending.append({"Key": self._api_key(rel)})
             if len(pending) == 1000:
                 flush()
-
-        # Probe the exact object separately, then list only the slash-bounded
-        # descendants. Listing Prefix=api_base would also scan every similarly
-        # named sibling (docs.txt, docs-archive, ...), which can be arbitrarily
-        # expensive even though the boundary filter would spare them.
-        if self.head_object(rel_key, verbose=verbose) is not None:
-            queue(api_base)
-
-        paginator = self._client.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
-            for item in page.get("Contents", []):
-                key = str(item["Key"])
-                queue(key)
         flush()
         return TransferResult(
             returncode=1 if errors else 0,
             stdout="\n".join(lines),
             stderr="\n".join(errors),
         )
+
+    def delete_subtree(
+        self, rel_key: str, *, dryrun: bool = False, verbose: bool = False
+    ) -> TransferResult:
+        """Delete the object at ``rel_key`` and objects below ``rel_key/``.
+
+        Used by an explicit missing sub-path push with ``--delete`` and by the
+        entry type-change migration. The exact object is probed separately and
+        the listing is slash-bounded (``iter_objects``), so a request for
+        ``docs`` can never remove - or even scan - a sibling such as
+        ``docs.txt``.
+        """
+        if verbose:
+            write_stderr(f"+ (boto3) delete subtree s3://{self.bucket}/{self._api_key(rel_key)}\n")
+
+        def doomed_keys() -> Iterator[str]:
+            if self.head_object(rel_key, verbose=verbose) is not None:
+                yield rel_key
+            for meta in self.iter_objects(rel_key, verbose=verbose):
+                yield f"{rel_key}/{meta.key}"
+
+        return self.delete_objects(doomed_keys(), dryrun=dryrun, verbose=verbose)
 
     def stream_object_to_stdout(self, rel_key: str, *, verbose: bool = False) -> int:
         from botocore.exceptions import ClientError

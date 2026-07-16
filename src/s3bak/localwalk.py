@@ -11,7 +11,8 @@ customizes exclude pruning:
 - **complete enumeration**: boto3-s3 returns directories, broken symlinks,
   special files, and unreadable entries before filtering. With symlink following
   disabled, links surface as lstat-based leaves and are never descended. An
-  unreadable directory degrades silently to its own record with no children;
+  unreadable directory degrades to its own record with no children (reported
+  through ``walk_tree``'s ``warn`` when the caller wires one);
 - **excludes as pruning**: a ``dir/*`` pattern drops the directory child before
   the walk descends, so an excluded subtree costs nothing;
 - **directories in-stream**: each directory's record is yielded between the
@@ -35,7 +36,7 @@ from boto3_s3.types import FileKind
 from s3bak.manifest import path_match, split_excludes
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
 
 class ManifestWalker(LocalFileGenerator):
@@ -44,12 +45,47 @@ class ManifestWalker(LocalFileGenerator):
     One instance serves one walk: it carries the exclude patterns and the
     ``rel_prefix`` that anchors them at the entry root (``"./"``, or
     ``"./{sub}/"`` for a sub-path push).
+
+    The walker also tracks scan completeness: a warn-skip that hides real
+    tree content (an unreadable directory or file, a path that vanished
+    mid-walk) sets ``scan_incomplete``, which ``push --delete`` consults to
+    refuse deletions decided on a partial local view (an S3 object whose
+    local file the walk could not see is not an orphan). Special-file skips
+    are the sync's normal, recurring behaviour and do not count.
     """
 
     def __init__(self, prune: list[str], skip: list[str], rel_prefix: str) -> None:
         self._prune = prune
         self._skip = skip
         self._rel_prefix = rel_prefix
+        self.scan_incomplete = False
+
+    def _completeness_watch(self, notify: Callable[[str], None]) -> Callable[[str], None]:
+        """Wrap a warn-skip ``notify`` so every skip of real content marks the
+        scan incomplete before the warning goes wherever it was going."""
+
+        def wrapped(body: str) -> None:
+            if "special device" not in body:
+                self.scan_incomplete = True
+            notify(body)
+
+        return wrapped
+
+    def triggers_warning(self, path: str, notify: Callable[[str], None]) -> bool:
+        return super().triggers_warning(path, self._completeness_watch(notify))
+
+    def should_ignore_entry(
+        self,
+        entry: os.DirEntry[str],
+        full: str,
+        dir_fd: int | None,
+        st: os.stat_result,
+        *,
+        notify: Callable[[str], None],
+    ) -> bool:
+        return super().should_ignore_entry(
+            entry, full, dir_fd, st, notify=self._completeness_watch(notify)
+        )
 
     def finalize_children(self, children: list[WalkChild]) -> list[WalkChild]:
         # The exclude pruning: rels are entry-rooted via rel_prefix, matching
@@ -73,7 +109,7 @@ class ManifestWalker(LocalFileGenerator):
         return self.normalize_sort(kept)
 
 
-def sync_walker(excludes: list[str], sub: str | None = None) -> ManifestWalker | None:
+def sync_walker(excludes: list[str], sub: str | None = None) -> ManifestWalker:
     """The data sync's local-side walk: the manifest walk's exclude pruning.
 
     Sharing ``ManifestWalker`` is what makes the sync and the manifest agree
@@ -83,16 +119,20 @@ def sync_walker(excludes: list[str], sub: str | None = None) -> ManifestWalker |
     to the sync as an ordinary orphan and ``push --delete`` can retire it,
     instead of the exclude hiding it from every lane forever. ``sub``
     re-roots a sub-path sync's rels at ``./{sub}/`` so the entry's patterns
-    keep their entry-rooted meaning. Returns None (boto3-s3's stock walk)
-    when there is nothing to exclude."""
-    if not excludes:
-        return None
+    keep their entry-rooted meaning. Always a ``ManifestWalker`` - with no
+    excludes the pruning is a no-op - because the push delete lane reads the
+    walker's ``scan_incomplete`` flag."""
     prune, skip = split_excludes(excludes)
     return ManifestWalker(prune, skip, f"./{sub}/" if sub else "./")
 
 
 def walk_tree(
-    root: str, excludes: list[str], *, root_rel: str = ".", rel_prefix: str = "./"
+    root: str,
+    excludes: list[str],
+    *,
+    root_rel: str = ".",
+    rel_prefix: str = "./",
+    warn: Callable[[str], None] | None = None,
 ) -> Iterator[tuple[str, os.stat_result, str | None]]:
     """Walk a directory tree yielding ``(rel, lstat, sym_target | None)`` in
     S3 key order - the items one manifest record each.
@@ -102,7 +142,11 @@ def walk_tree(
     push passes "./{sub}" / "./{sub}/" so every rel (and thus every exclude
     match) stays anchored at the ENTRY root, where the configured patterns are
     defined. A missing ``root`` raises OSError (the caller checked existence);
-    an unreadable directory keeps its record and silently loses its children.
+    an unreadable directory keeps its record and loses its children, and a
+    path that changes underfoot mid-walk is skipped - ``warn`` (when given)
+    receives one message per such gap, so a manifest walk can surface that it
+    did not see the whole tree. ``warn=None`` walks silently (the status /
+    pull diff, whose manifest-vs-local comparison fails safe on a gap).
     """
     prune, skip = split_excludes(excludes)
     yield root_rel, os.lstat(root), None
@@ -113,7 +157,7 @@ def walk_tree(
         follow_symlinks=False,
         enumerate_all_entries=True,
     )
-    for info in storage.walk_local():
+    for info in storage.walk_local(on_warning=warn):
         assert info.compare_key is not None and info.stat_result is not None
         if not info.compare_key:
             continue  # root was emitted above to preserve missing-root errors
@@ -126,12 +170,16 @@ def walk_tree(
             try:
                 sym = os.readlink(info.key.replace("/", os.sep))
             except OSError:
-                continue  # raced away between the scan and here
+                # Raced away (or changed type) between the scan and here; the
+                # record is dropped, so the walk is incomplete.
+                if warn is not None:
+                    warn(f"Skipping file {info.key}. File changed during the walk.")
+                continue
         yield rel_prefix + info.compare_key, info.stat_result, sym
 
 
 def iter_subtree(
-    local_sub: str, sub: str, excludes: list[str]
+    local_sub: str, sub: str, excludes: list[str], *, warn: Callable[[str], None] | None = None
 ) -> Iterator[tuple[str, os.stat_result, str | None]]:
     """Walk items for a sub-path push: ``local_sub`` as recorded under
     ``./{sub}``. Handles the file / symlink / directory cases. The walk rels
@@ -144,4 +192,6 @@ def iter_subtree(
     if not os.path.isdir(local_sub):
         yield f"./{sub}", st, None
         return
-    yield from walk_tree(local_sub, excludes, root_rel=f"./{sub}", rel_prefix=f"./{sub}/")
+    yield from walk_tree(
+        local_sub, excludes, root_rel=f"./{sub}", rel_prefix=f"./{sub}/", warn=warn
+    )

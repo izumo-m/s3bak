@@ -54,8 +54,11 @@ storage class, so none of these checks costs an extra S3 call:
   distinguished from an entry that was never pushed at all.
 
 A single-file entry has no listing to stream; its one record is checked with
-an exact head-object probe instead. A sub-path (`verify entry/sub`) scopes the
-join to that subtree, like `status`.
+an exact head-object probe (existence and size) instead, plus one
+slash-bounded listing of `entry/` that reports anything there as unrecorded —
+the residue of a directory that became this file, or an out-of-band upload,
+which no other command's listing can see (`push --delete` retires them). A
+sub-path (`verify entry/sub`) scopes the join to that subtree, like `status`.
 
 ## The content check (`--checksum`)
 

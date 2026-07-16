@@ -155,6 +155,27 @@ def test_remove_extras_reports_deletion_failure(tmp_path, monkeypatch, capfd):
 
     monkeypatch.setattr(restore.os, "remove", fail_remove)
 
-    assert restore.remove_extras([(str(extra), False)]) == 1
+    assert restore.remove_extras([(str(extra), False)]) == (1, 0)
     assert extra.exists()
     assert "delete failed" in capfd.readouterr().err
+
+
+def test_pull_replaces_inner_symlink_directory_without_writing_through_it(ws):
+    # A pre-existing local symlink where the manifest records a DIRECTORY
+    # would route the sync's downloads outside the restore tree; the pull
+    # replaces it with a real directory before any bytes move.
+    ws.write("data/sub/f.txt", "backup")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    victim = ws.root / "victim"
+    victim.mkdir()
+    dest = ws.root / "out"
+    dest.mkdir()
+    os.symlink(victim, dest / "sub")
+
+    ws.run("pull", "data", "-o", str(dest), expect_rc=0)
+
+    assert not (dest / "sub").is_symlink()
+    assert (dest / "sub" / "f.txt").read_text() == "backup"
+    assert not (victim / "f.txt").exists()
