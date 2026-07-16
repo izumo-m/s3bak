@@ -286,7 +286,9 @@ def _push_sub(
                 # still needs it (the prompt flags candidates it does not
                 # record, and the patch reuses it as the old side), and
                 # --data-only reads it to warn about the uploads it leaves
-                # unrecorded.
+                # unrecorded. As in cmd_push, --dry-run keeps the download
+                # even when nothing will read it: read-only work runs for
+                # real in a dry run so problems surface.
                 have_manifest = (
                     not opts.checksum or opts.delete or opts.data_only
                 ) and download_manifest(cfg, entry, manifest_path, opts.verbose)
@@ -544,7 +546,10 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 # whole-entry dir push always downloads the manifest: an
                 # ordinary push compares against it, any push uses it to notice
                 # objectless tree changes, and --data-only reads it to warn
-                # about the uploads it leaves unrecorded.
+                # about the uploads it leaves unrecorded. --dry-run keeps the
+                # download even when nothing above will read it (--checksum
+                # --data-only): a dry run runs read-only work for real, so a
+                # problem like a damaged manifest surfaces here.
                 have_manifest = download_manifest(cfg, entry, manifest_path, opts.verbose)
                 if have_manifest:
                     plan.old_manifest = manifest_path
