@@ -45,6 +45,8 @@ from s3bak.commands import (
     cmd_push,
     cmd_show,
     cmd_status,
+    cmd_verify,
+    verify_top_level,
 )
 from s3bak.compare import _resolve_use_color
 from s3bak.config import Config, Opts, load_config
@@ -297,6 +299,35 @@ _COMMAND_SPECS = {
             "s3bak status --all",
             "s3bak status -v bin",
             "s3bak status bin/s3bak",
+        ),
+    ),
+    "verify": _CommandSpec(
+        overview="Verify backup integrity on S3",
+        summary="Verify that the manifest and the stored objects agree, changing nothing.",
+        usage=(
+            "s3bak verify [options] <entry|path>...",
+            "s3bak verify [options] --all",
+        ),
+        arguments=(("<entry|path>...", "Entries or paths to verify"),),
+        options=("all", "checksum", "mtime_window", "verbose", "help"),
+        sections=(
+            (
+                "Checks",
+                (
+                    "Every manifest file record must have its data object, with the",
+                    "recorded size and a restorable storage class; directory, symlink,",
+                    "and special records must have none. Unrecorded objects and folder",
+                    "objects are reported. --all also inventories the prefix top level.",
+                    "--checksum additionally compares local file content against S3",
+                    "ETags and flags edits the size+mtime check can never see.",
+                    "Errors exit 1; a warnings-only run exits 2. Nothing is modified.",
+                ),
+            ),
+        ),
+        examples=(
+            "s3bak verify --all",
+            "s3bak verify bin",
+            "s3bak verify --all --checksum",
         ),
     ),
     "diff": _CommandSpec(
@@ -647,7 +678,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if opt_checksum and opt_meta_only:
         die("--checksum cannot be combined with --meta-only (no file data is compared)")
-    if opt_checksum and opt_mtime_window is not None:
+    # push/pull --checksum replaces the size+mtime check entirely, so a window is
+    # meaningless there. verify --checksum is the opposite: the window feeds the
+    # stat classification of content mismatches, and is useless without it.
+    if subcmd == "verify":
+        if opt_mtime_window is not None and not opt_checksum:
+            die("--mtime-window requires --checksum with verify (it classifies content mismatches)")
+    elif opt_checksum and opt_mtime_window is not None:
         die("--mtime-window cannot be combined with --checksum (content comparison ignores it)")
     if subcmd == "pull" and opt_delete and opt_meta_only:
         die("pull --delete cannot be combined with --meta-only")
@@ -709,6 +746,29 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_status(cfg_, entry_, opts_, sub=status_sub_by_entry.get(entry_))
 
         return run_entries(_status_one, cfg, entries, opts)
+
+    elif subcmd == "verify":
+        if opt_all:
+            entries = sorted(cfg.entries.keys())
+            verify_sub_by_entry: dict[str, str | None] = {e: None for e in entries}
+        else:
+            resolved = resolve_entry_files(cfg, positional, "verify")
+            verify_sub_by_entry = {}
+            for e, s in resolved:
+                if e in verify_sub_by_entry and verify_sub_by_entry[e] != s:
+                    die(f"conflicting sub paths for entry {e}")
+                verify_sub_by_entry[e] = s
+            entries = list(verify_sub_by_entry)
+
+        def _verify_one(cfg_: Config, entry_: str, opts_: Opts) -> int:
+            return cmd_verify(cfg_, entry_, opts_, sub=verify_sub_by_entry.get(entry_))
+
+        rc = run_entries(_verify_one, cfg, entries, opts)
+        if opt_all:
+            # The top-level inventory closes the sweep: warnings only, so the
+            # per-entry exit status stands and run() maps them to exit 2.
+            verify_top_level(cfg, opts)
+        return rc
 
     elif subcmd == "diff":
         entry, file = resolve_entry_file(cfg, positional, "diff")

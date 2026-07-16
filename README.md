@@ -84,6 +84,7 @@ Commands:
   pull        Restore entries or sub-paths from S3
   show        Print a backed-up file
   status      Compare local files with the backup
+  verify      Verify backup integrity on S3
   diff        Show content differences
   list        List locally configured entries
   ls-remote   List entries or files stored on S3
@@ -107,6 +108,8 @@ s3bak pull bin -o /tmp/out    # restore the bin entry to /tmp/out
 s3bak pull bin --delete --dry-run  # preview a mirror restore
 s3bak push --all --delete --yes    # unattended mirror (e.g. cron)
 s3bak push bin/subdir         # entry-rooted syntax; independent of CWD
+s3bak verify --all            # check manifests against stored objects
+s3bak verify --all --checksum # also compare local content to S3 ETags
 s3bak ls-remote               # list entries stored on S3
 ```
 

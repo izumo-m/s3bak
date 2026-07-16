@@ -77,7 +77,9 @@ with no local file there is nothing truthful to record, so the object stays
 unrecorded and is asked about again on every later `--delete`. To adopt it
 into the backup, materialize it locally (a pull downloads it) and push. To
 retire it, answer y or run the `--yes` mirror. To keep it long-term without
-adopting it, move it outside the entry prefix.
+adopting it, move it outside the entry prefix. `verify` reports every
+unrecorded object passively — no `--delete` run required (see
+[verify.md](verify.md)).
 
 ## Restore fidelity
 

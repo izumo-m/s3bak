@@ -49,6 +49,8 @@ quiet too, since `status` shares the predicate). `--checksum` (content) covers
 it completely; a tighter `mtime_window` (e.g. `0`, exact) covers the case where
 the mtime did advance but within the window. The window is set in `config.py`,
 or overridden for one run with `--mtime-window <seconds>`.
+`verify --checksum` detects a file sitting in the blind spot without
+uploading anything (see [verify.md](verify.md)).
 
 **Self-healing (push):** a spurious mtime-only difference re-transfers the file
 once; that push refreshes the manifest with the new mtime, and later runs pass

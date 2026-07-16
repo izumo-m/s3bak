@@ -34,11 +34,12 @@ _DEFAULT_MULTIPART = 8 * 1024 * 1024
 
 @dataclass
 class ObjectMeta:
-    """Subset of S3 head-object response that callers use."""
+    """Subset of S3 head-object / list-objects response that callers use."""
 
     key: str
     size: int = 0
     etag: str | None = None  # dequoted S3 ETag
+    storage_class: str | None = None  # None = STANDARD (S3 omits it on head)
 
 
 @dataclass
@@ -163,11 +164,12 @@ class Boto3S3Store:
 
         return EtagComparison(self._s3)
 
-    def _compare_pool_size(self) -> int:
+    def compare_pool_size(self) -> int:
         """Worker count for the `--checksum` parallel ETag comparison: the
         configured `compare_workers`, else the transfer `max_concurrency`, else
         boto3's default of 10 - the fallback the library-owned pool applied
-        before 0.5, now that the caller sizes the pool."""
+        before 0.5, now that the caller sizes the pool. Public because verify
+        sizes its own hashing pool with the same knob."""
         return self.compare_workers or self.max_concurrency or 10
 
     @contextmanager
@@ -187,7 +189,7 @@ class Boto3S3Store:
 
         if isinstance(compare, EtagComparison):
             with ThreadPoolExecutor(
-                max_workers=self._compare_pool_size(), thread_name_prefix="s3bak-cmp"
+                max_workers=self.compare_pool_size(), thread_name_prefix="s3bak-cmp"
             ) as pool:
                 yield ParallelFilter(decide=compare, executor=pool)
         else:
@@ -261,57 +263,102 @@ class Boto3S3Store:
             key=rel_key,
             size=int(data.get("ContentLength", 0)),
             etag=(data.get("ETag") or "").strip('"') or None,
+            storage_class=data.get("StorageClass"),
         )
+
+    def etag_checker(self) -> Callable[[str, str, int, str | None], bool]:
+        """A thread-safe ``(rel_key, local_path, s3_size, s3_etag) -> differs``
+        content check against an S3 ETag the caller already holds (a listing
+        or head result), so it costs no S3 call. One shared EtagComparison
+        (thread-safe by contract) serves every call; part_size comes from the
+        same profile the uploads use, so multipart ETags reconstruct to a
+        matching value. A missing ETag reports "differs" - verification must
+        fail loudly rather than silently pass."""
+        from boto3_s3 import LocalFileInfo, LocalStorage, S3FileInfo, SyncPair, TransferType
+        from boto3_s3.etagcompare import EtagComparison
+
+        comparison = EtagComparison(self._s3)
+
+        def differs(rel_key: str, local_path: str, s3_size: int, s3_etag: str | None) -> bool:
+            if not s3_etag:
+                return True
+            # Since 0.5 EtagComparison reads the readable side through its
+            # ``storage.open(compare_key)``, not a bare path: root a
+            # LocalStorage at the file's parent and key it by basename, so the
+            # open resolves back to local_path.
+            local_store = LocalStorage(os.path.dirname(local_path) or ".")
+            pair = SyncPair(
+                key=rel_key,
+                transfer_type=TransferType.UPLOAD,
+                src=LocalFileInfo(
+                    key=local_path,
+                    size=os.path.getsize(local_path),
+                    compare_key=os.path.basename(local_path),
+                    storage=local_store,
+                ),
+                dest=S3FileInfo(key=rel_key, size=s3_size, etag=s3_etag),
+            )
+            return comparison(pair)
+
+        return differs
 
     def needs_upload(self, rel_key: str, local_path: str, *, verbose: bool = False) -> bool:
         """True when local_path should be (re)uploaded to rel_key, by content.
 
         The single-object counterpart of `--checksum`: no stored object (or no
-        ETag) means upload; otherwise reuse EtagComparison so the decision
-        matches a dir entry's `--checksum` sync - an unchanged file is
-        skipped, a same-size/same-mtime content change is not. part_size comes
-        from the same profile the upload uses. The default (non-checksum)
-        single-file decision is the manifest size+mtime check, not this.
+        ETag) means upload; otherwise the shared ETag check (etag_checker) so
+        the decision matches a dir entry's `--checksum` sync - an unchanged
+        file is skipped, a same-size/same-mtime content change is not. The
+        default (non-checksum) single-file decision is the manifest size+mtime
+        check, not this.
         """
         head = self.head_object(rel_key, verbose=verbose)
         if head is None or not head.etag:
             return True
-        from boto3_s3 import LocalFileInfo, LocalStorage, S3FileInfo, SyncPair, TransferType
-        from boto3_s3.etagcompare import EtagComparison
+        return self.etag_checker()(rel_key, local_path, head.size, head.etag)
 
-        # Since 0.5 EtagComparison reads the readable side through its
-        # ``storage.open(compare_key)``, not a bare path: root a LocalStorage at
-        # the file's parent and key it by basename, so the open resolves back to
-        # local_path (``os.path.join(parent_abspath, basename)``).
-        local_store = LocalStorage(os.path.dirname(local_path) or ".")
-        pair = SyncPair(
-            key=rel_key,
-            transfer_type=TransferType.UPLOAD,
-            src=LocalFileInfo(
-                key=local_path,
-                size=os.path.getsize(local_path),
-                compare_key=os.path.basename(local_path),
-                storage=local_store,
-            ),
-            dest=S3FileInfo(key=rel_key, size=head.size, etag=head.etag),
-        )
-        return EtagComparison(self._s3)(pair)
+    def iter_objects(self, rel_prefix: str, *, verbose: bool = False) -> Iterator[ObjectMeta]:
+        """Stream the objects below ``rel_prefix/`` in listing (key byte) order,
+        keys relative to ``rel_prefix`` - the same compare keys the manifest
+        stream uses, so verify merge-joins the two without buffering. The
+        listing is slash-bounded (``docs`` never scans ``docs.txt``); the exact
+        object at ``rel_prefix`` itself is a caller-side head_object probe.
+        Size, ETag, and storage class ride along on the listing for free."""
+        api_base = self._api_key(rel_prefix)
+        prefix = api_base + "/"
+        if verbose:
+            write_stderr(f"+ (boto3) list objects s3://{self.bucket}/{prefix}\n")
+        paginator = self._client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+            for item in page.get("Contents", []):
+                key = str(item["Key"])
+                yield ObjectMeta(
+                    key=key[len(prefix) :],
+                    size=int(item.get("Size", 0)),
+                    etag=str(item.get("ETag") or "").strip('"') or None,
+                    storage_class=item.get("StorageClass"),
+                )
 
-    def list_top_level_names(self, *, verbose: bool = False) -> list[str]:
-        """Basenames of the objects directly under the prefix (no data keys
-        below entry directories - those are FileKind.DIR common prefixes)."""
+    def list_top_level(self, *, verbose: bool = False) -> tuple[list[str], list[str]]:
+        """Basenames directly under the prefix as ``(objects, prefixes)``:
+        top-level object names (manifests and single-file data keys) and the
+        common-prefix names the entry data trees appear as."""
         from boto3_s3 import FileKind
 
         if verbose:
             write_stderr(f"+ (boto3-s3) ls {self.prefix}/\n")
-        names: list[str] = []
+        objects: list[str] = []
+        prefixes: list[str] = []
 
         def collect(info: Any) -> None:
+            name = info.key.rstrip("/").rsplit("/", 1)[-1]
             if info.kind is FileKind.FILE:
-                names.append(info.key.rsplit("/", 1)[-1])
+                objects.append(name)
+            else:
+                prefixes.append(name)
 
         self._s3.ls(self._s3_loc(is_dir=True), recursive=False, on_result=collect)
-        return names
+        return objects, prefixes
 
     def _is_not_found(self, e: Any) -> bool:
         code = e.response.get("Error", {}).get("Code", "")

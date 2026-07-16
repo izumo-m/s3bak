@@ -3,8 +3,8 @@
 
 Orchestrates the lower layers - store (S3), syncops (manifest<->S3),
 restore (local filesystem), compare (status/diff) - into the push / pull /
-status / diff / show / list / ls-remote behaviours. ``cli.py`` parses argv and
-dispatches here.
+status / diff / show / list / ls-remote / verify behaviours. ``cli.py`` parses
+argv and dispatches here.
 """
 
 from __future__ import annotations
@@ -14,7 +14,9 @@ import shutil
 import stat as stat_mod
 import subprocess
 import tempfile
+from collections import deque
 from collections.abc import Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -55,6 +57,7 @@ from s3bak.restore import (
     windows_collect_writable_prep,
     windows_restore_modes,
 )
+from s3bak.store import ObjectMeta
 from s3bak.syncops import (
     download_from_s3,
     download_manifest,
@@ -1369,6 +1372,388 @@ def cmd_diff(cfg: Config, entry: str, opts: Opts, file: str | None = None) -> in
         os.unlink(manifest_path)
 
 
+# Objects in these storage classes reject get_object until manually restored,
+# so a pull over them fails. (An INTELLIGENT_TIERING archive tier fails the
+# same way but is invisible in listings - a documented verify limit.)
+_ARCHIVED_CLASSES = ("GLACIER", "DEEP_ARCHIVE")
+
+
+@dataclass
+class _VerifyReport:
+    """Finding accounting for one entry's verify. Errors mean the backup does
+    not restore what the manifest promises (exit 1); warnings mean an object
+    sits outside the backup (exit 2 via the global warning count); pending
+    changes are informational only and leave the exit code alone."""
+
+    entry: str
+    file_records: int = 0
+    objects: int = 0
+    errors: int = 0
+    warnings: int = 0
+    pendings: int = 0
+
+    def error(self, msg: str) -> None:
+        err(f"{self.entry}: {msg}")
+        self.errors += 1
+
+    def warn(self, msg: str) -> None:
+        note_warning(f"warning: {self.entry}: {msg}")
+        self.warnings += 1
+
+    def pending(self, msg: str) -> None:
+        write_output(f"{self.entry}: pending change: {msg}\n")
+        self.pendings += 1
+
+    def finish(self) -> int:
+        """Print the per-entry summary line - the record/object tallies double
+        as a heartbeat for cron logs - and return the entry's exit status."""
+        counts = f"{self.file_records} file record(s), {self.objects} data object(s)"
+        if self.pendings:
+            counts += f", {self.pendings} pending change(s)"
+        if self.errors or self.warnings:
+            write_output(
+                f"{self.entry}: {self.errors} error(s), {self.warnings} warning(s) ({counts})\n"
+            )
+        else:
+            write_output(f"{self.entry}: OK ({counts})\n")
+        return 1 if self.errors else 0
+
+
+class _ContentChecker:
+    """The verify ``--checksum`` lane: compare local file content against the
+    S3 ETag the listing (or head) already delivered - zero extra S3 calls.
+
+    Hashing runs on a pool sized by the same ``compare_workers`` knob as the
+    push --checksum comparison, with at most two hashes per worker in flight,
+    and findings emitted in submission (key) order. A mismatch splits on the
+    manifest stat: size+mtime still matching means the default push will never
+    upload the edit (the size+mtime blind spot - an error), a drifted stat is
+    an ordinary not-yet-pushed change (informational)."""
+
+    def __init__(self, cfg: Config, entry: str, report: _VerifyReport):
+        assert cfg.store is not None
+        self._differs = cfg.store.etag_checker()
+        self._window_ns = cfg.window_ns_for(entry)
+        self._report = report
+        self._size = cfg.store.compare_pool_size()
+        self._pool: ThreadPoolExecutor | None = None
+        self._queue: deque[tuple[Future[bool | None], ManifestEntry, os.stat_result, str]] = deque()
+
+    def check(self, rel_key: str, local_path: str, record: ManifestEntry, obj: ObjectMeta) -> None:
+        try:
+            st = os.lstat(local_path)
+        except OSError:
+            return  # a kept deletion has no local counterpart: nothing to compare
+        if not stat_mod.S_ISREG(st.st_mode):
+            return  # a local type change is a status finding, not a backup defect
+
+        def hash_one() -> bool | None:
+            try:
+                return self._differs(rel_key, local_path, obj.size, obj.etag)
+            except OSError:
+                return None  # vanished or unreadable mid-check: skip, not crash
+
+        if self._pool is None:
+            self._pool = ThreadPoolExecutor(
+                max_workers=self._size, thread_name_prefix="s3bak-verify"
+            )
+        self._queue.append((self._pool.submit(hash_one), record, st, local_path))
+        self._drain(self._size * 2)
+
+    def _drain(self, limit: int) -> None:
+        while len(self._queue) > limit:
+            future, record, st, local_path = self._queue.popleft()
+            if not future.result():
+                continue
+            if record.matches_stat(st, self._window_ns):
+                self._report.error(
+                    f"content differs but size+mtime match: {local_path}"
+                    f" (push will not upload it; use push --checksum)"
+                )
+            else:
+                self._report.pending(f"{local_path} (a push will upload it)")
+
+    def close(self) -> None:
+        self._drain(0)
+        if self._pool is not None:
+            self._pool.shutdown()
+
+
+def _report_folder_object(report: _VerifyReport, url: str, obj: ObjectMeta) -> None:
+    """A ``/``-terminated key - the manual-folder convention, never written by
+    s3bak. Zero bytes is the marker the sync skips (restore unaffected); one
+    carrying data would be a download to an impossible local path."""
+    if obj.size == 0:
+        report.warn(f"folder object: {url} (not created by s3bak; remove with aws s3 rm)")
+    else:
+        report.error(
+            f"folder object with data: {url}"
+            f" ({obj.size} bytes; a '/'-terminated key cannot restore to a local path)"
+        )
+
+
+def _check_archived(report: _VerifyReport, url: str, obj: ObjectMeta) -> bool:
+    """Flag an object pull cannot download. Applies to every listed object -
+    pull's listing-driven sync fetches unrecorded objects too."""
+    if obj.storage_class in _ARCHIVED_CLASSES:
+        report.error(
+            f"storage class {obj.storage_class} blocks restore: {url}"
+            f" (get_object fails until the object is restored from the archive)"
+        )
+        return True
+    return False
+
+
+def _verify_dir(
+    cfg: Config,
+    entry: str,
+    report: _VerifyReport,
+    manifest_path: str,
+    sub: str | None,
+    opts: Opts,
+    local_base: str,
+) -> None:
+    """Merge-join the manifest records against the S3 listing - both ascend in
+    key byte order, so one streaming pass checks the whole correspondence:
+    every file record has its object (size intact, class restorable), every
+    non-file record has none, and every object is accounted for."""
+    assert cfg.store is not None
+    rel_base = f"{entry}/{sub}" if sub else entry
+
+    # An object at the tree's own key (the residue of a file that became this
+    # directory) has no place in any restore: probe the exact key, the one spot
+    # the slash-bounded listing cannot see.
+    root_obj = cfg.store.head_object(rel_base, verbose=opts.verbose)
+    if root_obj is not None:
+        report.objects += 1
+        report.error(
+            f"type conflict: {cfg.prefix}/{rel_base}"
+            f" (manifest records a directory, but a data object exists at its key)"
+        )
+
+    checker = _ContentChecker(cfg, entry, report) if opts.checksum else None
+    # An unmatched object waits here while a directory record at key + "/"
+    # can still arrive (siblings such as "key.txt" sort between the two, since
+    # "." < "/"); once the join passes that key it settles as unrecorded.
+    waiting: list[ObjectMeta] = []
+
+    def settle(obj: ObjectMeta, *, conflict: bool) -> None:
+        url = f"{cfg.prefix}/{rel_base}/{obj.key}"
+        if conflict:
+            report.error(
+                f"type conflict: {url}"
+                f" (manifest records a directory, but a data object exists at its key)"
+            )
+        else:
+            report.warn(
+                f"unrecorded object: {url} (not in the manifest; push --delete decides its fate)"
+            )
+
+    try:
+        for key, record, obj in manifest.merge_join(
+            manifest.iter_compare_records(manifest_path, sub=sub),
+            ((o.key, o) for o in cfg.store.iter_objects(rel_base, verbose=opts.verbose)),
+        ):
+            if waiting:
+                still: list[ObjectMeta] = []
+                for w in waiting:
+                    if key < w.key + "/":
+                        still.append(w)
+                    else:
+                        settle(w, conflict=key == w.key + "/" and record is not None)
+                waiting = still
+            archived = False
+            if obj is not None:
+                report.objects += 1
+                archived = _check_archived(report, f"{cfg.prefix}/{rel_base}/{obj.key}", obj)
+            if record is not None and obj is not None:
+                if key.endswith("/"):
+                    # Only a directory record carries the trailing slash, and
+                    # only a folder object can share its key.
+                    _report_folder_object(report, f"{cfg.prefix}/{rel_base}/{obj.key}", obj)
+                elif record.is_file and record.sym_target is None:
+                    report.file_records += 1
+                    if record.size != obj.size:
+                        report.error(
+                            f"size mismatch: {cfg.prefix}/{rel_base}/{obj.key}"
+                            f" (manifest {record.size}, S3 {obj.size})"
+                        )
+                    elif checker is not None and not archived:
+                        local_path = os.path.join(local_base, *key.split("/"))
+                        checker.check(f"{rel_base}/{key}", local_path, record, obj)
+                else:
+                    kind = "symlink" if record.sym_target is not None else "special file"
+                    report.error(
+                        f"type conflict: {cfg.prefix}/{rel_base}/{obj.key}"
+                        f" (manifest records a {kind}, but a data object exists at its key)"
+                    )
+            elif record is not None:
+                if record.is_file and record.sym_target is None:
+                    report.file_records += 1
+                    report.error(
+                        f"missing data object: {cfg.prefix}/{rel_base}/{key}"
+                        f" (pull cannot restore it)"
+                    )
+                # Directory, symlink, and special records have no object by design.
+            else:
+                assert obj is not None
+                if obj.key.endswith("/"):
+                    _report_folder_object(report, f"{cfg.prefix}/{rel_base}/{obj.key}", obj)
+                else:
+                    waiting.append(obj)
+        for w in waiting:
+            settle(w, conflict=False)
+    finally:
+        if checker is not None:
+            checker.close()
+
+
+def _verify_file_record(
+    cfg: Config,
+    entry: str,
+    report: _VerifyReport,
+    record: ManifestEntry,
+    rel_key: str,
+    local_path: str,
+    opts: Opts,
+) -> None:
+    """Verify one recorded regular file (a single-file entry, or a file
+    sub-path) against its exact object - a head probe, since a lone file has
+    no listing to stream."""
+    assert cfg.store is not None
+    report.file_records += 1
+    head = cfg.store.head_object(rel_key, verbose=opts.verbose)
+    if head is None:
+        report.error(f"missing data object: {cfg.prefix}/{rel_key} (pull cannot restore it)")
+        return
+    report.objects += 1
+    if _check_archived(report, f"{cfg.prefix}/{rel_key}", head):
+        return
+    if record.size != head.size:
+        report.error(
+            f"size mismatch: {cfg.prefix}/{rel_key} (manifest {record.size}, S3 {head.size})"
+        )
+        return
+    if opts.checksum:
+        checker = _ContentChecker(cfg, entry, report)
+        try:
+            checker.check(rel_key, local_path, record, head)
+        finally:
+            checker.close()
+
+
+def _verify_objectless_record(
+    cfg: Config, report: _VerifyReport, rel_key: str, kind: str, opts: Opts
+) -> None:
+    """A recorded symlink or special file must have no data object at its key;
+    one there is the residue of a type change and collides with the restore."""
+    assert cfg.store is not None
+    if cfg.store.head_object(rel_key, verbose=opts.verbose) is not None:
+        report.objects += 1
+        report.error(
+            f"type conflict: {cfg.prefix}/{rel_key}"
+            f" (manifest records a {kind}, but a data object exists at its key)"
+        )
+
+
+def cmd_verify(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int:
+    entry_cfg = cfg.entries.get(entry)
+    if not entry_cfg:
+        err(f"no such entry: {entry}")
+        return 1
+    base_path: str = entry_cfg["path"]
+    report = _VerifyReport(entry)
+    assert cfg.store is not None
+
+    fd, manifest_path = tempfile.mkstemp(suffix=".jsonl")
+    os.close(fd)
+    try:
+        if not download_manifest(cfg, entry, manifest_path, opts.verbose):
+            # No manifest: an unrecorded backup (interrupted push, --data-only)
+            # and no backup at all are different emergencies - tell them apart.
+            has_data = cfg.store.head_object(entry, verbose=opts.verbose) is not None or (
+                next(iter(cfg.store.iter_objects(entry, verbose=opts.verbose)), None) is not None
+            )
+            if has_data:
+                report.error(
+                    "data objects exist but no manifest records them"
+                    " (interrupted push? a push records them)"
+                )
+            else:
+                report.error("no backup on S3 (entry never pushed)")
+            return report.finish()
+
+        entry_is_dir = _entry_kind_from_manifest(manifest_path) == "dir"
+        if sub is not None:
+            if not entry_is_dir:
+                err(f"sub path not allowed for single-file entry: {entry}")
+                return 1
+            kind = _sub_kind_from_manifest(manifest_path, sub)
+            if kind == "missing":
+                err(f"not found on S3: {entry}/{sub}")
+                return 1
+            rel_key = f"{entry}/{sub}"
+            local_path = os.path.join(base_path, *sub.split("/"))
+            if kind == "dir":
+                _verify_dir(cfg, entry, report, manifest_path, sub, opts, local_path)
+            elif kind == "file":
+                record = next(
+                    r
+                    for r in manifest.iter_manifest(manifest_path)
+                    if r.path.removeprefix("./") == sub
+                )
+                _verify_file_record(cfg, entry, report, record, rel_key, local_path, opts)
+            else:
+                kind_name = "symlink" if kind == "symlink" else "special file"
+                _verify_objectless_record(cfg, report, rel_key, kind_name, opts)
+        elif entry_is_dir:
+            _verify_dir(cfg, entry, report, manifest_path, None, opts, base_path)
+        else:
+            record = next(manifest.iter_manifest(manifest_path))
+            if record.is_file and record.sym_target is None:
+                _verify_file_record(cfg, entry, report, record, entry, base_path, opts)
+            else:
+                # Push only accepts regular-file or directory entry paths, so a
+                # non-file single record is foreign - but check it faithfully.
+                kind_name = "symlink" if record.sym_target is not None else "special file"
+                _verify_objectless_record(cfg, report, entry, kind_name, opts)
+        return report.finish()
+    finally:
+        os.unlink(manifest_path)
+
+
+def verify_top_level(cfg: Config, opts: Opts) -> None:
+    """The ``verify --all`` sweep: one non-recursive listing to inventory the
+    prefix top level and warn about anything no configured entry accounts for -
+    a stale manifest left behind by a removed entry, a data tree with no
+    manifest, or a stray top-level object. Warnings only: nothing here breaks
+    the restore of a configured entry."""
+    assert cfg.store is not None
+    objects, prefixes = cfg.store.list_top_level(verbose=opts.verbose)
+    manifests = {
+        name.removesuffix(manifest.MANIFEST_SUFFIX)
+        for name in objects
+        if name.endswith(manifest.MANIFEST_SUFFIX)
+    }
+    for name in sorted(manifests - cfg.entries.keys()):
+        note_warning(
+            f"warning: stale manifest (no configured entry):"
+            f" {cfg.prefix}/{manifest.manifest_key(name)}"
+        )
+    for name in sorted(objects):
+        # A name its own manifest accounts for is covered: configured, by the
+        # per-entry verify; unconfigured, by the stale-manifest warning above.
+        if name.endswith(manifest.MANIFEST_SUFFIX) or name in cfg.entries or name in manifests:
+            continue
+        note_warning(f"warning: top-level object outside any configured entry: {cfg.prefix}/{name}")
+    for name in sorted(set(prefixes)):
+        if name in cfg.entries or name in manifests:
+            continue
+        note_warning(
+            f"warning: data tree without a manifest or configured entry: {cfg.prefix}/{name}/"
+        )
+
+
 def cmd_list(cfg: Config, opts: Opts) -> int:
     for key in sorted(cfg.entries.keys()):
         path = cfg.entries[key]["path"]
@@ -1396,7 +1781,8 @@ def show_entry_files(manifest_path: str, sub: str | None = None) -> None:
 def cmd_ls_remote(cfg: Config, opts: Opts, entry: str | None = None, sub: str | None = None) -> int:
     assert cfg.store is not None
     if entry is None:
-        for name in cfg.store.list_top_level_names(verbose=opts.verbose):
+        names, _prefixes = cfg.store.list_top_level(verbose=opts.verbose)
+        for name in names:
             if name.endswith(manifest.MANIFEST_SUFFIX):
                 write_output(f"{name.removesuffix(manifest.MANIFEST_SUFFIX)}\n")
         return 0

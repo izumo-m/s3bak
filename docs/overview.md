@@ -52,6 +52,8 @@ compatibility layers.
   ordering, and streaming invariants.
 - **[Sync model](sync.md)** — comparison and transfer strategies, concurrency,
   and the push and pull pipelines.
+- **[Verification model](verify.md)** — the read-only manifest ↔ S3 integrity
+  check, its finding severities, and the suggested verification routine.
 - **[CLI contract](cli.md)** — argument resolution, explicit option handling,
   concurrent result aggregation, and exit codes.
 - **[Internal architecture](architecture.md)** — module responsibilities,

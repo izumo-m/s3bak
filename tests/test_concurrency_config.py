@@ -33,7 +33,7 @@ def test_defaults_leave_both_unset(ws):
     assert store._s3._transfer_config is None  # library default (10) applies
     # content_compare is the bare EtagComparison; the pool is sized at sync time.
     assert type(store.content_compare()).__name__ == "EtagComparison"
-    assert store._compare_pool_size() == 10  # both unset -> boto3's default
+    assert store.compare_pool_size() == 10  # both unset -> boto3's default
 
 
 def test_client_built_once_and_reused(ws):
@@ -79,7 +79,7 @@ def test_both_set_independently(ws):
     assert tc is not None and tc.max_concurrency == 7
 
     assert type(store.content_compare()).__name__ == "EtagComparison"
-    assert store._compare_pool_size() == 3  # compare_workers wins
+    assert store.compare_pool_size() == 3  # compare_workers wins
 
 
 def test_compare_workers_alone_leaves_transfer_default(ws):
@@ -88,7 +88,7 @@ def test_compare_workers_alone_leaves_transfer_default(ws):
 
     store = _store(ws)
     assert store._s3._transfer_config is None  # transfers keep the default
-    assert store._compare_pool_size() == 5
+    assert store.compare_pool_size() == 5
 
 
 def test_max_concurrency_alone_leaves_compare_unset(ws):
@@ -99,7 +99,7 @@ def test_max_concurrency_alone_leaves_compare_unset(ws):
     tc = store._s3._transfer_config
     assert tc is not None and tc.max_concurrency == 6
     # compare_workers unset -> the compare pool falls back to max_concurrency.
-    assert store._compare_pool_size() == 6
+    assert store.compare_pool_size() == 6
 
 
 @pytest.mark.parametrize("name", ["max_concurrency", "compare_workers", "entry_concurrency"])
