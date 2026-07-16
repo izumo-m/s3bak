@@ -125,6 +125,10 @@ def run_entries(
             index = futures[future]
             try:
                 statuses[index] = future.result()
+            except BrokenPipeError:
+                # Output is gone (e.g. piped to a closed reader): let run()'s
+                # handler map it to the documented 141 instead of a worker 1.
+                raise
             except Exception as exc:
                 err(f"{entries[index]}: {exc}")
                 statuses[index] = 1

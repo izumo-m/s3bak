@@ -12,6 +12,7 @@ higher-level orchestration
     restore | syncops
     compare | config | localwalk
     store
+    confirm
     manifest | console
 
 lower-level foundations
@@ -32,6 +33,10 @@ are foundational modules used from several layers.
   walker (`sync_walker`), so excludes prune only the local side of a sync.
 - **store** is the S3 boundary. `Boto3S3Store` wraps transfers, listing, and
   object inspection.
+- **confirm** owns the deletion confirmations: answer modes, the per-item
+  prompt (serialized across parallel entries), the kept-keys stream the
+  manifest merge consumes, and the one-question subtree confirmation. It
+  depends only on `console`.
 - **config** loads and validates executable `config.py`, constructs the store
   when a command needs S3, and defines the `Config` and `Opts` values passed
   through the command layers.

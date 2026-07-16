@@ -64,9 +64,10 @@ selected command are errors rather than ignored input. In particular, an
 unsupported preview-like option must never allow a mutating command to proceed
 as if it were a dry run.
 
-Argument and option validation happens before configuration creates an S3
-client. Local syntax errors therefore remain visible even when credentials or
-the remote service are unavailable. The `list` command loads configuration
+Option and syntax validation happens before configuration creates an S3
+client, so an option typo reports the typo even when credentials or the
+remote service are unavailable. Entry and path resolution needs the loaded
+configuration and therefore runs after the store exists. The `list` command loads configuration
 without constructing an S3 client because its result is entirely local.
 
 ## Concurrent entry results

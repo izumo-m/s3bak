@@ -769,3 +769,65 @@ def test_local_path_resolution_handles_an_entry_at_filesystem_root(tmp_path):
 
     assert entry == "root"
     assert sub == str(tmp_path / "child.txt").removeprefix(root).replace(os.sep, "/")
+
+
+def test_meta_only_refuses_entry_kind_change(ws):
+    # --meta-only moves no data and cannot migrate a kind change; recording
+    # the new kind would orphan the old tree (dir->file) or publish a manifest
+    # mixing both shapes (file->dir). Both directions must refuse untouched.
+    import shutil
+
+    ws.write("data/a.txt", "hello")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    shutil.rmtree(ws.root / "data")
+    (ws.root / "data").write_text("now a file")
+
+    res = ws.run("push", "--meta-only", "data")
+    assert res.rc == 1
+    assert "disagree on kind" in res.err
+    assert "data/a.txt" in ws.keys()
+    ws.run("verify", "data", expect_rc=0)  # the old backup is intact
+
+    solo = ws.write("solo", "s")
+    ws.config({"solo": {"path": str(solo)}})
+    ws.run("push", "solo", expect_rc=0)
+    os.remove(solo)
+    ws.write("solo/inner.txt", "i")
+
+    res = ws.run("push", "--meta-only", "solo")
+    assert res.rc == 1
+    assert "disagree on kind" in res.err
+    ws.run("verify", "solo", expect_rc=0)
+
+
+def test_first_nested_subpath_push_writes_valid_manifest(ws):
+    # The first-ever manifest born from a NESTED sub-path push must record the
+    # ancestor directories too: without them every later download rejects the
+    # manifest ("no directory parent") and the entry is unusable.
+    ws.write("data/sub/deep/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+
+    ws.run("push", str(ws.root / "data" / "sub" / "deep" / "a.txt"), expect_rc=0)
+
+    ws.run("status", "data", expect_rc=0)
+    ws.run("verify", "data", expect_rc=0)
+    dest = ws.root / "out"
+    ws.run("pull", "data", "-o", str(dest), expect_rc=0)
+    assert (dest / "sub" / "deep" / "a.txt").read_text() == "a"
+
+
+def test_subpath_push_of_new_nested_directory_records_ancestors(ws):
+    # A sub-path push below a directory the existing manifest predates must
+    # add the ancestor records, not just the leaf's.
+    ws.write("data/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    ws.write("data/new/nested/b.txt", "b")
+    ws.run("push", str(ws.root / "data" / "new" / "nested" / "b.txt"), expect_rc=0)
+
+    ws.run("status", "data", expect_rc=0)
+    ws.run("verify", "data", expect_rc=0)
+    paths = _manifest_paths(ws)
+    assert "./new" in paths and "./new/nested" in paths

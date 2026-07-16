@@ -84,14 +84,16 @@ class Boto3S3Store:
         self.max_concurrency = max_concurrency
         self.compare_workers = compare_workers
 
-        # Build the S3 orchestrator and ONE boto3 client up front, here in the
-        # single-threaded config-load path. boto3 client CONSTRUCTION is not
-        # thread-safe, and --all runs entries - each with its own cp / sync,
-        # and each sync its own transfer threads - concurrently. Every S3-side
+        # Build the S3 orchestrator and ONE boto3 client up front, on whatever
+        # thread constructs the store - always sequentially (client
+        # construction is not thread-safe; cli.run_entries builds all worker
+        # stores on the main thread before the pool starts). Every S3-side
         # location is handed to the library as an S3Storage bound to this one
         # client (see _s3_loc), so no client is ever built lazily on a worker
-        # thread; head_object shares it too. A built client is safe to share
-        # across threads; only construction races.
+        # thread; head_object shares it too. boto3-s3's contract: a client
+        # must not be shared across concurrently transferring threads, so one
+        # store serves one entry at a time (s3transfer's own worker threads
+        # under a single transfer are the library's business).
         import boto3
         from boto3_s3 import S3
 

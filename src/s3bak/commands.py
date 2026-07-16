@@ -664,32 +664,6 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             err(f"{entry}: aborted")
             return 1
 
-    # --meta-only refreshes the manifest and runs the post_hook even with no data
-    # change: the supported way to re-run the post_hook on demand (intended).
-    # A directory refresh merges against the old manifest with every old-only
-    # record kept: --meta-only moves no data, so it must not drop the records
-    # of objects that are still on S3 (--meta-only --delete is rejected).
-    if opts.meta_only:
-        if not os.path.isdir(target):
-            return upload_manifest(cfg, entry, target, excludes, opts)
-        fd, old_path = tempfile.mkstemp(suffix=".jsonl")
-        os.close(fd)
-        try:
-            # The download runs under --dry-run too (read-only), so the
-            # rehearsal validates the manifest and previews the real merge.
-            have_old = download_manifest(cfg, entry, old_path, opts.verbose)
-            return upload_manifest(
-                cfg,
-                entry,
-                target,
-                excludes,
-                opts,
-                old_manifest=old_path if have_old else None,
-                keep_old=True,
-            )
-        finally:
-            os.unlink(old_path)
-
     results = ""
     refresh_manifest = False
     assert cfg.store is not None
@@ -699,21 +673,50 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
     fd, manifest_path = tempfile.mkstemp(suffix=".jsonl")
     os.close(fd)
     try:
-        # Every push downloads and validates the manifest first: an ordinary
-        # push compares against it, any push uses it to notice objectless tree
-        # changes or an entry kind change, --data-only reads it to warn about
-        # the uploads it leaves unrecorded, and a damaged manifest must abort
-        # the push before anything on S3 moves. All of that is read-only, so
-        # it runs under --dry-run too - a rehearsal surfaces problems here.
+        # Every push - every mode - downloads and validates the manifest
+        # first: an ordinary push compares against it, any push uses it to
+        # notice objectless tree changes or an entry kind change, --data-only
+        # reads it to warn about the uploads it leaves unrecorded, and a
+        # damaged manifest must abort the push before anything on S3 moves.
+        # All of that is read-only, so it runs under --dry-run too - a
+        # rehearsal surfaces problems here.
         have_manifest = download_manifest(cfg, entry, manifest_path, opts.verbose)
         is_dir_target = os.path.isdir(target)
         if have_manifest and (_entry_kind_from_manifest(manifest_path) == "dir") != is_dir_target:
+            if opts.meta_only:
+                # --meta-only moves no data, so it cannot migrate a kind
+                # change; recording the new kind anyway would silently orphan
+                # the old tree or corrupt the manifest.
+                err(
+                    f"{entry}: the backup and the local path disagree on kind"
+                    f" (file vs directory); push --delete migrates it"
+                )
+                return 1
             st = _migrate_entry_kind(cfg, entry, is_dir_target, opts)
             if st != 0:
                 return st
             have_manifest = False  # the old backup is gone: record from scratch
         if have_manifest:
             plan.old_manifest = manifest_path
+
+        # --meta-only refreshes the manifest and runs the post_hook even with
+        # no data change: the supported way to re-run the post_hook on demand
+        # (intended). A directory refresh merges against the old manifest with
+        # every old-only record kept: --meta-only moves no data, so it must
+        # not drop the records of objects that are still on S3
+        # (--meta-only --delete is rejected).
+        if opts.meta_only:
+            if not is_dir_target:
+                return upload_manifest(cfg, entry, target, excludes, opts)
+            return upload_manifest(
+                cfg,
+                entry,
+                target,
+                excludes,
+                opts,
+                old_manifest=manifest_path if have_manifest else None,
+                keep_old=True,
+            )
 
         if is_dir_target:
             compare = None
@@ -963,6 +966,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         # the dry-run sync then runs against the uncorrected root, so its
         # transfer report may differ from what the real pull does.
         stage_dir: str | None = None
+        stage_holds_old_root = False
         prep: list[tuple[str, int]] = []
         if has_data and not opts.meta_only and os.path.lexists(outpath):
             if is_dir:
@@ -1043,7 +1047,13 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                     try:
                         os.replace(dest, outpath)
                     except BaseException:
-                        os.replace(replaced, outpath)  # put the old root back
+                        try:
+                            os.replace(replaced, outpath)  # put the old root back
+                        except OSError:
+                            # The rollback itself failed: the cleanup below
+                            # must not delete the only remaining copy.
+                            stage_holds_old_root = True
+                            err(f"could not restore {outpath}; it is preserved at {replaced}")
                         raise
 
             # 4. Apply manifest metadata (mode, mtime, symlinks): objectless or
@@ -1097,9 +1107,10 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 windows_restore_modes(prep)
             raise
         finally:
-            if stage_dir is not None:
+            if stage_dir is not None and not stage_holds_old_root:
                 # Retires the swapped-out old root on success, the partial
-                # download on failure - never anything this pull did not make.
+                # download on failure - never anything this pull did not make,
+                # and never a stranded old root the rollback could not put back.
                 shutil.rmtree(stage_dir, ignore_errors=True)
     except DeletionAbortedError:
         err(f"{entry}: aborted")
@@ -1937,14 +1948,10 @@ def cmd_verify(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
         elif entry_is_dir:
             _verify_dir(cfg, entry, report, manifest_path, None, opts, base_path)
         else:
+            # A validated file-shaped manifest holds exactly one regular-file
+            # record (validate_manifest), so there is nothing else to classify.
             record = next(manifest.iter_manifest(manifest_path))
-            if record.is_file and record.sym_target is None:
-                _verify_file_record(cfg, entry, report, record, entry, base_path, opts)
-            else:
-                # Push only accepts regular-file or directory entry paths, so a
-                # non-file single record is foreign - but check it faithfully.
-                kind_name = "symlink" if record.sym_target is not None else "special file"
-                _verify_objectless_record(cfg, report, entry, kind_name, opts)
+            _verify_file_record(cfg, entry, report, record, entry, base_path, opts)
             # A file-shaped manifest records nothing below entry/, so anything
             # there is outside the backup - the residue of a directory that
             # became this file, or an out-of-band upload. A single-file pull

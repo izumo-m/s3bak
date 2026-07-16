@@ -312,3 +312,66 @@ def test_multi_entry_push_uses_one_store_per_worker(ws):
     ws.run("pull", "two", "-o", str(dest2), expect_rc=0)
     assert (dest1 / "a.txt").read_text() == "1"
     assert (dest2 / "b.txt").read_text() == "2"
+
+
+def test_run_entries_gives_concurrent_tasks_distinct_stores():
+    # boto3-s3 forbids sharing a client across concurrently transferring
+    # threads: two tasks running at the same time must see different stores,
+    # and clones must be built before the pool starts (on the main thread).
+    import threading
+    from typing import ClassVar
+
+    from s3bak.cli import run_entries
+    from s3bak.config import Config, Opts
+
+    class FakeStore:
+        built_on: ClassVar[list[str]] = []
+
+        def __init__(self):
+            FakeStore.built_on.append(threading.current_thread().name)
+
+        def clone(self):
+            return FakeStore()
+
+    cfg = Config(
+        profile="p",
+        prefix="s3://b/x",
+        bucket="b",
+        path_prefix="x",
+        entries={"one": {"path": "/one"}, "two": {"path": "/two"}},
+        store=FakeStore(),  # type: ignore[arg-type]
+    )
+    barrier = threading.Barrier(2, timeout=10)
+    seen: list[int] = []
+
+    def fn(cfg_: Config, entry: str, opts_: Opts) -> int:
+        barrier.wait()  # both tasks in flight at once
+        seen.append(id(cfg_.store))
+        return 0
+
+    assert run_entries(fn, cfg, ["one", "two"], Opts()) == 0
+    assert len(seen) == 2 and seen[0] != seen[1]
+    assert all(name == "MainThread" for name in FakeStore.built_on)
+
+
+def test_run_entries_propagates_broken_pipe():
+    # A worker's BrokenPipeError must reach run()'s 141 handler, not be
+    # flattened into a per-entry status 1.
+    import pytest
+
+    from s3bak.cli import run_entries
+    from s3bak.config import Config, Opts
+
+    cfg = Config(
+        profile="p",
+        prefix="s3://b/x",
+        bucket="b",
+        path_prefix="x",
+        entries={"one": {"path": "/one"}, "two": {"path": "/two"}},
+    )
+
+    def fn(cfg_: Config, entry: str, opts_: Opts) -> int:
+        raise BrokenPipeError
+
+    with pytest.raises(BrokenPipeError):
+        run_entries(fn, cfg, ["one", "two"], Opts())

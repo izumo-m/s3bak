@@ -123,8 +123,8 @@ record and object tallies), so a quiet cron log still shows the check ran.
 
 ## Suggested routine
 
-- `s3bak verify --all` daily — listing-only, one manifest GET plus one LIST
-  page per ~1000 objects per entry.
+- `s3bak verify --all` daily — listing-only: per entry, one manifest GET,
+  one HEAD of the tree's own key, and one LIST page per ~1000 objects.
 - `s3bak verify --all --checksum` weekly — reads and hashes every recorded
   local file.
 - A restore drill quarterly, or after changing excludes, entries, or bucket

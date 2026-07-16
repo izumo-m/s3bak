@@ -69,11 +69,26 @@ def write_manifest_to_aws(
                 st = os.lstat(target)
                 sym = os.readlink(target) if stat_mod.S_ISLNK(st.st_mode) else None
                 manifest.write_manifest(f, [(os.path.basename(target), st, sym)])
+        _validate_before_publish(entry, tmp)
         if upload:
             assert cfg.store is not None
             cfg.store.put_file(key, tmp, verbose=verbose)
     finally:
         os.unlink(tmp)
+
+
+def _validate_before_publish(entry: str, path: str) -> None:
+    """Run the reader's full validation over a freshly written manifest before
+    it is uploaded: no writer may publish a manifest the next download would
+    reject (which would brick the entry - every command validates on
+    download). Runs on dry-run rehearsals too, so they fail where the real
+    push would."""
+    try:
+        manifest.validate_manifest(path)
+    except manifest.ManifestError as e:
+        raise manifest.ManifestError(
+            f"{entry}: refusing to publish an invalid manifest ({e})"
+        ) from e
 
 
 def patch_manifest_subtree(
@@ -110,7 +125,22 @@ def patch_manifest_subtree(
         local_sub = os.path.join(target_root, sub)
         new_entries: Iterator[tuple[str, os.stat_result, str | None]] = iter(())
         if os.path.lexists(local_sub):
-            new_entries = localwalk.iter_subtree(local_sub, sub, excludes, warn=_walk_warning)
+            # Ancestor directory records for sub's parents: every record needs
+            # a recorded directory parent (the validator's rule), and neither
+            # a first-ever manifest nor one that predates a newly created
+            # nested directory has them. Re-recording an already-recorded
+            # ancestor is harmless - a walked path wins the merge, exactly as
+            # a full push would re-record it.
+            ancestors: list[tuple[str, os.stat_result, str | None]] = []
+            acc = target_root
+            rel = "."
+            for part in sub.split("/")[:-1]:
+                acc = os.path.join(acc, part)
+                rel = f"{rel}/{part}"
+                ancestors.append((rel, os.lstat(acc), None))
+            new_entries = itertools.chain(
+                ancestors, localwalk.iter_subtree(local_sub, sub, excludes, warn=_walk_warning)
+            )
         if old_manifest is None:
             # First-ever manifest for this entry, born from a sub-path push:
             # record the entry root too, so the manifest keeps the dir-entry
@@ -126,6 +156,7 @@ def patch_manifest_subtree(
                 keep_old=keep_old,
                 warn=note_warning,
             )
+        _validate_before_publish(entry, new_path)
         if opts.dryrun:
             print(f"(dry-run) would patch manifest: {key} (sub={sub})")
         else:

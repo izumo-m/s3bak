@@ -55,7 +55,7 @@ Minimal example:
 ```python
 import os
 
-HOME = os.environ.get("HOME", "")
+HOME = os.environ["HOME"]  # fail loudly if unset; on Windows use USERPROFILE
 
 profile = "default"
 prefix = "s3://my-bucket/backup"

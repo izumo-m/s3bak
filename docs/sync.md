@@ -288,7 +288,9 @@ Deleting is opt-in and confirmed:
   warns (exit 2): an orphan decision built on a partial local view could
   delete a good backup. Special-file skips are the sync's normal behaviour
   and do not count. Candidates already confirmed before the gap were decided
-  on sound data and stand; re-run `push --delete` after fixing the cause.
+  on sound data and stand — their records go stale and the next
+  `push --delete` merge drops them, the standard self-healing; re-run
+  `push --delete` after fixing the cause.
 - **A single-file entry sweeps `entry/` explicitly.** Its push has no sync
   listing, so `--delete` lists the slash-bounded `entry/` prefix and offers
   every object there — always `(not in manifest)`, since a file-shaped
@@ -357,7 +359,9 @@ Deleting is opt-in and confirmed:
    sync into an existing tree, local symlinks sitting at recorded directory
    paths are replaced with real directories: the sync opens `dir/file` paths
    through whatever is at `dir`, and a symlink there would route downloads
-   outside the restore tree (the root itself gets the same treatment). On
+   outside the restore tree (the root itself gets the same treatment). That
+   replacement stands even if the download then fails — a conflicting
+   symlink is never something a pull preserves. On
    Windows, read-only files the sync may overwrite are made writable first
    and restored after.
 4. **Apply manifest metadata** (unless `--data-only`): one streaming
@@ -425,6 +429,8 @@ names).
   single `would apply manifest metadata` line stands in for the metadata
   apply (mode / mtime / symlinks) when it would run. The transfer report
   comes from the same sync decisions as a real pull, only with the actions
-  suppressed.
+  suppressed — with one caveat: a conflicting-type restore root is only
+  reported, and the rehearsal sync runs against the uncorrected root, so its
+  transfer report can differ from what the real (staged) pull transfers.
 - **`-o/--output`** restores one target to an alternative path instead of the
   entry's configured path. It is not available for multi-target pulls.

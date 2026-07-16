@@ -783,3 +783,33 @@ def test_missing_subpath_delete_aborts_on_damaged_manifest_before_deleting(ws):
     res = ws.run("push", "--delete", "--yes", "data/sub")
     assert res.rc == 1
     assert "data/sub/f.txt" in ws.keys()
+
+
+def test_pull_preserves_old_root_when_cutover_and_rollback_both_fail(ws, monkeypatch):
+    # Worst case of the staged swap: the old root was moved aside, the new
+    # root cannot be renamed in, and the rollback rename fails too. The stage
+    # cleanup must then keep the directory that holds the only copy.
+    ws.write("data", "payload")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    dest = ws.root / "out"
+    ws.write("out/precious.txt", "keep me")
+
+    real_replace = os.replace
+
+    def failing_replace(src, dst):
+        # Fail every rename INTO the restore root: both the cutover and the
+        # rollback target it. Everything else (the atomic manifest/object
+        # downloads, moving the old root aside) proceeds normally.
+        if os.fspath(dst) == str(dest):
+            raise OSError("injected rename failure")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr("s3bak.commands.os.replace", failing_replace)
+    with pytest.raises(OSError, match="injected"):
+        ws.run("pull", "data", "-o", str(dest))
+
+    stages = list(ws.root.glob("*.s3bak-stage*"))
+    assert len(stages) == 1  # preserved, not cleaned up
+    assert (stages[0] / "replaced" / "precious.txt").read_text() == "keep me"

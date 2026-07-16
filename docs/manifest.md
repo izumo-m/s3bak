@@ -41,8 +41,8 @@ error.
 | ---------- | ------ | ---------------------- | --------------------------------------------------- |
 | `path`     | string | every record          | entry-relative path (see below)                     |
 | `mode`     | string | every record          | full `st_mode` as octal, e.g. `100644`, `40755`     |
-| `owner`    | string | every record          | user name, or the uid as a string when unresolvable |
-| `group`    | string | every record          | group name, or the gid as a string                  |
+| `owner`    | string | optional (default `""`) | user name, or the uid as a string when unresolvable |
+| `group`    | string | optional (default `""`) | group name, or the gid as a string                  |
 | `size`     | int    | regular files only    | byte size                                           |
 | `mtime_ns` | int    | every record          | `st_mtime_ns` (nanoseconds since epoch)             |
 | `link`     | string | symlinks only         | the symlink target, verbatim                        |
@@ -97,8 +97,9 @@ memory bounded by one directory level rather than the whole tree:
   between the two. It returns directories, lstat-based symlink leaves, special
   files, and unreadable entries before filtering. s3bak customizes only exclude
   subtree pruning; boto3-s3 emits each directory record in-stream just before
-  its children. An unreadable directory keeps its own record and silently loses
-  its children.
+  its children. An unreadable directory keeps its own record and loses its
+  children; the manifest-writing walk reports that gap as a warning (exit 2),
+  while the read-only diff walks stay silent (their comparison fails safe).
 - **The writer** streams walk → temp file → upload; it never buffers the whole
   manifest.
 - **The status / pull `--delete` diff** (`merge_join`) pairs the manifest
@@ -143,6 +144,12 @@ against either side of a sync without materializing it.
 - Manifest reads fail closed. A bad header, invalid UTF-8, blank or malformed
   record, unsafe path, inconsistent type fields, duplicate, or out-of-order
   record aborts with `ManifestError` before manifest-driven mutation starts.
+  A duplicate means a duplicate sort key; a regular-file record and a
+  directory record may share one logical path (a kind change kept by the
+  merge) — the merge warns that they cannot all restore, and `push --delete`
+  prunes the losers. Writers run this same validation over every manifest
+  before uploading it, so no push can publish a manifest the next download
+  would reject.
   Treating a damaged record as absent would be unsafe: `pull --delete` could
   otherwise classify the corresponding local path as an extra and remove it.
   A directory push reads the manifest at some stage in every mode, so a
