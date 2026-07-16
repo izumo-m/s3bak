@@ -783,7 +783,3 @@ def run() -> int:
     if rc == 0 and warning_count() > 0:
         return 2
     return rc
-
-
-if __name__ == "__main__":
-    sys.exit(run())
