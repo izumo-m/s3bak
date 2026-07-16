@@ -224,9 +224,12 @@ similarly prefixed sibling) and removes that subtree from the manifest.
 Deleting is opt-in and confirmed:
 
 - **`--delete`** enables the delete lane behind a per-orphan prompt
-  (`y/n/a/d/q`): y deletes this object, n keeps it, a deletes this and every
+  (`y/n/a/d/q/?`): y deletes this object, n keeps it, a deletes this and every
   later candidate, d keeps this and every later candidate, q aborts the whole
-  command (a bare Enter re-asks; EOF aborts). Candidates arrive in ascending
+  command. Full words (yes/no/all/quit) are accepted; `?` or any answer not
+  understood (a bare Enter included) prints the answer legend and re-asks,
+  EOF aborts, and a one-line summary of the answers precedes the first
+  question of a run. Candidates arrive in ascending
   key order (the sync decides the delete lane serially). An object answered n
   keeps its manifest record too — the record and the object always travel
   together — and shows up as `D` in `status` until a later `--delete` removes
@@ -326,7 +329,7 @@ names).
 - **`--data-only`** downloads data without applying mode / mtime / symlinks.
 - **`--delete`** removes local files not present in the manifest (a mirror
   restore), behind the same per-item confirmation as push: each extra is
-  prompted `y/n/a/d/q` deepest-first (the removal order), `--yes` answers
+  prompted `y/n/a/d/q/?` deepest-first (the removal order), `--yes` answers
   yes to everything, and a non-TTY run without `--yes` answers no (removes
   nothing, still exits 0). Keeping an item silently keeps its ancestor extra
   directories too — their `rmdir` could only fail — and is a choice, not a

@@ -10,9 +10,13 @@ a failure).
 
 The interactive answers follow ``rm -i`` / ``git add -p`` conventions:
 y = delete this one, n = keep this one, a = delete this and everything after,
-d = keep this and everything after, q = abort the whole command. Kept keys are
-appended (in arrival order, which the sync guarantees is ascending key order)
-to a temp file the manifest merge later streams (manifest.KeptKeys).
+d = keep this and everything after, q = abort the whole command. Full words
+(yes/no/all/quit) are accepted; "delete" deliberately is not, because d means
+keep. ``?`` - or any answer not understood, a bare Enter included - prints the
+legend and re-asks, and a one-line summary of the answers precedes the first
+question of a run. Kept keys are appended (in arrival order, which the sync
+guarantees is ascending key order) to a temp file the manifest merge later
+streams (manifest.KeptKeys).
 """
 
 from __future__ import annotations
@@ -24,7 +28,7 @@ import threading
 from enum import Enum, auto
 from typing import IO
 
-from s3bak.console import prompt_is_interactive, read_prompt_answer
+from s3bak.console import prompt_is_interactive, read_prompt_answer, write_stderr
 
 
 class DeletionAbortedError(Exception):
@@ -57,9 +61,27 @@ _prompt_lock = threading.Lock()
 # wind down too. Reset at each cli.main() entry (in-process test runs).
 _abort = threading.Event()
 
+# Printed once before the first per-item question of a run, so the answer keys
+# are explained before the first one is typed.
+_ANSWER_SUMMARY = (
+    "s3bak: --delete answers: y=delete, n=keep, a=delete all, d=keep all, q=abort, ?=help\n"
+)
+_summary_shown = False
+
+# Printed by ? - or any answer not understood - before re-asking.
+_ANSWER_LEGEND = (
+    "y, yes  - delete this one\n"
+    "n, no   - keep this one\n"
+    "a, all  - delete this one and everything after, without asking again\n"
+    "d       - keep this one and everything after, without asking again\n"
+    "q, quit - abort the whole command; nothing further is deleted\n"
+)
+
 
 def reset_confirmations() -> None:
+    global _summary_shown
     _abort.clear()
+    _summary_shown = False
 
 
 class DeleteConfirmer:
@@ -95,21 +117,33 @@ class DeleteConfirmer:
         with _prompt_lock:
             if _abort.is_set():  # another entry aborted while we waited
                 raise DeletionAbortedError()
+            global _summary_shown
+            if not _summary_shown:
+                _summary_shown = True
+                write_stderr(_ANSWER_SUMMARY)
             while True:
-                answer = read_prompt_answer(f"s3bak: {self._entry}: delete {display}? [y/n/a/d/q] ")
-                if answer == "y":
+                answer = read_prompt_answer(
+                    f"s3bak: {self._entry}: delete {display}? [y/n/a/d/q/?] "
+                )
+                if answer is None:  # EOF
+                    _abort.set()
+                    raise DeletionAbortedError()
+                if answer in ("y", "yes"):
                     return True
-                if answer == "n":
+                if answer in ("n", "no"):
                     return self._note_kept(kept_key)
-                if answer == "a":
+                if answer in ("a", "all"):
                     self._mode = AnswerMode.ALL_YES
                     return True
                 if answer == "d":
                     self._mode = AnswerMode.ALL_NO
                     return self._note_kept(kept_key)
-                if answer == "q" or answer is None:  # None = EOF; bare Enter re-asks
+                if answer in ("q", "quit"):
                     _abort.set()
                     raise DeletionAbortedError()
+                # ? or anything unrecognized - "delete" (which d does NOT
+                # mean) and a bare Enter included - explains and re-asks.
+                write_stderr(_ANSWER_LEGEND)
 
     def kept_keys_path(self) -> str | None:
         """Path of the kept-keys file, flushed for reading; None if every
@@ -142,7 +176,8 @@ def confirm_subtree_delete(mode: AnswerMode, entry: str, display: str) -> bool:
             answer = read_prompt_answer(
                 f"s3bak: {entry}: delete the backup subtree {display}? [y/n] "
             )
-            if answer == "y":
+            if answer in ("y", "yes"):
                 return True
-            if answer == "n" or answer is None:  # None = EOF; bare Enter re-asks
+            if answer in ("n", "no") or answer is None:  # None = EOF
                 return False
+            write_stderr("y, yes - delete the subtree\nn, no  - keep it\n")

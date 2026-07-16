@@ -198,6 +198,7 @@ _DELETE_CONFIRMATION = (
         "Deletion confirmation",
         (
             "--delete prompts with y/n/a/d/q: delete, keep, delete all, keep all, or quit.",
+            "? explains the answers at the prompt; full words (yes/no/all/quit) also work.",
             "Without a TTY, every answer is no unless --yes is set.",
         ),
     ),
