@@ -263,7 +263,9 @@ def _place_symlink(target: str, st: os.stat_result | None, sym_target: str) -> N
     """Create the recorded symlink at ``target``, clearing what ``st`` says is
     there. A symlink is removed as a link (never recursing into its target); a
     real dir (e.g. left by an older follow-symlinks backup) is removed
-    wholesale."""
+    wholesale. Windows distinguishes file and directory symlinks, so the
+    link's own target is probed (best effort - it may not exist yet) to pick
+    the kind; POSIX ignores the flag."""
     parent = os.path.dirname(target)
     if parent:
         os.makedirs(parent, exist_ok=True)
@@ -272,7 +274,8 @@ def _place_symlink(target: str, st: os.stat_result | None, sym_target: str) -> N
             shutil.rmtree(target)
         else:
             os.remove(target)
-    os.symlink(sym_target, target)
+    resolved = sym_target if os.path.isabs(sym_target) else os.path.join(parent or ".", sym_target)
+    os.symlink(sym_target, target, target_is_directory=os.path.isdir(resolved))
     write_output(f"{target} -> {sym_target}\n")
 
 

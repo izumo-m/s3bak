@@ -209,3 +209,17 @@ def test_verify_reports_strays_under_single_file_entry(ws):
     res = ws.run("verify", "data", expect_rc=0)  # cli.main; cli.run maps warnings to 2
     assert "unrecorded object" in res.err and "data/rogue" in res.err
     assert "1 warning(s)" in res.out
+
+
+def test_verify_reports_root_folder_object(ws):
+    # A folder object at the tree's own key strips to an empty relative key;
+    # it must still be classified as a folder object - with data it is an
+    # error, since a '/'-terminated key cannot restore to any local path.
+    _push_tree(ws)
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/", Body=b"payload")
+    res = ws.run("verify", "data", expect_rc=1)
+    assert "folder object with data" in res.err
+
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/", Body=b"")
+    res = ws.run("verify", "data", expect_rc=0)  # cli.main; cli.run maps warnings to 2
+    assert "folder object" in res.err

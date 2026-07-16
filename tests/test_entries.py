@@ -426,6 +426,43 @@ def test_post_hook_failure_propagates(ws):
     assert res.rc == 3
 
 
+def test_post_hook_exit_2_normalizes_to_hard_error(ws):
+    # Exit 2 is reserved for a warnings-only s3bak run; a hook exiting 2 is a
+    # hook failure and must not masquerade as one.
+    ws.write("data/a.txt", "x")
+    ws.config(
+        {
+            "data": {
+                "path": str(ws.root / "data"),
+                "post_hook": [sys.executable, "-c", "raise SystemExit(2)"],
+            }
+        }
+    )
+    res = ws.run("push", "data")
+    assert res.rc == 1
+    assert "post_hook failed (exit 2)" in res.err
+
+
+def test_post_hook_signal_death_maps_to_128_plus_signal(ws):
+    # subprocess reports a signal death as a negative returncode; sys.exit
+    # must see the conventional 128+N instead.
+    ws.write("data/a.txt", "x")
+    ws.config(
+        {
+            "data": {
+                "path": str(ws.root / "data"),
+                "post_hook": [
+                    sys.executable,
+                    "-c",
+                    "import os, signal; os.kill(os.getpid(), signal.SIGTERM)",
+                ],
+            }
+        }
+    )
+    res = ws.run("push", "data")
+    assert res.rc == 128 + 15
+
+
 def test_post_hook_runs_on_success(ws):
     marker = ws.root / "hook-ran"
     ws.write("data/a.txt", "x")

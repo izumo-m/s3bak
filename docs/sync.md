@@ -132,9 +132,13 @@ files is exactly what its machinery is for.
   spawns s3transfer's transfer threads (`max_concurrency`), and `--checksum`
   its compare workers (`compare_workers`).
 
-All workers share the client constructed before the entry pool starts. See
-[architecture.md](architecture.md#s3-client-lifetime) for its lifetime and
-thread-safety boundary.
+Each entry worker slot gets its own S3 client, all constructed sequentially
+before the entry pool starts (boto3-s3 forbids sharing a client across
+concurrently transferring threads). See
+[architecture.md](architecture.md#s3-client-lifetime) for the lifetime and
+thread-safety boundary. `SIGINT` during a multi-entry run cancels the entries
+that have not started; entries already running finish (killing one mid-push
+would leave its manifest and data inconsistent) before the process exits 130.
 
 ## The push pipeline
 
@@ -346,8 +350,10 @@ Deleting is opt-in and confirmed:
    (multipart via `S3.cp` if the recorded size is large). A restore root of
    the wrong type (a directory where a file entry restores, a file or symlink
    where a tree does) is never destroyed up front: the download lands in a
-   `<outpath>.s3bak-stage` sibling first, and the root is replaced only after
-   it succeeded — a failed download costs nothing local. Before a directory
+   unique stage directory beside it first, and the root is swapped in two
+   atomic renames only after the download succeeded — a failed download costs
+   nothing local, and the swap keeps the old root recoverable until the new
+   one is in place. Before a directory
    sync into an existing tree, local symlinks sitting at recorded directory
    paths are replaced with real directories: the sync opens `dir/file` paths
    through whatever is at `dir`, and a symlink there would route downloads

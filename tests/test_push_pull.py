@@ -626,7 +626,7 @@ def test_pull_keeps_conflicting_dir_root_when_download_fails(ws):
     res = ws.run("pull", "data", "-o", str(dest))
     assert res.rc == 1
     assert keep.read_text() == "keep me"
-    assert not os.path.lexists(str(dest) + ".s3bak-stage")
+    assert not list(ws.root.glob("*.s3bak-stage*"))
 
 
 def test_pull_replaces_conflicting_dir_root_after_staged_download(ws):
@@ -639,7 +639,7 @@ def test_pull_replaces_conflicting_dir_root_after_staged_download(ws):
 
     ws.run("pull", "data", "-o", str(dest), expect_rc=0)
     assert dest.read_text() == "payload"
-    assert not os.path.lexists(str(dest) + ".s3bak-stage")
+    assert not list(ws.root.glob("*.s3bak-stage*"))
 
 
 def test_pull_keeps_conflicting_file_root_when_dir_download_fails(ws, monkeypatch):
@@ -662,7 +662,7 @@ def test_pull_keeps_conflicting_file_root_when_dir_download_fails(ws, monkeypatc
     res = ws.run("pull", "data", "-o", str(dest))
     assert res.rc == 1
     assert dest.read_text() == "in the way"
-    assert not os.path.lexists(str(dest) + ".s3bak-stage")
+    assert not list(ws.root.glob("*.s3bak-stage*"))
 
 
 def test_pull_delete_skipped_when_metadata_apply_fails(ws):

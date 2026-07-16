@@ -107,6 +107,12 @@ known limits, as input for choosing what to back up:
   that differ only by case land in one local file, the last download winning
   silently (the destination-overlap check guards distinct pull targets, not
   paths within one entry).
+- **A filename must be valid UTF-8 to become an S3 key.** POSIX exposes
+  undecodable filename bytes as surrogate code points; the manifest can
+  round-trip them, but the S3 request encoding cannot, so pushing such a name
+  fails that file's transfer (the push exits non-zero and the manifest is not
+  rewritten — nothing corrupts, but the file cannot be backed up until it is
+  renamed or excluded).
 
 See [manifest.md](manifest.md) for the exact record format and invariants, and
 [sync.md](sync.md) for the commands that read or update it.

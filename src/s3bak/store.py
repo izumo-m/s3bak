@@ -110,6 +110,21 @@ class Boto3S3Store:
         self._client = self._s3.client()
         self._small_limit = self._resolve_small_limit()
 
+    def clone(self) -> Boto3S3Store:
+        """A fresh store - its own boto3-s3 orchestrator and client - with this
+        store's configuration. Entry workers each get one (cli.run_entries):
+        boto3-s3's contract is one client per concurrently transferring
+        thread, built sequentially up front - never shared across transfers,
+        never built on a worker thread."""
+        return Boto3S3Store(
+            self.profile,
+            self.prefix,
+            self.bucket,
+            self.path_prefix,
+            max_concurrency=self.max_concurrency,
+            compare_workers=self.compare_workers,
+        )
+
     def _resolve_small_limit(self) -> int:
         """Objects strictly smaller than this go through a direct client call
         instead of S3.cp.

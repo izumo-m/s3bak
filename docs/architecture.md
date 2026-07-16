@@ -56,9 +56,14 @@ are foundational modules used from several layers.
 
 An S3 command constructs one `Boto3S3Store` while loading configuration, before
 entry worker threads start. The store creates one boto3-s3 `S3` object and one
-boto3 client, then binds every S3 location to that shared client.
+boto3 client, then binds every S3 location to that client.
 
-This structure avoids constructing boto3 clients concurrently while allowing
-the completed client to be shared by entry workers and transfer workers. The
-local-only `list` command does not construct the store. Runtime concurrency and
-its configuration are described in [sync.md](sync.md#concurrency).
+boto3-s3's concurrency contract is that transfers running on different threads
+must not share a client, and that clients must be built sequentially (client
+construction is not thread-safe). A multi-entry command therefore builds one
+store per worker slot up front on the main thread (`Boto3S3Store.clone`), and
+each entry task borrows one for its duration — a running sync/cp never shares
+a client with another. Within one entry, s3transfer's own worker threads
+operate under that entry's client, which the library manages. The local-only
+`list` command does not construct a store. Runtime concurrency and its
+configuration are described in [sync.md](sync.md#concurrency).

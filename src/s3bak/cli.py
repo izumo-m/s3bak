@@ -27,12 +27,13 @@ import concurrent.futures
 import math
 import os
 import posixpath
+import queue
 import shlex
 import signal
 import subprocess
 import sys
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib.metadata import version
 from typing import NoReturn
 
@@ -99,11 +100,27 @@ def run_entries(
     if cfg.entry_concurrency is not None:
         workers = min(workers, cfg.entry_concurrency)
 
+    # boto3-s3's concurrency contract: transfers running on different threads
+    # must not share a client, and clients must be built sequentially up
+    # front. One store (own orchestrator + client) per worker slot, built
+    # here on the main thread; each task borrows one for its duration, so a
+    # worker's sync/cp never shares a client with another running transfer.
+    stores: queue.SimpleQueue[Boto3S3Store | None] = queue.SimpleQueue()
+    stores.put(cfg.store)
+    for _ in range(workers - 1):
+        stores.put(cfg.store.clone() if cfg.store is not None else None)
+
+    def run_one(entry: str) -> int:
+        store = stores.get()
+        try:
+            return fn(replace(cfg, store=store), entry, opts)
+        finally:
+            stores.put(store)
+
     statuses = [0] * len(entries)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {
-            executor.submit(fn, cfg, entry, opts): index for index, entry in enumerate(entries)
-        }
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+    try:
+        futures = {executor.submit(run_one, entry): index for index, entry in enumerate(entries)}
         for future in concurrent.futures.as_completed(futures):
             index = futures[future]
             try:
@@ -111,6 +128,12 @@ def run_entries(
             except Exception as exc:
                 err(f"{entries[index]}: {exc}")
                 statuses[index] = 1
+    finally:
+        # SIGINT lands in this (main) thread as SystemExit: cancel the entries
+        # that have not started, but let the running ones finish - killing an
+        # entry mid-push would leave its manifest and data inconsistent. The
+        # normal path has nothing pending, so this is then a plain shutdown.
+        executor.shutdown(wait=True, cancel_futures=True)
     # Completion order varies with scheduling. Preserve the first configured
     # entry's failure so --all has a deterministic exit code (including a
     # post_hook's documented 3+ code) rather than whichever worker happened to

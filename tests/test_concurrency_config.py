@@ -289,3 +289,26 @@ def test_push_pull_roundtrip_with_concurrency_settings(ws):
     dest = ws.root / "out"
     ws.run("pull", "data", "-o", str(dest), expect_rc=0)
     assert (dest / "a.txt").read_text() == "hello"
+
+
+def test_multi_entry_push_uses_one_store_per_worker(ws):
+    # boto3-s3 forbids sharing a client across concurrently transferring
+    # threads: a multi-entry run must round-trip correctly with per-worker
+    # stores (Boto3S3Store.clone) borrowed from the pool.
+    ws.write("one/a.txt", "1")
+    ws.write("two/b.txt", "2")
+    ws.config(
+        {
+            "one": {"path": str(ws.root / "one")},
+            "two": {"path": str(ws.root / "two")},
+        }
+    )
+    ws.run("push", "--all", expect_rc=0)
+    assert {"one/a.txt", "two/b.txt"} <= ws.keys()
+
+    dest1 = ws.root / "out1"
+    dest2 = ws.root / "out2"
+    ws.run("pull", "one", "-o", str(dest1), expect_rc=0)
+    ws.run("pull", "two", "-o", str(dest2), expect_rc=0)
+    assert (dest1 / "a.txt").read_text() == "1"
+    assert (dest2 / "b.txt").read_text() == "2"

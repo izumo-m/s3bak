@@ -71,7 +71,12 @@ from s3bak.syncops import (
 
 
 def _run_hook(name: str, hook: list[str] | None, opts: Opts) -> int:
-    """Run one configured hook directly, without a command shell."""
+    """Run one configured hook directly, without a command shell. A failing
+    hook's status propagates (the documented 3+ lane), normalized where it
+    would collide with s3bak's own exit codes: 2 is reserved for a
+    warnings-only run, so it maps to 1, and a signal death (negative
+    returncode) becomes the conventional 128+N instead of leaking a negative
+    value into sys.exit."""
     if not hook:
         return 0
     if opts.dryrun:
@@ -80,9 +85,12 @@ def _run_hook(name: str, hook: list[str] | None, opts: Opts) -> int:
     if opts.verbose:
         write_stderr(f"+ {name}: {hook!r}\n")
     rc = subprocess.run(hook, shell=False).returncode
-    if rc != 0:
-        err(f"{name} failed (exit {rc}): {hook!r}")
-    return rc
+    if rc == 0:
+        return 0
+    err(f"{name} failed (exit {rc}): {hook!r}")
+    if rc < 0:
+        return 128 - rc  # killed by signal N -> 128+N
+    return 1 if rc == 2 else rc
 
 
 def upload_manifest(
@@ -948,12 +956,14 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         # a single-file write follow one. s3transfer/direct downloads replace
         # inner leaves atomically; this handles the operation root itself.
         # A conflicting root is not destroyed up front: the download lands in a
-        # stage sibling first and the root is replaced only after it succeeded,
-        # so a failed download cannot cost the local state it was replacing.
-        # A dry run reports the conflict instead of staging anything; the
-        # dry-run sync then runs against the uncorrected root, so its transfer
-        # report may differ from what the real (post-replacement) pull does.
-        stage: str | None = None
+        # unique stage directory beside it (mkdtemp - a fixed name could
+        # collide with unrelated user data) and the root is swapped only after
+        # it succeeded, so a failed download cannot cost the local state it
+        # was replacing. A dry run reports the conflict instead of staging;
+        # the dry-run sync then runs against the uncorrected root, so its
+        # transfer report may differ from what the real pull does.
+        stage_dir: str | None = None
+        prep: list[tuple[str, int]] = []
         if has_data and not opts.meta_only and os.path.lexists(outpath):
             if is_dir:
                 conflict = os.path.islink(outpath) or not os.path.isdir(outpath)
@@ -963,10 +973,10 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 if opts.dryrun:
                     write_output(f"(dry-run) would replace {outpath} (conflicting type)\n")
                 else:
-                    stage = outpath + ".s3bak-stage"
-                    _clear_stage(stage)  # a leftover from an interrupted pull
-                    if is_dir:
-                        os.makedirs(stage)
+                    parent = os.path.dirname(os.path.abspath(outpath))
+                    stage_dir = tempfile.mkdtemp(
+                        prefix=os.path.basename(outpath) + ".s3bak-stage-", dir=parent
+                    )
 
         try:
             # Replace local symlinks sitting at recorded directory paths before
@@ -979,7 +989,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 and has_data
                 and not opts.meta_only
                 and not opts.dryrun
-                and stage is None
+                and stage_dir is None
                 and os.path.isdir(outpath)
                 and prepare_dir_conflicts(outpath, manifest_path, sub)
             ):
@@ -987,9 +997,10 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
 
             # 3. Normal path: prep, then sync (dir) or cp (file). Root correction
             # must precede the Windows writable pass so that pass cannot traverse a
-            # symlinked restore root and chmod a file outside the destination.
-            prep: list[tuple[str, int]] = []
-            if IS_WINDOWS and not opts.meta_only and not opts.dryrun:
+            # symlinked restore root and chmod a file outside the destination. A
+            # staged pull downloads into a fresh stage, where nothing needs prep
+            # (and the conflicting root itself must not be walked into).
+            if IS_WINDOWS and not opts.meta_only and not opts.dryrun and stage_dir is None:
                 prep = windows_collect_writable_prep(outpath, is_dir, manifest_path, sub)
 
             changed = False
@@ -997,7 +1008,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 # The compare only matters for the dir sync; a single-file transfer
                 # always happens (we only reach it on a manifest mismatch). Its
                 # size (from the manifest) routes a large file through multipart.
-                dest = stage if stage is not None else outpath
+                dest = os.path.join(stage_dir, "new") if stage_dir is not None else outpath
                 compare = sync_compare(cfg, opts, entry, manifest_path, sub=sub) if is_dir else None
                 file_size = None if is_dir else _single_file_size(manifest_path)
                 try:
@@ -1022,14 +1033,18 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                     if IS_WINDOWS:
                         windows_restore_modes(prep)
                     return rc
-                if stage is not None:
-                    # The download is complete: only now is the conflicting root
-                    # cleared and the staged result renamed into place.
-                    if os.path.islink(outpath) or not os.path.isdir(outpath):
-                        os.remove(outpath)
-                    else:
-                        shutil.rmtree(outpath)
-                    os.replace(stage, outpath)
+                if stage_dir is not None:
+                    # The download is complete: swap in two atomic renames with
+                    # the old root recoverable in between - the stage cleanup
+                    # in the finally below then retires it (or, on a failed
+                    # swap, the partial download).
+                    replaced = os.path.join(stage_dir, "replaced")
+                    os.replace(outpath, replaced)
+                    try:
+                        os.replace(dest, outpath)
+                    except BaseException:
+                        os.replace(replaced, outpath)  # put the old root back
+                        raise
 
             # 4. Apply manifest metadata (mode, mtime, symlinks): objectless or
             #    metadata-only diffs (empty dirs, symlinks, mode/mtime) have nothing
@@ -1074,8 +1089,18 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                     )
 
             return st
+        except BaseException:
+            # An exception (S3 error, local I/O, SIGINT) skips the normal
+            # mode-restoring exits; put the Windows writable prep back before
+            # it propagates.
+            if IS_WINDOWS:
+                windows_restore_modes(prep)
+            raise
         finally:
-            _clear_stage(stage)
+            if stage_dir is not None:
+                # Retires the swapped-out old root on success, the partial
+                # download on failure - never anything this pull did not make.
+                shutil.rmtree(stage_dir, ignore_errors=True)
     except DeletionAbortedError:
         err(f"{entry}: aborted")
         return 1
@@ -1095,18 +1120,6 @@ def _single_file_size(manifest_path: str) -> int | None:
 # The status / pull --delete diff runs on the manifest-vs-local-walk merge-join
 # (restore.manifest_keyed / restore.local_keyed), the same streams the pull
 # metadata apply consumes.
-
-
-def _clear_stage(stage: str | None) -> None:
-    """Remove a pull download stage (``<outpath>.s3bak-stage``), whatever it
-    holds - the leftover of an interrupted pull, or a stage whose pull failed.
-    A no-op once the stage was renamed into place (or never created)."""
-    if stage is None or not os.path.lexists(stage):
-        return
-    if os.path.islink(stage) or not os.path.isdir(stage):
-        os.remove(stage)
-    else:
-        shutil.rmtree(stage)
 
 
 def _delete_extras(
@@ -1809,7 +1822,10 @@ def _verify_dir(
                 # Directory, symlink, and special records have no object by design.
             else:
                 assert obj is not None
-                if obj.key.endswith("/"):
+                if obj.key.endswith("/") or not obj.key:
+                    # An empty relative key is a folder object at the tree's
+                    # own key (`<rel_base>/`): the same manual-folder
+                    # convention, at the one position that strips to "".
                     _report_folder_object(report, f"{cfg.prefix}/{rel_base}/{obj.key}", obj)
                 else:
                     waiting.append(obj)

@@ -93,6 +93,10 @@ exit codes:
 | `130` | The process was interrupted by `SIGINT`. |
 | `141` | Output ended because of a broken pipe. |
 
+A hook status that would collide with the reserved meanings is normalized: a
+hook exiting `2` maps to `1` (2 is the warnings-only signal), and a hook killed
+by signal `N` maps to `128+N` instead of leaking a negative value.
+
 Status 2 distinguishes retained but incomplete work from both success and a
 hard failure, allowing scripts to require inspection without discarding work
 that did complete.
