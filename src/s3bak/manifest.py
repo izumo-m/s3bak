@@ -25,8 +25,7 @@ The sorted-order invariant is what keeps everything here streaming: the walk
 (localwalk.py, boto3-s3's engine) emits in S3 key order, the writer streams
 walk -> file, and the sub-path patch, the sync compare (ManifestFilter), and
 the status / pull ``--delete`` diff (merge_join) are all merges of sorted
-streams instead of a read-all + sort. This module is pure stdlib - the format,
-the joins, and the pattern matching, with no boto3-s3 dependency.
+streams instead of a read-all + sort.
 """
 
 from __future__ import annotations

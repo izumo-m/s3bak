@@ -26,8 +26,7 @@ are foundational modules used from several layers.
 - **console** owns terminal output, warning accounting, and small path helpers.
   It imports no other s3bak module.
 - **manifest** owns the JSONL format, validation, streaming subtree patches,
-  sorted-stream joins, and the stat-based manifest comparison. It uses only the
-  standard library.
+  sorted-stream joins, and the stat-based manifest comparison.
 - **localwalk** enumerates local trees in the same key order as the data sync
   and owns exclude pruning; the data sync's local side walks with the same
   walker (`sync_walker`), so excludes prune only the local side of a sync.

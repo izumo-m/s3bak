@@ -5,9 +5,8 @@ tree and metadata. It provides the input for `status`, metadata restoration on
 `pull`, and the default sync comparison. See [storage.md](storage.md) for its
 place alongside directly accessible data objects.
 
-The format lives in `src/s3bak/manifest.py`, which is pure (stdlib only); the
-tree walk that produces the records lives in `src/s3bak/localwalk.py`, on
-boto3-s3's directory engine.
+The format lives in `src/s3bak/manifest.py`; the tree walk that produces the
+records lives in `src/s3bak/localwalk.py`, on boto3-s3's directory engine.
 
 ## File layout
 
