@@ -36,7 +36,7 @@ import os
 import stat as stat_mod
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
-from typing import IO, Any, TypeVar
+from typing import IO, TYPE_CHECKING, TypeVar
 
 try:
     import grp
@@ -47,7 +47,8 @@ try:
 except ModuleNotFoundError:
     pwd = None  # type: ignore[assignment]
 
-from boto3_s3 import SyncPair
+if TYPE_CHECKING:
+    from boto3_s3 import SyncPair
 
 MANIFEST_SUFFIX = "-manifest.jsonl"
 FORMAT_VERSION = 3
@@ -314,7 +315,7 @@ def _owner_group(st: os.stat_result) -> tuple[str, str]:
 def format_entry(path: str, st: os.stat_result, sym_target: str | None) -> str:
     """One walk item -> one manifest line (no trailing newline)."""
     owner, group = _owner_group(st)
-    obj: dict[str, Any] = {
+    obj: dict[str, str | int] = {
         "path": path,
         "mode": format(st.st_mode, "o"),
         "owner": owner,
@@ -466,7 +467,7 @@ def write_merged(
     # tracks the most recent non-directory records whose descendant key range
     # is still open ("blockers", a stack because siblings like `sub.txt` sort
     # between a file `sub` and the `sub/...` range).
-    blockers: list[list[Any]] = []  # [rel, warned]
+    blockers: list[tuple[str, bool]] = []  # (rel, warned)
 
     def emit(rel: str, is_dir: bool, text: str) -> None:
         key = rel + "/" if is_dir else rel
@@ -479,14 +480,14 @@ def write_merged(
                         f" ./{top_rel}; pull cannot restore them"
                         f" (push --delete prunes them)"
                     )
-                    blockers[-1][1] = True
+                    blockers[-1] = (top_rel, True)
                 break
             if key > top_rel + "/":
                 blockers.pop()
                 continue
             break  # a sibling like `{top_rel}.x`: the blocker's range is still ahead
         if not is_dir and rel != ".":
-            blockers.append([rel, False])
+            blockers.append((rel, False))
         out.write(text)
 
     def old_items() -> Iterator[tuple[str, tuple[str, ManifestEntry, str]]]:

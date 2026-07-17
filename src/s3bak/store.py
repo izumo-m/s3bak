@@ -20,9 +20,25 @@ from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING
 
 from s3bak.console import note_warning, write_stderr
+
+if TYPE_CHECKING:
+    from boto3_s3 import (
+        FileFilter,
+        FileInfo,
+        LocalFileGenerator,
+        OpResult,
+        PairFilter,
+        ParallelFilter,
+        ResultCallback,
+        S3Storage,
+        SyncPair,
+    )
+    from boto3_s3.etagcompare import EtagComparison
+    from botocore.exceptions import ClientError
+    from mypy_boto3_s3.type_defs import ObjectIdentifierTypeDef
 
 # s3transfer's default multipart threshold, and boto3's default part size. Below
 # this an object is a single PutObject / GetObject in both the transfer path and
@@ -144,7 +160,7 @@ class Boto3S3Store:
         return min(threshold, part_size or _DEFAULT_MULTIPART)
 
     # --- internal ----------------------------------------------------------
-    def _s3_loc(self, rel_key: str = "", *, is_dir: bool = False) -> Any:
+    def _s3_loc(self, rel_key: str = "", *, is_dir: bool = False) -> S3Storage:
         """An ``s3://`` location for ``rel_key`` as an ``S3Storage`` bound to
         this store's one shared client.
 
@@ -161,7 +177,7 @@ class Boto3S3Store:
             url += "/"
         return S3Storage(url, client=self._client)
 
-    def content_compare(self) -> Any:
+    def content_compare(self) -> EtagComparison:
         """The `--checksum` update-lane strategy: ETag content comparison.
 
         Returns the bare `EtagComparison` PairFilter; `sync_up` / `sync_down`
@@ -190,7 +206,9 @@ class Boto3S3Store:
         return self.compare_workers or self.max_concurrency or 10
 
     @contextmanager
-    def _update_lane(self, compare: Any) -> Iterator[Any]:
+    def _update_lane(
+        self, compare: PairFilter | None
+    ) -> Iterator[PairFilter | ParallelFilter[SyncPair] | None]:
         """Resolve `compare` into an `S3.sync` `update_filter`, owning any thread
         pool it needs.
 
@@ -218,7 +236,9 @@ class Boto3S3Store:
     def _s3_url(self, rel_key: str = "") -> str:
         return f"{self.prefix}/{rel_key}" if rel_key else self.prefix
 
-    def _transfer(self, verbose: bool, label: str, op: Callable[[Any], None]) -> TransferResult:
+    def _transfer(
+        self, verbose: bool, label: str, op: Callable[[ResultCallback], None]
+    ) -> TransferResult:
         """Run a boto3-s3 transfer op, collecting aws-style result lines.
 
         `op(on_result)` calls the S3 method with the given result callback;
@@ -235,7 +255,7 @@ class Boto3S3Store:
         errs: list[str] = []
         lock = threading.Lock()
 
-        def on_result(r: Any) -> None:
+        def on_result(r: OpResult) -> None:
             if r.outcome in (OpOutcome.SUCCEEDED, OpOutcome.DRYRUN):
                 pre = "(dry-run) " if r.outcome is OpOutcome.DRYRUN else ""
                 if r.transfer_type is TransferType.DELETE:
@@ -348,7 +368,7 @@ class Boto3S3Store:
         paginator = self._client.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
             for item in page.get("Contents", []):
-                key = str(item["Key"])
+                key = item.get("Key", "")
                 yield ObjectMeta(
                     key=key[len(prefix) :],
                     size=int(item.get("Size", 0)),
@@ -367,7 +387,7 @@ class Boto3S3Store:
         objects: list[str] = []
         prefixes: list[str] = []
 
-        def collect(info: Any) -> None:
+        def collect(info: FileInfo) -> None:
             name = info.key.rstrip("/").rsplit("/", 1)[-1]
             if info.kind is FileKind.FILE:
                 objects.append(name)
@@ -377,7 +397,7 @@ class Boto3S3Store:
         self._s3.ls(self._s3_loc(is_dir=True), recursive=False, on_result=collect)
         return objects, prefixes
 
-    def _is_not_found(self, e: Any) -> bool:
+    def _is_not_found(self, e: ClientError) -> bool:
         code = e.response.get("Error", {}).get("Code", "")
         return code in ("404", "NoSuchKey", "NotFound")
 
@@ -463,7 +483,7 @@ class Boto3S3Store:
         """
         lines: list[str] = []
         errors: list[str] = []
-        pending: list[dict[str, str]] = []
+        pending: list[ObjectIdentifierTypeDef] = []
 
         def flush() -> None:
             if not pending or dryrun:
@@ -536,7 +556,7 @@ class Boto3S3Store:
         rel_prefix: str,
         dest_dir: str,
         *,
-        compare: Any = None,
+        compare: PairFilter | None = None,
         dryrun: bool = False,
         verbose: bool = False,
     ) -> TransferResult:
@@ -601,10 +621,10 @@ class Boto3S3Store:
         src_dir: str,
         rel_prefix: str,
         *,
-        walker: Any = None,
-        compare: Any = None,
-        create: Any = True,
-        delete: Any = False,
+        walker: LocalFileGenerator | None = None,
+        compare: PairFilter | None = None,
+        create: bool | FileFilter = True,
+        delete: bool | FileFilter = False,
         dryrun: bool = False,
         verbose: bool = False,
     ) -> TransferResult:

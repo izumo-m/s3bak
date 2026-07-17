@@ -17,7 +17,7 @@ import tempfile
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING
 
 from s3bak import localwalk, manifest
 from s3bak.compare import (
@@ -68,6 +68,9 @@ from s3bak.syncops import (
     sync_compare,
     write_manifest_to_aws,
 )
+
+if TYPE_CHECKING:
+    from boto3_s3 import FileFilter, FileInfo, PairFilter
 
 
 def _run_hook(name: str, hook: list[str] | None, opts: Opts) -> int:
@@ -135,7 +138,7 @@ class _PushDeletePlan:
     """How this push treats S3 orphans: the sync's delete-lane value, plus what
     the manifest merge must do about old-only records afterwards."""
 
-    lane: Any  # sync_up delete=: False | True | per-orphan callable
+    lane: bool | FileFilter  # sync_up delete=: False | True | per-orphan callable
     confirmer: DeleteConfirmer | None  # --delete without --yes (asked or auto-n)
     mirror: bool  # --delete --yes: every record follows its object; pure walk
     walker: localwalk.ManifestWalker | None = None  # the sync's local walker (--delete only)
@@ -213,12 +216,13 @@ def _plan_push_deletes(
     # stale ones (records whose object is already gone).
     confirmer = DeleteConfirmer(resolve_answer_mode(yes=opts.yes), entry)
 
-    def decide(info: Any) -> bool:
+    def decide(info: FileInfo) -> bool:
         if not plan.allow():
             return False
         # compare_key is relative to the sync's S3 listing prefix, i.e. to the
         # sub on a sub-path push; the kept key must be entry-rooted to match
         # the manifest merge.
+        assert info.compare_key is not None  # the sync stamps every listed entry
         rel = info.compare_key if sub is None else f"{sub}/{info.compare_key}"
         # A candidate the manifest never recorded is outside the backup: n
         # keeps its object for this run only, so the prompt says so.
@@ -241,7 +245,7 @@ def _warn_refused_deletes(entry: str, plan: _PushDeletePlan) -> None:
 
 def _plan_data_only_creates(
     plan: _PushDeletePlan, sub: str | None, opts: Opts
-) -> tuple[Any, list[int]]:
+) -> tuple[bool | FileFilter, list[int]]:
     """Create-lane hook for --data-only: count uploads of files the manifest
     does not record - the unrecorded objects this push creates (see
     storage.md). The count feeds _warn_unrecorded_uploads after the sync.
@@ -256,7 +260,8 @@ def _plan_data_only_creates(
     if not opts.data_only:
         return True, count
 
-    def note(info: Any) -> bool:
+    def note(info: FileInfo) -> bool:
+        assert info.compare_key is not None  # the sync stamps every listed entry
         rel = info.compare_key if sub is None else f"{sub}/{info.compare_key}"
         if not plan.recorded(rel):
             count[0] += 1
@@ -265,7 +270,9 @@ def _plan_data_only_creates(
     return note, count
 
 
-def _warn_unrecorded_uploads(entry: str, opts: Opts, count: list[int], compare: Any) -> None:
+def _warn_unrecorded_uploads(
+    entry: str, opts: Opts, count: list[int], compare: PairFilter | None
+) -> None:
     """Emit the --data-only unrecorded-upload warning after a successful sync.
     `count` is the create-lane tally (the run that creates the object); a
     later --data-only push meets the same object as an update pair instead,

@@ -41,6 +41,7 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "basedpyright>=1.13",
+    "boto3-stubs-lite[s3]>=1.43",
     "ruff>=0.6",
     "vermin>=1.6",
     "pytest>=8.0",

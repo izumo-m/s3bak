@@ -14,12 +14,15 @@ import os
 import stat as stat_mod
 import tempfile
 from collections.abc import Iterator
-from typing import Any
+from typing import TYPE_CHECKING
 
 from s3bak import localwalk, manifest
 from s3bak.config import Config, Opts
 from s3bak.console import err, note_warning, write_output, write_stderr
 from s3bak.manifest import ManifestEntry
+
+if TYPE_CHECKING:
+    from boto3_s3 import PairFilter
 
 
 def _walk_warning(body: str) -> None:
@@ -180,7 +183,7 @@ def download_manifest(cfg: Config, entry: str, dest: str, verbose: bool = False)
 
 def sync_compare(
     cfg: Config, opts: Opts, entry: str, manifest_path: str | None, sub: str | None = None
-) -> Any:
+) -> PairFilter:
     """Build the sync update-lane strategy (`S3.sync`'s `update_filter`): the
     stat-only streaming ManifestFilter by default, EtagComparison under
     --checksum. `manifest_path=None` (nothing on S3 yet) yields an empty filter,
@@ -217,7 +220,7 @@ def download_from_s3(
     is_dir: bool,
     verbose: bool,
     sub: str | None = None,
-    compare: Any = None,
+    compare: PairFilter | None = None,
     size: int | None = None,
     dryrun: bool = False,
 ) -> tuple[int, bool]:
