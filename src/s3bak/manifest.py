@@ -47,6 +47,8 @@ try:
 except ModuleNotFoundError:
     pwd = None  # type: ignore[assignment]
 
+from boto3_s3 import SyncPair
+
 MANIFEST_SUFFIX = "-manifest.jsonl"
 FORMAT_VERSION = 3
 _HEADER_KEY = "s3bak_manifest"
@@ -655,7 +657,7 @@ class ManifestFilter:
             return entry
         return None
 
-    def __call__(self, pair: Any) -> bool:
+    def __call__(self, pair: SyncPair) -> bool:
         # As an ``update_filter`` this is only ever handed a both-sides pair
         # (source and destination both present); the create lane (source-only)
         # and delete lane (destination-only) never reach here.
