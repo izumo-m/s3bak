@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import os
+import re
+
+MTIME_DETAIL = re.compile(r"mtime: remote=(.+) [<>] local=(.+) \((.+)\)")
 
 
 def test_status_clean_then_reports_changes(ws):
@@ -307,6 +310,52 @@ def test_status_of_unpushed_entry_reports_error(ws):
     res = ws.run("status", "data")
     assert res.rc == 1
     assert "not found on s3" in res.err.lower()
+
+
+def test_status_verbose_shows_subsecond_mtime_drift(ws):
+    # A drift below one second (e.g. WSL2 drvfs truncating a restored mtime to
+    # whole seconds) used to render as two identical second-precision
+    # timestamps with a floor-divided "(-1s)". The detail line must show the
+    # fractional digits that actually differ and a fractional diff.
+    ws.write("data/a.txt", "alpha")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    p = ws.root / "data" / "a.txt"
+    base = (os.lstat(p).st_mtime_ns // 1_000_000_000) * 1_000_000_000
+    os.utime(p, ns=(base, base))  # whole-second mtime recorded in the manifest
+    ws.run("push", "data", expect_rc=0)
+
+    drifted = base - 961_276_900
+    os.utime(p, ns=(drifted, drifted))
+    res = ws.run("status", "-v", "data", expect_rc=0)
+    m = MTIME_DETAIL.search(res.out)
+    assert m is not None
+    remote_disp, local_disp, diff_str = m.groups()
+    assert remote_disp != local_disp
+    assert remote_disp.endswith(".0")
+    assert local_disp.endswith(".0387231")
+    assert diff_str == "-0.9612769s"
+
+
+def test_status_verbose_mtime_diff_matches_displayed_seconds(ws):
+    # At one second or more the timestamps stay whole-second, and the diff is
+    # the difference of the two displayed values (not a floor-divided delta
+    # that can disagree with them by one).
+    ws.write("data/a.txt", "alpha")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    p = ws.root / "data" / "a.txt"
+    base = (os.lstat(p).st_mtime_ns // 1_000_000_000) * 1_000_000_000
+    remote = base + 500_000_000  # manifest keeps a fractional part
+    os.utime(p, ns=(remote, remote))
+    ws.run("push", "data", expect_rc=0)
+
+    local = base - 1_000_000_000  # displayed seconds differ by 1, exact by 1.5
+    os.utime(p, ns=(local, local))
+    res = ws.run("status", "-v", "data", expect_rc=0)
+    m = MTIME_DETAIL.search(res.out)
+    assert m is not None
+    remote_disp, local_disp, diff_str = m.groups()
+    assert "." not in remote_disp and "." not in local_disp
+    assert diff_str == "-1s"
 
 
 def test_diff_of_unpushed_single_file_reports_error(ws):

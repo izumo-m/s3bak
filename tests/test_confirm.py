@@ -98,15 +98,84 @@ def test_answer_d_keeps_everything_after(answers):
         confirmer.close()
 
 
-def test_invalid_and_empty_answers_reprompt(answers):
+def test_invalid_and_empty_answers_print_the_legend_and_reprompt(answers, capfd):
     # A bare Enter must re-ask, never abort: only EOF (None) counts as q.
     answers.feed("", "maybe", "y")
     confirmer = DeleteConfirmer(AnswerMode.ASK, "data")
     try:
         assert confirmer.confirm("a.txt") is True
         assert len(answers.prompts) == 3
+        assert capfd.readouterr().err.count("q, quit - abort the whole command") == 2
     finally:
         confirmer.close()
+
+
+def test_question_mark_prints_the_legend(answers, capfd):
+    answers.feed("?", "n")
+    confirmer = DeleteConfirmer(AnswerMode.ASK, "data")
+    try:
+        assert confirmer.confirm("a.txt", kept_key="a.txt") is False
+        assert len(answers.prompts) == 2
+        assert "[y/n/a/d/q/?]" in answers.prompts[0]
+        assert "y, yes  - delete this one" in capfd.readouterr().err
+    finally:
+        confirmer.close()
+
+
+def test_full_word_answers(answers):
+    answers.feed("yes", "no", "all")
+    confirmer = DeleteConfirmer(AnswerMode.ASK, "data")
+    try:
+        assert confirmer.confirm("a.txt", kept_key="a.txt") is True
+        assert confirmer.confirm("b.txt", kept_key="b.txt") is False
+        assert confirmer.confirm("c.txt", kept_key="c.txt") is True
+        assert confirmer.confirm("d.txt", kept_key="d.txt") is True  # all is sticky
+        assert len(answers.prompts) == 3
+        assert _kept_lines(confirmer) == ["b.txt"]
+    finally:
+        confirmer.close()
+
+
+def test_quit_word_aborts(answers):
+    answers.feed("quit")
+    confirmer = DeleteConfirmer(AnswerMode.ASK, "data")
+    try:
+        with pytest.raises(DeletionAbortedError):
+            confirmer.confirm("a.txt")
+    finally:
+        confirmer.close()
+
+
+def test_delete_word_is_not_an_answer(answers, capfd):
+    # d means keep, so the word "delete" must never be accepted as an answer;
+    # like any unrecognized input it prints the legend and re-asks.
+    answers.feed("delete", "n")
+    confirmer = DeleteConfirmer(AnswerMode.ASK, "data")
+    try:
+        assert confirmer.confirm("a.txt", kept_key="a.txt") is False
+        assert len(answers.prompts) == 2
+        assert "d       - keep this one" in capfd.readouterr().err
+    finally:
+        confirmer.close()
+
+
+def test_answer_summary_prints_once_per_run(answers, capfd):
+    answers.feed("y", "y")
+    confirmer = DeleteConfirmer(AnswerMode.ASK, "data")
+    try:
+        assert confirmer.confirm("a.txt") is True
+        assert confirmer.confirm("b.txt") is True
+    finally:
+        confirmer.close()
+    assert capfd.readouterr().err.count("--delete answers:") == 1
+    confirm.reset_confirmations()  # a new run reprints the summary
+    answers.feed("y")
+    fresh = DeleteConfirmer(AnswerMode.ASK, "data")
+    try:
+        assert fresh.confirm("a.txt") is True
+    finally:
+        fresh.close()
+    assert "--delete answers:" in capfd.readouterr().err
 
 
 def test_q_aborts_this_and_every_later_confirmation(answers):
@@ -172,14 +241,15 @@ def test_kept_keys_survive_newlines_in_filenames(answers):
         confirmer.close()
 
 
-def test_confirm_subtree_delete_modes(answers):
+def test_confirm_subtree_delete_modes(answers, capfd):
     assert confirm.confirm_subtree_delete(AnswerMode.ALL_YES, "data", "sub") is True
     assert confirm.confirm_subtree_delete(AnswerMode.ALL_NO, "data", "sub") is False
     assert answers.prompts == []
     answers.feed("y")
     assert confirm.confirm_subtree_delete(AnswerMode.ASK, "data", "sub") is True
-    answers.feed("n")
+    answers.feed("no")
     assert confirm.confirm_subtree_delete(AnswerMode.ASK, "data", "sub") is False
-    answers.feed("bogus", "")  # invalid re-prompts; EOF answers n
+    answers.feed("bogus", "")  # unrecognized answers explain and re-ask; EOF answers n
     assert confirm.confirm_subtree_delete(AnswerMode.ASK, "data", "sub") is False
     assert "data" in answers.prompts[0]
+    assert capfd.readouterr().err.count("keep it") == 2

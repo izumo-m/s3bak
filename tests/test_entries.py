@@ -71,26 +71,224 @@ def test_subpath_push_keeps_excludes_entry_rooted(ws):
     assert res.out.strip() == ""
 
 
-def test_entry_dir_replaced_by_same_stat_file_reuploads(ws):
-    # The entry path was a directory; it becomes a single file whose stat
-    # matches a record inside the stale dir manifest. The size+mtime check must
-    # match records by rel (the basename), not by stat coincidence.
+def _manifest_paths(ws) -> list[str]:
+    import json
+
+    body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl")["Body"].read()
+    return [json.loads(ln)["path"] for ln in body.decode().splitlines()[1:]]
+
+
+def _push_then_exclude_cache(ws) -> None:
+    """Push a tree, then add an exclude covering an already-pushed subtree.
+
+    cache/ stays on disk: excludes prune only the sync's local side, so its
+    S3 objects (and nothing else) become delete-lane orphans."""
+    ws.write("data/keep.txt", "k")
+    ws.write("data/cache/c.txt", "c")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    assert "data/cache/c.txt" in ws.keys()
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["cache/*"]}})
+
+
+def test_push_delete_offers_excluded_objects_as_orphans(ws, answers):
+    # An exclude added after a push must not strand the pushed objects: the
+    # local side no longer lists cache/, so its S3 objects surface as ordinary
+    # delete candidates - recorded ones, so no "(not in manifest)" flag - and
+    # the confirmed deletion drops object and record together.
+    _push_then_exclude_cache(ws)
+
+    answers.feed("y")
+    res = ws.run("push", "--delete", "data", expect_rc=0)
+
+    assert len(answers.prompts) == 1
+    assert "cache/c.txt" in answers.prompts[0]
+    assert "(not in manifest)" not in answers.prompts[0]
+    assert "delete:" in res.out
+    assert "data/cache/c.txt" not in ws.keys()
+    assert "./cache/c.txt" not in _manifest_paths(ws)
+    assert (ws.root / "data" / "cache" / "c.txt").read_text() == "c"  # local untouched
+
+
+def test_push_delete_yes_prunes_excluded_objects_unattended(ws, answers):
+    _push_then_exclude_cache(ws)
+
+    ws.run("push", "--delete", "--yes", "data", expect_rc=0)
+
+    assert answers.prompts == []
+    assert "data/cache/c.txt" not in ws.keys()
+    assert _manifest_paths(ws) == [".", "./keep.txt"]
+
+
+def test_push_delete_answer_n_keeps_excluded_object_and_record(ws, answers):
+    # n keeps the pair - even through a manifest rewrite forced by another
+    # change, the kept record must survive the KeptKeys merge, so the entry
+    # still verifies clean and a later --delete asks again.
+    _push_then_exclude_cache(ws)
+    (ws.root / "data" / "keep.txt").write_text("k-v2")  # forces a rewrite
+
+    answers.feed("n")
+    ws.run("push", "--delete", "data", expect_rc=0)
+
+    assert len(answers.prompts) == 1
+    assert "data/cache/c.txt" in ws.keys()
+    assert "./cache/c.txt" in _manifest_paths(ws)
+    res = ws.run("verify", "data", expect_rc=0)
+    assert "data: OK" in res.out
+
+
+def test_push_delete_dry_run_lists_excluded_orphans_without_prompting(ws, answers):
+    _push_then_exclude_cache(ws)
+
+    res = ws.run("push", "--delete", "--dry-run", "data", expect_rc=0)
+
+    assert answers.prompts == []
+    assert "(dry-run)" in res.out and "delete:" in res.out
+    assert "cache/c.txt" in res.out
+    assert "data/cache/c.txt" in ws.keys()
+    assert "./cache/c.txt" in _manifest_paths(ws)
+
+
+def test_plain_push_neither_uploads_nor_deletes_excluded_paths(ws):
+    # Without --delete the exclude only stops uploads: the stranded object
+    # stays (deleting is never the default) and verify keeps reporting the
+    # entry as intact - record and object still correspond.
+    _push_then_exclude_cache(ws)
+
+    (ws.root / "data" / "cache" / "c.txt").write_text("changed")
+    res = ws.run("push", "data", expect_rc=0)
+
+    assert "upload:" not in res.out
+    assert "delete:" not in res.out
+    assert "data/cache/c.txt" in ws.keys()
+    res = ws.run("verify", "data", expect_rc=0)
+    assert "data: OK" in res.out
+
+
+def test_push_delete_retires_unrecorded_excluded_object(ws, answers):
+    # The verify deadlock this design fixes: an object under an excluded path
+    # that the manifest never recorded (out-of-band upload, or residue of the
+    # old both-sides exclude semantics). verify warns about it, and push
+    # --delete - not a manual `aws s3 rm` - must be able to retire it.
+    ws.write("data/keep.txt", "k")
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["logs.db"]}})
+    ws.run("push", "data", expect_rc=0)
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/logs.db", Body=b"stray")
+
+    res = ws.run("verify", "data", expect_rc=0)
+    assert "unrecorded object" in res.err and "logs.db" in res.err
+
+    answers.feed("y")
+    ws.run("push", "--delete", "data", expect_rc=0)
+
+    assert len(answers.prompts) == 1
+    assert "(not in manifest)" in answers.prompts[0]
+    assert "data/logs.db" not in ws.keys()
+    res = ws.run("verify", "data", expect_rc=0)
+    assert "data: OK" in res.out
+
+
+def test_subpath_push_delete_offers_excluded_objects(ws, answers):
+    # The delete lane honors the entry-rooted excludes on a sub-path push too:
+    # the sub walk re-roots at ./sub/, so "sub/cache/*" prunes the local side
+    # and the pushed cache object becomes this sync's delete candidate.
+    ws.write("data/sub/a.txt", "a")
+    ws.write("data/sub/cache/c.txt", "c")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["sub/cache/*"]}})
+
+    answers.feed("y")
+    ws.run("push", "--delete", "data/sub", expect_rc=0)
+
+    assert len(answers.prompts) == 1
+    assert "sub/cache/c.txt" in answers.prompts[0]
+    keys = ws.keys()
+    assert "data/sub/cache/c.txt" not in keys
+    assert "data/sub/a.txt" in keys
+    assert "./sub/cache/c.txt" not in _manifest_paths(ws)
+    assert "./sub/a.txt" in _manifest_paths(ws)
+
+
+def test_subpath_push_of_excluded_subtree_backs_it_up(ws):
+    # Explicitly pushing an excluded sub-path wins over the exclude, exactly
+    # as the manifest walk (iter_subtree) already treats it: the sub's own
+    # subtree is walked, uploaded, AND recorded, so data and manifest agree.
+    # (The old both-sides filter uploaded nothing while the manifest patch
+    # recorded everything - records whose objects never existed.)
+    ws.write("data/keep.txt", "k")
+    ws.write("data/tmp/x.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["tmp/*"]}})
+    ws.run("push", "data", expect_rc=0)
+    assert "data/tmp/x.txt" not in ws.keys()
+
+    ws.run("push", "data/tmp", expect_rc=0)
+
+    assert "data/tmp/x.txt" in ws.keys()
+    assert "./tmp/x.txt" in _manifest_paths(ws)
+    res = ws.run("verify", "data", expect_rc=0)
+    assert "data: OK" in res.out
+
+
+def test_entry_dir_replaced_by_file_refuses_without_delete(ws):
+    # The entry path was a directory; it becomes a single file. An ordinary
+    # push must refuse - recording the new kind would silently orphan the old
+    # tree's objects - and leave the backup untouched.
     import shutil
 
     ws.write("data/a.txt", "hello")
     ws.config({"data": {"path": str(ws.root / "data")}})
     ws.run("push", "data", expect_rc=0)
 
-    st = os.lstat(ws.root / "data" / "a.txt")
     shutil.rmtree(ws.root / "data")
-    f = ws.root / "data"
-    f.write_text("hello")  # same size as the old ./a.txt record
-    os.utime(f, ns=(st.st_mtime_ns, st.st_mtime_ns))  # and the same mtime
+    (ws.root / "data").write_text("bye")
 
-    res = ws.run("push", "data", expect_rc=0)
-    assert "upload:" in res.out
+    res = ws.run("push", "data", expect_rc=1)
+    assert "push --delete replaces the old backup" in res.err
+    assert "data/a.txt" in ws.keys()  # the refused push changed nothing
+
+
+def test_entry_dir_replaced_by_file_migrates_with_delete(ws):
+    # push --delete --yes migrates the entry kind: the old tree's objects are
+    # deleted and the single-file backup (object + file-shaped manifest)
+    # replaces them, so every later command sees a consistent backup.
+    import shutil
+
+    ws.write("data/a.txt", "hello")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    shutil.rmtree(ws.root / "data")
+    (ws.root / "data").write_text("bye")
+
+    res = ws.run("push", "--delete", "--yes", "data", expect_rc=0)
+    assert "delete:" in res.out and "upload:" in res.out
+    assert "data/a.txt" not in ws.keys()
     body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data")["Body"].read()
-    assert body == b"hello"
+    assert body == b"bye"
+    ws.run("verify", "data", expect_rc=0)
+
+
+def test_entry_file_replaced_by_dir_migrates_with_delete(ws):
+    # The reverse kind change: a single-file entry becomes a directory. The
+    # ordinary push refuses; --delete --yes deletes the old exact object and
+    # records the directory from scratch (a bare-basename record must never
+    # survive into a directory manifest).
+    ws.write("data", "hello")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    os.remove(ws.root / "data")
+    ws.write("data/b.txt", "b")
+
+    ws.run("push", "data", expect_rc=1)
+    ws.run("push", "--delete", "--yes", "data", expect_rc=0)
+    assert "data" not in ws.keys()
+    assert "data/b.txt" in ws.keys()
+    ws.run("verify", "data", expect_rc=0)
+    dest = ws.root / "out"
+    ws.run("pull", "data", "-o", str(dest), expect_rc=0)
+    assert (dest / "b.txt").read_text() == "b"
 
 
 def test_first_subpath_push_keeps_dir_entry_shape(ws):
@@ -226,6 +424,43 @@ def test_post_hook_failure_propagates(ws):
     )
     res = ws.run("push", "data")
     assert res.rc == 3
+
+
+def test_post_hook_exit_2_normalizes_to_hard_error(ws):
+    # Exit 2 is reserved for a warnings-only s3bak run; a hook exiting 2 is a
+    # hook failure and must not masquerade as one.
+    ws.write("data/a.txt", "x")
+    ws.config(
+        {
+            "data": {
+                "path": str(ws.root / "data"),
+                "post_hook": [sys.executable, "-c", "raise SystemExit(2)"],
+            }
+        }
+    )
+    res = ws.run("push", "data")
+    assert res.rc == 1
+    assert "post_hook failed (exit 2)" in res.err
+
+
+def test_post_hook_signal_death_maps_to_128_plus_signal(ws):
+    # subprocess reports a signal death as a negative returncode; sys.exit
+    # must see the conventional 128+N instead.
+    ws.write("data/a.txt", "x")
+    ws.config(
+        {
+            "data": {
+                "path": str(ws.root / "data"),
+                "post_hook": [
+                    sys.executable,
+                    "-c",
+                    "import os, signal; os.kill(os.getpid(), signal.SIGTERM)",
+                ],
+            }
+        }
+    )
+    res = ws.run("push", "data")
+    assert res.rc == 128 + 15
 
 
 def test_post_hook_runs_on_success(ws):
@@ -534,3 +769,65 @@ def test_local_path_resolution_handles_an_entry_at_filesystem_root(tmp_path):
 
     assert entry == "root"
     assert sub == str(tmp_path / "child.txt").removeprefix(root).replace(os.sep, "/")
+
+
+def test_meta_only_refuses_entry_kind_change(ws):
+    # --meta-only moves no data and cannot migrate a kind change; recording
+    # the new kind would orphan the old tree (dir->file) or publish a manifest
+    # mixing both shapes (file->dir). Both directions must refuse untouched.
+    import shutil
+
+    ws.write("data/a.txt", "hello")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    shutil.rmtree(ws.root / "data")
+    (ws.root / "data").write_text("now a file")
+
+    res = ws.run("push", "--meta-only", "data")
+    assert res.rc == 1
+    assert "disagree on kind" in res.err
+    assert "data/a.txt" in ws.keys()
+    ws.run("verify", "data", expect_rc=0)  # the old backup is intact
+
+    solo = ws.write("solo", "s")
+    ws.config({"solo": {"path": str(solo)}})
+    ws.run("push", "solo", expect_rc=0)
+    os.remove(solo)
+    ws.write("solo/inner.txt", "i")
+
+    res = ws.run("push", "--meta-only", "solo")
+    assert res.rc == 1
+    assert "disagree on kind" in res.err
+    ws.run("verify", "solo", expect_rc=0)
+
+
+def test_first_nested_subpath_push_writes_valid_manifest(ws):
+    # The first-ever manifest born from a NESTED sub-path push must record the
+    # ancestor directories too: without them every later download rejects the
+    # manifest ("no directory parent") and the entry is unusable.
+    ws.write("data/sub/deep/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+
+    ws.run("push", str(ws.root / "data" / "sub" / "deep" / "a.txt"), expect_rc=0)
+
+    ws.run("status", "data", expect_rc=0)
+    ws.run("verify", "data", expect_rc=0)
+    dest = ws.root / "out"
+    ws.run("pull", "data", "-o", str(dest), expect_rc=0)
+    assert (dest / "sub" / "deep" / "a.txt").read_text() == "a"
+
+
+def test_subpath_push_of_new_nested_directory_records_ancestors(ws):
+    # A sub-path push below a directory the existing manifest predates must
+    # add the ancestor records, not just the leaf's.
+    ws.write("data/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    ws.write("data/new/nested/b.txt", "b")
+    ws.run("push", str(ws.root / "data" / "new" / "nested" / "b.txt"), expect_rc=0)
+
+    ws.run("status", "data", expect_rc=0)
+    ws.run("verify", "data", expect_rc=0)
+    paths = _manifest_paths(ws)
+    assert "./new" in paths and "./new/nested" in paths

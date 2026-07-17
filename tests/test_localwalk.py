@@ -128,3 +128,20 @@ def test_iter_subtree_single_file_and_symlink(tmp_path):
 
     links = list(localwalk.iter_subtree(str(tmp_path / "ln"), "ln", []))
     assert [(rel, sym) for rel, _st, sym in links] == [("./ln", "f.txt")]
+
+
+def test_walk_tree_warns_when_symlink_races_away(tmp_path, monkeypatch):
+    # A symlink that changes underfoot between the scan and its readlink is
+    # skipped; the wired warn hook must hear about the gap instead of the
+    # record vanishing silently.
+    (tmp_path / "real").mkdir()
+    os.symlink("real", tmp_path / "lnk")
+
+    def raise_oserror(path, *args, **kwargs):
+        raise OSError("raced")
+
+    monkeypatch.setattr("s3bak.localwalk.os.readlink", raise_oserror)
+    warns: list[str] = []
+    rels = [rel for rel, _st, _sym in localwalk.walk_tree(str(tmp_path), [], warn=warns.append)]
+    assert "./lnk" not in rels
+    assert any("changed during the walk" in w for w in warns)

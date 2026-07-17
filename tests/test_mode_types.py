@@ -11,6 +11,7 @@ import json
 import os
 import stat
 
+from s3bak import compare
 from s3bak.manifest import parse_entry
 
 MTIME_NS = 1_600_000_000 * 1_000_000_000
@@ -56,6 +57,32 @@ def test_perm_str_keeps_setuid_and_sticky_bits():
     assert entry.is_file
     assert entry.perm_bits == 0o4755
     assert entry.perm_str == "4755"
+
+
+# --- the shared mode predicate (status's mode report, push's manifest refresh) --
+
+
+def _st(mode: int) -> os.stat_result:
+    # Only st_mode matters to mode_differs.
+    return os.stat_result((mode, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+
+
+def test_mode_differs_compares_permission_bits(monkeypatch):
+    monkeypatch.setattr(compare, "IS_WINDOWS", False)
+    entry = parse_entry(_line("100644", "./a.txt", size=5))
+    assert entry is not None
+    assert not compare.mode_differs(entry, _st(0o100644))
+    assert compare.mode_differs(entry, _st(0o100600))
+
+
+def test_mode_differs_windows_reads_only_owner_write_bit(monkeypatch):
+    # Windows-native Python reports synthetic modes (0o666 writable, 0o444
+    # read-only), so only the owner-write bit carries information there.
+    monkeypatch.setattr(compare, "IS_WINDOWS", True)
+    entry = parse_entry(_line("100644", "./a.txt", size=5))
+    assert entry is not None
+    assert not compare.mode_differs(entry, _st(0o100666))
+    assert compare.mode_differs(entry, _st(0o100444))
 
 
 # --- status / pull against hand-built manifests --------------------------------

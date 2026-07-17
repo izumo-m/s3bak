@@ -49,6 +49,8 @@ quiet too, since `status` shares the predicate). `--checksum` (content) covers
 it completely; a tighter `mtime_window` (e.g. `0`, exact) covers the case where
 the mtime did advance but within the window. The window is set in `config.py`,
 or overridden for one run with `--mtime-window <seconds>`.
+`verify --checksum` detects a file sitting in the blind spot without
+uploading anything (see [verify.md](verify.md)).
 
 **Self-healing (push):** a spurious mtime-only difference re-transfers the file
 once; that push refreshes the manifest with the new mtime, and later runs pass
@@ -75,8 +77,9 @@ a push or pull would actually do. The window is resolved per entry:
 which overrides the top-level `mtime_window` in `config.py` (0 = exact
 everywhere). A per-entry window suits a tree whose filesystem needs a different
 tolerance than the rest. `status` additionally reports mode changes for the
-metadata view — but the sync never transfers over a mode change (that is a
-`--meta-only` refresh, below).
+metadata view — the sync never transfers over a mode change; a push refreshes
+just the manifest instead (step 3 of the push pipeline, below), through the
+same mode predicate `status` uses.
 
 For a directory entry, `status` is one streaming merge-join
 (`manifest.merge_join`) of the manifest against a fresh local walk, both in S3
@@ -84,8 +87,10 @@ key order: both-sides pairs run the shared predicate (M), manifest-only records
 report D, local-only paths report A — every line in key order, holding one pair
 in memory, so a manifest far larger than RAM still works. Excluded paths are
 invisible on the local side of the diff: never compared, never an A — so a
-record left in the manifest by a later-added exclude reads D until the next
-push drops it.
+record left in the manifest by a later-added exclude reads D until a
+`push --delete` retires it together with its object. The excluded
+directory's own record is objectless, so it outlives that cleanup and keeps
+reading D — like every directory record, only the `--yes` mirror prunes it.
 
 ## The transfer path: direct client call vs. `S3.cp`
 
@@ -127,9 +132,13 @@ files is exactly what its machinery is for.
   spawns s3transfer's transfer threads (`max_concurrency`), and `--checksum`
   its compare workers (`compare_workers`).
 
-All workers share the client constructed before the entry pool starts. See
-[architecture.md](architecture.md#s3-client-lifetime) for its lifetime and
-thread-safety boundary.
+Each entry worker slot gets its own S3 client, all constructed sequentially
+before the entry pool starts (boto3-s3 forbids sharing a client across
+concurrently transferring threads). See
+[architecture.md](architecture.md#s3-client-lifetime) for the lifetime and
+thread-safety boundary. `SIGINT` during a multi-entry run cancels the entries
+that have not started; entries already running finish (killing one mid-push
+would leave its manifest and data inconsistent) before the process exits 130.
 
 ## The push pipeline
 
@@ -144,37 +153,58 @@ environment.
 
 1. Run `pre_hook` (always, before target validation or any backup work), so a
    hook may generate the file or tree being backed up.
-2. **Directory entry:** download and validate the manifest, build the compare
-   strategy, and `sync_up`. New and changed local files upload; a locally
+2. Download and validate the manifest — every push, of either entry kind,
+   before anything on S3 moves, so a damaged manifest aborts while the backup
+   is intact. An entry whose local path changed kind (file ↔ directory) is
+   caught here: an ordinary push refuses — recording the new kind would
+   silently orphan the old tree's objects, or plant an invalid bare-basename
+   record inside a directory manifest — and `push --delete` migrates: one
+   confirmed deletion removes the old backup (the exact key and everything
+   under `entry/`), then the push records the new kind from scratch.
+   **Directory entry:** build the compare strategy and `sync_up`. New and
+   changed local files upload; a locally
    deleted file keeps its S3 object AND its manifest record — **push never
    deletes a backup unless `--delete` was given and the deletion confirmed**
    (see "Deleting backups" below). `--checksum` ignores manifest file stats
-   for its content decision, but a whole-entry push still downloads the
-   manifest: it detects objectless tree changes, and `--data-only` reads it
-   to warn about the uploads it leaves unrecorded. Excludes are
-   applied by the same entry-rooted matcher the manifest walk uses, so the
-   data sync and the manifest can never disagree on what an exclude means.
+   for its content decision (the download above still validates and feeds
+   the kind check, the objectless-tree-change check, and `--data-only`'s
+   unrecorded-upload warning). Excludes prune the
+   sync's **local side only**, through the same walker the manifest walk
+   uses (`localwalk.sync_walker`), so the data sync and the manifest can
+   never disagree on what an exclude means. The S3 listing is never
+   filtered: an object under an excluded path — pushed before the exclude
+   was added — is an ordinary delete-lane orphan, so `push --delete` can
+   retire it (see "Deleting backups" below) instead of the exclude hiding
+   it from every lane forever.
    **Single-file entry:** upload iff the size+mtime check fails — the manifest holds
    no matching-basename record, the local stat differs, or the S3 object is
-   missing (a HeadObject confirms existence, since a single file has no listing
-   to self-heal from). `--checksum` uses the ETag comparison instead.
+   missing or size-drifted (a HeadObject confirms existence at the recorded
+   size, since a single file has no listing to self-heal from). `--checksum`
+   uses the ETag comparison instead.
 3. **Refresh the manifest if data was transferred or deleted, its tree
-   structure or a symlink target changed, on `--meta-only`, or when no
-   manifest exists yet.** The refresh merges the fresh local walk into the
-   old manifest (`write_merged`): a walked path always wins, and old-only
-   records — the backups of locally vanished files — are kept, except file
-   records dropped by a `--delete` run: those whose object the confirmation
-   removed, and stale ones whose object was already gone (how an interrupted
-   deletion self-heals). A record kept under a path that is no longer a
-   directory (the local tree replaced a directory with a same-named file)
-   makes the entry unrestorable as a tree; the merge detects this and warns
-   (exit 2), and a `push --delete --yes` prunes such records. The
-   structural check makes empty and symlink-only changes restorable even
-   though they have no data objects. A mode-only change or an mtime drift inside
-   the window transfers nothing and does not refresh an existing manifest;
-   `status` keeps showing the mode or mtime difference until a `--meta-only`
-   push. Owner and group are informational rather than comparison inputs, and
-   update whenever the manifest is rewritten.
+   structure, a symlink target, or a permission changed, on `--meta-only`,
+   or when no manifest exists yet.** The refresh merges the fresh local walk
+   into the old manifest (`write_merged`): a walked path always wins, and
+   old-only records — the backups of locally vanished files — are kept, except
+   file records dropped by a `--delete` run: those whose object the
+   confirmation removed, and stale ones whose object was already gone (how an
+   interrupted deletion self-heals). A record kept under a path that is no
+   longer a directory (the local tree replaced a directory with a same-named
+   file) makes the entry unrestorable as a tree; the merge detects this and
+   warns (exit 2), and a `push --delete --yes` prunes such records. The
+   no-transfer check makes empty-directory, symlink-only, and permission
+   changes restorable even though they move no data: a `chmod` refreshes the
+   manifest without re-uploading anything, settling exactly the mode
+   differences `status` reports — the two share one mode predicate, which
+   never compares symlink permission bits and on Windows reads only the
+   owner-write bit (`os.stat` modes there are synthetic). A single-file entry
+   runs the same permission check against its one record. An mtime drift
+   inside the window transfers nothing and does not refresh an existing
+   manifest — the window is a rounding tolerance. Owner and group are
+   informational rather than comparison inputs, and update whenever the
+   manifest is rewritten. The manifest walk warns (exit 2) when it cannot
+   see the whole tree — an unreadable directory, a path racing away
+   mid-walk — since the manifest is the record of what the push saw.
 4. Run `post_hook` — but only after a push that did work (transferred data
    and/or refreshed the manifest), so a side-effecting hook does not fire on a
    pure no-op. `--meta-only` always refreshes and runs the hook, which is the
@@ -190,8 +220,16 @@ way (see "Deleting backups" below).
 
 A **sub-path push** (`push entry/sub` or a local path inside an entry) syncs or
 uploads just that sub-tree and patches the manifest sub-tree in place
-(`write_merged` over the replaced range). A symlink sub-path uploads no data —
-only its manifest record is updated. If the entry has no manifest yet, the
+(`write_merged` over the replaced range). Like a whole-entry push, it
+downloads and validates the manifest before any S3 mutation (the deletion,
+upload, and patch all reuse that one copy), and it refuses a file-shaped
+entry — patching a sub-path into a single-file manifest would corrupt it;
+push the entry itself to migrate the kind first. A symlink sub-path uploads
+no data — only its manifest record is updated. Excludes keep their entry-rooted meaning
+inside the range (the sub walk re-anchors them), with one deliberate edge: a
+sub-path that is itself covered by an exclude is still walked, uploaded, and
+recorded — naming a path explicitly wins over the exclude, and the data and
+the manifest agree on the result. If the entry has no manifest yet, the
 patch also writes the `.` root record so the manifest keeps its directory-entry
 shape. A sub-path push is a whole-entry push scoped to the sub-path: the same
 keep-by-default and `--delete` confirmation rules apply within the range, and
@@ -211,9 +249,12 @@ similarly prefixed sibling) and removes that subtree from the manifest.
 Deleting is opt-in and confirmed:
 
 - **`--delete`** enables the delete lane behind a per-orphan prompt
-  (`y/n/a/d/q`): y deletes this object, n keeps it, a deletes this and every
+  (`y/n/a/d/q/?`): y deletes this object, n keeps it, a deletes this and every
   later candidate, d keeps this and every later candidate, q aborts the whole
-  command (a bare Enter re-asks; EOF aborts). Candidates arrive in ascending
+  command. Full words (yes/no/all/quit) are accepted; `?` or any answer not
+  understood (a bare Enter included) prints the answer legend and re-asks,
+  EOF aborts, and a one-line summary of the answers precedes the first
+  question of a run. Candidates arrive in ascending
   key order (the sync decides the delete lane serially). An object answered n
   keeps its manifest record too — the record and the object always travel
   together — and shows up as `D` in `status` until a later `--delete` removes
@@ -231,6 +272,31 @@ Deleting is opt-in and confirmed:
   question returns on every later `--delete`. See
   [storage.md](storage.md#unrecorded-objects) for what such an object is and
   how to adopt or retire it.
+- **An object under an excluded path is a candidate like any other**, because
+  excludes prune only the local side of the sync. This is how the backup of a
+  path excluded *after* it was pushed (an accidentally uploaded `node_modules`,
+  a log file excluded later) is cleaned up: `push --delete` offers the
+  leftovers, and a confirmed deletion drops each object and its file record
+  together. Answering n keeps both, and the local file — excluded, so
+  invisible to the walk — stays untouched either way. The excluded
+  directory's own record follows the rule above: objectless, never asked,
+  kept until a `--yes` mirror.
+- **An incomplete local scan refuses deletions.** Once the walk warn-skips
+  real tree content — an unreadable directory or file, a path that vanished
+  mid-walk — every later delete candidate is kept, the manifest merge keeps
+  every old-only record (records travel with their objects), and the push
+  warns (exit 2): an orphan decision built on a partial local view could
+  delete a good backup. Special-file skips are the sync's normal behaviour
+  and do not count. Candidates already confirmed before the gap were decided
+  on sound data and stand — their records go stale and the next
+  `push --delete` merge drops them, the standard self-healing; re-run
+  `push --delete` after fixing the cause.
+- **A single-file entry sweeps `entry/` explicitly.** Its push has no sync
+  listing, so `--delete` lists the slash-bounded `entry/` prefix and offers
+  every object there — always `(not in manifest)`, since a file-shaped
+  manifest records only the entry's own key. This is how the residue of an
+  entry that used to be a directory, or an out-of-band upload below a
+  single-file entry, is retired; the manifest itself is untouched.
 - **`--yes`** answers yes to every confirmation: the unattended mirror for
   cron. Without a TTY (stdin/stderr), `--delete` without `--yes` answers no
   to everything — nothing is deleted and the run still succeeds (rc 0).
@@ -283,15 +349,47 @@ Deleting is opt-in and confirmed:
    is the very stat check whose blind spot `--checksum` exists to cover.
 3. **Download** (unless `--meta-only`, or a symlink sub-path with no data
    object): `sync_down` for a directory, a single `get_object` for a file
-   (multipart via `S3.cp` if the recorded size is large). On Windows, read-only
-   files the sync may overwrite are made writable first and restored after.
-4. **Apply manifest metadata** (unless `--data-only`): recreate symlinks and
-   empty directories, and set mode / mtime on entries whose local filesystem
-   type matches the record. Directory and symlink conflicts are recreated from
-   the manifest; a regular-file conflict is reported instead of following a
-   hostile local symlink. A regular file the manifest records but that no
-   object placed is reported missing (exit 1), rather than silently created as
-   a directory. Recorded owner and group names are not applied.
+   (multipart via `S3.cp` if the recorded size is large). A restore root of
+   the wrong type (a directory where a file entry restores, a file or symlink
+   where a tree does) is never destroyed up front: the download lands in a
+   unique stage directory beside it first, and the root is swapped in two
+   atomic renames only after the download succeeded — a failed download costs
+   nothing local, and the swap keeps the old root recoverable until the new
+   one is in place. Before a directory
+   sync into an existing tree, local symlinks sitting at recorded directory
+   paths are replaced with real directories: the sync opens `dir/file` paths
+   through whatever is at `dir`, and a symlink there would route downloads
+   outside the restore tree (the root itself gets the same treatment). That
+   replacement stands even if the download then fails — a conflicting
+   symlink is never something a pull preserves. On
+   Windows, read-only files the sync may overwrite are made writable first
+   and restored after.
+4. **Apply manifest metadata** (unless `--data-only`): one streaming
+   merge-join of the manifest against a fresh local walk - the same join
+   `status` and `--delete` run - repairs **only the records whose local state
+   differs**: the shared size+mtime predicate plus mode, symlink target, and
+   directory mtime. A matching record is left untouched and unreported: an
+   mtime drift inside the window is never "snapped" to the recorded value
+   (the window is a rounding tolerance; `--meta-only --mtime-window 0` is the
+   exact-value refresh), and an unchanged symlink is not recreated. A
+   downloaded file normally mismatches afterwards - the directory sync stamps
+   the S3 object's upload time onto it, the single-file lane leaves the write
+   time - and gets its recorded mtime applied; a stamp that already lands
+   inside the window is a match and stays, the same bounded tolerance every
+   match gets. Directory mode/mtime is applied deepest-first after all child
+   mutations and re-checked fresh then, so a directory dirtied only by the
+   downloads themselves converges in the same pull. The walk prunes the
+   entry's excludes (an excluded subtree is never scanned) but serves purely
+   as a stat cache: a record it did not pair up is judged from a direct
+   lstat, so a record under an excluded path - pull's data sync is
+   exclude-blind - is still repaired. Mismatches repair as before: symlinks
+   and empty directories are recreated, and mode / mtime set on entries whose
+   local filesystem type matches the record. Directory and symlink conflicts
+   are recreated from the manifest; a regular-file conflict is reported
+   instead of following a hostile local symlink. A regular file the manifest
+   records but that no object placed is reported missing (exit 1), rather
+   than silently created as a directory. Recorded owner and group names are
+   not applied.
 
 What a pull can reproduce is bounded by what the backup records — see
 [storage.md](storage.md#restore-fidelity) for the limits (hard links,
@@ -300,11 +398,13 @@ names).
 
 ### Mode flags
 
-- **`--meta-only`** applies recorded metadata without downloading data.
+- **`--meta-only`** applies recorded metadata without downloading data. It
+  runs the same gated apply, so it too repairs only the records whose local
+  state differs.
 - **`--data-only`** downloads data without applying mode / mtime / symlinks.
 - **`--delete`** removes local files not present in the manifest (a mirror
   restore), behind the same per-item confirmation as push: each extra is
-  prompted `y/n/a/d/q` deepest-first (the removal order), `--yes` answers
+  prompted `y/n/a/d/q/?` deepest-first (the removal order), `--yes` answers
   yes to everything, and a non-TTY run without `--yes` answers no (removes
   nothing, still exits 0). Keeping an item silently keeps its ancestor extra
   directories too — their `rmdir` could only fail — and is a choice, not a
@@ -312,7 +412,12 @@ names).
   merge-join `status` runs; only the extras themselves are held in memory, and
   they are removed deepest-first so directories empty out before their `rmdir`.
   A failed removal makes the command fail instead of reporting a successful
-  mirror while an extra remains. An extra is judged solely by the manifest,
+  mirror while an extra remains. The pass runs after the metadata apply and
+  is skipped when that apply failed — extras diffed against a tree that is
+  not in its recorded state are not trustworthy deletion candidates. Each
+  removal bumps its parent directory's mtime, so when anything was removed
+  the manifest metadata is applied once more, re-settling exactly the
+  directories the removals dirtied. An extra is judged solely by the manifest,
   so **an extra can be the only copy of real data**: a file never pushed, or
   one pushed by `--data-only` or by a push interrupted before its manifest
   write — its object then sits [unrecorded](storage.md#unrecorded-objects)
@@ -324,6 +429,8 @@ names).
   single `would apply manifest metadata` line stands in for the metadata
   apply (mode / mtime / symlinks) when it would run. The transfer report
   comes from the same sync decisions as a real pull, only with the actions
-  suppressed.
+  suppressed — with one caveat: a conflicting-type restore root is only
+  reported, and the rehearsal sync runs against the uncorrected root, so its
+  transfer report can differ from what the real (staged) pull transfers.
 - **`-o/--output`** restores one target to an alternative path instead of the
   entry's configured path. It is not available for multi-target pulls.

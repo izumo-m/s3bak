@@ -64,9 +64,10 @@ selected command are errors rather than ignored input. In particular, an
 unsupported preview-like option must never allow a mutating command to proceed
 as if it were a dry run.
 
-Argument and option validation happens before configuration creates an S3
-client. Local syntax errors therefore remain visible even when credentials or
-the remote service are unavailable. The `list` command loads configuration
+Option and syntax validation happens before configuration creates an S3
+client, so an option typo reports the typo even when credentials or the
+remote service are unavailable. Entry and path resolution needs the loaded
+configuration and therefore runs after the store exists. The `list` command loads configuration
 without constructing an S3 client because its result is entirely local.
 
 ## Concurrent entry results
@@ -92,6 +93,10 @@ exit codes:
 | `3+` | A failing hook or another command result propagated its non-zero status. |
 | `130` | The process was interrupted by `SIGINT`. |
 | `141` | Output ended because of a broken pipe. |
+
+A hook status that would collide with the reserved meanings is normalized: a
+hook exiting `2` maps to `1` (2 is the warnings-only signal), and a hook killed
+by signal `N` maps to `128+N` instead of leaking a negative value.
 
 Status 2 distinguishes retained but incomplete work from both success and a
 hard failure, allowing scripts to require inspection without discarding work

@@ -4,7 +4,8 @@ presentation helpers (color, humanized sizes/durations).
 
 ``compare_to_local`` shares its size+mtime check with the sync's
 ``ManifestFilter`` (see manifest.py), so ``status`` and push/pull agree on
-what counts as changed; mode is compared additionally for the metadata report.
+what counts as changed; ``mode_differs`` is the shared mode predicate, used
+here for the metadata report and by push's manifest-refresh check.
 """
 
 from __future__ import annotations
@@ -99,13 +100,32 @@ def _humanize_duration(diff_sec: int) -> str:
     return sign + " ".join(parts[:2])
 
 
-def _fmt_mtime(mtime_ns: int) -> str:
+def _fmt_mtime(mtime_ns: int, *, subsecond: bool = False) -> str:
+    secs, frac_ns = divmod(mtime_ns, 1_000_000_000)
     try:
-        return datetime.datetime.fromtimestamp(mtime_ns / 1_000_000_000).strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
+        text = datetime.datetime.fromtimestamp(secs).strftime("%Y-%m-%d %H:%M:%S")
     except (OSError, OverflowError, ValueError):
         return f"{mtime_ns}ns"
+    if subsecond:
+        text += "." + (f"{frac_ns:09d}".rstrip("0") or "0")
+    return text
+
+
+def mode_differs(entry: ManifestEntry, st: os.stat_result) -> bool:
+    """Whether the record's permission bits differ from the local stat's.
+
+    The shared mode predicate: ``status``'s mode report and push's
+    manifest-refresh check both use it, so a push settles exactly the mode
+    differences ``status`` shows. Callers skip symlink records (their
+    permission bits are compared nowhere)."""
+    if stat_mod.S_IMODE(st.st_mode) == entry.perm_bits:
+        return False
+    if IS_WINDOWS:
+        # Windows-native Python (incl. msys2 UCRT64) reports synthetic modes
+        # via os.stat: 0o666 for writable files, 0o444 for read-only - not
+        # the Unix permission bits. Only the owner-write bit is meaningful.
+        return (entry.perm_bits & 0o200) != (st.st_mode & 0o200)
+    return True
 
 
 @dataclass
@@ -171,7 +191,8 @@ def compare_to_stat(
     The size + mtime part is the same check the sync's ManifestFilter
     applies (mtime within ``window_ns``), so `status` and push/pull agree on
     what counts as changed; mode is additionally compared here for the
-    metadata report (the sync never transfers over a mode change).
+    metadata report (a mode change never re-transfers data - push refreshes
+    the manifest instead, through the same ``mode_differs`` predicate).
     """
     diff = EntryDiff(status=None, tags=[], details=[])
 
@@ -214,30 +235,29 @@ def compare_to_stat(
             diff_str = _humanize_size_diff(loc_size - entry.size)
             diff.details.append(f"size: remote={remote_disp} {cmp} local={local_disp} ({diff_str})")
 
-    loc_mode = format(stat_mod.S_IMODE(st.st_mode), "o")
-    mode_differs = loc_mode != entry.perm_str
-    if mode_differs and IS_WINDOWS:
-        # Windows-native Python (incl. msys2 UCRT64) reports synthetic modes
-        # via os.stat: 0o666 for writable files, 0o444 for read-only - not
-        # the Unix permission bits. Only the owner-write bit is meaningful.
-        if (entry.perm_bits & 0o200) == (st.st_mode & 0o200):
-            mode_differs = False
-    if mode_differs:
+    if mode_differs(entry, st):
+        loc_mode = format(stat_mod.S_IMODE(st.st_mode), "o")
         diff.status = "M"
         diff.tags.append("mode")
         diff.details.append(f"mode: remote={entry.perm_str} local={loc_mode}")
 
     # A directory's mtime changes whenever its children are added/removed, so
     # it is noise in `status` and is suppressed there (ignore_dir_mtime=True).
-    # The restore path (_manifest_matches_local) keeps the default and still
-    # detects dir mtime drift so apply_manifest can restore it.
+    # The restore paths (_manifest_matches_local and apply_manifest's gate)
+    # keep the default and still detect dir mtime drift so the apply can
+    # restore it.
     if ignore_dir_mtime and is_dir_local:
         return diff
 
     if entry.mtime_ns is not None and abs(st.st_mtime_ns - entry.mtime_ns) > window_ns:
         loc_mtime_ns = st.st_mtime_ns
-        fmt_local = _fmt_mtime(loc_mtime_ns)
-        fmt_remote = _fmt_mtime(entry.mtime_ns)
+        diff_ns = loc_mtime_ns - entry.mtime_ns
+        # A sub-second drift (e.g. WSL2 drvfs truncates a restored mtime to
+        # whole seconds) renders as two identical second-precision timestamps,
+        # so show the fractional digits that actually differ.
+        subsecond = abs(diff_ns) < 1_000_000_000
+        fmt_local = _fmt_mtime(loc_mtime_ns, subsecond=subsecond)
+        fmt_remote = _fmt_mtime(entry.mtime_ns, subsecond=subsecond)
         diff.status = "M"
         diff.tags.append("mtime")
         if entry.mtime_ns < loc_mtime_ns:
@@ -248,7 +268,14 @@ def compare_to_stat(
             cmp = ">"
             remote_disp = _color_wrap(fmt_remote, use_color)
             local_disp = fmt_local
-        diff_str = _humanize_duration((loc_mtime_ns - entry.mtime_ns) // 1_000_000_000)
+        if subsecond:
+            diff_str = f"{diff_ns / 1_000_000_000:+.9f}".rstrip("0") + "s"
+        else:
+            # Difference of the displayed whole seconds, so the number always
+            # agrees with the two rendered timestamps.
+            diff_str = _humanize_duration(
+                loc_mtime_ns // 1_000_000_000 - entry.mtime_ns // 1_000_000_000
+            )
         diff.details.append(f"mtime: remote={remote_disp} {cmp} local={local_disp} ({diff_str})")
 
     return diff

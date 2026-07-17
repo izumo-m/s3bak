@@ -27,12 +27,13 @@ import concurrent.futures
 import math
 import os
 import posixpath
+import queue
 import shlex
 import signal
 import subprocess
 import sys
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib.metadata import version
 from typing import NoReturn
 
@@ -45,6 +46,8 @@ from s3bak.commands import (
     cmd_push,
     cmd_show,
     cmd_status,
+    cmd_verify,
+    verify_top_level,
 )
 from s3bak.compare import _resolve_use_color
 from s3bak.config import Config, Opts, load_config
@@ -97,18 +100,44 @@ def run_entries(
     if cfg.entry_concurrency is not None:
         workers = min(workers, cfg.entry_concurrency)
 
+    # boto3-s3's concurrency contract: transfers running on different threads
+    # must not share a client, and clients must be built sequentially up
+    # front. One store (own orchestrator + client) per worker slot, built
+    # here on the main thread; each task borrows one for its duration, so a
+    # worker's sync/cp never shares a client with another running transfer.
+    stores: queue.SimpleQueue[Boto3S3Store | None] = queue.SimpleQueue()
+    stores.put(cfg.store)
+    for _ in range(workers - 1):
+        stores.put(cfg.store.clone() if cfg.store is not None else None)
+
+    def run_one(entry: str) -> int:
+        store = stores.get()
+        try:
+            return fn(replace(cfg, store=store), entry, opts)
+        finally:
+            stores.put(store)
+
     statuses = [0] * len(entries)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {
-            executor.submit(fn, cfg, entry, opts): index for index, entry in enumerate(entries)
-        }
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+    try:
+        futures = {executor.submit(run_one, entry): index for index, entry in enumerate(entries)}
         for future in concurrent.futures.as_completed(futures):
             index = futures[future]
             try:
                 statuses[index] = future.result()
+            except BrokenPipeError:
+                # Output is gone (e.g. piped to a closed reader): let run()'s
+                # handler map it to the documented 141 instead of a worker 1.
+                raise
             except Exception as exc:
                 err(f"{entries[index]}: {exc}")
                 statuses[index] = 1
+    finally:
+        # SIGINT lands in this (main) thread as SystemExit: cancel the entries
+        # that have not started, but let the running ones finish - killing an
+        # entry mid-push would leave its manifest and data inconsistent. The
+        # normal path has nothing pending, so this is then a plain shutdown.
+        executor.shutdown(wait=True, cancel_futures=True)
     # Completion order varies with scheduling. Preserve the first configured
     # entry's failure so --all has a deterministic exit code (including a
     # post_hook's documented 3+ code) rather than whichever worker happened to
@@ -196,6 +225,7 @@ _DELETE_CONFIRMATION = (
         "Deletion confirmation",
         (
             "--delete prompts with y/n/a/d/q: delete, keep, delete all, keep all, or quit.",
+            "? explains the answers at the prompt; full words (yes/no/all/quit) also work.",
             "Without a TTY, every answer is no unless --yes is set.",
         ),
     ),
@@ -297,6 +327,35 @@ _COMMAND_SPECS = {
             "s3bak status --all",
             "s3bak status -v bin",
             "s3bak status bin/s3bak",
+        ),
+    ),
+    "verify": _CommandSpec(
+        overview="Verify backup integrity on S3",
+        summary="Verify that the manifest and the stored objects agree, changing nothing.",
+        usage=(
+            "s3bak verify [options] <entry|path>...",
+            "s3bak verify [options] --all",
+        ),
+        arguments=(("<entry|path>...", "Entries or paths to verify"),),
+        options=("all", "checksum", "mtime_window", "verbose", "help"),
+        sections=(
+            (
+                "Checks",
+                (
+                    "Every manifest file record must have its data object, with the",
+                    "recorded size and a restorable storage class; directory, symlink,",
+                    "and special records must have none. Unrecorded objects and folder",
+                    "objects are reported. --all also inventories the prefix top level.",
+                    "--checksum additionally compares local file content against S3",
+                    "ETags and flags edits the size+mtime check can never see.",
+                    "Errors exit 1; a warnings-only run exits 2. Nothing is modified.",
+                ),
+            ),
+        ),
+        examples=(
+            "s3bak verify --all",
+            "s3bak verify bin",
+            "s3bak verify --all --checksum",
         ),
     ),
     "diff": _CommandSpec(
@@ -647,7 +706,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if opt_checksum and opt_meta_only:
         die("--checksum cannot be combined with --meta-only (no file data is compared)")
-    if opt_checksum and opt_mtime_window is not None:
+    # push/pull --checksum replaces the size+mtime check entirely, so a window is
+    # meaningless there. verify --checksum is the opposite: the window feeds the
+    # stat classification of content mismatches, and is useless without it.
+    if subcmd == "verify":
+        if opt_mtime_window is not None and not opt_checksum:
+            die("--mtime-window requires --checksum with verify (it classifies content mismatches)")
+    elif opt_checksum and opt_mtime_window is not None:
         die("--mtime-window cannot be combined with --checksum (content comparison ignores it)")
     if subcmd == "pull" and opt_delete and opt_meta_only:
         die("pull --delete cannot be combined with --meta-only")
@@ -709,6 +774,29 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_status(cfg_, entry_, opts_, sub=status_sub_by_entry.get(entry_))
 
         return run_entries(_status_one, cfg, entries, opts)
+
+    elif subcmd == "verify":
+        if opt_all:
+            entries = sorted(cfg.entries.keys())
+            verify_sub_by_entry: dict[str, str | None] = {e: None for e in entries}
+        else:
+            resolved = resolve_entry_files(cfg, positional, "verify")
+            verify_sub_by_entry = {}
+            for e, s in resolved:
+                if e in verify_sub_by_entry and verify_sub_by_entry[e] != s:
+                    die(f"conflicting sub paths for entry {e}")
+                verify_sub_by_entry[e] = s
+            entries = list(verify_sub_by_entry)
+
+        def _verify_one(cfg_: Config, entry_: str, opts_: Opts) -> int:
+            return cmd_verify(cfg_, entry_, opts_, sub=verify_sub_by_entry.get(entry_))
+
+        rc = run_entries(_verify_one, cfg, entries, opts)
+        if opt_all:
+            # The top-level inventory closes the sweep: warnings only, so the
+            # per-entry exit status stands and run() maps them to exit 2.
+            verify_top_level(cfg, opts)
+        return rc
 
     elif subcmd == "diff":
         entry, file = resolve_entry_file(cfg, positional, "diff")

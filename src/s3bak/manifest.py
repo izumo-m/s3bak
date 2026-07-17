@@ -25,8 +25,7 @@ The sorted-order invariant is what keeps everything here streaming: the walk
 (localwalk.py, boto3-s3's engine) emits in S3 key order, the writer streams
 walk -> file, and the sub-path patch, the sync compare (ManifestFilter), and
 the status / pull ``--delete`` diff (merge_join) are all merges of sorted
-streams instead of a read-all + sort. This module is pure stdlib - the format,
-the joins, and the pattern matching, with no boto3-s3 dependency.
+streams instead of a read-all + sort.
 """
 
 from __future__ import annotations
@@ -37,7 +36,7 @@ import os
 import stat as stat_mod
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
-from typing import IO, Any, TypeVar
+from typing import IO, TYPE_CHECKING, TypeVar
 
 try:
     import grp
@@ -47,6 +46,9 @@ try:
     import pwd
 except ModuleNotFoundError:
     pwd = None  # type: ignore[assignment]
+
+if TYPE_CHECKING:
+    from boto3_s3 import SyncPair
 
 MANIFEST_SUFFIX = "-manifest.jsonl"
 FORMAT_VERSION = 3
@@ -313,7 +315,7 @@ def _owner_group(st: os.stat_result) -> tuple[str, str]:
 def format_entry(path: str, st: os.stat_result, sym_target: str | None) -> str:
     """One walk item -> one manifest line (no trailing newline)."""
     owner, group = _owner_group(st)
-    obj: dict[str, Any] = {
+    obj: dict[str, str | int] = {
         "path": path,
         "mode": format(st.st_mode, "o"),
         "owner": owner,
@@ -465,7 +467,7 @@ def write_merged(
     # tracks the most recent non-directory records whose descendant key range
     # is still open ("blockers", a stack because siblings like `sub.txt` sort
     # between a file `sub` and the `sub/...` range).
-    blockers: list[list[Any]] = []  # [rel, warned]
+    blockers: list[tuple[str, bool]] = []  # (rel, warned)
 
     def emit(rel: str, is_dir: bool, text: str) -> None:
         key = rel + "/" if is_dir else rel
@@ -478,14 +480,14 @@ def write_merged(
                         f" ./{top_rel}; pull cannot restore them"
                         f" (push --delete prunes them)"
                     )
-                    blockers[-1][1] = True
+                    blockers[-1] = (top_rel, True)
                 break
             if key > top_rel + "/":
                 blockers.pop()
                 continue
             break  # a sibling like `{top_rel}.x`: the blocker's range is still ahead
         if not is_dir and rel != ".":
-            blockers.append([rel, False])
+            blockers.append((rel, False))
         out.write(text)
 
     def old_items() -> Iterator[tuple[str, tuple[str, ManifestEntry, str]]]:
@@ -581,39 +583,6 @@ def merge_join(
             hb = next(itb, None)
 
 
-def _excluded(rel: str, prune: list[str], skip: list[str]) -> bool:
-    """Whether an entry-rooted ``./...`` rel is excluded: a skip pattern
-    matches it, or a prune pattern matches it or any of its ancestors (a
-    pruned directory excludes its whole subtree)."""
-    if any(path_match(rel, p) for p in skip):
-        return True
-    anc = rel
-    while True:
-        if any(path_match(anc, p) for p in prune):
-            return True
-        i = anc.rfind("/")
-        if i <= 1:  # reached "./"
-            return False
-        anc = anc[:i]
-
-
-def exclude_filter(excludes: list[str], sub: str | None = None) -> Any:
-    """The sync ``filter=`` for an entry's excludes (True = keep).
-
-    Matches each side's compare_key against the entry-rooted patterns - the
-    same semantics the manifest walk applies - re-rooting a sub-path
-    sync's keys with ``./{sub}/`` so the entry's patterns keep their meaning.
-    Applies to both sides of the sync, so an excluded key is neither
-    transferred nor treated as a delete candidate."""
-    prune, skip = split_excludes(excludes)
-    prefix = f"./{sub}/" if sub else "./"
-
-    def keep(info: Any) -> bool:
-        return not _excluded(prefix + (info.compare_key or ""), prune, skip)
-
-    return keep
-
-
 # =============================================================================
 # ManifestFilter (the default sync compare)
 # =============================================================================
@@ -689,7 +658,7 @@ class ManifestFilter:
             return entry
         return None
 
-    def __call__(self, pair: Any) -> bool:
+    def __call__(self, pair: SyncPair) -> bool:
         # As an ``update_filter`` this is only ever handed a both-sides pair
         # (source and destination both present); the create lane (source-only)
         # and delete lane (destination-only) never reach here.
