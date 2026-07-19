@@ -10,13 +10,17 @@ layout, and [architecture.md](architecture.md) for module boundaries.
 Every sync needs an **update-lane** strategy (`S3.sync`'s `update_filter`):
 given a pair present on *both* sides (a local side and its S3 side for one key),
 does it need re-copying? New entries and orphans are separate lanes —
-`create_filter` copies every new local/S3 file (the default), `delete_filter`
+`create_filter` copies every new local/S3 file, `delete_filter`
 prunes orphans (off by default; `push --delete` turns it into the per-orphan
 confirmation, `--yes` into an unconditional prune; pull prunes local extras
 itself, see `--delete` below) — so the strategy below only judges the
-intersection. s3bak has two.
+intersection. s3bak has two judgments; where each lives differs by direction:
+pull wires `ManifestFilter` (or the `--checksum` comparison) as its update
+filter directly, while push folds the same judgment into its journal emitter
+(`PushJournal`), which spans all three lanes to record manifest changes as it
+decides — see [journal.md](journal.md).
 
-### Default: `ManifestFilter` (size+mtime check)
+### Default: the size+mtime check
 
 The default reads no file content. For a pair it copies unless the local file's
 **size and mtime both match the manifest record** — an rsync-style size+mtime check —
@@ -62,13 +66,13 @@ the last real push, and only a push may change it.
 
 ### Opt-in: ETag content comparison (`--checksum`)
 
-`--checksum` swaps in boto3-s3's `EtagComparison`, wrapped in `ParallelFilter`
-on a per-sync thread pool s3bak owns. It copies a pair when the S3 ETag does not
+`--checksum` swaps in boto3-s3's `EtagComparison`, run serially on the sync's
+own thread — push's journal needs every lane decision in ascending key order,
+so there is no compare pool. It copies a pair when the S3 ETag does not
 match the local file's reconstructed ETag — so a same-size, same-mtime content
 change *is* transferred, and an mtime-only drift is not. It reads and hashes
 every candidate file, which is why it is opt-in. `part_size` comes from the same
 profile the uploads use, so multipart ETags reconstruct to a matching value.
-`compare_workers` sizes that pool (it is idle otherwise).
 
 `status` and both compare directions share one size/mtime predicate
 (`compare_to_local` / `compare_to_stat`), so `status` never disagrees with what
@@ -129,8 +133,8 @@ files is exactly what its machinery is for.
 - Multi-entry commands run entries through a thread pool, one thread per entry
   by default, capped at `entry_concurrency`. This includes explicit target
   lists and `--all`. For push and pull, each entry's own `cp` / `sync` then
-  spawns s3transfer's transfer threads (`max_concurrency`), and `--checksum`
-  its compare workers (`compare_workers`).
+  spawns s3transfer's transfer threads (`max_concurrency`); the compare
+  itself is serial (push's journal needs ordered decisions).
 
 Each entry worker slot gets its own S3 client, all constructed sequentially
 before the entry pool starts (boto3-s3 forbids sharing a client across
@@ -161,14 +165,17 @@ environment.
    record inside a directory manifest — and `push --delete` migrates: one
    confirmed deletion removes the old backup (the exact key and everything
    under `entry/`), then the push records the new kind from scratch.
-   **Directory entry:** build the compare strategy and `sync_up`. New and
+   **Directory entry:** one `sync_up` over the complete local view, with the
+   journal emitter (`PushJournal`, [journal.md](journal.md)) wired as all
+   three lane filters — the single scan that both decides the transfers and
+   records every manifest change. New and
    changed local files upload; a locally
    deleted file keeps its S3 object AND its manifest record — **push never
    deletes a backup unless `--delete` was given and the deletion confirmed**
    (see "Deleting backups" below). `--checksum` ignores manifest file stats
    for its content decision (the download above still validates and feeds
-   the kind check, the objectless-tree-change check, and `--data-only`'s
-   unrecorded-upload warning). Excludes prune the
+   the kind check and the journal's cursor, which still journals mode and
+   structure drift). Excludes prune the
    sync's **local side only**, through the same walker the manifest walk
    uses (`localwalk.sync_walker`), so the data sync and the manifest can
    never disagree on what an exclude means. The S3 listing is never
@@ -181,30 +188,35 @@ environment.
    missing or size-drifted (a HeadObject confirms existence at the recorded
    size, since a single file has no listing to self-heal from). `--checksum`
    uses the ETag comparison instead.
-3. **Refresh the manifest if data was transferred or deleted, its tree
-   structure, a symlink target, or a permission changed, on `--meta-only`,
-   or when no manifest exists yet.** The refresh merges the fresh local walk
-   into the old manifest (`write_merged`): a walked path always wins, and
-   old-only records — the backups of locally vanished files — are kept, except
-   file records dropped by a `--delete` run: those whose object the
-   confirmation removed, and stale ones whose object was already gone (how an
-   interrupted deletion self-heals). A record kept under a path that is no
-   longer a directory (the local tree replaced a directory with a same-named
-   file) makes the entry unrestorable as a tree; the merge detects this and
-   warns (exit 2), and a `push --delete --yes` prunes such records. The
-   no-transfer check makes empty-directory, symlink-only, and permission
+3. **Publish the journal if it is non-empty — the only refresh condition.**
+   A directory push's manifest changes were journaled during the sync (a
+   transfer, a confirmed deletion, an objectless structural change, a symlink
+   retarget, a permission drift, or the first push's `+`-everything journal);
+   `merge_journal` applies them to the old manifest and the result is
+   validated and uploaded. Records with no event — the backups of locally
+   vanished files included — survive verbatim; a `--delete` run journals the
+   drops of confirmed deletions and of stale file records whose object was
+   already gone (how an interrupted deletion self-heals). A record kept under
+   a path that is no longer a directory (the local tree replaced a directory
+   with a same-named file) makes the entry unrestorable as a tree; the merge
+   detects this and warns (exit 2), and a `push --delete --yes` prunes such
+   records. Journaling objectless changes makes empty-directory,
+   symlink-only, and permission
    changes restorable even though they move no data: a `chmod` refreshes the
    manifest without re-uploading anything, settling exactly the mode
    differences `status` reports — the two share one mode predicate, which
    never compares symlink permission bits and on Windows reads only the
    owner-write bit (`os.stat` modes there are synthetic). A single-file entry
-   runs the same permission check against its one record. An mtime drift
-   inside the window transfers nothing and does not refresh an existing
-   manifest — the window is a rounding tolerance. Owner and group are
-   informational rather than comparison inputs, and update whenever the
-   manifest is rewritten. The manifest walk warns (exit 2) when it cannot
+   runs the same permission check against its one record and rewrites its
+   manifest from a fresh walk instead of a journal. An mtime drift
+   inside the window transfers nothing and journals nothing — the window is
+   a rounding tolerance. Owner and group are informational rather than
+   comparison inputs, and refresh only when their record is rewritten for
+   another reason. The walk warns (exit 2) when it cannot
    see the whole tree — an unreadable directory, a path racing away
-   mid-walk — since the manifest is the record of what the push saw.
+   mid-walk — since the manifest is the record of what the push saw; the
+   journal's records carry the very stats the compare judged, so that record
+   is literal.
 4. Run `post_hook` — but only after a push that did work (transferred data
    and/or refreshed the manifest), so a side-effecting hook does not fire on a
    pure no-op. `--meta-only` always refreshes and runs the hook, which is the
@@ -219,21 +231,28 @@ writes the manifest that records it. An interrupted `--delete` heals the same
 way (see "Deleting backups" below).
 
 A **sub-path push** (`push entry/sub` or a local path inside an entry) syncs or
-uploads just that sub-tree and patches the manifest sub-tree in place
-(`write_merged` over the replaced range). Like a whole-entry push, it
+uploads just that sub-tree and journals within its range: the journal stays
+entry-rooted, events land only at/under `sub` (plus a missing or drifted
+ancestor-directory record — every record needs a recorded directory parent),
+and records outside the range have no events, so the merge copies them
+verbatim. Like a whole-entry push, it
 downloads and validates the manifest before any S3 mutation (the deletion,
-upload, and patch all reuse that one copy), and it refuses a file-shaped
+upload, and merge all reuse that one copy), and it refuses a file-shaped
 entry — patching a sub-path into a single-file manifest would corrupt it;
-push the entry itself to migrate the kind first. A symlink sub-path uploads
+push the entry itself to migrate the kind first. An explicitly named file or
+symlink sub-path always re-records (naming the path is the instruction to
+back up its current state; a file also always re-uploads), while a directory
+sub-path follows the ordinary journal rules — an unchanged sub-tree journals
+nothing and rewrites nothing. A symlink sub-path uploads
 no data — only its manifest record is updated. Excludes keep their entry-rooted meaning
 inside the range (the sub walk re-anchors them), with one deliberate edge: a
 sub-path that is itself covered by an exclude is still walked, uploaded, and
 recorded — naming a path explicitly wins over the exclude, and the data and
 the manifest agree on the result. If the entry has no manifest yet, the
-patch also writes the `.` root record so the manifest keeps its directory-entry
+journal also writes the `.` root record so the manifest keeps its directory-entry
 shape. A sub-path push is a whole-entry push scoped to the sub-path: the same
-keep-by-default and `--delete` confirmation rules apply within the range, and
-records outside it are copied verbatim. A file-typed sub-path has no S3
+keep-by-default and `--delete` confirmation rules apply within the range. A
+file-typed sub-path has no S3
 listing, so `--delete` there has nothing to confirm: records under a
 same-named former directory are kept (with the restorability warning), and
 pruning them takes a directory-level `push --delete`.
@@ -281,16 +300,23 @@ Deleting is opt-in and confirmed:
   invisible to the walk — stays untouched either way. The excluded
   directory's own record follows the rule above: objectless, never asked,
   kept until a `--yes` mirror.
-- **An incomplete local scan refuses deletions.** Once the walk warn-skips
-  real tree content — an unreadable directory or file, a path that vanished
-  mid-walk — every later delete candidate is kept, the manifest merge keeps
-  every old-only record (records travel with their objects), and the push
+- **A kind-conflict object is offered out-of-lane.** A pushed file since
+  replaced locally by a symlink or special file occupies its key in the
+  complete-view walk, so the S3 object forms an update pair instead of an
+  orphan and the sync's delete lane never sees it. `push --delete` collects
+  such paired objects and offers each after the sync, through the same
+  confirmation (a/d stickiness carries over); a confirmed deletion removes
+  just the object — the record already describes the local non-file and
+  stays.
+- **An incomplete local scan refuses deletions.** Once the walk warns about
+  real tree content — an unopenable directory, a path that vanished
+  mid-walk, an unreadable file the compare wanted to transfer — every later
+  delete candidate is kept, the journal writes no further drops (records
+  travel with their objects), and the push
   warns (exit 2): an orphan decision built on a partial local view could
-  delete a good backup. Special-file skips are the sync's normal behaviour
-  and do not count. Candidates already confirmed before the gap were decided
-  on sound data and stand — their records go stale and the next
-  `push --delete` merge drops them, the standard self-healing; re-run
-  `push --delete` after fixing the cause.
+  delete a good backup. Candidates already confirmed before the gap were
+  decided on sound data and stand, their record drops already journaled;
+  re-run `push --delete` after fixing the cause.
 - **A single-file entry sweeps `entry/` explicitly.** Its push has no sync
   listing, so `--delete` lists the slash-bounded `entry/` prefix and offers
   every object there — always `(not in manifest)`, since a file-shaped
@@ -302,10 +328,9 @@ Deleting is opt-in and confirmed:
   to everything — nothing is deleted and the run still succeeds (rc 0).
 - **`q` (abort)** exits 1 without rewriting the manifest or running
   `post_hook`. Deletions already confirmed may have run; their records then
-  linger until the next `push --delete`, whose merge drops any old-only file
-  record that no longer has a delete candidate (the object is gone) and was
-  not explicitly kept. The same self-healing covers a push interrupted
-  mid-deletion.
+  linger until the next `push --delete`, which journals the drop of any
+  stale old-only file record with no object behind it. The same self-healing
+  covers a push interrupted mid-deletion.
 - **`--meta-only` / `--data-only` cannot combine with `--delete`**: a deletion
   drops the object and its record atomically, which a one-sided push cannot.
 

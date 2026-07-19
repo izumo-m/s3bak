@@ -52,6 +52,9 @@ compatibility layers.
   ordering, and streaming invariants.
 - **[Sync model](sync.md)** — comparison and transfer strategies, concurrency,
   and the push and pull pipelines.
+- **[Push journal](journal.md)** — the single-scan push: the journal of
+  manifest changes the compare emits, its format, and the streaming manifest
+  rewrite it drives.
 - **[Verification model](verify.md)** — the read-only manifest ↔ S3 integrity
   check, its finding severities, and the suggested verification routine.
 - **[CLI contract](cli.md)** — argument resolution, explicit option handling,

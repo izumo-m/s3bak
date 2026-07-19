@@ -177,12 +177,10 @@ def load_config(*, create_store: bool = True) -> Config:
 
     # Optional knobs (see config.example.py):
     #   max_concurrency   - parallel S3 transfer threads for cp / sync
-    #   compare_workers   - parallel ETag comparisons under --checksum
     #   entry_concurrency - entries processed at once by multi-entry commands
     #   mtime_window      - mtime tolerance for the size+mtime check, seconds (0 = exact),
     #                       top-level default; overridable per entry
     max_concurrency = _config_int(ns, "max_concurrency", config_path, minimum=1)
-    compare_workers = _config_int(ns, "compare_workers", config_path, minimum=1)
     entry_concurrency = _config_int(ns, "entry_concurrency", config_path, minimum=1)
     mtime_window = _config_seconds(ns.get("mtime_window"), config_path, label="mtime_window")
 
@@ -247,6 +245,5 @@ def load_config(*, create_store: bool = True) -> Config:
             bucket,
             path_prefix,
             max_concurrency=max_concurrency,
-            compare_workers=compare_workers,
         )
     return cfg

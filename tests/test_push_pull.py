@@ -813,3 +813,150 @@ def test_pull_preserves_old_root_when_cutover_and_rollback_both_fail(ws, monkeyp
     stages = list(ws.root.glob("*.s3bak-stage*"))
     assert len(stages) == 1  # preserved, not cleaned up
     assert (stages[0] / "replaced" / "precious.txt").read_text() == "keep me"
+
+
+def test_push_delete_retires_object_shielded_by_a_kind_conflict(ws):
+    # A pushed file replaced locally by a symlink occupies its key, so the S3
+    # object forms an update pair instead of an orphan and the sync's delete
+    # lane never sees it. push --delete offers it out-of-lane: the object
+    # goes, the symlink record (already journaled) stays.
+    ws.write("data/f.txt", "was a file")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "f.txt").unlink()
+    os.symlink("elsewhere", ws.root / "data" / "f.txt")
+    ws.run("push", "data", expect_rc=0)  # records the symlink; the object stays
+    assert "data/f.txt" in ws.keys()
+    assert '"link":"elsewhere"' in _manifest_body(ws, "data")
+
+    ws.run("push", "--delete", "--yes", "data", expect_rc=0)
+    assert "data/f.txt" not in ws.keys()
+    assert '"link":"elsewhere"' in _manifest_body(ws, "data")  # the record survives
+
+
+def test_noop_push_does_not_rewrite_the_manifest(ws):
+    # The rewrite condition is "the journal is non-empty": a push that finds
+    # nothing to do must not re-upload an identical manifest.
+    ws.write("data/a.txt", "alpha")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    key = f"{ws.prefix}/data-manifest.jsonl"
+    first = ws.s3.get_object(Bucket=ws.bucket, Key=key)
+    res = ws.run("push", "data", expect_rc=0)
+    assert res.out.strip() == ""
+    second = ws.s3.get_object(Bucket=ws.bucket, Key=key)
+    assert first["ETag"] == second["ETag"]
+    assert first["LastModified"] == second["LastModified"]  # not re-uploaded
+
+
+def test_noop_subpath_push_does_not_rewrite_the_manifest(ws):
+    # A sub-path push journals like a whole-entry push: an unchanged sub-tree
+    # produces no events, so nothing is rewritten and no hook would fire.
+    ws.write("data/sub/f.txt", "f")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    key = f"{ws.prefix}/data-manifest.jsonl"
+    first = ws.s3.get_object(Bucket=ws.bucket, Key=key)
+    ws.run("push", "data/sub", expect_rc=0)
+    second = ws.s3.get_object(Bucket=ws.bucket, Key=key)
+    assert first["LastModified"] == second["LastModified"]
+
+
+def test_push_delete_of_unrecorded_object_leaves_manifest_untouched(ws):
+    # Deleting an object the manifest never recorded journals nothing: the
+    # object goes, and the manifest is not rewritten (there is no record to
+    # drop).
+    ws.write("data/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/stray.bin", Body=b"x")
+    key = f"{ws.prefix}/data-manifest.jsonl"
+    first = ws.s3.get_object(Bucket=ws.bucket, Key=key)
+
+    ws.run("push", "--delete", "--yes", "data", expect_rc=0)
+    assert "data/stray.bin" not in ws.keys()
+    second = ws.s3.get_object(Bucket=ws.bucket, Key=key)
+    assert first["LastModified"] == second["LastModified"]
+
+
+def test_push_probes_readability_only_on_transfer(ws):
+    # Readability is probed only on files a lane decided to copy: a chmod-0
+    # file whose content is already backed up passes the stat compare, so no
+    # open is attempted - the mode drift refreshes just its record, with no
+    # warning and rc 0 (the old per-file probe warn-skipped it every run).
+    bad = ws.write("data/bad.txt", "secret")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    os.chmod(bad, 0)
+    try:
+        res = ws.run("push", "data", expect_rc=0)
+    finally:
+        os.chmod(bad, 0o644)
+    assert "not readable" not in res.err
+    assert "upload:" not in res.out  # no transfer, record-only refresh
+    assert '"mode":"100000"' in _manifest_body(ws, "data")
+
+
+def test_checksum_push_with_unreadable_file_warns_and_exits_2(ws, monkeypatch):
+    # --checksum reads every paired file; an unreadable one must warn-skip
+    # (exit 2) like the default compare, not abort the sync with AccessDenied.
+    # The probe runs before the content comparison for exactly this reason.
+    import signal
+
+    from s3bak import cli
+
+    ws.write("data/bad.txt", "secret")
+    ws.write("data/good.txt", "good")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    bad = ws.root / "data" / "bad.txt"
+    os.chmod(bad, 0)
+    ws.write("data/good.txt", "good v2")
+    monkeypatch.setattr("sys.argv", ["s3bak", "push", "--checksum", "data"])
+    saved = signal.getsignal(signal.SIGINT)
+    try:
+        rc = cli.run()
+    finally:
+        signal.signal(signal.SIGINT, saved)
+        os.chmod(bad, 0o644)
+
+    assert rc == 2  # warned, not aborted
+    body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/good.txt")["Body"].read()
+    assert body == b"good v2"  # the readable file still synced
+
+
+def test_subpath_delete_keeps_kind_changed_record_at_sub_itself(ws):
+    # entry/a/b was pushed as a file, then became a directory locally. The
+    # sub sync's S3 listing is slash-bounded (a/b/), so the object a/b never
+    # enters any lane - its record is not provably stale and must survive a
+    # sub-path --delete (records travel with their objects). A directory-
+    # level push --delete retires the pair.
+    ws.write("data/a/b", "was a file")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "a" / "b").unlink()
+    ws.write("data/a/b/inner.txt", "now a dir")
+
+    res = ws.run("push", "--delete", "--yes", "data/a/b", expect_rc=0)
+    assert "data/a/b" in ws.keys()  # the out-of-listing object survives
+    body = _manifest_body(ws, "data")
+    assert '{"path":"./a/b","mode":"100644"' in body  # its record too
+    assert "./a/b/inner.txt" in body
+    assert "non-directory ./a/b" in res.err  # the surviving pair is warned
+
+
+def test_push_delete_without_tty_keeps_kind_conflict_object(ws):
+    # A non-TTY --delete without --yes answers no to everything - the
+    # out-of-lane kind-conflict candidates included.
+    ws.write("data/f.txt", "was a file")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "f.txt").unlink()
+    os.symlink("elsewhere", ws.root / "data" / "f.txt")
+    ws.run("push", "--delete", "data", expect_rc=0)
+    assert "data/f.txt" in ws.keys()  # kept: every answer is no

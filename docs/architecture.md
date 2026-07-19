@@ -25,17 +25,17 @@ are foundational modules used from several layers.
 
 - **console** owns terminal output, warning accounting, and small path helpers.
   It imports no other s3bak module.
-- **manifest** owns the JSONL format, validation, streaming subtree patches,
-  sorted-stream joins, and the stat-based manifest comparison.
+- **manifest** owns the JSONL format, validation, the push-journal format and
+  its streaming merge, sorted-stream joins, and the stat-based manifest
+  comparison pull uses.
 - **localwalk** enumerates local trees in the same key order as the data sync
   and owns exclude pruning; the data sync's local side walks with the same
   walker (`sync_walker`), so excludes prune only the local side of a sync.
 - **store** is the S3 boundary. `Boto3S3Store` wraps transfers, listing, and
   object inspection.
 - **confirm** owns the deletion confirmations: answer modes, the per-item
-  prompt (serialized across parallel entries), the kept-keys stream the
-  manifest merge consumes, and the one-question subtree confirmation. It
-  depends only on `console`.
+  prompt (serialized across parallel entries), and the one-question subtree
+  confirmation. It depends only on `console`.
 - **config** loads and validates executable `config.py`, constructs the store
   when a command needs S3, and defines the `Config` and `Opts` values passed
   through the command layers.
@@ -47,9 +47,10 @@ are foundational modules used from several layers.
   the keyed manifest / local-walk streams (`manifest_keyed` / `local_keyed`)
   whose merge-join drives both the metadata apply and, via commands, the
   status and `pull --delete` diffs.
-- **syncops** connects manifests and local trees to the S3 store. It writes and
-  downloads manifests, orchestrates downloads, and builds sync comparison
-  strategies.
+- **syncops** connects manifests and local trees to the S3 store. It writes
+  and downloads manifests, orchestrates downloads, owns push's journal
+  emitter (`PushJournal`, the single-scan compare and keep/drop policy of
+  [journal.md](journal.md)), and builds pull's comparison strategy.
 - **commands** implements one `cmd_*` function per subcommand and composes the
   lower layers into complete operations.
 - **cli** parses and validates arguments, resolves entries and paths, dispatches

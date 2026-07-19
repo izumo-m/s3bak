@@ -66,7 +66,8 @@ The listing check can only prove the manifest and S3 agree with each other —
 both can agree and still be stale. On a machine that holds the local tree,
 `--checksum` additionally compares every recorded file's local content against
 the S3 ETag the listing already delivered (the same reconstruction as
-`push --checksum`, same `compare_workers` pool, zero extra S3 calls). A
+`push --checksum`, hashed on a pool sized by `max_concurrency`, zero extra S3
+calls). A
 mismatch is split by the manifest stat, and the split is the point:
 
 - **Content differs but size+mtime match** — an error. The default push skips

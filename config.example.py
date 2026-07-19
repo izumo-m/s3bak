@@ -24,13 +24,10 @@ prefix = "s3://my-bucket/backup"
 # these here if the defaults don't fit.
 #
 #   max_concurrency    parallel S3 transfer threads for cp / sync (default 10),
-#                      like aws-cli's s3.max_concurrent_requests.
-#   compare_workers    parallel ETag comparisons under --checksum, which
-#                      hashes each candidate file locally; raise this to speed
-#                      up a --checksum sync bottlenecked on that hashing,
-#                      lower it to cap CPU/IO. Defaults to max_concurrency,
-#                      else 10. The default (non-checksum) compare is
-#                      stat-only and needs no workers.
+#                      like aws-cli's s3.max_concurrent_requests. Also sizes
+#                      verify --checksum's local hashing pool. (The push/pull
+#                      sync compare itself runs serially: push's journal needs
+#                      its decisions in key order.)
 #   entry_concurrency  how many entries run at once in a multi-entry command
 #                      (default: all of them, one thread each). Each entry also
 #                      opens its own transfer pool, so cap this when you have
@@ -46,7 +43,6 @@ prefix = "s3://my-bucket/backup"
 #                      per entry.
 #
 # max_concurrency = 10
-# compare_workers = 10
 # entry_concurrency = 4
 # mtime_window = 0.01
 

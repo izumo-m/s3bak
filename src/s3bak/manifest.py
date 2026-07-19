@@ -1,5 +1,5 @@
-"""Manifest v3: JSONL read/write, the sorted-stream merge-join, and the
-stat-based sync compare (ManifestFilter).
+"""Manifest v3: JSONL read/write, the sorted-stream merge-join, the push
+journal, and the stat-based pull compare (ManifestFilter).
 
 A manifest is stored as ``<entry>-manifest.jsonl`` next to the entry's data
 (the suffix cannot collide with a single-file entry's own key, unlike a bare
@@ -23,9 +23,16 @@ header version only changes when an existing key's meaning does.
 
 The sorted-order invariant is what keeps everything here streaming: the walk
 (localwalk.py, boto3-s3's engine) emits in S3 key order, the writer streams
-walk -> file, and the sub-path patch, the sync compare (ManifestFilter), and
-the status / pull ``--delete`` diff (merge_join) are all merges of sorted
-streams instead of a read-all + sort.
+walk -> file, and the push-journal merge, the ``--meta-only`` rewrite, the
+pull compare (ManifestFilter), and the status / pull ``--delete`` diff
+(merge_join) are all merges of sorted streams instead of a read-all + sort.
+
+The push journal (docs/journal.md) is the diff a push's single scan emits:
+one line per manifest change, a one-character marker (``+`` add / ``!``
+replace / ``-`` drop) followed by a manifest record line, in sort-key order.
+``merge_journal`` applies it to the old manifest; the emitter
+(syncops.PushJournal) holds every policy decision, so the merge is a pure
+apply.
 """
 
 from __future__ import annotations
@@ -266,6 +273,24 @@ def validate_manifest(manifest_path: str) -> str:
     return kind
 
 
+def iter_manifest_raw(manifest_path: str) -> Iterator[tuple[str, str, ManifestEntry, str]]:
+    """Stream ``(sort_key, rel, entry, line)`` for every record, root included
+    (path ``"."`` -> rel ``"."``, sort key ``""``). The raw line (no trailing
+    newline) lets a merge copy an untouched record verbatim, preserving any
+    unknown keys. Fails closed like ``iter_manifest``."""
+    try:
+        with open(manifest_path, encoding="utf-8") as f:
+            _check_header(f.readline())
+            for line_number, line in enumerate(f, start=2):
+                e = parse_entry(line)
+                if e is None:
+                    raise ManifestError(f"invalid manifest record at line {line_number}")
+                rel = "." if e.path == "." else e.path.removeprefix("./")
+                yield entry_sort_key(e.path, e.is_dir), rel, e, line.rstrip("\n")
+    except UnicodeError as e:
+        raise ManifestError(f"manifest is not valid UTF-8: {e}") from e
+
+
 def iter_compare_records(
     manifest_path: str, sub: str | None = None
 ) -> Iterator[tuple[str, ManifestEntry]]:
@@ -350,56 +375,6 @@ def entry_sort_key(path: str, is_dir: bool) -> str:
     return norm + "/" if is_dir else norm
 
 
-class KeptKeys:
-    """Streaming reader of a kept-keys file: the entry-relative keys of the S3
-    objects the user chose NOT to delete, one ``json.dumps(rel)`` per line
-    (JSON-encoded because filenames may contain newlines). The file is written
-    in delete-lane decide order, which the sync guarantees is ascending key
-    order, so a one-line lookahead answers every query - but queries must also
-    arrive in ascending order (they do: old-only records are examined in
-    manifest order). ``path=None`` is the empty stream (nothing was kept)."""
-
-    def __init__(self, path: str | None) -> None:
-        self._f = open(path, encoding="utf-8") if path is not None else None
-        self._head = self._read()
-
-    def _read(self) -> str | None:
-        if self._f is None:
-            return None
-        line = self._f.readline()
-        if not line:
-            return None
-        rel = json.loads(line)
-        if not isinstance(rel, str):
-            raise ManifestError("invalid kept-keys line")
-        return rel
-
-    def consume_file(self, rel: str) -> bool:
-        """True iff ``rel`` was kept. Keys skipped while advancing had no old
-        record (pre-existing orphan objects) and stay unrecorded."""
-        while self._head is not None and self._head < rel:
-            self._head = self._read()
-        if self._head == rel:
-            self._head = self._read()
-            return True
-        return False
-
-    def close(self) -> None:
-        if self._f is not None:
-            self._f.close()
-
-
-# The keep policy for old-only records in write_merged's replaced range.
-# Only a regular file's record can be confirmed away - its S3 object is the
-# delete candidate; directories, symlinks, and specials have no object, hence
-# no question, and their records survive everything short of the mirror. So:
-# True keeps every old-only record (no deletions were made), False drops them
-# all (--yes, the mirror), and a KeptKeys stream drops exactly the FILE
-# records whose key it does not hold (their objects were deleted - or were
-# already gone, which is how stale records self-heal).
-KeepOld = bool | KeptKeys
-
-
 class RecordedFiles:
     """Streaming membership test over a manifest's regular-file records - the
     records that own an S3 object. Queries must arrive in ascending key order
@@ -436,46 +411,30 @@ class RecordedFiles:
         self._head = None
 
 
-def write_merged(
-    out: IO[str],
-    old_manifest: str | None,
-    sub: str | None,
-    new_entries: Iterable[tuple[str, os.stat_result, str | None]],
-    *,
-    keep_old: KeepOld = False,
-    warn: Callable[[str], None] | None = None,
-) -> None:
-    """Write a v3 manifest merging a fresh local walk into the old manifest.
+class _RestorabilityWarner:
+    """Warn once per subtree that a merged manifest leaves unrestorable.
 
-    Old records outside the replaced range (everything when ``sub`` is None,
-    the records at/under ``sub`` otherwise) are copied verbatim (preserving
-    any unknown keys). Inside the range, a walked path always wins over its
-    old record and old-only records survive per ``keep_old`` (see its
-    comment); keeping only file records that were explicitly kept never
-    orphans them, because their ancestor directory records are objectless and
-    always survive. Everything streams in sort-key order: one record of
-    lookahead per input (merge_join) plus one kept-key line.
+    Every emitted record passes through ``emit``, which tracks the most recent
+    non-directory records whose descendant key range is still open
+    ("blockers", a stack because siblings like ``sub.txt`` sort between a file
+    ``sub`` and the ``sub/...`` range). A record landing under a blocker means
+    records survive under a path another record says is not a directory (a
+    local change replaced a directory with a file, or vice versa): they stay
+    backed up but ``pull`` cannot materialize both."""
 
-    ``warn`` is called once per subtree that the merge leaves unrestorable:
-    records surviving under a path that another record says is not a
-    directory (a local change replaced a directory with a file, or vice
-    versa). Such records stay backed up but ``pull`` cannot materialize both.
-    """
-    out.write(_header_line() + "\n")
+    def __init__(self, out: IO[str], warn: Callable[[str], None] | None) -> None:
+        self._out = out
+        self._warn = warn
+        self._blockers: list[tuple[str, bool]] = []  # (rel, warned)
 
-    # Restorability check: every emitted record passes through emit(), which
-    # tracks the most recent non-directory records whose descendant key range
-    # is still open ("blockers", a stack because siblings like `sub.txt` sort
-    # between a file `sub` and the `sub/...` range).
-    blockers: list[tuple[str, bool]] = []  # (rel, warned)
-
-    def emit(rel: str, is_dir: bool, text: str) -> None:
+    def emit(self, rel: str, is_dir: bool, text: str) -> None:
         key = rel + "/" if is_dir else rel
+        blockers = self._blockers
         while blockers:
             top_rel = blockers[-1][0]
             if rel == top_rel or rel.startswith(top_rel + "/"):
-                if not blockers[-1][1] and warn is not None:
-                    warn(
+                if not blockers[-1][1] and self._warn is not None:
+                    self._warn(
                         f"warning: manifest keeps records under non-directory"
                         f" ./{top_rel}; pull cannot restore them"
                         f" (push --delete prunes them)"
@@ -488,18 +447,41 @@ def write_merged(
             break  # a sibling like `{top_rel}.x`: the blocker's range is still ahead
         if not is_dir and rel != ".":
             blockers.append((rel, False))
-        out.write(text)
+        self._out.write(text)
+
+
+def write_merged(
+    out: IO[str],
+    old_manifest: str | None,
+    sub: str | None,
+    new_entries: Iterable[tuple[str, os.stat_result, str | None]],
+    *,
+    keep_old: bool = False,
+    warn: Callable[[str], None] | None = None,
+) -> None:
+    """Write a v3 manifest merging a fresh local walk into the old manifest -
+    the ``--meta-only`` rewrite (an ordinary push merges its journal instead,
+    see ``merge_journal``).
+
+    Old records outside the replaced range (everything when ``sub`` is None,
+    the records at/under ``sub`` otherwise) are copied verbatim (preserving
+    any unknown keys). Inside the range, a walked path always wins over its
+    old record and old-only records survive when ``keep_old`` is True (the
+    ``--meta-only`` keep merge; False drops them - the sub-path removal).
+    Everything streams in sort-key order: one record of lookahead per input
+    (merge_join).
+
+    ``warn`` receives the ``_RestorabilityWarner`` message for records kept
+    under a non-directory path.
+    """
+    out.write(_header_line() + "\n")
+    warner = _RestorabilityWarner(out, warn)
 
     def old_items() -> Iterator[tuple[str, tuple[str, ManifestEntry, str]]]:
         if old_manifest is None:
             return
-        with open(old_manifest, encoding="utf-8") as f:
-            _check_header(f.readline())
-            for line in f:
-                e = parse_entry(line)
-                if e is None:
-                    raise ManifestError("invalid record in manifest being merged")
-                yield entry_sort_key(e.path, e.is_dir), (e.path.removeprefix("./"), e, line)
+        for key, rel, e, line in iter_manifest_raw(old_manifest):
+            yield key, (rel, e, line)
 
     def walk_items() -> Iterator[tuple[str, tuple[str, os.stat_result, str | None]]]:
         for item in new_entries:
@@ -510,16 +492,110 @@ def write_merged(
         if new is not None:  # the fresh walk record wins over any old record
             path, st, sym_target = new
             rel = "." if path == "." else path.removeprefix("./")
-            emit(rel, stat_mod.S_ISDIR(st.st_mode), format_entry(path, st, sym_target) + "\n")
+            line = format_entry(path, st, sym_target) + "\n"
+            warner.emit(rel, stat_mod.S_ISDIR(st.st_mode), line)
             continue
         assert old is not None
         rel, e, line = old
-        if sub is None or rel == sub or rel.startswith(sub + "/"):  # the replaced range
-            if keep_old is False:
-                continue
-            if keep_old is not True and e.is_file and not keep_old.consume_file(rel):
-                continue
-        emit(rel, e.is_dir, line if line.endswith("\n") else line + "\n")
+        in_range = sub is None or rel == sub or rel.startswith(sub + "/")
+        if in_range and not keep_old:
+            continue
+        warner.emit(rel, e.is_dir, line + "\n")
+
+
+# =============================================================================
+# The push journal (docs/journal.md)
+# =============================================================================
+
+JOURNAL_ADD = "+"
+JOURNAL_REPLACE = "!"
+JOURNAL_DROP = "-"
+
+
+def iter_journal(journal_path: str) -> Iterator[tuple[str, str, ManifestEntry, str]]:
+    """Stream ``(sort_key, marker, entry, payload_line)`` from a push journal.
+
+    Validates the journal's own shape fail closed: a known marker, a payload
+    that parses as a manifest record, and strictly ascending sort keys (at
+    most one event per key - a ``-`` plus ``+`` pair at one key is an emitter
+    bug that must have been a ``!``). Marker consistency against the old
+    manifest is ``merge_journal``'s job, where the old record is in hand."""
+    previous: str | None = None
+    try:
+        with open(journal_path, encoding="utf-8") as f:
+            for line_number, line in enumerate(f, start=1):
+                marker, payload = line[:1], line[1:]
+                if marker not in (JOURNAL_ADD, JOURNAL_REPLACE, JOURNAL_DROP):
+                    raise ManifestError(f"invalid journal marker at line {line_number}")
+                e = parse_entry(payload)
+                if e is None:
+                    raise ManifestError(f"invalid journal record at line {line_number}")
+                key = entry_sort_key(e.path, e.is_dir)
+                if previous is not None and key <= previous:
+                    raise ManifestError(
+                        f"journal events are duplicated or out of order at {e.path!r}"
+                    )
+                previous = key
+                yield key, marker, e, payload.rstrip("\n")
+    except UnicodeError as exc:
+        raise ManifestError(f"journal is not valid UTF-8: {exc}") from exc
+
+
+def merge_journal(
+    out: IO[str],
+    old_manifest: str | None,
+    journal_path: str,
+    *,
+    warn: Callable[[str], None] | None = None,
+) -> None:
+    """Write a v3 manifest applying a push journal to the old manifest.
+
+    The 2-way streaming merge of the journal design: a key with no event
+    copies its old record verbatim (unknown keys preserved), ``+`` / ``!``
+    copy the event payload byte-for-byte (marker stripped, no
+    re-serialization), ``-`` skips the old record. The merge applies events
+    and knows no policy - every keep/drop decision was the emitter's.
+
+    Markers are cross-checked against the old manifest, fail closed: a ``+``
+    whose key exists, a ``!`` / ``-`` whose key does not, or a ``-`` payload
+    that differs from the record it drops is an emitter bug and raises
+    ``ManifestError`` rather than publishing a manifest built on it. ``warn``
+    receives the same restorability message as ``write_merged``.
+    """
+    out.write(_header_line() + "\n")
+    warner = _RestorabilityWarner(out, warn)
+
+    def old_items() -> Iterator[tuple[str, tuple[str, ManifestEntry, str]]]:
+        if old_manifest is None:
+            return
+        for key, rel, e, line in iter_manifest_raw(old_manifest):
+            yield key, (rel, e, line)
+
+    def events() -> Iterator[tuple[str, tuple[str, ManifestEntry, str]]]:
+        for key, marker, e, payload in iter_journal(journal_path):
+            yield key, (marker, e, payload)
+
+    for _key, old, event in merge_join(old_items(), events()):
+        if event is None:
+            assert old is not None
+            rel, e, line = old
+            warner.emit(rel, e.is_dir, line + "\n")
+            continue
+        marker, e, payload = event
+        rel = "." if e.path == "." else e.path.removeprefix("./")
+        if marker == JOURNAL_ADD:
+            if old is not None:
+                raise ManifestError(f"journal adds an already-recorded path: {e.path!r}")
+            warner.emit(rel, e.is_dir, payload + "\n")
+        elif marker == JOURNAL_REPLACE:
+            if old is None:
+                raise ManifestError(f"journal replaces an unrecorded path: {e.path!r}")
+            warner.emit(rel, e.is_dir, payload + "\n")
+        else:  # JOURNAL_DROP
+            if old is None:
+                raise ManifestError(f"journal drops an unrecorded path: {e.path!r}")
+            if payload != old[2]:
+                raise ManifestError(f"journal drop does not match the record at {e.path!r}")
 
 
 # =============================================================================
@@ -584,26 +660,26 @@ def merge_join(
 
 
 # =============================================================================
-# ManifestFilter (the default sync compare)
+# ManifestFilter (the pull compare)
 # =============================================================================
 
 
 class ManifestFilter:
-    """The default update-lane strategy for sync: an rsync-style size+mtime
-    check against the manifest (True = copy). Wired as ``S3.sync``'s
-    ``update_filter``, so it is handed only the both-sides pairs; new entries
-    (``create_filter``) and orphans (``delete_filter``) are decided by those
-    lanes, never here.
+    """Pull's update-lane strategy: an rsync-style size+mtime check against
+    the manifest (True = copy). Wired as ``S3.sync``'s ``update_filter`` on
+    ``sync_down``, so it is handed only the both-sides download pairs; new
+    entries (``create_filter``) and local extras are decided by those lanes,
+    never here. (Push's compare lives in ``syncops.PushJournal``, which folds
+    the same size+mtime judgment into its journal emission.)
 
     Streaming: it reads the manifest once, front to back, merge-joining its
     records against ``S3.sync``'s ascending compare-key pairs - the whole
     manifest is never held in memory. This works because the manifest is
-    written in ``LocalStorage.scan`` order (``entry_sort_key``) and a bare
-    ``update_filter`` is decided serially on one thread in that same order
-    (``--checksum``'s ``ParallelFilter`` content strategy is the only concurrent
-    path, and it never wraps this filter), so a one-record lookahead suffices -
-    the cursor self-heals over any key it is not asked about. A filter is a
-    forward-only cursor: one serves exactly one sync.
+    written in ``LocalStorage.scan`` order (``entry_sort_key``) and the
+    update lane is decided serially on one thread in that same order, so a
+    one-record lookahead suffices - the cursor self-heals over any key it is
+    not asked about. A filter is a forward-only cursor: one serves exactly
+    one sync.
 
     A pair is skipped only when the local side's size and mtime both match the
     manifest record (mtime within ``window_ns``) and the remote side has the
@@ -615,13 +691,10 @@ class ManifestFilter:
     (a content edit with a restored mtime, or an S3-side write that bypassed
     s3bak at the same size) is invisible here; ``--checksum`` covers those.
 
-    A spurious mtime-only difference self-heals on push: the file is
-    re-transferred once, the manifest is refreshed with the new mtime, and
-    later runs pass the size+mtime check again. The converse does not hold for a
-    STALE manifest (``push --data-only``, or out-of-band S3 writes): pull
-    never rewrites the manifest, so affected pairs re-transfer on every pull
-    until a full push refreshes the record. Deliberate: the manifest is the
-    record of the last real push, and only a push may change it.
+    A STALE manifest (``push --data-only``, or out-of-band S3 writes) makes
+    affected pairs re-transfer on every pull until a real push refreshes the
+    record - pull never rewrites the manifest. Deliberate: the manifest is
+    the record of the last real push, and only a push may change it.
     """
 
     def __init__(self, records: Iterator[tuple[str, ManifestEntry]], *, window_ns: int):
@@ -629,11 +702,6 @@ class ManifestFilter:
         self._records = iter(records)
         self.window_ns = window_ns
         self._head: tuple[str, ManifestEntry] | None = next(self._records, None)
-        # Upload pairs copied because the manifest holds no owning file record:
-        # the re-upload face of an unrecorded object (a create-lane upload is
-        # its birth). Read by push --data-only's warning, so the warning
-        # repeats on every push while the object stays unrecorded.
-        self.unknown_uploads = 0
 
     def close(self) -> None:
         """Release the manifest file handle the record stream holds open. The
@@ -659,27 +727,18 @@ class ManifestFilter:
         return None
 
     def __call__(self, pair: SyncPair) -> bool:
-        # As an ``update_filter`` this is only ever handed a both-sides pair
-        # (source and destination both present); the create lane (source-only)
-        # and delete lane (destination-only) never reach here.
-        direction = pair.transfer_type.value
-        if direction == "upload":
-            local, remote = pair.src, pair.dest
-        elif direction == "download":
-            local, remote = pair.dest, pair.src
-        else:
-            raise ValueError(f"ManifestFilter cannot judge a {direction!r} pair: {pair.key!r}")
+        # Only ever handed a both-sides download pair (pull's sync_down).
+        if pair.transfer_type.value != "download":
+            raise ValueError(f"ManifestFilter judges download pairs only: {pair.key!r}")
+        local, remote = pair.dest, pair.src
 
         m = self._lookup(pair.key)
         if m is None or not m.is_file:
             # Both sides present, but the manifest is silent or records a
-            # dir/symlink at this key: a push re-uploads it (local is the source
-            # of truth); a pull re-downloads an unknown key but leaves a recorded
-            # non-file to apply_manifest, which recreates it with no data object.
-            if direction == "download":
-                return m is None
-            self.unknown_uploads += 1
-            return True
+            # dir/symlink at this key: re-download an unknown key, but leave a
+            # recorded non-file to apply_manifest, which recreates it with no
+            # data object.
+            return m is None
         if remote.size != m.size:
             return True  # the remote drifted from the record; size is free evidence
         try:

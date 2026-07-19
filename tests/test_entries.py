@@ -122,8 +122,9 @@ def test_push_delete_yes_prunes_excluded_objects_unattended(ws, answers):
 
 def test_push_delete_answer_n_keeps_excluded_object_and_record(ws, answers):
     # n keeps the pair - even through a manifest rewrite forced by another
-    # change, the kept record must survive the KeptKeys merge, so the entry
-    # still verifies clean and a later --delete asks again.
+    # change, the kept record must survive the journal merge (n journals no
+    # drop), so the entry still verifies clean and a later --delete asks
+    # again.
     _push_then_exclude_cache(ws)
     (ws.root / "data" / "keep.txt").write_text("k-v2")  # forces a rewrite
 

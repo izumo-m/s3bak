@@ -38,6 +38,8 @@ from s3bak.manifest import path_match, split_excludes
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
+    from boto3_s3.types import LocalScanOptions
+
 
 class ManifestWalker(LocalFileGenerator):
     """Prune manifest excludes before boto3-s3 descends into directories.
@@ -46,12 +48,18 @@ class ManifestWalker(LocalFileGenerator):
     ``rel_prefix`` that anchors them at the entry root (``"./"``, or
     ``"./{sub}/"`` for a sub-path push).
 
-    The walker also tracks scan completeness: a warn-skip that hides real
-    tree content (an unreadable directory or file, a path that vanished
-    mid-walk) sets ``scan_incomplete``, which ``push --delete`` consults to
-    refuse deletions decided on a partial local view (an S3 object whose
-    local file the walk could not see is not an orphan). Special-file skips
-    are the sync's normal, recurring behaviour and do not count.
+    The walker also tracks scan completeness: a warning that hides real tree
+    content (an unopenable directory, a path that vanished mid-walk) sets
+    ``scan_incomplete``, which ``push --delete`` consults to refuse deletions
+    decided on a partial local view (an S3 object whose local file the walk
+    could not see is not an orphan). Every walk here runs the complete view
+    (``enumerate_all_entries``), which enumerates special files and
+    content-unreadable entries instead of warn-skipping them - so a warning
+    IS a gap, with one exception: the invalid-timestamp fallback warns but
+    keeps its entry (the record is built from the raw ``st_mtime_ns``, which
+    the fallback does not touch). ``PushJournal`` marks the same flag for
+    the gaps only it can see (an unreadable file it decided to transfer, a
+    symlink racing away before its readlink).
     """
 
     def __init__(self, prune: list[str], skip: list[str], rel_prefix: str) -> None:
@@ -61,11 +69,11 @@ class ManifestWalker(LocalFileGenerator):
         self.scan_incomplete = False
 
     def _completeness_watch(self, notify: Callable[[str], None]) -> Callable[[str], None]:
-        """Wrap a warn-skip ``notify`` so every skip of real content marks the
-        scan incomplete before the warning goes wherever it was going."""
+        """Wrap a walk ``notify`` so every warning for missing content marks
+        the scan incomplete before the message goes wherever it was going."""
 
         def wrapped(body: str) -> None:
-            if "special device" not in body:
+            if "invalid timestamp" not in body:
                 self.scan_incomplete = True
             notify(body)
 
@@ -74,17 +82,17 @@ class ManifestWalker(LocalFileGenerator):
     def triggers_warning(self, path: str, notify: Callable[[str], None]) -> bool:
         return super().triggers_warning(path, self._completeness_watch(notify))
 
-    def should_ignore_entry(
+    def classify_child(
         self,
         entry: os.DirEntry[str],
         full: str,
         dir_fd: int | None,
-        st: os.stat_result,
         *,
+        options: LocalScanOptions,
         notify: Callable[[str], None],
-    ) -> bool:
-        return super().should_ignore_entry(
-            entry, full, dir_fd, st, notify=self._completeness_watch(notify)
+    ) -> WalkChild | None:
+        return super().classify_child(
+            entry, full, dir_fd, options=options, notify=self._completeness_watch(notify)
         )
 
     def finalize_children(self, children: list[WalkChild]) -> list[WalkChild]:
@@ -110,7 +118,9 @@ class ManifestWalker(LocalFileGenerator):
 
 
 def sync_walker(excludes: list[str], sub: str | None = None) -> ManifestWalker:
-    """The data sync's local-side walk: the manifest walk's exclude pruning.
+    """The push sync's local-side walk: the manifest walk's exclude pruning
+    over the complete view (``store.sync_up`` enumerates every entry into the
+    pair stream for the journal; see docs/journal.md).
 
     Sharing ``ManifestWalker`` is what makes the sync and the manifest agree
     on what an exclude means - one predicate, one anchor. The pruning applies

@@ -336,79 +336,122 @@ def test_write_merged_keep_all_retains_old_only_records_verbatim(tmp_path):
     assert entries[3]["mtime_ns"] != 7  # both sides: the fresh walk record won
 
 
-def test_write_merged_selective_drops_only_unkept_file_records(tmp_path):
-    # Only a regular file's record can be confirmed away (its object is the
-    # delete candidate): a.txt was answered "delete" and its record falls out.
-    # Directory, symlink, and other objectless records were never asked and
-    # survive - which also keeps every kept file's ancestor chain intact.
-    old = tmp_path / "old.jsonl"
-    old.write_text(
-        _manifest_text(
-            [
-                '{"path":".","mode":"40755","mtime_ns":0}',
-                '{"path":"./gone","mode":"40755","mtime_ns":0}',
-                '{"path":"./gone/a.txt","mode":"100644","size":1,"mtime_ns":0}',
-                '{"path":"./gone/link","mode":"120777","mtime_ns":0,"link":"a.txt"}',
-                '{"path":"./gone/sub","mode":"40755","mtime_ns":0}',
-                '{"path":"./gone/sub/x.txt","mode":"100644","size":1,"mtime_ns":0}',
-                '{"path":"./keep.txt","mode":"100644","size":1,"mtime_ns":0}',
-            ]
-        )
-    )
-    kept = tmp_path / "kept.jsonl"
-    kept.write_text(json.dumps("gone/sub/x.txt") + "\n")
-    root = tmp_path / "root"
-    root.mkdir()
-    (root / "keep.txt").write_text("k")
+# --- the push journal ----------------------------------------------------------
 
+
+_OLD_LINES = [
+    '{"path":".","mode":"40755","mtime_ns":0}',
+    '{"path":"./gone.txt","mode":"100644","size":1,"mtime_ns":0}',
+    '{"path":"./keep.txt","mode":"100644","size":1,"mtime_ns":7,"future":"kept"}',
+    '{"path":"./link","mode":"120777","mtime_ns":0,"link":"gone.txt"}',
+]
+
+
+def _write_journal(tmp_path, lines: list[str]) -> str:
+    p = tmp_path / "push.journal"
+    p.write_text("".join(line + "\n" for line in lines))
+    return str(p)
+
+
+def test_merge_journal_applies_events_and_copies_the_rest_verbatim(tmp_path):
+    old = tmp_path / "old.jsonl"
+    old.write_text(_manifest_text(_OLD_LINES))
+    journal = _write_journal(
+        tmp_path,
+        [
+            '+{"path":"./added.txt","mode":"100644","size":2,"mtime_ns":1}',
+            "-" + _OLD_LINES[1],  # gone.txt: a confirmed deletion drops its record
+            '!{"path":"./link","mode":"120777","mtime_ns":0,"link":"added.txt"}',
+        ],
+    )
     out_path = tmp_path / "merged.jsonl"
-    kept_keys = manifest.KeptKeys(str(kept))
-    try:
-        with open(out_path, "w", encoding="utf-8") as out:
-            manifest.write_merged(
-                out, str(old), None, localwalk.walk_tree(str(root), []), keep_old=kept_keys
-            )
-    finally:
-        kept_keys.close()
-    rels = [json.loads(ln)["path"] for ln in out_path.read_text().splitlines()[1:]]
-    assert rels == [
-        ".",
-        "./gone",
-        "./gone/link",
-        "./gone/sub",
-        "./gone/sub/x.txt",
-        "./keep.txt",
-    ]
+    with open(out_path, "w", encoding="utf-8") as out:
+        manifest.merge_journal(out, str(old), journal)
+    entries = [json.loads(ln) for ln in out_path.read_text().splitlines()[1:]]
+    assert [e["path"] for e in entries] == [".", "./added.txt", "./keep.txt", "./link"]
+    assert entries[2]["future"] == "kept"  # untouched record copied verbatim
+    assert entries[3]["link"] == "added.txt"  # ! replaced the record
     assert manifest.validate_manifest(str(out_path)) == "dir"
 
 
-def test_write_merged_selective_skips_kept_keys_without_records(tmp_path):
-    # A kept orphan object with no old record has nothing to keep: the key is
-    # discarded while advancing and later records still match.
+def test_merge_journal_without_old_manifest_is_the_first_push(tmp_path):
+    journal = _write_journal(
+        tmp_path,
+        [
+            '+{"path":".","mode":"40755","mtime_ns":0}',
+            '+{"path":"./a.txt","mode":"100644","size":1,"mtime_ns":0}',
+        ],
+    )
+    out_path = tmp_path / "merged.jsonl"
+    with open(out_path, "w", encoding="utf-8") as out:
+        manifest.merge_journal(out, None, journal)
+    assert manifest.validate_manifest(str(out_path)) == "dir"
+
+
+@pytest.mark.parametrize(
+    ("event", "message"),
+    [
+        ('+{"path":"./keep.txt","mode":"100644","size":1,"mtime_ns":7}', "already-recorded"),
+        ('!{"path":"./zzz.txt","mode":"100644","size":1,"mtime_ns":0}', "unrecorded"),
+        ('-{"path":"./zzz.txt","mode":"100644","size":1,"mtime_ns":0}', "unrecorded"),
+        ('-{"path":"./keep.txt","mode":"100644","size":9,"mtime_ns":7}', "does not match"),
+    ],
+)
+def test_merge_journal_marker_mismatch_fails_closed(tmp_path, event, message):
+    # A + whose key exists, a ! / - whose key does not, or a - payload that
+    # differs from the record it drops is an emitter bug, never absorbed.
+    old = tmp_path / "old.jsonl"
+    old.write_text(_manifest_text(_OLD_LINES))
+    journal = _write_journal(tmp_path, [event])
+    with pytest.raises(manifest.ManifestError, match=message):
+        manifest.merge_journal(io.StringIO(), str(old), journal)
+
+
+@pytest.mark.parametrize(
+    ("lines", "message"),
+    [
+        (['*{"path":"./a.txt","mode":"100644","size":1,"mtime_ns":0}'], "invalid journal marker"),
+        (["+not json"], "invalid journal record"),
+        (
+            [
+                '+{"path":"./b.txt","mode":"100644","size":1,"mtime_ns":0}',
+                '+{"path":"./a.txt","mode":"100644","size":1,"mtime_ns":0}',
+            ],
+            "out of order",
+        ),
+        (
+            [
+                '-{"path":"./a.txt","mode":"100644","size":1,"mtime_ns":0}',
+                '+{"path":"./a.txt","mode":"100644","size":2,"mtime_ns":1}',
+            ],
+            "out of order",  # one key, one event: a -/+ pair must have been a !
+        ),
+    ],
+)
+def test_iter_journal_validates_shape(tmp_path, lines, message):
+    journal = _write_journal(tmp_path, lines)
+    with pytest.raises(manifest.ManifestError, match=message):
+        list(manifest.iter_journal(journal))
+
+
+def test_merge_journal_warns_when_records_survive_under_a_file(tmp_path):
+    # A + at the free file key "d" while the old dir record and its children
+    # survive: same restorability warning as write_merged, once per subtree.
     old = tmp_path / "old.jsonl"
     old.write_text(
         _manifest_text(
             [
                 '{"path":".","mode":"40755","mtime_ns":0}',
-                '{"path":"./kept.txt","mode":"100644","size":1,"mtime_ns":0}',
+                '{"path":"./d","mode":"40755","mtime_ns":0}',
+                '{"path":"./d/x.txt","mode":"100644","size":1,"mtime_ns":0}',
             ]
         )
     )
-    kept = tmp_path / "kept.jsonl"
-    kept.write_text(json.dumps("aaa-unrecorded.bin") + "\n" + json.dumps("kept.txt") + "\n")
-    root = tmp_path / "root"
-    root.mkdir()
-
-    out = io.StringIO()
-    kept_keys = manifest.KeptKeys(str(kept))
-    try:
-        manifest.write_merged(
-            out, str(old), None, localwalk.walk_tree(str(root), []), keep_old=kept_keys
-        )
-    finally:
-        kept_keys.close()
-    rels = [json.loads(ln)["path"] for ln in out.getvalue().splitlines()[1:]]
-    assert rels == [".", "./kept.txt"]
+    journal = _write_journal(tmp_path, ['+{"path":"./d","mode":"100644","size":1,"mtime_ns":0}'])
+    warnings: list[str] = []
+    manifest.merge_journal(io.StringIO(), str(old), journal, warn=warnings.append)
+    assert len(warnings) == 1
+    assert "./d" in warnings[0]
 
 
 def test_write_merged_warns_once_when_records_survive_under_a_file(tmp_path):
@@ -447,35 +490,6 @@ def test_write_merged_warns_once_when_records_survive_under_a_file(tmp_path):
     assert rels == [".", "./d", "./d.txt", "./d", "./d/x.txt", "./d/y.txt"]
     assert len(warnings) == 1
     assert "./d" in warnings[0]
-
-
-def test_write_merged_empty_kept_stream_drops_every_unkept_file_record(tmp_path):
-    # KeptKeys(None) is the empty stream: every old-only FILE record falls out
-    # (its object was deleted, or was already gone - the stale-record heal),
-    # while objectless records still survive.
-    old = tmp_path / "old.jsonl"
-    old.write_text(
-        _manifest_text(
-            [
-                '{"path":".","mode":"40755","mtime_ns":0}',
-                '{"path":"./gone.txt","mode":"100644","size":1,"mtime_ns":0}',
-                '{"path":"./link","mode":"120777","mtime_ns":0,"link":"gone.txt"}',
-            ]
-        )
-    )
-    root = tmp_path / "root"
-    root.mkdir()
-
-    out = io.StringIO()
-    kept_keys = manifest.KeptKeys(None)
-    try:
-        manifest.write_merged(
-            out, str(old), None, localwalk.walk_tree(str(root), []), keep_old=kept_keys
-        )
-    finally:
-        kept_keys.close()
-    rels = [json.loads(ln)["path"] for ln in out.getvalue().splitlines()[1:]]
-    assert rels == [".", "./link"]
 
 
 # --- RecordedFiles -------------------------------------------------------------
