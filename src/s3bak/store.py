@@ -104,8 +104,7 @@ class Boto3S3Store:
         # must not be shared across concurrently transferring threads, so one
         # store serves one entry at a time (s3transfer's own worker threads
         # under a single transfer are the library's business).
-        import boto3
-        from boto3_s3 import S3
+        from boto3_s3 import S3, session
 
         transfer_config = None
         if max_concurrency is not None:
@@ -114,9 +113,11 @@ class Boto3S3Store:
             transfer_config = TransferConfig(max_concurrency=max_concurrency)
         # A configured max_concurrency becomes the default TransferConfig for
         # every cp / sync (the library otherwise uses boto3's default of 10 and
-        # never reads ~/.aws/config for it).
+        # never reads ~/.aws/config for it). boto3_s3.session is a boto3.Session
+        # whose clients parse response timestamps at C speed - the listings that
+        # drive sync and verify are severalfold faster on large trees.
         self._s3 = S3(
-            session=boto3.Session(profile_name=profile),
+            session=session(profile_name=profile),
             transfer_config=transfer_config,
         )
         self._client = self._s3.client()
@@ -223,7 +224,9 @@ class Boto3S3Store:
             if r.outcome in (OpOutcome.SUCCEEDED, OpOutcome.DRYRUN):
                 pre = "(dry-run) " if r.outcome is OpOutcome.DRYRUN else ""
                 if r.transfer_type is TransferType.DELETE:
-                    line = f"{pre}delete: {r.key}"
+                    # A delete record's src is the display endpoint
+                    # (s3://bucket/key), matching aws-cli's delete line.
+                    line = f"{pre}delete: {r.src}"
                 elif r.src is not None and r.dest is not None:
                     line = f"{pre}{r.transfer_type.value}: {r.src} to {r.dest}"
                 else:
@@ -232,12 +235,17 @@ class Boto3S3Store:
                     lines.append(line)
             elif r.outcome is OpOutcome.FAILED:
                 with lock:
-                    errs.append(f"{r.key}: {r.error}")
+                    errs.append(f"{r.compare_key}: {r.error}")
             elif r.outcome is OpOutcome.WARNED:
-                note_warning(f"warning: {r.error}" if r.error else f"warning: skipped {r.key}")
+                note_warning(
+                    f"warning: {r.error}" if r.error else f"warning: skipped {r.compare_key}"
+                )
             elif r.outcome is OpOutcome.NOTICE:
                 if r.error:
                     write_stderr(f"{r.error}\n")
+            # CANCELLED (a fatal elsewhere revoked the item) is dropped, like
+            # aws-cli, which omits cancelled items from its output; the fatal
+            # itself surfaces through the Boto3S3Error the operation raises.
 
         try:
             op(on_result)
@@ -289,7 +297,7 @@ class Boto3S3Store:
             # open resolves back to local_path.
             local_store = LocalStorage(os.path.dirname(local_path) or ".")
             pair = SyncPair(
-                key=rel_key,
+                compare_key=rel_key,
                 transfer_type=TransferType.UPLOAD,
                 src=LocalFileInfo(
                     key=local_path,
@@ -358,7 +366,7 @@ class Boto3S3Store:
             else:
                 prefixes.append(name)
 
-        self._s3.ls(self._s3_loc(is_dir=True), recursive=False, on_result=collect)
+        self._s3.ls(self._s3_loc(is_dir=True), recursive=False, on_entry=collect)
         return objects, prefixes
 
     def _is_not_found(self, e: ClientError) -> bool:

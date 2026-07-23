@@ -729,10 +729,10 @@ class ManifestFilter:
     def __call__(self, pair: SyncPair) -> bool:
         # Only ever handed a both-sides download pair (pull's sync_down).
         if pair.transfer_type.value != "download":
-            raise ValueError(f"ManifestFilter judges download pairs only: {pair.key!r}")
+            raise ValueError(f"ManifestFilter judges download pairs only: {pair.compare_key!r}")
         local, remote = pair.dest, pair.src
 
-        m = self._lookup(pair.key)
+        m = self._lookup(pair.compare_key)
         if m is None or not m.is_file:
             # Both sides present, but the manifest is silent or records a
             # dir/symlink at this key: re-download an unknown key, but leave a
