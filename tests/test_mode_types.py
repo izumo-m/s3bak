@@ -93,6 +93,7 @@ def test_status_clean_against_manifest(ws):
     os.chmod(ws.root / "data", 0o755)
     os.chmod(ws.root / "data" / "a.txt", 0o640)
     os.utime(ws.root / "data" / "a.txt", ns=(MTIME_NS, MTIME_NS))
+    os.utime(ws.root / "data", ns=(MTIME_NS, MTIME_NS))
     ws.config({"data": {"path": str(ws.root / "data")}})
 
     _put_manifest(

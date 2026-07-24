@@ -183,7 +183,6 @@ def compare_to_local(
     *,
     window_ns: int,
     use_color: bool = False,
-    ignore_dir_mtime: bool = False,
 ) -> EntryDiff:
     """Manifest record vs local filesystem state, stat'd here.
 
@@ -208,7 +207,6 @@ def compare_to_local(
         local_sym,
         window_ns=window_ns,
         use_color=use_color,
-        ignore_dir_mtime=ignore_dir_mtime,
     )
 
 
@@ -219,7 +217,6 @@ def compare_to_stat(
     *,
     window_ns: int,
     use_color: bool = False,
-    ignore_dir_mtime: bool = False,
 ) -> EntryDiff:
     """Manifest record vs the local side's already-taken ``lstat``.
 
@@ -230,7 +227,10 @@ def compare_to_stat(
     applies (mtime within ``window_ns``), so `status` and push/pull agree on
     what counts as changed; mode is additionally compared here for the
     metadata report (a mode change never re-transfers data - push refreshes
-    the manifest instead, through the same ``mode_differs`` predicate).
+    the manifest instead, through the same ``mode_differs`` predicate). A
+    directory's own mtime is compared the same as any other record's: push
+    tracks its drift and refreshes the record, so status reports it and pull
+    restores it, the same as any other tracked mtime.
     """
     diff = EntryDiff(status=None, tags=[], details=[])
 
@@ -288,14 +288,6 @@ def compare_to_stat(
         diff.tags.append("mode")
         diff.details.append(f"mode: remote={entry.perm_str} local={loc_mode}")
 
-    # A directory's mtime changes whenever its children are added/removed, so
-    # it is noise in `status` and is suppressed there (ignore_dir_mtime=True).
-    # The restore paths (_manifest_matches_local and apply_manifest's gate)
-    # keep the default and still detect dir mtime drift so the apply can
-    # restore it.
-    if ignore_dir_mtime and is_dir_local:
-        return diff
-
     if entry.mtime_ns is not None and abs(st.st_mtime_ns - entry.mtime_ns) > window_ns:
         diff.status = "M"
         tag, detail = _mtime_mismatch(entry.mtime_ns, st.st_mtime_ns, use_color)
@@ -324,9 +316,6 @@ def check_metadata(
     verbose: bool,
     window_ns: int,
     use_color: bool = False,
-    ignore_dir_mtime: bool = False,
 ) -> str | None:
-    diff = compare_to_local(
-        entry, target, window_ns=window_ns, use_color=use_color, ignore_dir_mtime=ignore_dir_mtime
-    )
+    diff = compare_to_local(entry, target, window_ns=window_ns, use_color=use_color)
     return format_diff_block(diff, target, verbose)

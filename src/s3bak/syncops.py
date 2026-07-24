@@ -488,10 +488,9 @@ class PushJournal:
         """Journal a directory / symlink / special-file item: an event only
         when the record would change - a new path, a changed symlink target
         or (where ``SYMLINK_MTIME_SUPPORTED``) an out-of-window symlink mtime
-        drift, a mode drift (directories and specials; symlink permission
-        bits are compared nowhere), or a type change. Directory mtime drift
-        alone is not a change (matching the old pipeline's refresh
-        triggers)."""
+        drift, an out-of-window directory or special-file mtime drift, a mode
+        drift (directories and specials; symlink permission bits are compared
+        nowhere), or a type change."""
         is_dir = stat_mod.S_ISDIR(st.st_mode)
         path = self._record_path(key, is_dir=is_dir)
         sym: str | None = None
@@ -513,12 +512,18 @@ class PushJournal:
                 and (e.mtime_ns is None or abs(st.st_mtime_ns - e.mtime_ns) > self._window_ns)
             )
         elif is_dir:
-            changed = mode_differs(e, st)  # a dir key always holds a dir record
+            # a dir key always holds a dir record; its own mtime drift is
+            # tracked the same as a special file's - see the else branch.
+            changed = (
+                mode_differs(e, st)
+                or e.mtime_ns is None
+                or abs(st.st_mtime_ns - e.mtime_ns) > self._window_ns
+            )
         else:
-            # A special file (FIFO, device): a type change, a mode drift, or -
-            # unlike a directory, whose mtime is child-driven noise - an
-            # out-of-window mtime drift, so status's M settles and pull restores
-            # the current mtime instead of a stale one.
+            # A special file (FIFO, device): a type change, a mode drift, or
+            # an out-of-window own-mtime drift (tracked the same as a
+            # directory's or symlink's), so status's M settles and pull
+            # restores the current mtime instead of a stale one.
             changed = (
                 stat_mod.S_IFMT(e.mode) != stat_mod.S_IFMT(st.st_mode)
                 or mode_differs(e, st)

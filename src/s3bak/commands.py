@@ -1494,7 +1494,6 @@ def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
                     opts.verbose,
                     window_ns,
                     use_color=use_color,
-                    ignore_dir_mtime=True,
                 )
                 if block:
                     write_output(block)
@@ -1535,7 +1534,6 @@ def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
                     sym,
                     window_ns=window_ns,
                     use_color=use_color,
-                    ignore_dir_mtime=True,
                 )
                 block = format_diff_block(diff, target, opts.verbose)
                 if block:

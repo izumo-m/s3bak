@@ -131,8 +131,7 @@ def test_push_ignores_symlink_permission_drift(ws):
 @pytest.mark.skipif(not SYMLINK_MTIME_SUPPORTED, reason=_NO_SYMLINK_MTIME_REASON)
 def test_push_tracks_symlink_own_mtime_drift(ws):
     # A symlink's own mtime (not its target) drifting is a real change to
-    # track, same as a special file's - unlike a directory's, it is never
-    # child-driven noise.
+    # track, same as a directory's or special file's own mtime.
     ws.write("data/a.txt", "a")
     link = ws.root / "data" / "link"
     os.symlink("a.txt", link)
@@ -170,6 +169,82 @@ def test_pull_restores_symlink_own_mtime_and_settles(ws):
 
     res = ws.run("status", "data", expect_rc=0)
     assert res.out.strip() == ""
+
+
+def test_status_reports_directory_mtime_drift(ws):
+    # Creating and then removing a file inside a directory bumps the
+    # directory's own mtime - a real drift status now reports, no longer
+    # suppressed.
+    ws.write("data/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data")}}, mtime_window=0)
+    ws.run("push", "data", expect_rc=0)
+
+    tmp = ws.root / "data" / "tmp.txt"
+    tmp.write_text("x")
+    tmp.unlink()
+
+    res = ws.run("status", "data", expect_rc=0)
+    assert any(ln.startswith("M") and "mtime" in ln for ln in res.out.splitlines())
+
+
+def test_push_tracks_directory_mtime_drift(ws):
+    # A directory's own mtime drifting (children added/removed since the last
+    # push) is a real change to track, same as a symlink's or special file's.
+    ws.write("data/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data")}}, mtime_window=0)
+    ws.run("push", "data", expect_rc=0)
+
+    tmp = ws.root / "data" / "tmp.txt"
+    tmp.write_text("x")
+    tmp.unlink()
+    actual_ns = os.lstat(ws.root / "data").st_mtime_ns
+
+    res = ws.run("push", "data", expect_rc=0)
+
+    assert "upload:" not in res.out  # a directory mtime drift re-transfers no data
+    assert "Updating" in res.err
+    body = _manifest_body(ws, "data")
+    record = next(
+        json.loads(line) for line in body.splitlines()[1:] if json.loads(line)["path"] == "."
+    )
+    assert record["mtime_ns"] == actual_ns  # the drifted mtime is now recorded
+    assert ws.run("status", "data", expect_rc=0).out.strip() == ""  # no perpetual M
+
+
+def test_pull_restores_directory_mtime_and_settles(ws):
+    # status has no -o/--output (it always reads the entry's configured
+    # path), so the empty destination here is that same configured path,
+    # wiped first - the pull then restores into it from nothing.
+    ws.write("data/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data")}}, mtime_window=0)
+    ws.run("push", "data", expect_rc=0)
+
+    tmp = ws.root / "data" / "tmp.txt"
+    tmp.write_text("x")
+    tmp.unlink()
+    ws.run("push", "data", expect_rc=0)  # records the drifted directory mtime
+    recorded_ns = os.lstat(ws.root / "data").st_mtime_ns
+
+    shutil.rmtree(ws.root / "data")
+
+    ws.run("pull", "data", expect_rc=0)
+
+    assert os.lstat(ws.root / "data").st_mtime_ns == recorded_ns
+
+    res = ws.run("status", "data", expect_rc=0)
+    assert res.out.strip() == ""
+
+
+def test_push_skips_directory_mtime_drift_within_window(ws):
+    ws.write("data/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data")}}, mtime_window=2)
+    ws.run("push", "data", expect_rc=0)
+
+    ns = os.lstat(ws.root / "data").st_mtime_ns + 1_000_000_000  # +1s: inside the 2s window
+    os.utime(ws.root / "data", ns=(ns, ns))
+
+    res = ws.run("push", "data", expect_rc=0)
+    assert "Updating" not in res.err  # inside the window: no journal event
 
 
 def test_single_file_push_refreshes_manifest_on_mode_change(ws):
@@ -449,19 +524,27 @@ def test_push_after_local_delete_keeps_backup_by_default(ws):
     assert (dest / "b.txt").read_text() == "b"
 
 
-def test_push_with_only_a_local_delete_does_not_touch_the_manifest(ws):
-    # Nothing to transfer and the kept record is not a structural change, so
-    # the push is a full no-op (no manifest re-upload, no output).
+def test_push_with_only_a_local_delete_settles_directory_mtime_but_keeps_the_record(ws):
+    # Nothing to transfer and the kept file record is not itself a structural
+    # change - but the deletion bumped the directory's own mtime, which push
+    # now tracks and refreshes; a second push (nothing left to see) converges.
     ws.write("data/a.txt", "a")
     ws.write("data/b.txt", "b")
     ws.config({"data": {"path": str(ws.root / "data")}})
     ws.run("push", "data", expect_rc=0)
 
     (ws.root / "data" / "b.txt").unlink()
-    res = ws.run("push", "data", expect_rc=0)
+    first = ws.run("push", "data", expect_rc=0)
+    second = ws.run("push", "data", expect_rc=0)
 
-    assert res.out == ""
-    assert "Updating" not in res.err
+    assert first.out == ""
+    assert second.out == ""
+    assert "Updating" in first.err  # the directory's own mtime drifted
+    assert "Updating" not in second.err  # settled: converges
+    assert (
+        b'"path":"./b.txt"'
+        in ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl")["Body"].read()
+    )  # the file record survives (no --delete)
 
 
 def test_push_keeps_records_of_locally_deleted_symlink_and_empty_dir(ws):
@@ -1141,9 +1224,9 @@ def test_status_warns_on_inaccessible_single_file_entry(ws):
 
 @pytest.mark.skipif(os.name == "nt", reason="needs os.mkfifo")
 def test_push_refreshes_special_file_mtime(ws):
-    # A special file's mtime is meaningful (not child-driven noise like a
-    # directory's): an out-of-window mtime drift must refresh the manifest, so
-    # status settles and pull restores the current mtime.
+    # A special file's own mtime is meaningful: an out-of-window mtime drift
+    # must refresh the manifest, so status settles and pull restores the
+    # current mtime.
     ws.write("data/a.txt", "a")
     fifo = ws.root / "data" / "pipe"
     os.mkfifo(fifo)

@@ -191,8 +191,9 @@ environment.
 3. **Publish the journal if it is non-empty — the only refresh condition.**
    A directory push's manifest changes were journaled during the sync (a
    transfer, a confirmed deletion, an objectless structural change, a symlink
-   retarget or (platform permitting) own-mtime drift, a permission drift, or
-   the first push's `+`-everything journal);
+   retarget or (platform permitting) own-mtime drift, a directory or
+   special-file own-mtime drift, a permission drift, or the first push's
+   `+`-everything journal);
    `merge_journal` applies them to the old manifest and the result is
    validated and uploaded. Records with no event — the backups of locally
    vanished files included — survive verbatim; a `--delete` run journals the

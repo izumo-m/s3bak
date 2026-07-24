@@ -623,9 +623,11 @@ def test_push_delete_interactive_never_drops_objectless_records(ws, answers):
 
 
 def test_push_delete_with_all_answers_no_converges(ws):
-    # A kept record must not read as "structure changed": the same non-TTY
-    # push --delete run twice may not rewrite the manifest or produce output,
-    # or a cron mirror would re-upload and fire post_hook forever.
+    # A kept record must not read as "structure changed" beyond the directory
+    # mtime the deletion itself bumped: the first non-TTY push --delete
+    # settles that drift, and the second run - with nothing left to see -
+    # may not rewrite the manifest or produce output, or a cron mirror would
+    # re-upload and fire post_hook forever.
     ws.write("data/keep.txt", "k")
     ws.write("data/gone.txt", "g")
     ws.config({"data": {"path": str(ws.root / "data")}})
@@ -635,9 +637,10 @@ def test_push_delete_with_all_answers_no_converges(ws):
     first = ws.run("push", "--delete", "data", expect_rc=0)
     second = ws.run("push", "--delete", "data", expect_rc=0)
 
-    for res in (first, second):
-        assert res.out == ""
-        assert "Updating" not in res.err
+    assert first.out == ""
+    assert second.out == ""
+    assert "Updating" in first.err  # the deletion bumped the directory's own mtime
+    assert "Updating" not in second.err  # settled: converges
 
 
 def test_push_delete_heals_stale_record_whose_object_is_gone(ws):

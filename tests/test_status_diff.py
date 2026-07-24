@@ -29,7 +29,9 @@ def test_status_clean_then_reports_changes(ws):
 def test_status_reports_m_d_a_interleaved_in_key_order(ws):
     # status is one merge-join over the manifest and a fresh walk, so every
     # line - M, D, and A alike - comes out in S3 key order (A is no longer
-    # batched at the end).
+    # batched at the end). The root's own record sorts first (empty compare
+    # key) and shows M too: the additions and the deletion all bumped the
+    # directory's own mtime.
     ws.write("data/b.txt", "b")
     ws.write("data/d.txt", "d")
     ws.config({"data": {"path": str(ws.root / "data")}})
@@ -42,7 +44,13 @@ def test_status_reports_m_d_a_interleaved_in_key_order(ws):
 
     res = ws.run("status", "data", expect_rc=0)
     marks = [(line.split()[0], os.path.basename(line.split()[1])) for line in res.out.splitlines()]
-    assert marks == [("A", "a.txt"), ("M", "b.txt"), ("D", "d.txt"), ("A", "e.txt")]
+    assert marks == [
+        ("M", "data"),
+        ("A", "a.txt"),
+        ("M", "b.txt"),
+        ("D", "d.txt"),
+        ("A", "e.txt"),
+    ]
 
 
 def test_status_excluded_paths_are_invisible_locally(ws):
