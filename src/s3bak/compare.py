@@ -24,6 +24,14 @@ from s3bak.manifest import ManifestEntry
 _ANSI_GREEN = "\033[1;32m"
 _ANSI_RESET = "\033[0m"
 
+# Whether the platform's os.utime can set a symlink's own mtime without
+# following it (POSIX; not Windows). Gates every place a symlink's mtime is
+# compared or restored - compare_to_stat's symlink branch, PushJournal's
+# symlink journaling, and restore's _place_symlink - so an unsupported
+# platform degrades all three to target-only handling instead of churning the
+# manifest with a creation-time mtime on every pull-then-push cycle.
+SYMLINK_MTIME_SUPPORTED = os.utime in os.supports_follow_symlinks
+
 
 def _resolve_use_color(mode: str) -> bool:
     if mode == "always":
@@ -109,6 +117,36 @@ def _fmt_mtime(mtime_ns: int, *, subsecond: bool = False) -> str:
     if subsecond:
         text += "." + (f"{frac_ns:09d}".rstrip("0") or "0")
     return text
+
+
+def _mtime_mismatch(entry_mtime_ns: int, loc_mtime_ns: int, use_color: bool) -> tuple[str, str]:
+    """Build the ("mtime", detail-line) pair for a manifest/local mtime
+    mismatch, shared by the regular-file and symlink mtime checks so both
+    render identically."""
+    diff_ns = loc_mtime_ns - entry_mtime_ns
+    # A sub-second drift (e.g. WSL2 drvfs truncates a restored mtime to whole
+    # seconds) renders as two identical second-precision timestamps, so show
+    # the fractional digits that actually differ.
+    subsecond = abs(diff_ns) < 1_000_000_000
+    fmt_local = _fmt_mtime(loc_mtime_ns, subsecond=subsecond)
+    fmt_remote = _fmt_mtime(entry_mtime_ns, subsecond=subsecond)
+    if entry_mtime_ns < loc_mtime_ns:
+        cmp = "<"
+        remote_disp = fmt_remote
+        local_disp = _color_wrap(fmt_local, use_color)
+    else:
+        cmp = ">"
+        remote_disp = _color_wrap(fmt_remote, use_color)
+        local_disp = fmt_local
+    if subsecond:
+        diff_str = f"{diff_ns / 1_000_000_000:+.9f}".rstrip("0") + "s"
+    else:
+        # Difference of the displayed whole seconds, so the number always
+        # agrees with the two rendered timestamps.
+        diff_str = _humanize_duration(
+            loc_mtime_ns // 1_000_000_000 - entry_mtime_ns // 1_000_000_000
+        )
+    return "mtime", f"mtime: remote={remote_disp} {cmp} local={local_disp} ({diff_str})"
 
 
 def mode_differs(entry: ManifestEntry, st: os.stat_result) -> bool:
@@ -205,6 +243,15 @@ def compare_to_stat(
             diff.status = "M"
             diff.tags.append("link")
             diff.details.append(f"link: remote={entry.sym_target} local={loc_link}")
+        if (
+            SYMLINK_MTIME_SUPPORTED
+            and entry.mtime_ns is not None
+            and abs(st.st_mtime_ns - entry.mtime_ns) > window_ns
+        ):
+            diff.status = "M"
+            tag, detail = _mtime_mismatch(entry.mtime_ns, st.st_mtime_ns, use_color)
+            diff.tags.append(tag)
+            diff.details.append(detail)
         return diff
 
     if st is None:
@@ -250,33 +297,10 @@ def compare_to_stat(
         return diff
 
     if entry.mtime_ns is not None and abs(st.st_mtime_ns - entry.mtime_ns) > window_ns:
-        loc_mtime_ns = st.st_mtime_ns
-        diff_ns = loc_mtime_ns - entry.mtime_ns
-        # A sub-second drift (e.g. WSL2 drvfs truncates a restored mtime to
-        # whole seconds) renders as two identical second-precision timestamps,
-        # so show the fractional digits that actually differ.
-        subsecond = abs(diff_ns) < 1_000_000_000
-        fmt_local = _fmt_mtime(loc_mtime_ns, subsecond=subsecond)
-        fmt_remote = _fmt_mtime(entry.mtime_ns, subsecond=subsecond)
         diff.status = "M"
-        diff.tags.append("mtime")
-        if entry.mtime_ns < loc_mtime_ns:
-            cmp = "<"
-            remote_disp = fmt_remote
-            local_disp = _color_wrap(fmt_local, use_color)
-        else:
-            cmp = ">"
-            remote_disp = _color_wrap(fmt_remote, use_color)
-            local_disp = fmt_local
-        if subsecond:
-            diff_str = f"{diff_ns / 1_000_000_000:+.9f}".rstrip("0") + "s"
-        else:
-            # Difference of the displayed whole seconds, so the number always
-            # agrees with the two rendered timestamps.
-            diff_str = _humanize_duration(
-                loc_mtime_ns // 1_000_000_000 - entry.mtime_ns // 1_000_000_000
-            )
-        diff.details.append(f"mtime: remote={remote_disp} {cmp} local={local_disp} ({diff_str})")
+        tag, detail = _mtime_mismatch(entry.mtime_ns, st.st_mtime_ns, use_color)
+        diff.tags.append(tag)
+        diff.details.append(detail)
 
     return diff
 

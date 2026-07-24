@@ -116,8 +116,10 @@ push — never uploaded, deleted when the push ends.
 - **`+` / `!`**: every transfer the update or create lane decides (including
   the S3-size-drift and missing-object re-uploads); a mode drift on a
   no-transfer pair, through the same mode predicate `status` uses; a symlink
-  target change; objectless additions (empty directory, symlink, special
-  file); the root record when its metadata drifted.
+  target change or (where the platform can set a symlink's own mtime without
+  following it) an out-of-window symlink mtime drift; objectless additions
+  (empty directory, symlink, special file); the root record when its
+  metadata drifted.
 - **`-`**: only on `--delete` runs — a confirmed deletion (the object and its
   record travel together), a stale old-only file record with no object behind
   it, and, under the `--yes` mirror, objectless records whose local

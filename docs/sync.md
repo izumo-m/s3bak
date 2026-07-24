@@ -191,7 +191,8 @@ environment.
 3. **Publish the journal if it is non-empty — the only refresh condition.**
    A directory push's manifest changes were journaled during the sync (a
    transfer, a confirmed deletion, an objectless structural change, a symlink
-   retarget, a permission drift, or the first push's `+`-everything journal);
+   retarget or (platform permitting) own-mtime drift, a permission drift, or
+   the first push's `+`-everything journal);
    `merge_journal` applies them to the old manifest and the result is
    validated and uploaded. Records with no event — the backups of locally
    vanished files included — survive verbatim; a `--delete` run journals the
@@ -392,29 +393,32 @@ Deleting is opt-in and confirmed:
 4. **Apply manifest metadata** (unless `--data-only`): one streaming
    merge-join of the manifest against a fresh local walk - the same join
    `status` and `--delete` run - repairs **only the records whose local state
-   differs**: the shared size+mtime predicate plus mode, symlink target, and
-   directory mtime. A matching record is left untouched and unreported: an
-   mtime drift inside the window is never "snapped" to the recorded value
-   (the window is a rounding tolerance; `--meta-only --mtime-window 0` is the
-   exact-value refresh), and an unchanged symlink is not recreated. A
-   downloaded file normally mismatches afterwards - the directory sync stamps
-   the S3 object's upload time onto it, the single-file lane leaves the write
-   time - and gets its recorded mtime applied; a stamp that already lands
-   inside the window is a match and stays, the same bounded tolerance every
-   match gets. Directory mode/mtime is applied deepest-first after all child
-   mutations and re-checked fresh then, so a directory dirtied only by the
-   downloads themselves converges in the same pull. The walk prunes the
-   entry's excludes (an excluded subtree is never scanned) but serves purely
-   as a stat cache: a record it did not pair up is judged from a direct
-   lstat, so a record under an excluded path - pull's data sync is
-   exclude-blind - is still repaired. Mismatches repair as before: symlinks
-   and empty directories are recreated, and mode / mtime set on entries whose
-   local filesystem type matches the record. Directory and symlink conflicts
-   are recreated from the manifest; a regular-file conflict is reported
-   instead of following a hostile local symlink. A regular file the manifest
-   records but that no object placed is reported missing (exit 1), rather
-   than silently created as a directory. Recorded owner and group names are
-   not applied.
+   differs**: the shared size+mtime predicate plus mode, symlink target and
+   own mtime (platform permitting), and directory mtime. A matching record is
+   left untouched and unreported: an mtime drift inside the window is never
+   "snapped" to the recorded value (the window is a rounding tolerance;
+   `--meta-only --mtime-window 0` is the exact-value refresh), and an
+   unchanged symlink (target and, platform permitting, mtime) is not
+   recreated. A downloaded file normally mismatches afterwards - the
+   directory sync stamps the S3 object's upload time onto it, the
+   single-file lane leaves the write time - and gets its recorded mtime
+   applied; a stamp that already lands inside the window is a match and
+   stays, the same bounded tolerance every match gets. Directory mode/mtime
+   is applied deepest-first after all child mutations and re-checked fresh
+   then, so a directory dirtied only by the downloads themselves converges in
+   the same pull. The walk prunes the entry's excludes (an excluded subtree
+   is never scanned) but serves purely as a stat cache: a record it did not
+   pair up is judged from a direct lstat, so a record under an excluded path
+   - pull's data sync is exclude-blind - is still repaired. Mismatches repair
+   as before: symlinks are recreated (restoring their own recorded mtime with
+   `os.utime(..., follow_symlinks=False)` where the platform supports setting
+   it without following the link) and empty directories are recreated, and
+   mode / mtime set on entries whose local filesystem type matches the
+   record. Directory and symlink conflicts are recreated from the manifest; a
+   regular-file conflict is reported instead of following a hostile local
+   symlink. A regular file the manifest records but that no object placed is
+   reported missing (exit 1), rather than silently created as a directory.
+   Recorded owner and group names are not applied.
 
 What a pull can reproduce is bounded by what the backup records — see
 [storage.md](storage.md#restore-fidelity) for the limits (hard links,

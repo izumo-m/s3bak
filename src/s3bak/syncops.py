@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING
 from boto3_s3 import LocalFileInfo
 
 from s3bak import localwalk, manifest
-from s3bak.compare import mode_differs
+from s3bak.compare import SYMLINK_MTIME_SUPPORTED, mode_differs
 from s3bak.config import Config, Opts
 from s3bak.console import err, note_warning, write_output, write_stderr
 from s3bak.manifest import ManifestEntry
@@ -486,10 +486,12 @@ class PushJournal:
         old: tuple[ManifestEntry, str] | None,
     ) -> None:
         """Journal a directory / symlink / special-file item: an event only
-        when the record would change - a new path, a changed symlink target,
-        a mode drift (directories and specials; symlink permission bits are
-        compared nowhere), or a type change. Directory mtime drift alone is
-        not a change (matching the old pipeline's refresh triggers)."""
+        when the record would change - a new path, a changed symlink target
+        or (where ``SYMLINK_MTIME_SUPPORTED``) an out-of-window symlink mtime
+        drift, a mode drift (directories and specials; symlink permission
+        bits are compared nowhere), or a type change. Directory mtime drift
+        alone is not a change (matching the old pipeline's refresh
+        triggers)."""
         is_dir = stat_mod.S_ISDIR(st.st_mode)
         path = self._record_path(key, is_dir=is_dir)
         sym: str | None = None
@@ -506,7 +508,10 @@ class PushJournal:
             return
         e = old[0]
         if stat_mod.S_ISLNK(st.st_mode):
-            changed = e.sym_target != sym
+            changed = e.sym_target != sym or (
+                SYMLINK_MTIME_SUPPORTED
+                and (e.mtime_ns is None or abs(st.st_mtime_ns - e.mtime_ns) > self._window_ns)
+            )
         elif is_dir:
             changed = mode_differs(e, st)  # a dir key always holds a dir record
         else:

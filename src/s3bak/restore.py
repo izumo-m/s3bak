@@ -19,7 +19,7 @@ import unicodedata
 from collections.abc import Callable, Iterator
 
 from s3bak import localwalk, manifest
-from s3bak.compare import compare_to_stat
+from s3bak.compare import SYMLINK_MTIME_SUPPORTED, compare_to_stat
 from s3bak.confirm import DeleteConfirmer
 from s3bak.console import err, write_output
 from s3bak.manifest import ManifestEntry
@@ -307,7 +307,9 @@ def _lstat_readlink(target: str) -> tuple[os.stat_result | None, str | None]:
     return st, local_sym
 
 
-def _place_symlink(target: str, st: os.stat_result | None, sym_target: str) -> None:
+def _place_symlink(
+    target: str, st: os.stat_result | None, sym_target: str, mtime_ns: int | None
+) -> bool:
     """Create the recorded symlink at ``target``, clearing what ``st`` says is
     there - transactionally, so a failed ``os.symlink`` (Windows privilege,
     ENOSPC, ...) never destroys the file or directory it was replacing (a failed
@@ -316,7 +318,14 @@ def _place_symlink(target: str, st: os.stat_result | None, sym_target: str) -> N
     only after the link is in place (rolled back on failure). Windows
     distinguishes file and directory symlinks, so the link's own target is
     probed (best effort - it may not exist yet) to pick the kind; POSIX ignores
-    the flag."""
+    the flag.
+
+    Once the link sits at its final path, its own recorded mtime is applied
+    (where ``SYMLINK_MTIME_SUPPORTED``) with ``follow_symlinks=False``, so the
+    stamp lands on the link itself, never on ``sym_target``. Returns False (and
+    reports) on a metadata-apply failure; the link itself is already in place
+    by then, so the caller still counts it as an error rather than rolling
+    back."""
     parent = os.path.dirname(target)
     if parent:
         os.makedirs(parent, exist_ok=True)
@@ -356,6 +365,18 @@ def _place_symlink(target: str, st: os.stat_result | None, sym_target: str) -> N
                 pass
             raise
     write_output(f"{target} -> {sym_target}\n")
+    if not SYMLINK_MTIME_SUPPORTED or mtime_ns is None:
+        return True
+    try:
+        os.utime(target, ns=(mtime_ns, mtime_ns), follow_symlinks=False)
+    # A manifest (downloaded, possibly damaged) may carry an mtime_ns the
+    # platform cannot represent; os.utime raises OverflowError/ValueError,
+    # which run() would let escape as a traceback. Treat it as an ordinary
+    # metadata-apply failure (exit 1) like any other utime error.
+    except (OSError, OverflowError, ValueError) as e:
+        err(f"utime failed: {target}: {e}")
+        return False
+    return True
 
 
 def _apply_record(
@@ -383,9 +404,8 @@ def _apply_record(
             return 0
         if st is not None and stat_mod.S_ISDIR(st.st_mode):
             deferred_symlinks.append((target, m_entry))
-        else:
-            _place_symlink(target, st, m_entry.sym_target)
-        return 0
+            return 0
+        return 0 if _place_symlink(target, st, m_entry.sym_target, m_entry.mtime_ns) else 1
 
     # Symlinks are handled above; the recorded type distinguishes a
     # directory (including an empty one, which has no S3 object) from a
@@ -531,7 +551,8 @@ def apply_manifest(
     for target, m_entry in deferred_symlinks:
         st, _sym = _lstat_readlink(target)
         assert m_entry.sym_target is not None
-        _place_symlink(target, st, m_entry.sym_target)
+        if not _place_symlink(target, st, m_entry.sym_target, m_entry.mtime_ns):
+            errors += 1
 
     # Directory mode/mtime goes deepest-first, after every child mutation (the
     # downloads ran before apply; symlink recreation and dir creation above

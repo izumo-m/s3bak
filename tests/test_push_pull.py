@@ -9,6 +9,10 @@ import shutil
 import pytest
 
 from s3bak import cli
+from s3bak.compare import SYMLINK_MTIME_SUPPORTED
+
+_NO_SYMLINK_MTIME_REASON = "platform cannot set a symlink's own mtime without following it"
+_DRIFTED_LINK_MTIME_NS = 1_700_000_000_000_000_000
 
 
 def _manifest_body(ws, entry: str) -> str:
@@ -122,6 +126,50 @@ def test_push_ignores_symlink_permission_drift(ws):
     res = ws.run("push", "data", expect_rc=0)
 
     assert "Updating" not in res.err  # symlink perm bits are never compared
+
+
+@pytest.mark.skipif(not SYMLINK_MTIME_SUPPORTED, reason=_NO_SYMLINK_MTIME_REASON)
+def test_push_tracks_symlink_own_mtime_drift(ws):
+    # A symlink's own mtime (not its target) drifting is a real change to
+    # track, same as a special file's - unlike a directory's, it is never
+    # child-driven noise.
+    ws.write("data/a.txt", "a")
+    link = ws.root / "data" / "link"
+    os.symlink("a.txt", link)
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    os.utime(link, ns=(_DRIFTED_LINK_MTIME_NS, _DRIFTED_LINK_MTIME_NS), follow_symlinks=False)
+
+    res = ws.run("push", "data", expect_rc=0)
+
+    assert "upload:" not in res.out  # an own-mtime drift re-transfers no data
+    assert "Updating" in res.err
+    assert f'"mtime_ns":{_DRIFTED_LINK_MTIME_NS}' in _manifest_body(ws, "data")
+    assert ws.run("status", "data", expect_rc=0).out.strip() == ""
+
+
+@pytest.mark.skipif(not SYMLINK_MTIME_SUPPORTED, reason=_NO_SYMLINK_MTIME_REASON)
+def test_pull_restores_symlink_own_mtime_and_settles(ws):
+    # status has no -o/--output (it always reads the entry's configured
+    # path), so the empty destination here is that same configured path,
+    # wiped first - the pull then restores into it from nothing.
+    ws.write("data/a.txt", "a")
+    link = ws.root / "data" / "link"
+    os.symlink("a.txt", link)
+    os.utime(link, ns=(_DRIFTED_LINK_MTIME_NS, _DRIFTED_LINK_MTIME_NS), follow_symlinks=False)
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    shutil.rmtree(ws.root / "data")
+
+    ws.run("pull", "data", expect_rc=0)
+
+    restored = os.lstat(ws.root / "data" / "link")
+    assert restored.st_mtime_ns == _DRIFTED_LINK_MTIME_NS
+
+    res = ws.run("status", "data", expect_rc=0)
+    assert res.out.strip() == ""
 
 
 def test_single_file_push_refreshes_manifest_on_mode_change(ws):
