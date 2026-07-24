@@ -113,6 +113,20 @@ class ManifestEntry:
         return abs(st.st_mtime_ns - self.mtime_ns) <= window_ns
 
 
+def _fsencodable(s: str) -> bool:
+    """Whether ``s`` can round-trip to a filesystem path. A surrogateescape'd
+    undecodable byte (``\\udc80``-``\\udcff``) round-trips (POSIX filenames use
+    those), but a lone surrogate like ``\\ud800`` - which a damaged/hostile
+    manifest can carry - raises UnicodeEncodeError deep in os.symlink/os.stat,
+    uncaught by run(), and only after _place_symlink has already removed the
+    existing file (data loss + traceback). Reject it at parse time instead."""
+    try:
+        os.fsencode(s)
+        return True
+    except (UnicodeEncodeError, ValueError):
+        return False
+
+
 def parse_entry(line: str) -> ManifestEntry | None:
     """Parse one record, returning ``None`` for invalid input.
 
@@ -136,6 +150,10 @@ def parse_entry(line: str) -> ManifestEntry | None:
             not isinstance(path, str)
             or not path
             or "\x00" in path
+            # The path must round-trip to a filesystem path: a lone surrogate
+            # (unlike a surrogateescape'd byte) is not fsencodable and would
+            # crash os.path.join/os.stat on restore.
+            or not _fsencodable(path)
             or mode < 0
             or mode > 0o177777
             or not (size is None or (isinstance(size, int) and not isinstance(size, bool)))
@@ -143,7 +161,15 @@ def parse_entry(line: str) -> ManifestEntry | None:
             or not (
                 mtime_ns is None or (isinstance(mtime_ns, int) and not isinstance(mtime_ns, bool))
             )
-            or not (link is None or isinstance(link, str))
+            # A NUL or non-fsencodable link target survives every type check but
+            # raises ValueError/UnicodeEncodeError deep in os.symlink/os.path.isdir
+            # on restore, which run() does not catch - and only AFTER _place_symlink
+            # removed the existing file (data loss + traceback). Reject it here so
+            # a damaged manifest fails closed at download.
+            or not (
+                link is None
+                or (isinstance(link, str) and "\x00" not in link and _fsencodable(link))
+            )
             or not isinstance(owner, str)
             or not isinstance(group, str)
         ):
@@ -227,6 +253,7 @@ def validate_manifest(manifest_path: str) -> str:
                     entry.path.startswith("./")
                     or "/" in entry.path
                     or entry.path in (".", "..")
+                    or (os.name == "nt" and "\\" in entry.path)  # a path separator on Windows
                     or not entry.is_file
                     or entry.sym_target is not None
                 ):
@@ -241,6 +268,15 @@ def validate_manifest(manifest_path: str) -> str:
             parts = entry.path[2:].split("/")
             if any(part in ("", ".", "..") for part in parts):
                 raise ManifestError(f"manifest path escapes restore root: {entry.path!r}")
+            # A POSIX filename may contain a backslash; on Windows it is a path
+            # separator, so a record like "./a\\b" (a single file on POSIX) would
+            # restore as a nested dir a / file b. Fail closed there before any
+            # transfer; on POSIX os.name != "nt", so this is a no-op.
+            if os.name == "nt" and any("\\" in part for part in parts):
+                raise ManifestError(
+                    f"manifest path component contains a backslash,"
+                    f" unrestorable on Windows: {entry.path!r}"
+                )
             parent = tuple(parts[:-1])
             while directory_stack and len(directory_stack[-1]) > len(parent):
                 directory_stack.pop()

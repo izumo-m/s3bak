@@ -167,3 +167,22 @@ def test_confirm_subtree_delete_modes(answers, capfd):
     assert confirm.confirm_subtree_delete(AnswerMode.ASK, "data", "sub") is False
     assert "data" in answers.prompts[0]
     assert capfd.readouterr().err.count("keep it") == 2
+
+
+def test_confirm_subtree_delete_rechecks_abort_after_acquiring_lock(monkeypatch):
+    # Another entry answers q (sets _abort) while this subtree confirmation is
+    # blocked waiting for the prompt lock. After acquiring the lock it must
+    # re-check _abort and abort, not show the prompt and delete on a y.
+    monkeypatch.setattr(confirm, "read_prompt_answer", lambda _p: "y")
+
+    class AbortOnEnter:
+        def __enter__(self):
+            confirm._abort.set()  # simulate the concurrent q during the lock wait
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+    monkeypatch.setattr(confirm, "_prompt_lock", AbortOnEnter())
+    with pytest.raises(DeletionAbortedError):
+        confirm.confirm_subtree_delete(AnswerMode.ASK, "entry", "s3://bucket/entry/sub")

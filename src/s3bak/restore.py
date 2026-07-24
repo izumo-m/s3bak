@@ -14,8 +14,9 @@ from __future__ import annotations
 import os
 import shutil
 import stat as stat_mod
+import tempfile
 import unicodedata
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 from s3bak import localwalk, manifest
 from s3bak.compare import compare_to_stat
@@ -35,14 +36,22 @@ def resolve_pull_destination(
     output: str | None,
 ) -> str | None:
     """Resolve one pull selector to the filesystem path it will restore."""
+    # -o/--output is the exact destination (its own documented contract), so it
+    # is returned verbatim - never appended to, even with a trailing slash.
     if output is not None:
-        outpath = output
-    elif configured_path is not None:
-        outpath = os.path.join(configured_path, sub) if sub else configured_path
-    else:
+        return output
+    if configured_path is None:
         return None
 
-    if outpath.endswith("/"):
+    # A configured path is a container: a trailing separator means "restore into
+    # this directory under the entry/sub name" (see the disjoint-destinations
+    # test), so append the tail there. Recognize the native separators too, not
+    # just "/", or a Windows "C:\\restore\\" would restore to C:\\restore itself
+    # (and a --delete there could remove unrelated files). On POSIX os.sep is
+    # "/", so this is a no-op change.
+    seps = tuple(s for s in ("/", os.sep, os.altsep) if s)
+    outpath = os.path.join(configured_path, sub) if sub else configured_path
+    if outpath.endswith(seps):
         tail = sub if sub else entry
         outpath = os.path.join(outpath, tail)
     return outpath
@@ -199,7 +208,11 @@ def _apply_meta(target: str, mode: int, mtime_ns: int | None) -> bool:
     if mtime_ns is not None:
         try:
             os.utime(target, ns=(mtime_ns, mtime_ns))
-        except OSError as e:
+        # A manifest (downloaded, possibly damaged) may carry an mtime_ns the
+        # platform cannot represent; os.utime raises OverflowError/ValueError,
+        # which run() would let escape as a traceback. Treat it as an ordinary
+        # metadata-apply failure (exit 1) like any other utime error.
+        except (OSError, OverflowError, ValueError) as e:
             err(f"utime failed: {target}: {e}")
             ok = False
     try:
@@ -229,19 +242,54 @@ def manifest_keyed(
 
 
 def local_keyed(
-    outpath: str, excludes: list[str]
+    outpath: str,
+    excludes: list[str],
+    sub: str | None = None,
+    warn: Callable[[str], None] | None = None,
 ) -> Iterator[tuple[str, tuple[str, os.stat_result, str | None]]]:
     """Stream ``(sort_key, (rel, lstat, sym_target))`` for the local tree.
 
-    The manifest walk under ``outpath``, excludes applied outpath-relative -
-    an excluded path is invisible to the diff on both lanes (never compared,
-    never a local extra). A missing ``outpath`` yields nothing, so status
-    degrades to reporting every record D."""
+    The manifest walk under ``outpath``. ``sub`` (the entry-relative path that
+    ``outpath`` corresponds to) re-anchors the walk's exclude matching at the
+    ENTRY root, so the entry's entry-rooted patterns prune the same paths they
+    would in a full walk - otherwise a sub-path ``pull --delete`` would treat an
+    excluded local file as an extra and remove it. The emitted ``rel`` and sort
+    key stay sub-relative, so they merge-join with ``manifest_keyed(sub)``. An
+    excluded path is invisible to the diff on both lanes (never compared, never a
+    local extra). A missing ``outpath`` yields nothing, so status degrades to
+    reporting every record D.
+
+    ``warn`` (``status`` passes it) surfaces walk gaps - an unreadable directory
+    hides its children, so ``status`` would otherwise report a clean tree while a
+    local-only file sits behind it. pull's apply/--delete lanes pass None: a gap
+    there is judged by the direct-lstat fallback (apply) or safely left un-deleted
+    (--delete)."""
     if not os.path.lexists(outpath):
         return
-    for rel, st, sym in localwalk.walk_tree(outpath, excludes):
-        norm = "." if rel == "." else rel.removeprefix("./")
-        yield manifest.entry_sort_key(rel, stat_mod.S_ISDIR(st.st_mode)), (norm, st, sym)
+    if sub is not None:
+        prune, _skip = manifest.split_excludes(excludes)
+        # If the sub root itself - or any ancestor of it - is a pruned directory,
+        # the whole sub subtree is excluded. A full walk prunes it as a directory
+        # child before descending; a sub-path walk STARTS inside it (its own root
+        # is yielded unconditionally, and children of an already-excluded dir do
+        # not match the ancestor pattern), so detect it here and yield nothing -
+        # otherwise pull --delete would treat the excluded contents as extras.
+        # Records under an excluded sub are still applied via apply_manifest's
+        # direct-lstat fallback.
+        parts = sub.split("/")
+        for depth in range(len(parts)):
+            ancestor = "./" + "/".join(parts[: depth + 1])
+            if any(manifest.path_match(ancestor, p) for p in prune):
+                return
+    root_rel = "." if sub is None else f"./{sub}"
+    rel_prefix = "./" if sub is None else f"./{sub}/"
+    for rel, st, sym in localwalk.walk_tree(
+        outpath, excludes, root_rel=root_rel, rel_prefix=rel_prefix, warn=warn
+    ):
+        # rel is entry-rooted so the entry's excludes matched at the right anchor;
+        # strip back to the sub-relative form the merge key and callers use.
+        sub_rel = "." if rel == root_rel else rel.removeprefix(rel_prefix)
+        yield manifest.entry_sort_key(sub_rel, stat_mod.S_ISDIR(st.st_mode)), (sub_rel, st, sym)
 
 
 def _lstat_readlink(target: str) -> tuple[os.stat_result | None, str | None]:
@@ -261,21 +309,52 @@ def _lstat_readlink(target: str) -> tuple[os.stat_result | None, str | None]:
 
 def _place_symlink(target: str, st: os.stat_result | None, sym_target: str) -> None:
     """Create the recorded symlink at ``target``, clearing what ``st`` says is
-    there. A symlink is removed as a link (never recursing into its target); a
-    real dir (e.g. left by an older follow-symlinks backup) is removed
-    wholesale. Windows distinguishes file and directory symlinks, so the
-    link's own target is probed (best effort - it may not exist yet) to pick
-    the kind; POSIX ignores the flag."""
+    there - transactionally, so a failed ``os.symlink`` (Windows privilege,
+    ENOSPC, ...) never destroys the file or directory it was replacing (a failed
+    pull must not cost local state). A regular file or symlink is swapped out
+    with an atomic ``os.replace``; a real directory is moved aside and retired
+    only after the link is in place (rolled back on failure). Windows
+    distinguishes file and directory symlinks, so the link's own target is
+    probed (best effort - it may not exist yet) to pick the kind; POSIX ignores
+    the flag."""
     parent = os.path.dirname(target)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    if st is not None:
-        if stat_mod.S_ISDIR(st.st_mode):
-            shutil.rmtree(target)
-        else:
-            os.remove(target)
     resolved = sym_target if os.path.isabs(sym_target) else os.path.join(parent or ".", sym_target)
-    os.symlink(sym_target, target, target_is_directory=os.path.isdir(resolved))
+    is_dir_link = os.path.isdir(resolved)
+
+    def _free_adjacent_name(suffix: str) -> str:
+        fd, name = tempfile.mkstemp(prefix=os.path.basename(target) + suffix, dir=parent or ".")
+        os.close(fd)
+        os.remove(name)  # mkstemp made a regular file; free the unique name for our use
+        return name
+
+    if st is None:
+        os.symlink(sym_target, target, target_is_directory=is_dir_link)
+    elif stat_mod.S_ISDIR(st.st_mode):
+        # A real directory can't be atomically replaced by a symlink: move it
+        # aside, create the link, then retire it - rolling back if creation fails.
+        aside = _free_adjacent_name(".s3bak-old-")
+        os.rename(target, aside)
+        try:
+            os.symlink(sym_target, target, target_is_directory=is_dir_link)
+        except BaseException:
+            os.rename(aside, target)  # put the directory back
+            raise
+        shutil.rmtree(aside, ignore_errors=True)
+    else:
+        # A regular file or symlink: build the new link at a unique adjacent name
+        # and swap it in atomically, leaving the existing file intact on failure.
+        tmp = _free_adjacent_name(".s3bak-new-")
+        os.symlink(sym_target, tmp, target_is_directory=is_dir_link)
+        try:
+            os.replace(tmp, target)
+        except BaseException:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
     write_output(f"{target} -> {sym_target}\n")
 
 
@@ -289,6 +368,7 @@ def _apply_record(
     is_dir_entry: bool,
     deferred_dirs: list[tuple[str, ManifestEntry]],
     deferred_symlinks: list[tuple[str, ManifestEntry]],
+    enforce_size: bool,
 ) -> int:
     """Repair one manifest record against its local lstat; a record whose
     local state already matches (the shared ``compare_to_stat`` predicate) is
@@ -333,6 +413,21 @@ def _apply_record(
         # target outside the restore tree.
         err(f"expected {m_entry.path} to have its recorded file type: {target}")
         return 1
+    if enforce_size and m_entry.is_file and m_entry.size is not None and st.st_size != m_entry.size:
+        # After the data sync a regular file must have its recorded size: the
+        # ManifestFilter re-downloads any pair whose size drifted, so a surviving
+        # mismatch means the S3 object itself does not match the record (an
+        # out-of-band overwrite, a truncated object, or one that was missing so
+        # a stale local file was left in place). Applying metadata would report
+        # success on wrong content, so fail instead - restore fidelity is the
+        # point of the backup. Only checked when the data sync ran: --meta-only
+        # applies metadata over whatever data is already there and must not fail
+        # on a size difference it was never asked to reconcile.
+        err(
+            f"restored size does not match manifest ({st.st_size} != {m_entry.size}),"
+            f" the stored object does not match the record: {target}"
+        )
+        return 1
     write_output(f"{m_entry.perm_str} {target}\n")
     return 0 if _apply_meta(target, m_entry.perm_bits, m_entry.mtime_ns) else 1
 
@@ -345,6 +440,7 @@ def apply_manifest(
     *,
     window_ns: int,
     excludes: list[str] | None = None,
+    enforce_size: bool = True,
 ) -> int:
     """Repair local state to match the manifest, touching (and reporting)
     only records whose local state differs - the shared size+mtime predicate
@@ -356,7 +452,13 @@ def apply_manifest(
     scanned) but serves purely as a stat cache: a record the walk did not
     pair up is judged from a direct lstat before anything is concluded, so a
     record under an excluded path - pull's data sync is exclude-blind - is
-    still repaired, and a genuinely missing file still errors."""
+    still repaired, and a genuinely missing file still errors.
+
+    ``enforce_size`` (True after a real data sync) makes a regular file whose
+    on-disk size differs from its record a hard error - the object does not
+    match the backup. ``--meta-only`` passes False: it applies metadata over
+    whatever data is already present and must not fail on a size it never
+    downloaded."""
     deferred_dirs: list[tuple[str, ManifestEntry]] = []
     deferred_symlinks: list[tuple[str, ManifestEntry]] = []
     errors = 0
@@ -376,7 +478,7 @@ def apply_manifest(
 
     if is_dir:
         for _key, m, loc in manifest.merge_join(
-            manifest_keyed(manifest_path, sub), local_keyed(outpath, excludes or [])
+            manifest_keyed(manifest_path, sub), local_keyed(outpath, excludes or [], sub)
         ):
             if m is None:
                 continue  # local-only: pull --delete's lane, not apply's
@@ -401,6 +503,7 @@ def apply_manifest(
                 is_dir_entry=True,
                 deferred_dirs=deferred_dirs,
                 deferred_symlinks=deferred_symlinks,
+                enforce_size=enforce_size,
             )
     else:
         for m_entry in manifest.iter_manifest(manifest_path):
@@ -418,6 +521,7 @@ def apply_manifest(
                 is_dir_entry=False,
                 deferred_dirs=deferred_dirs,
                 deferred_symlinks=deferred_symlinks,
+                enforce_size=enforce_size,
             )
 
     # Symlink-over-directory replacements ran into nothing above (the lazy

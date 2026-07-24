@@ -149,3 +149,28 @@ def test_direct_download_preserves_existing_file_mode(ws):
 
     assert dest.read_text() == "new"
     assert os.stat(dest).st_mode & 0o777 == 0o640
+
+
+def test_delete_objects_reports_only_actually_deleted_keys(ws, monkeypatch):
+    # A per-key DeleteObjects failure (Object Lock, a per-object policy) must not
+    # be printed as a successful `delete:` line: only keys absent from the
+    # response's Errors were actually deleted.
+    ws.write("data/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    store = _store(ws)
+
+    def fake_delete_objects(Bucket, Delete):  # noqa: N803 (boto3 kwarg names)
+        errors = [
+            {"Key": o["Key"], "Code": "AccessDenied"}
+            for o in Delete["Objects"]
+            if o["Key"].endswith("/b")
+        ]
+        return {"Errors": errors}
+
+    monkeypatch.setattr(store._client, "delete_objects", fake_delete_objects)
+    result = store.delete_objects(["data/a", "data/b"])
+
+    assert result.returncode == 1
+    assert "data/a" in result.stdout  # actually deleted
+    assert "data/b" not in result.stdout  # NOT claimed deleted
+    assert "data/b" in result.stderr  # reported as failed

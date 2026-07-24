@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+
+import pytest
 
 from s3bak import restore
 
@@ -94,6 +97,394 @@ def test_pull_meta_only_does_not_apply_file_metadata_through_symlink(ws):
     after = os.lstat(victim)
     assert (after.st_mode, after.st_mtime_ns) == (before.st_mode, before.st_mtime_ns)
     assert (dest / "a.txt").is_symlink()
+
+
+def test_push_subpath_rejects_symlinked_ancestor(ws):
+    # `push entry/link/passwd` with `link` a symlink to an outside directory
+    # would make os.lstat(target_root/link/passwd) resolve to the outside file
+    # and upload it as entry/link/passwd - data outside the entry, left as an
+    # unrecorded object (the ancestor cannot form a valid directory record).
+    # The push must refuse before any upload.
+    ws.write("data/a.txt", "x")
+    secret_dir = ws.root / "secret"
+    secret_dir.mkdir()
+    (secret_dir / "passwd").write_text("root:x:0:0")
+    os.symlink(secret_dir, ws.root / "data" / "link")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    res = ws.run("push", "data/link/passwd")
+    assert res.rc == 1
+    assert "ancestor" in res.err.lower()
+    assert "data/link/passwd" not in ws.keys()
+    assert not any(k.endswith("link/passwd") for k in ws.keys())
+
+
+def test_pull_subpath_rejects_symlinked_ancestor(ws):
+    # A local `dir -> /outside` ancestor would make `pull entry/dir/file` write
+    # its download to /outside/file (get_object creates its temp file in
+    # dirname(dest), which resolves through the link). Refuse before any write.
+    ws.write("data/dir/file.txt", "content")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    outside = ws.root / "outside"
+    outside.mkdir()
+    os.remove(ws.root / "data" / "dir" / "file.txt")
+    os.rmdir(ws.root / "data" / "dir")
+    os.symlink(outside, ws.root / "data" / "dir")
+
+    res = ws.run("pull", "data/dir/file.txt")
+    assert res.rc == 1
+    assert "ancestor" in res.err.lower()
+    assert not (outside / "file.txt").exists()  # nothing written outside the entry
+
+
+def test_pull_subpath_rejects_symlinked_entry_root(ws):
+    # The entry root itself being a symlink (not just an intermediate ancestor)
+    # would make `pull entry/file` write through it, outside the entry.
+    ws.write("data/file.txt", "content")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    outside = ws.root / "outside"
+    outside.mkdir()
+    os.remove(ws.root / "data" / "file.txt")
+    os.rmdir(ws.root / "data")
+    os.symlink(outside, ws.root / "data")  # relocate the whole entry root
+
+    res = ws.run("pull", "data/file.txt")
+    assert res.rc == 1
+    assert "ancestor" in res.err.lower()
+    assert not (outside / "file.txt").exists()
+
+
+def test_pull_rejects_manifest_with_nul_in_symlink_target(ws):
+    # A NUL in a symlink target survives every type check but would raise
+    # ValueError in os.symlink/os.path.isdir on restore, bypassing run()'s
+    # operational-error handling. It must be rejected at download.
+    _put_manifest(ws, "data", [_line("40755", "."), _line("120777", "./bad", link="x\x00y")])
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    res = ws.run("pull", "data", "-o", str(ws.root / "out"))
+    assert res.rc == 1
+    assert "invalid manifest" in res.err.lower()
+    assert not (ws.root / "out").exists()  # failed closed before any write
+
+
+def test_verify_checksum_skips_file_under_symlinked_ancestor(ws):
+    # verify --checksum must not hash a file reached through a local symlinked
+    # ancestor: doing so would read an entry-outside file and wrongly flag the
+    # healthy backup as "content differs but size+mtime match".
+    src = ws.write("data/dir/f.txt", "hello")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    recorded = os.lstat(src)
+
+    outside = ws.root / "outside"
+    outside.mkdir()
+    decoy = outside / "f.txt"
+    decoy.write_text("world")  # same size (5), different content
+    os.utime(decoy, ns=(recorded.st_mtime_ns, recorded.st_mtime_ns))  # same mtime
+    os.remove(src)
+    os.rmdir(ws.root / "data" / "dir")
+    os.symlink(outside, ws.root / "data" / "dir")
+
+    res = ws.run("verify", "--checksum", "data")
+    assert "content differs" not in res.err  # the symlinked ancestor was skipped
+
+
+def test_verify_checksum_skips_when_entry_root_is_symlink(ws):
+    # The entry root itself being a symlink (not just an intermediate ancestor)
+    # must skip the content hash, not read through it.
+    src = ws.write("data/f.txt", "hello")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    recorded = os.lstat(src)
+
+    outside = ws.root / "outside"
+    outside.mkdir()
+    decoy = outside / "f.txt"
+    decoy.write_text("world")  # same size, different content
+    os.utime(decoy, ns=(recorded.st_mtime_ns, recorded.st_mtime_ns))
+    shutil.rmtree(ws.root / "data")
+    os.symlink(outside, ws.root / "data")  # entry root is now a symlink
+
+    res = ws.run("verify", "--checksum", "data")
+    assert "content differs" not in res.err
+
+
+def test_verify_checksum_file_subpath_skips_symlinked_ancestor(ws):
+    # The explicit file sub-path verify goes through _verify_file_record, which
+    # must also skip the content hash under a symlinked ancestor.
+    src = ws.write("data/dir/f.txt", "hello")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    recorded = os.lstat(src)
+
+    outside = ws.root / "outside"
+    outside.mkdir()
+    decoy = outside / "f.txt"
+    decoy.write_text("world")
+    os.utime(decoy, ns=(recorded.st_mtime_ns, recorded.st_mtime_ns))
+    shutil.rmtree(ws.root / "data" / "dir")
+    os.symlink(outside, ws.root / "data" / "dir")
+
+    res = ws.run("verify", "--checksum", "data/dir/f.txt")
+    assert "content differs" not in res.err
+
+
+def test_diff_file_subpath_does_not_follow_symlinked_ancestor(ws):
+    # An explicit file sub-path diff must not read an entry-outside file through
+    # a symlinked ancestor and disclose its contents.
+    ws.write("data/dir/f.txt", "hello")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    outside = ws.root / "outside"
+    outside.mkdir()
+    (outside / "f.txt").write_text("SECRET OUTSIDE CONTENT")
+    shutil.rmtree(ws.root / "data" / "dir")
+    os.symlink(outside, ws.root / "data" / "dir")
+
+    res = ws.run("diff", "data/dir/f.txt")
+    assert "SECRET OUTSIDE CONTENT" not in res.out
+    assert "unreachable" in (res.out + res.err).lower()
+
+
+def test_status_leaf_subpath_through_symlinked_ancestor_shows_missing(ws):
+    # status entry/d/f with local `d` a symlink to a decoy that matches size,
+    # mtime and mode must not read through the symlink and report clean; it must
+    # show D, consistent with the full-entry no-follow walk.
+    src = ws.write("data/d/f.txt", "hello")
+    os.chmod(src, 0o644)
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    recorded = os.lstat(src)
+
+    outside = ws.root / "outside"
+    outside.mkdir()
+    decoy = outside / "f.txt"
+    decoy.write_text("world")  # same size (5)
+    os.chmod(decoy, 0o644)
+    os.utime(decoy, ns=(recorded.st_mtime_ns, recorded.st_mtime_ns))
+    os.remove(src)
+    os.rmdir(ws.root / "data" / "d")
+    os.symlink(outside, ws.root / "data" / "d")
+
+    res = ws.run("status", "data/d/f.txt", expect_rc=0)
+    assert any(ln.startswith("D ") for ln in res.out.splitlines())  # missing, not clean
+
+
+def test_diff_symlink_leaf_through_symlinked_ancestor_not_clean(ws):
+    # diff entry/d/link (a recorded symlink) with local `d` a symlink to a decoy
+    # holding the SAME symlink must not falsely exit 0 by reading the decoy.
+    (ws.root / "data" / "d").mkdir(parents=True)
+    os.symlink("/some/target", ws.root / "data" / "d" / "link")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    outside = ws.root / "outside"
+    outside.mkdir()
+    os.symlink("/some/target", outside / "link")  # decoy with the same target
+    shutil.rmtree(ws.root / "data" / "d")
+    os.symlink(outside, ws.root / "data" / "d")
+
+    res = ws.run("diff", "data/d/link")
+    assert res.rc == 1  # not falsely clean
+    assert "unreachable" in (res.out + res.err).lower()
+
+
+def test_diff_dir_subpath_does_not_follow_ancestor_above_sub(ws):
+    # `diff entry/d/e` with local `d` (an ancestor ABOVE the sub root `d/e`) a
+    # symlink to an outside tree must not read the outside content - diff_backup's
+    # own guards only cover ancestors at/under the sub root.
+    ws.write("data/d/e/f.txt", "hello")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    outside = ws.root / "outside"
+    (outside / "e").mkdir(parents=True)
+    (outside / "e" / "f.txt").write_text("SECRET OUTSIDE")
+    shutil.rmtree(ws.root / "data" / "d")
+    os.symlink(outside, ws.root / "data" / "d")
+
+    res = ws.run("diff", "data/d/e")
+    assert "SECRET OUTSIDE" not in res.out
+    assert "unreachable" in (res.out + res.err).lower()
+
+
+def test_pull_symlink_over_file_preserves_file_when_symlink_creation_fails(ws, monkeypatch):
+    # If os.symlink fails while replacing a local regular file with a recorded
+    # symlink, the existing file must survive - a failed pull must not cost it.
+    _put_manifest(ws, "data", [_line("40755", "."), _line("120777", "./link", link="somewhere")])
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    dest = ws.root / "out"
+    dest.mkdir()
+    victim = dest / "link"
+    victim.write_text("precious")
+
+    def failing_symlink(src, dst, target_is_directory=False):
+        raise PermissionError("no symlink privilege")
+
+    monkeypatch.setattr("s3bak.restore.os.symlink", failing_symlink)
+    # cli.main lets the OSError propagate (cli.run maps it to exit 1); the point
+    # is that the existing file is NOT destroyed on the way to that failure.
+    with pytest.raises(PermissionError):
+        ws.run("pull", "data", "-o", str(dest))
+    assert victim.exists() and victim.read_text() == "precious"  # existing file intact
+
+
+def test_validate_rejects_backslash_path_component_on_windows(ws, monkeypatch):
+    # A backslash is a legal POSIX filename character but a Windows path
+    # separator; a record like "./a\\b" restores as a nested dir/file on Windows.
+    # Validation must accept it on POSIX and fail closed on Windows.
+    from s3bak import manifest
+
+    _put_manifest(ws, "data", [_line("40755", "."), _line("100644", "./a\\b", size=1)])
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/a\\b", Body=b"x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+
+    ws.run("pull", "data", "-o", str(ws.root / "out_posix"), expect_rc=0)  # legal on POSIX
+
+    monkeypatch.setattr(manifest.os, "name", "nt")  # simulate Windows
+    res = ws.run("pull", "data", "-o", str(ws.root / "out_win"))
+    assert res.rc == 1
+    assert "backslash" in res.err.lower()
+    assert not (ws.root / "out_win").exists()  # failed closed before any transfer
+
+
+def test_pull_handles_unrepresentable_mtime_ns(ws):
+    # A damaged manifest with an out-of-range mtime_ns must fail cleanly (exit 1),
+    # not crash pull with an uncaught OverflowError from os.utime.
+    body = (
+        '{"s3bak_manifest":3}\n'
+        + json.dumps(
+            {"path": ".", "mode": "40755", "owner": "o", "group": "g", "mtime_ns": MTIME_NS}
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "path": "./f.txt",
+                "mode": "100644",
+                "owner": "o",
+                "group": "g",
+                "size": 3,
+                "mtime_ns": 10**30,
+            }
+        )
+        + "\n"
+    ).encode()
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl", Body=body)
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/f.txt", Body=b"abc")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+
+    res = ws.run("pull", "data", "-o", str(ws.root / "out"))
+    assert res.rc == 1
+    assert "utime failed" in res.err.lower()
+
+
+def _conflict_manifest_lines() -> list[str]:
+    # A symlink, a directory, AND a file recorded at/under the same path ./d -
+    # what "replace a dir with a symlink, then push without --delete" produces.
+    return [
+        _line("40755", "."),
+        _line("120777", "./d", link="/tmp/somewhere"),
+        _line("40755", "./d"),
+        _line("100644", "./d/x", size=3),
+    ]
+
+
+def test_pull_fails_closed_on_unrestorable_conflict_manifest(ws):
+    # Pulling a manifest that records a non-directory and a directory/descendants
+    # at one path would restore ./d/x and then rmtree ./d (the deferred symlink
+    # replacement), destroying the restored file AND unrecorded local data, before
+    # failing. Pull must instead fail closed BEFORE any mutation.
+    _put_manifest(ws, "data", _conflict_manifest_lines())
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/d/x", Body=b"abc")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+
+    dest = ws.root / "out"
+    (dest / "d").mkdir(parents=True)
+    precious = dest / "d" / "precious.txt"
+    precious.write_text("do not delete me")  # unrecorded local data under d
+
+    res = ws.run("pull", "data", "-o", str(dest))
+    assert res.rc == 1
+    assert "unrestorable" in res.err.lower()
+    assert precious.exists() and precious.read_text() == "do not delete me"  # untouched
+
+
+def test_verify_reports_unrestorable_conflict_manifest(ws):
+    _put_manifest(ws, "data", _conflict_manifest_lines())
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/d/x", Body=b"abc")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+
+    res = ws.run("verify", "data")
+    assert res.rc == 1
+    assert "unrestorable" in res.err.lower()
+
+
+def test_subpath_pull_fails_closed_on_root_level_conflict(ws):
+    # The conflict is AT the sub root itself (symlink ./d + dir ./d): the
+    # sub-scoped check must find it in entry-relative space, not collapse both
+    # sub-root records to "." and miss it, letting the destructive restore run.
+    _put_manifest(ws, "data", _conflict_manifest_lines())
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/d/x", Body=b"abc")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+
+    d = ws.root / "data" / "d"
+    d.mkdir(parents=True)
+    precious = d / "precious.txt"
+    precious.write_text("do not delete me")  # unrecorded local data under the sub
+
+    res = ws.run("pull", "data/d")
+    assert res.rc == 1
+    assert "unrestorable" in res.err.lower()
+    assert precious.exists() and precious.read_text() == "do not delete me"
+
+
+def test_subpath_verify_reports_root_level_conflict(ws):
+    _put_manifest(ws, "data", _conflict_manifest_lines())
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/d/x", Body=b"abc")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+
+    res = ws.run("verify", "data/d")
+    assert res.rc == 1
+    assert "unrestorable" in res.err.lower()
+
+
+def test_pull_rejects_manifest_with_unencodable_symlink_target(ws):
+    # A lone surrogate in the link target passes every type check but raises
+    # UnicodeEncodeError in os.symlink on restore - AFTER _place_symlink removed
+    # the existing file (data loss + traceback). Reject it at download instead.
+    body = (
+        '{"s3bak_manifest":3}\n'
+        + json.dumps({"path": ".", "mode": "40755", "owner": "o", "group": "g", "mtime_ns": 0})
+        + "\n"
+        + json.dumps(
+            {
+                "path": "./ln",
+                "mode": "120777",
+                "owner": "o",
+                "group": "g",
+                "mtime_ns": 0,
+                "link": "\ud800",
+            }
+        )
+        + "\n"
+    ).encode()
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl", Body=body)
+    ws.config({"data": {"path": str(ws.root / "data")}})
+
+    dest = ws.root / "out"
+    dest.mkdir()
+    victim = dest / "ln"
+    victim.write_text("do not delete me")
+
+    res = ws.run("pull", "data", "-o", str(dest))
+    assert res.rc == 1
+    assert "invalid manifest" in res.err.lower()
+    assert victim.exists() and victim.read_text() == "do not delete me"  # untouched
 
 
 def test_pull_replaces_symlink_directory_root_without_writing_through_it(ws):

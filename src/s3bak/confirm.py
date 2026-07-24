@@ -140,6 +140,8 @@ def confirm_subtree_delete(mode: AnswerMode, entry: str, display: str) -> bool:
     if mode is AnswerMode.ALL_NO:
         return False
     with _prompt_lock:
+        if _abort.is_set():  # another entry answered q while we waited for the lock
+            raise DeletionAbortedError()
         while True:
             answer = read_prompt_answer(
                 f"s3bak: {entry}: delete the backup subtree {display}? [y/n] "

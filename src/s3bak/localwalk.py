@@ -40,6 +40,16 @@ if TYPE_CHECKING:
 
     from boto3_s3.types import LocalScanOptions
 
+# The one boto3-s3 walk warning that does NOT hide tree content: the
+# invalid-timestamp epoch fallback keeps its entry (the record is built from the
+# raw ``st_mtime_ns`` the fallback never touches), so it must not mark the scan
+# incomplete. Every other warning names a skipped/vanished path. Matched in
+# full, not as a substring: a path literally containing this text (e.g.
+# ``.../invalid timestamp/secret``) would otherwise let a genuine gap warning
+# slip past the completeness gate and let ``push --delete`` delete a live
+# backup. Any unrecognized wording is treated as a gap (fail closed).
+_INVALID_TIMESTAMP_WARNING = "File has an invalid timestamp. Passing epoch time as timestamp."
+
 
 class ManifestWalker(LocalFileGenerator):
     """Prune manifest excludes before boto3-s3 descends into directories.
@@ -73,7 +83,7 @@ class ManifestWalker(LocalFileGenerator):
         the scan incomplete before the message goes wherever it was going."""
 
         def wrapped(body: str) -> None:
-            if "invalid timestamp" not in body:
+            if body != _INVALID_TIMESTAMP_WARNING:
                 self.scan_incomplete = True
             notify(body)
 
@@ -154,9 +164,11 @@ def walk_tree(
     defined. A missing ``root`` raises OSError (the caller checked existence);
     an unreadable directory keeps its record and loses its children, and a
     path that changes underfoot mid-walk is skipped - ``warn`` (when given)
-    receives one message per such gap, so a manifest walk can surface that it
-    did not see the whole tree. ``warn=None`` walks silently (the status /
-    pull diff, whose manifest-vs-local comparison fails safe on a gap).
+    receives one message per such gap, so a caller can surface that it did not
+    see the whole tree. ``status`` and ``diff`` pass ``warn`` too (an unreadable
+    directory hides local-only files, so a silent walk would report a clean tree
+    that is not). ``warn=None`` (pull's apply/--delete lanes) walks silently: a
+    gap there is judged by the direct-lstat fallback or safely left un-deleted.
     """
     prune, skip = split_excludes(excludes)
     yield root_rel, os.lstat(root), None

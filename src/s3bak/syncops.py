@@ -411,10 +411,19 @@ class PushJournal:
             return True
         # No transfer, but the record may still be stale: a mode drift (the
         # predicate status shares), or - under --checksum, whose ETag decision
-        # reads no manifest - a missing or non-file record for a content-equal
-        # object. An mtime drift inside the window stays untouched: the window
-        # is a rounding tolerance, never snapped.
-        if e is None or not e.is_file or mode_differs(e, st):
+        # skips the transfer on content-equal files - a missing/non-file record
+        # or a size+mtime drift outside the window. Refreshing the record there
+        # keeps --checksum's self-healing on par with the default push (which
+        # re-transfers and refreshes). A within-window mtime drift stays
+        # untouched: the window is a rounding tolerance, never snapped. In the
+        # default path this branch only runs when matches_stat already held (why
+        # copy was False), so the extra check is a no-op there.
+        if (
+            e is None
+            or not e.is_file
+            or mode_differs(e, st)
+            or not e.matches_stat(st, self._window_ns)
+        ):
             self._emit_new(
                 manifest.JOURNAL_ADD if old is None else manifest.JOURNAL_REPLACE,
                 self._record_path(key, is_dir=False),
@@ -501,7 +510,16 @@ class PushJournal:
         elif is_dir:
             changed = mode_differs(e, st)  # a dir key always holds a dir record
         else:
-            changed = stat_mod.S_IFMT(e.mode) != stat_mod.S_IFMT(st.st_mode) or mode_differs(e, st)
+            # A special file (FIFO, device): a type change, a mode drift, or -
+            # unlike a directory, whose mtime is child-driven noise - an
+            # out-of-window mtime drift, so status's M settles and pull restores
+            # the current mtime instead of a stale one.
+            changed = (
+                stat_mod.S_IFMT(e.mode) != stat_mod.S_IFMT(st.st_mode)
+                or mode_differs(e, st)
+                or e.mtime_ns is None
+                or abs(st.st_mtime_ns - e.mtime_ns) > self._window_ns
+            )
         if changed:
             self._emit_new(manifest.JOURNAL_REPLACE, path, st, sym)
 

@@ -723,3 +723,15 @@ def test_file_subpath_push_delete_keeps_former_directory_records(ws, answers):
     paths = _manifest_paths(ws)
     assert "./sub/x.txt" in paths
     assert "data/sub/x.txt" in ws.keys()
+
+
+def test_resolve_pull_destination_treats_native_sep_as_container():
+    # A configured path ending in the native separator is a container: the entry
+    # name is appended. On Windows os.sep is "\\", so checking only "/" would
+    # miss it and restore to the container itself (a --delete data-loss risk).
+    from s3bak import restore
+
+    got = restore.resolve_pull_destination("data", f"/restore{os.sep}", None, None)
+    assert got == os.path.join("/restore", "data")
+    # -o is exact: no append, even with a trailing separator
+    assert restore.resolve_pull_destination("data", None, None, f"/out{os.sep}") == f"/out{os.sep}"

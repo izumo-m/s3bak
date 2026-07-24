@@ -751,7 +751,7 @@ def test_hook_string_is_rejected(ws):
     res = ws.run("list")
 
     assert res.rc == 1
-    assert "pre_hook must be a non-empty list of strings" in res.err
+    assert "pre_hook must be a non-empty list of" in res.err
 
 
 def test_local_path_resolution_handles_an_entry_at_filesystem_root(tmp_path):

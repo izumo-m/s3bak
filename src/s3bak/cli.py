@@ -477,7 +477,16 @@ def _resolve_one_arg(cfg: Config, arg: str) -> tuple[str, str | None]:
             sub = posixpath.normpath(raw_sub)
             if sub == ".":
                 return name, None
-            if sub == ".." or sub.startswith("../") or sub.startswith("/"):
+            # os.path.splitdrive is identity on POSIX (so a filename containing
+            # ':' is fine there) but strips a Windows drive: on Windows a
+            # drive-qualified sub like "C:/escape" makes os.path.join(entry_path,
+            # sub) discard the entry path entirely and escape the entry root.
+            if (
+                sub == ".."
+                or sub.startswith("../")
+                or sub.startswith("/")
+                or os.path.splitdrive(sub)[0]
+            ):
                 die(f"sub path must stay inside entry {name}: {arg}")
             return name, sub
 
@@ -645,6 +654,10 @@ def main(argv: list[str] | None = None) -> int:
                 die(f"--mtime-window requires a non-negative number of seconds (got {val!r})")
             if not math.isfinite(opt_mtime_window) or opt_mtime_window < 0:
                 die(f"--mtime-window must be >= 0 (got {opt_mtime_window})")
+            # Converted to an integer nanosecond count (window_ns_for); reject a
+            # value so large the * 1e9 overflows to inf and would crash round().
+            if not math.isfinite(opt_mtime_window * 1_000_000_000):
+                die(f"--mtime-window is too large to use (got {opt_mtime_window})")
         elif a in ("-o", "--output") or a.startswith("--output="):
             used_options.append("output")
             opt_outpath, i = take_value(a, i)

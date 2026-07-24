@@ -35,7 +35,6 @@ if TYPE_CHECKING:
     )
     from boto3_s3.etagcompare import EtagComparison
     from botocore.exceptions import ClientError
-    from mypy_boto3_s3.type_defs import ObjectIdentifierTypeDef
 
 # s3transfer's default multipart threshold, and boto3's default part size. Below
 # this an object is a single PutObject / GetObject in both the transfer path and
@@ -455,29 +454,42 @@ class Boto3S3Store:
         """
         lines: list[str] = []
         errors: list[str] = []
-        pending: list[ObjectIdentifierTypeDef] = []
+        batch: list[str] = []  # entry-relative rels queued for the current request
 
         def flush() -> None:
-            if not pending or dryrun:
-                pending.clear()
+            if not batch:
+                return
+            if dryrun:
+                lines.extend(f"(dry-run) delete: {self._s3_url(rel)}" for rel in batch)
+                batch.clear()
                 return
             if verbose:
                 write_stderr(
-                    f"+ (boto3) delete_objects s3://{self.bucket}/ ({len(pending)} key(s))\n"
+                    f"+ (boto3) delete_objects s3://{self.bucket}/ ({len(batch)} key(s))\n"
                 )
             response = self._client.delete_objects(
                 Bucket=self.bucket,
-                Delete={"Objects": list(pending), "Quiet": True},
+                Delete={"Objects": [{"Key": self._api_key(rel)} for rel in batch], "Quiet": True},
             )
-            for item in response.get("Errors", []):
-                errors.append(f"{item.get('Key', '?')}: {item.get('Code', 'delete failed')}")
-            pending.clear()
+            # Per-key failures (Object Lock, a per-object policy): only the keys
+            # NOT in Errors were actually deleted, so only they get a delete:
+            # line - emitting it eagerly for every queued key would claim a
+            # failed key was deleted while stderr says it failed.
+            failed: dict[str, str] = {
+                item.get("Key", ""): item.get("Code", "delete failed")
+                for item in response.get("Errors", [])
+            }
+            for rel in batch:
+                code = failed.get(self._api_key(rel))
+                if code is None:
+                    lines.append(f"delete: {self._s3_url(rel)}")
+                else:
+                    errors.append(f"{self._s3_url(rel)}: {code}")
+            batch.clear()
 
-        marker = "(dry-run) " if dryrun else ""
         for rel in rel_keys:
-            lines.append(f"{marker}delete: {self._s3_url(rel)}")
-            pending.append({"Key": self._api_key(rel)})
-            if len(pending) == 1000:
+            batch.append(rel)
+            if len(batch) == 1000:
                 flush()
         flush()
         return TransferResult(

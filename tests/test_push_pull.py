@@ -771,6 +771,366 @@ def test_push_delete_refuses_deletions_when_scan_is_incomplete(ws):
     assert "./sub/f.txt" in _manifest_body(ws, "data")
 
 
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs an unreadable directory")
+def test_push_delete_refuses_deletions_when_incomplete_scan_path_looks_like_timestamp_warning(ws):
+    # A path whose name contains the invalid-timestamp warning's text must not
+    # let the "Skipping file .../invalid timestamp/f.txt. File/Directory is not
+    # readable." gap warning be misread as the (harmless) timestamp fallback.
+    # A substring match on the warning body would clear scan_incomplete and
+    # mirror a partial view, deleting a good backup.
+    ws.write("data/a.txt", "a")
+    ws.write("data/invalid timestamp/f.txt", "f")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    sub = ws.root / "data" / "invalid timestamp"
+    os.chmod(sub, 0)
+    try:
+        res = ws.run("push", "--delete", "--yes", "data")
+    finally:
+        os.chmod(sub, 0o755)
+    assert res.rc == 0  # cli.main; cli.run maps the warnings to exit 2
+    assert "kept 1 deletion candidate(s)" in res.err
+    assert "data/invalid timestamp/f.txt" in ws.keys()
+    assert "./invalid timestamp/f.txt" in _manifest_body(ws, "data")
+
+
+def test_pull_errors_on_size_mismatched_object(ws):
+    # An out-of-band overwrite leaves the S3 object a different size than the
+    # manifest records. Pull must not apply metadata and report success on the
+    # wrong bytes - restore fidelity is the point of the backup.
+    ws.write("data", "hello")  # 5 bytes
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data", Body=b"x")  # 1 byte
+    dest = ws.root / "restored"
+    res = ws.run("pull", "data", "-o", str(dest))
+    assert res.rc == 1
+    assert "size does not match" in (res.out + res.err).lower()
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs an unsearchable directory")
+def test_push_delete_refuses_when_sub_ancestor_is_unsearchable(ws):
+    # os.path.lexists reports EACCES (an unsearchable parent) as "absent";
+    # push --delete must not read that as "locally deleted" and drop a backup
+    # for a path it merely could not reach.
+    ws.write("data/locked/file.txt", "secret")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    locked = ws.root / "data" / "locked"
+    os.chmod(locked, 0)
+    try:
+        res = ws.run("push", "--delete", "--yes", "data/locked/file.txt")
+    finally:
+        os.chmod(locked, 0o755)
+    assert res.rc == 1
+    assert "cannot access" in res.err.lower()
+    assert "data/locked/file.txt" in ws.keys()  # the backup is intact
+
+
+def test_subpath_pull_delete_keeps_excluded_local_file(ws):
+    # A sub-path pull --delete's local walk must anchor the entry's excludes at
+    # the ENTRY root; otherwise an excluded local-only file under the sub is
+    # matched against the wrong prefix, seen as an extra, and deleted.
+    ws.write("data/sub/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["sub/private/*"]}})
+    ws.run("push", "data", expect_rc=0)
+
+    secret = ws.write("data/sub/private/secret", "keep me")  # excluded, local-only
+    ws.run("pull", "--delete", "--yes", "data/sub", expect_rc=0)
+    assert secret.exists() and secret.read_text() == "keep me"  # the exclude protected it
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs an unreadable file")
+def test_verify_checksum_warns_on_unreadable_local_file(ws):
+    # A verification tool must say it could not check a file, not silently skip
+    # it as if the content matched.
+    p = ws.write("data", "hello")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    os.chmod(p, 0)
+    try:
+        res = ws.run("verify", "--checksum", "data")
+    finally:
+        os.chmod(p, 0o644)
+    assert "cannot read local file for --checksum" in res.err
+    assert "1 warning(s)" in res.out  # surfaced in the summary, not reported OK
+
+
+def test_pull_meta_only_ignores_size_difference(ws):
+    # --meta-only applies metadata over whatever data is already present; it
+    # never downloads, so it must NOT fail on a size difference from the record
+    # (the presence/size check is for real data pulls only).
+    p = ws.write("data/a.txt", "hello")
+    os.chmod(p, 0o644)
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    p.write_text("a much longer replacement body")  # size now differs from the record
+    os.chmod(p, 0o600)  # and a mode drift for --meta-only to settle
+    res = ws.run("pull", "--meta-only", "data")
+    assert res.rc == 0
+    assert (os.lstat(p).st_mode & 0o777) == 0o644  # metadata applied despite the size
+
+
+def test_pull_data_only_detects_size_mismatched_object(ws):
+    # --data-only skips apply_manifest; the integrity check must still catch an
+    # object whose size no longer matches the record (out-of-band overwrite).
+    ws.write("data/a.txt", "hello")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/a.txt", Body=b"x")  # 1 byte
+    res = ws.run("pull", "--data-only", "data", "-o", str(ws.root / "out"))
+    assert res.rc == 1
+    assert "size does not match" in res.err.lower()
+
+
+def test_pull_data_only_detects_missing_object(ws):
+    ws.write("data/a.txt", "hello")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.s3.delete_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/a.txt")
+    res = ws.run("pull", "--data-only", "data", "-o", str(ws.root / "out"))
+    assert res.rc == 1
+    assert "missing" in res.err.lower()
+
+
+def test_staged_pull_preserves_old_root_when_apply_fails(ws):
+    # A conflicting-type restore root is swapped only after the download; if the
+    # post-swap metadata apply then fails (here a size-mismatched object), the
+    # swapped-out old root must be preserved, not destroyed by the cleanup.
+    ws.write("data/a.txt", "hello")  # 5 bytes
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/a.txt", Body=b"x")  # corrupt: 1 byte
+
+    dest = ws.root / "restore_here"
+    dest.write_text("precious pre-existing data")  # a conflicting type (regular file)
+    res = ws.run("pull", "data", "-o", str(dest))
+    assert res.rc == 1
+    assert "preserved at" in res.err
+    stages = list(ws.root.glob("restore_here.s3bak-stage*"))
+    assert len(stages) == 1
+    assert (stages[0] / "replaced").read_text() == "precious pre-existing data"
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs an unsearchable directory")
+def test_pull_subpath_rejects_unsearchable_ancestor(ws):
+    # A deepest ancestor that lstat's fine (a directory) but is itself
+    # unsearchable (mode 000) must be caught by the guard up front, not surface
+    # as a bare EACCES only when the download tries to write through it.
+    ws.write("data/a/file.txt", "content")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    a = ws.root / "data" / "a"
+    os.chmod(a, 0)
+    try:
+        res = ws.run("pull", "data/a/file.txt")
+    finally:
+        os.chmod(a, 0o755)
+    assert res.rc == 1
+    assert "cannot access" in res.err.lower()
+
+
+def test_staged_pull_preserves_old_root_on_interrupt_right_after_move(ws, monkeypatch):
+    # A SIGINT landing right after the old root is moved into the stage (before
+    # the code could record where it went) must still preserve it, not let the
+    # cleanup delete the only copy.
+    ws.write("data/a.txt", "hello")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    dest = ws.root / "restore_here"
+    dest.write_text("precious pre-existing data")  # a conflicting type -> staged pull
+
+    real_replace = os.replace
+
+    def replace_then_interrupt(src, dst):
+        real_replace(src, dst)  # perform the real move...
+        if os.fspath(dst).endswith(os.sep + "replaced"):
+            raise KeyboardInterrupt  # ...then interrupt, as a signal would mid-swap
+
+    monkeypatch.setattr("s3bak.commands.os.replace", replace_then_interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        ws.run("pull", "data", "-o", str(dest))
+
+    stages = list(ws.root.glob("restore_here.s3bak-stage*"))
+    assert len(stages) == 1
+    assert (stages[0] / "replaced").read_text() == "precious pre-existing data"
+
+
+def test_staged_pull_preserves_old_root_when_delete_step_fails(ws, monkeypatch):
+    # The apply succeeds after the staged swap, but the --delete extras step
+    # fails: the preserve check runs AFTER --delete, so the old root is still kept.
+    ws.write("data/a.txt", "hello")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    # An unrecorded object: the staged download materializes it as a local extra.
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/extra.txt", Body=b"x")
+
+    dest = ws.root / "restore_here"
+    dest.write_text("precious pre-existing data")  # conflicting type -> staged pull
+
+    real_remove = os.remove
+
+    def remove_failing_on_extra(path):
+        if os.fspath(path).endswith("extra.txt"):
+            raise OSError("injected delete failure")
+        return real_remove(path)
+
+    monkeypatch.setattr("s3bak.restore.os.remove", remove_failing_on_extra)
+    res = ws.run("pull", "--delete", "--yes", "data", "-o", str(dest))
+    assert res.rc == 1
+    assert "preserved at" in res.err
+    stages = list(ws.root.glob("restore_here.s3bak-stage*"))
+    assert len(stages) == 1
+    assert (stages[0] / "replaced").read_text() == "precious pre-existing data"
+
+
+def test_subpath_pull_delete_keeps_data_when_whole_sub_excluded(ws):
+    # An exclude that targets the sub itself ("sub/*") excludes the whole sub;
+    # a sub-path pull --delete must not treat the excluded contents as extras.
+    ws.write("data/sub/kept.txt", "kept")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["sub/*"]}})
+    precious = ws.write("data/sub/precious.txt", "keep me")  # excluded, local-only
+    ws.run("pull", "--delete", "--yes", "data/sub", expect_rc=0)
+    assert precious.exists() and precious.read_text() == "keep me"
+
+
+def test_pull_output_trailing_slash_is_exact(ws):
+    # -o is the exact destination: a trailing slash must NOT append the entry
+    # name (that container behavior belongs to the configured path only).
+    ws.write("data/a.txt", "hello")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    dest = ws.root / "exact"
+    ws.run("pull", "data", "-o", str(dest) + os.sep, expect_rc=0)
+    assert (dest / "a.txt").read_text() == "hello"  # restored AT dest...
+    assert not (dest / "data").exists()  # ...not dest/data
+
+
+def test_diff_ignores_conflicting_unrecorded_orphans(ws):
+    # --data-only pushes leave unrecorded objects; two that conflict (a file and
+    # a directory recorded at one path) cannot be materialized together by a bulk
+    # prefix sync. diff must ignore unrecorded objects (download only recorded
+    # files), not fail trying to download them all.
+    (ws.root / "data").mkdir()
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)  # empty dir entry: manifest = root only
+
+    foo = ws.write("data/foo", "i am a file")
+    ws.run("push", "--data-only", "data/foo", expect_rc=0)  # unrecorded object data/foo
+
+    os.remove(foo)
+    (ws.root / "data" / "foo").mkdir()
+    ws.write("data/foo/bar", "i am under a dir")
+    ws.run("push", "--data-only", "data/foo/bar", expect_rc=0)  # unrecorded data/foo/bar
+
+    shutil.rmtree(ws.root / "data" / "foo")  # local foo gone; S3 has conflicting orphans
+    res = ws.run("diff", "data")
+    assert res.rc == 0  # nothing recorded, nothing local: no diff, not a download failure
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs an unreadable directory")
+def test_status_warns_when_unreadable_dir_hides_local_file(ws):
+    # An unreadable directory hides its children from the walk; status must warn
+    # that it could not see the whole tree, not silently report a clean tree
+    # while a local-only file sits behind the unreadable directory.
+    ws.write("data/a.txt", "a")
+    (ws.root / "data" / "locked").mkdir()
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "locked" / "extra.txt").write_text("hidden")  # local-only
+    os.chmod(ws.root / "data" / "locked", 0)
+    try:
+        res = ws.run("status", "data")
+    finally:
+        os.chmod(ws.root / "data" / "locked", 0o755)
+    assert "not readable" in res.err.lower()  # surfaced, not silently clean
+
+
+def test_push_delete_removes_exact_root_object(ws):
+    # An object at a directory entry's OWN key (out-of-band, or a former-file
+    # residue) is invisible to the slash-bounded delete lane; push --delete must
+    # still retire it (verify flags it as a root type conflict otherwise).
+    ws.write("data/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data", Body=b"orphan")
+
+    assert "data" in ws.keys()  # the exact-key orphan exists
+    ws.run("push", "--delete", "--yes", "data", expect_rc=0)
+    assert "data" not in ws.keys()  # retired
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs an unreadable parent")
+def test_status_warns_on_inaccessible_single_file_entry(ws):
+    # A single-file entry whose parent is unsearchable is inaccessible, not
+    # missing: status must warn, not silently report D.
+    (ws.root / "locked").mkdir()
+    solo = ws.root / "locked" / "solo"
+    solo.write_text("hi")
+    ws.config({"solo": {"path": str(solo)}})
+    ws.run("push", "solo", expect_rc=0)
+
+    os.chmod(ws.root / "locked", 0)
+    try:
+        res = ws.run("status", "solo")
+    finally:
+        os.chmod(ws.root / "locked", 0o755)
+    assert "cannot access" in res.err.lower()
+    assert not res.out.strip().startswith("D ")  # not falsely reported missing
+
+
+@pytest.mark.skipif(os.name == "nt", reason="needs os.mkfifo")
+def test_push_refreshes_special_file_mtime(ws):
+    # A special file's mtime is meaningful (not child-driven noise like a
+    # directory's): an out-of-window mtime drift must refresh the manifest, so
+    # status settles and pull restores the current mtime.
+    ws.write("data/a.txt", "a")
+    fifo = ws.root / "data" / "pipe"
+    os.mkfifo(fifo)
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    os.utime(fifo, (2_000_000_000, 2_000_000_000))  # drift far, mode unchanged
+    actual_ns = os.lstat(fifo).st_mtime_ns
+    ws.run("push", "data", expect_rc=0)
+
+    body = (
+        ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl")["Body"]
+        .read()
+        .decode()
+    )
+    record = next(
+        json.loads(line) for line in body.splitlines()[1:] if json.loads(line)["path"] == "./pipe"
+    )
+    assert record["mtime_ns"] == actual_ns  # the drifted mtime is now recorded
+    assert ws.run("status", "data", expect_rc=0).out.strip() == ""  # no perpetual M
+
+
+def test_diff_empty_single_file_detects_missing_local(ws):
+    # A missing local file is a difference even against a 0-byte backup, whose
+    # content diff vs /dev/null shows nothing and used to exit 0.
+    ws.write("solo", "")  # 0-byte single-file entry
+    ws.config({"solo": {"path": str(ws.root / "solo")}})
+    ws.run("push", "solo", expect_rc=0)
+    os.remove(ws.root / "solo")
+
+    res = ws.run("diff", "solo")
+    assert res.rc == 1
+    assert "missing" in res.out.lower()
+
+
 def test_missing_subpath_delete_aborts_on_damaged_manifest_before_deleting(ws):
     # The manifest is downloaded and validated BEFORE the subtree deletion, so
     # a corrupt manifest aborts the push while the backup is still intact.

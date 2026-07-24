@@ -99,14 +99,23 @@ def _config_seconds(value: Any, config_path: str, *, label: str) -> float | None
     fractional allowed; bool rejected). Returns None when unset."""
     if value is None:
         return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        die(f"{label} must be a non-negative number of seconds in {config_path} (got {value!r})")
+    try:
+        # A huge Python int (e.g. 10**1000) overflows in the int->float
+        # conversion math.isfinite would do, so convert here under guard first.
+        seconds = float(value)
+    except (OverflowError, ValueError):
+        die(f"{label} is too large to use in {config_path} (got {value!r})")
     if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(value)
-        or value < 0
+        not math.isfinite(seconds)
+        or seconds < 0
+        # The window is converted to an integer nanosecond count (window_ns_for);
+        # a value so large the * 1e9 overflows to inf would crash that round().
+        or not math.isfinite(seconds * 1_000_000_000)
     ):
         die(f"{label} must be a non-negative number of seconds in {config_path} (got {value!r})")
-    return float(value)
+    return seconds
 
 
 def _validate_entry_name(name: Any, config_path: str) -> str:
@@ -193,6 +202,12 @@ def load_config(*, create_store: bool = True) -> Config:
         path = entry_cfg.get("path")
         if not isinstance(path, str) or not path:
             die(f"entries[{name!r}].path must be a non-empty string in {config_path}")
+        # A NUL survives every string check but raises ValueError deep inside the
+        # first filesystem call (os.lstat/lexists), which run() does not catch;
+        # reject it here so a malformed config dies with a message, not a
+        # traceback. Same for exclude patterns and hook arguments below.
+        if "\x00" in path:
+            die(f"entries[{name!r}].path must not contain NUL in {config_path}")
         # A relative path silently depends on the working directory, and a
         # filesystem root as an entry is almost certainly a broken f-string
         # (e.g. an empty HOME); both would aim push/pull at the wrong tree.
@@ -209,19 +224,20 @@ def load_config(*, create_store: bool = True) -> Config:
             )
         excludes = entry_cfg.get("excludes")
         if excludes is not None and (
-            not isinstance(excludes, list) or not all(isinstance(x, str) for x in excludes)
+            not isinstance(excludes, list)
+            or not all(isinstance(x, str) and "\x00" not in x for x in excludes)
         ):
-            die(f"entries[{name!r}].excludes must be a list of strings in {config_path}")
+            die(f"entries[{name!r}].excludes must be a list of NUL-free strings in {config_path}")
         for hook in ("pre_hook", "post_hook"):
             hook_value = entry_cfg.get(hook)
             if hook_value is not None and (
                 not isinstance(hook_value, list)
                 or not hook_value
-                or not all(isinstance(arg, str) for arg in hook_value)
+                or not all(isinstance(arg, str) and "\x00" not in arg for arg in hook_value)
                 or not hook_value[0]
             ):
                 die(
-                    f"entries[{name!r}].{hook} must be a non-empty list of strings "
+                    f"entries[{name!r}].{hook} must be a non-empty list of NUL-free strings "
                     f"with a non-empty executable in {config_path}"
                 )
         # Per-entry mtime_window overrides the top-level one (validated the same way).
