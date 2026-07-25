@@ -153,6 +153,24 @@ parsing, expansion, pipelines, or redirection. Complex hook behaviour belongs
 in a standalone executable or script selected by `config.py` for the current
 environment.
 
+A journal-driven `post_hook` run — the ordinary directory push (step 3 below)
+and a sub-path push whose local target still exists — additionally gets
+`S3BAK_JOURNAL` in its environment, naming the push journal file
+([journal.md](journal.md)) so the hook can inspect exactly what the push
+transferred and changed instead of assuming the worst. The variable is
+absent from every other `post_hook` run — a `--meta-only` refresh, a
+single-file entry's manifest write, and a sub-path push whose local target
+had vanished (a subtree deletion or an ancestor-only `--meta-only` patch) —
+because none of those runs a journal-driven compare. An unset `S3BAK_JOURNAL`
+means "no per-file detail available; assume anything may have changed".
+Entries push concurrently, so the variable is passed through the hook's own
+environment, never through the process-wide one. The file is valid only
+until the hook process exits — s3bak deletes it right after — so a hook that
+needs the data later must copy it before returning. Under a directory push's
+`--data-only`, `S3BAK_JOURNAL` is still set even though the manifest was not
+rewritten: the journal reflects what the sync observed and transferred,
+which is exactly what a `--data-only` hook needs to know.
+
 `cmd_push` for a whole entry:
 
 1. Run `pre_hook` (always, before target validation or any backup work), so a
@@ -222,7 +240,10 @@ environment.
 4. Run `post_hook` — but only after a push that did work (transferred data
    and/or refreshed the manifest), so a side-effecting hook does not fire on a
    pure no-op. `--meta-only` always refreshes and runs the hook, which is the
-   supported way to run the hook on demand.
+   supported way to run the hook on demand. A directory entry's `post_hook`
+   run is the journal-driven case described above (`S3BAK_JOURNAL` set); a
+   single-file entry's and `--meta-only`'s are not (no compare, hence no
+   journal).
 
 A push is not atomic: the data sync runs first and the manifest write last,
 so a push interrupted between them leaves its new uploads as

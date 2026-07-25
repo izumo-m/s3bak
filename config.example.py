@@ -61,6 +61,14 @@ prefix = "s3://my-bucket/backup"
 # executable and each remaining item is passed as one argument. Shell syntax
 # such as globbing, pipelines, and redirection is not interpreted; put complex
 # work in a standalone executable or script.
+#
+# When the push that fires post_hook was journal-driven (an ordinary
+# directory push, or a sub-path push whose target still exists), post_hook
+# also gets S3BAK_JOURNAL in its environment: the path of that push's journal
+# file (see docs/journal.md), readable only until the hook returns. It is
+# unset for a --meta-only refresh, a single-file entry, and a sub-path
+# deletion - a hook must treat "unset" as "no per-file detail, assume
+# anything may have changed".
 entries = {
     ".ssh": {"path": f"{HOME}/.ssh", "excludes": ["agent/*"]},
     "bin": {"path": f"{HOME}/bin", "excludes": ["__pycache__/*"], "mtime_window": 0},

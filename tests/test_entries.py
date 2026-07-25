@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
@@ -15,6 +16,25 @@ def _marker_hook(ws, marker) -> list[str]:
         "from pathlib import Path\nimport sys\nPath(sys.argv[1]).touch()\n",
     )
     return [sys.executable, str(hook), str(marker)]
+
+
+def _journal_hook(ws, info, copy) -> list[str]:
+    """A post_hook that records what it saw: S3BAK_JOURNAL's value (or the
+    literal "UNSET") into ``info``, and - only when set - a copy of the
+    journal file's content into ``copy``, taken while the file is still
+    guaranteed to exist (s3bak deletes it only after the hook returns)."""
+    hook = ws.write(
+        "record-journal.py",
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        "journal = os.environ.get('S3BAK_JOURNAL')\n"
+        "if journal is None:\n"
+        "    Path(sys.argv[1]).write_text('UNSET')\n"
+        "else:\n"
+        "    Path(sys.argv[1]).write_text(journal)\n"
+        "    Path(sys.argv[2]).write_text(Path(journal).read_text())\n",
+    )
+    return [sys.executable, str(hook), str(info), str(copy)]
 
 
 def test_single_file_entry_roundtrip(ws):
@@ -477,6 +497,137 @@ def test_post_hook_runs_on_success(ws):
     )
     ws.run("push", "data", expect_rc=0)
     assert marker.exists()
+
+
+def test_post_hook_receives_the_push_journal(ws):
+    # A directory push that did work is journal-driven: post_hook must see
+    # S3BAK_JOURNAL pointing at a readable journal file, and the file must be
+    # gone once the push (which deletes it right after the hook returns) has
+    # completed.
+    info = ws.root / "journal-path.txt"
+    copy = ws.root / "journal-copy.jsonl"
+    ws.write("data/a.txt", "a")
+    ws.config(
+        {
+            "data": {
+                "path": str(ws.root / "data"),
+                "post_hook": _journal_hook(ws, info, copy),
+            }
+        }
+    )
+    ws.run("push", "data", expect_rc=0)
+
+    journal_path = info.read_text()
+    assert journal_path != "UNSET"
+    assert not os.path.exists(journal_path)  # deleted after the hook returned
+
+    paths = set()
+    for line in copy.read_text().splitlines():
+        assert line[0] in "+!-"
+        paths.add(json.loads(line[1:])["path"])
+    # A first push journals `+` for everything, root included.
+    assert paths == {".", "./a.txt"}
+
+
+def test_subpath_post_hook_receives_the_push_journal(ws):
+    # A sub-path push whose local target still exists is journal-driven too.
+    info = ws.root / "journal-path.txt"
+    copy = ws.root / "journal-copy.jsonl"
+    ws.write("data/sub/a.txt", "a")
+    ws.config(
+        {
+            "data": {
+                "path": str(ws.root / "data"),
+                "post_hook": _journal_hook(ws, info, copy),
+            }
+        }
+    )
+    ws.run("push", "data/sub", expect_rc=0)
+
+    journal_path = info.read_text()
+    assert journal_path != "UNSET"
+    assert not os.path.exists(journal_path)
+    assert copy.read_text().strip() != ""
+
+
+def test_subpath_deletion_post_hook_has_no_journal(ws):
+    # A sub-path push whose local target vanished runs drop_subtree_records,
+    # not a journal-driven compare: post_hook must see no S3BAK_JOURNAL.
+    info = ws.root / "journal-path.txt"
+    copy = ws.root / "journal-copy.jsonl"
+    ws.write("data/sub/a.txt", "a")
+    ws.config(
+        {
+            "data": {
+                "path": str(ws.root / "data"),
+                "post_hook": _journal_hook(ws, info, copy),
+            }
+        }
+    )
+    ws.run("push", "data", expect_rc=0)
+    info.unlink()
+    shutil.rmtree(ws.root / "data" / "sub")
+
+    ws.run("push", "--delete", "--yes", "data/sub", expect_rc=0)
+
+    assert info.read_text() == "UNSET"
+
+
+def test_single_file_post_hook_has_no_journal(ws):
+    info = ws.root / "journal-path.txt"
+    copy = ws.root / "journal-copy.jsonl"
+    target = ws.write("solo.txt", "x")
+    ws.config(
+        {
+            "solo.txt": {
+                "path": str(target),
+                "post_hook": _journal_hook(ws, info, copy),
+            }
+        }
+    )
+    ws.run("push", "solo.txt", expect_rc=0)
+
+    assert info.read_text() == "UNSET"
+
+
+def test_meta_only_post_hook_has_no_journal(ws):
+    info = ws.root / "journal-path.txt"
+    copy = ws.root / "journal-copy.jsonl"
+    ws.write("data/a.txt", "a")
+    ws.config(
+        {
+            "data": {
+                "path": str(ws.root / "data"),
+                "post_hook": _journal_hook(ws, info, copy),
+            }
+        }
+    )
+    ws.run("push", "data", expect_rc=0)  # journal-driven: sets info to a path
+    info.unlink()
+
+    ws.run("push", "--meta-only", "data", expect_rc=0)
+
+    assert info.read_text() == "UNSET"
+
+
+def test_noop_push_does_not_run_post_hook(ws):
+    marker = ws.root / "hook-ran"
+    ws.write("data/a.txt", "a")
+    ws.config(
+        {
+            "data": {
+                "path": str(ws.root / "data"),
+                "post_hook": _marker_hook(ws, marker),
+            }
+        }
+    )
+    ws.run("push", "data", expect_rc=0)
+    assert marker.exists()
+    marker.unlink()
+
+    ws.run("push", "data", expect_rc=0)  # nothing changed: a pure no-op
+
+    assert not marker.exists()
 
 
 def test_hook_arguments_are_passed_without_shell_expansion(ws):

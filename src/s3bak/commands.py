@@ -76,13 +76,24 @@ if TYPE_CHECKING:
     from boto3_s3 import FileFilter, FileInfo
 
 
-def _run_hook(name: str, hook: list[str] | None, opts: Opts) -> int:
+def _run_hook(
+    name: str, hook: list[str] | None, opts: Opts, journal_path: str | None = None
+) -> int:
     """Run one configured hook directly, without a command shell. A failing
     hook's status propagates (the documented 3+ lane), normalized where it
     would collide with s3bak's own exit codes: 2 is reserved for a
     warnings-only run, so it maps to 1, and a signal death (negative
     returncode) becomes the conventional 128+N instead of leaking a negative
-    value into sys.exit."""
+    value into sys.exit.
+
+    ``journal_path`` is the just-produced push journal (see journal.md),
+    passed only by the journal-driven directory and sub-path pushes; every
+    other caller leaves it None. When set, the hook's environment gets
+    ``S3BAK_JOURNAL`` pointing at it - the file is still on disk (the caller
+    unlinks it only after this call returns). Entries push concurrently in a
+    thread pool, so the variable is passed through ``env=`` rather than
+    mutating ``os.environ``; when None, no ``env`` argument is passed at all
+    and the hook simply inherits the process environment unchanged."""
     if not hook:
         return 0
     if opts.dryrun:
@@ -90,7 +101,12 @@ def _run_hook(name: str, hook: list[str] | None, opts: Opts) -> int:
         return 0
     if opts.verbose:
         write_stderr(f"+ {name}: {hook!r}\n")
-    rc = subprocess.run(hook, shell=False).returncode
+    if journal_path is None:
+        rc = subprocess.run(hook, shell=False).returncode
+    else:
+        rc = subprocess.run(
+            hook, shell=False, env={**os.environ, "S3BAK_JOURNAL": journal_path}
+        ).returncode
     if rc == 0:
         return 0
     err(f"{name} failed (exit {rc}): {hook!r}")
@@ -532,11 +548,13 @@ def _push_sub(
             if journal.has_events and not opts.data_only:
                 publish_journal_manifest(cfg, entry, old_manifest, journal_path, opts)
                 did_work = True
+            if conflict_deleted:
+                did_work = True
+            # The journal must still be on disk for post_hook (S3BAK_JOURNAL);
+            # it is unlinked in the finally below, after the hook returns.
+            return _run_hook("post_hook", post_hook, opts, journal_path) if did_work else 0
         finally:
             os.unlink(journal_path)
-        if conflict_deleted:
-            did_work = True
-        return _run_hook("post_hook", post_hook, opts) if did_work else 0
     finally:
         plan.close()
         os.unlink(manifest_path)
@@ -842,12 +860,15 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                     refresh_manifest = True
                 else:
                     refresh_manifest = False
+                if results or refresh_manifest or conflict_deleted:
+                    post_hook: list[str] | None = entry_cfg.get("post_hook")
+                    # The journal must still be on disk for post_hook
+                    # (S3BAK_JOURNAL); it is unlinked in the finally below,
+                    # after the hook returns.
+                    return _run_hook("post_hook", post_hook, opts, journal_path)
+                return 0
             finally:
                 os.unlink(journal_path)
-            if results or refresh_manifest or conflict_deleted:
-                post_hook: list[str] | None = entry_cfg.get("post_hook")
-                return _run_hook("post_hook", post_hook, opts)
-            return 0
         else:
             needs_upload, mode_drifted = _single_file_compare(
                 cfg, entry, target, opts, manifest_path if have_manifest else None

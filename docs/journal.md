@@ -73,8 +73,13 @@ local-only (the create lane), S3-only (the delete lane).
 
 One line per event: **a one-character marker followed by a manifest v3 record
 line** (the exact record format of [manifest.md](manifest.md)). No header, no
-line numbers. The journal is a temporary, process-private artifact of one
-push — never uploaded, deleted when the push ends.
+line numbers. The journal is a temporary file, never uploaded, but it is not
+purely internal: a journal-driven push (the ordinary directory push and the
+sub-path push) exposes the file to `post_hook` through the `S3BAK_JOURNAL`
+environment variable (see [sync.md](sync.md#the-push-pipeline)) before
+deleting it, which makes this format a hook-facing interface, not just an
+implementation detail. s3bak deletes the file once the hook returns (or
+immediately, on a push where no hook fires).
 
 ```
 +{"path":"./docs/new.txt","mode":"100644","owner":"iz","group":"iz","size":12,"mtime_ns":1789000000000000001}
@@ -169,7 +174,11 @@ keep-everything merge of a fresh walk.)
   manifest is rewritten from a fresh lstat.
 - **`--meta-only`** runs no sync, so it keeps the full-walk manifest rebuild —
   itself a single scan.
-- **`--data-only`** never rewrites the manifest; the journal is discarded.
+- **`--data-only`** never rewrites the manifest, but the journal itself is
+  ordinary: it still records every event the sync decided and transferred,
+  and is still handed to `post_hook` through `S3BAK_JOURNAL` when the push
+  did work - a hook reading it under `--data-only` sees what was transferred,
+  not what the manifest now says (the manifest did not change).
 - **`--dry-run`** runs the journal and the merge for real (to a local temp
   file, surfacing the same warnings a real push would) and skips only the S3
   upload — the same rehearsal contract as every no-change step.
