@@ -44,6 +44,19 @@ behaviour should be verified with automated tests. Superseded implementations
 are removed, and a clear current design is preferred over backward-
 compatibility layers.
 
+## Scope
+
+s3bak is designed for personal use by a single, attentive operator. Problems
+that the operator can avoid simply by taking care are out of scope for the
+tool itself, for example:
+
+- Running multiple s3bak invocations against the same configuration at the
+  same time.
+- Backing up a directory while it is being modified.
+
+s3bak does not detect or guard against these conditions; avoiding them is
+the operator's responsibility.
+
 ## Design documents
 
 - **[Storage model](storage.md)** — how local trees, data objects, and manifests
