@@ -51,7 +51,7 @@ from s3bak.commands import (
 )
 from s3bak.compare import _resolve_use_color
 from s3bak.config import Config, Opts, load_config
-from s3bak.confirm import reset_confirmations
+from s3bak.confirm import AnswerMode, is_aborted, reset_confirmations, resolve_answer_mode
 from s3bak.console import (
     die,
     err,
@@ -89,11 +89,27 @@ def run_entries(
     cfg: Config,
     entries: list[str],
     opts: Opts,
+    *,
+    serial: bool = False,
 ) -> int:
     if not entries:
         return 0
     if len(entries) == 1:
         return fn(cfg, entries[0], opts)
+
+    if serial:
+        # Interactive --delete: the per-item confirmation reads stdin on the
+        # calling thread. Running entries on worker threads would leave a Ctrl-C
+        # during a prompt unable to interrupt the blocking read (SIGINT reaches
+        # only the main thread), hanging executor.shutdown(wait=True). Run the
+        # entries sequentially on this thread so the prompt - and its interrupt -
+        # stays here; a q abort then also stops the entries not yet run.
+        statuses = []
+        for entry in entries:
+            if is_aborted():
+                break
+            statuses.append(fn(cfg, entry, opts))
+        return next((status for status in statuses if status), 0)
 
     # One thread per entry by default; cap at entry_concurrency when configured.
     workers = len(entries)
@@ -161,6 +177,8 @@ def _run_resolved_entries(
     cfg: Config,
     resolved: Sequence[tuple[str, str | None]],
     opts: Opts,
+    *,
+    serial: bool = False,
 ) -> int:
     entries = [entry for entry, _sub in resolved]
     sub_by_entry = {entry: sub for entry, sub in resolved}
@@ -168,7 +186,14 @@ def _run_resolved_entries(
     def _run_one(cfg_: Config, entry_: str, opts_: Opts) -> int:
         return fn(cfg_, entry_, opts_, sub_by_entry.get(entry_))
 
-    return run_entries(_run_one, cfg, entries, opts)
+    return run_entries(_run_one, cfg, entries, opts, serial=serial)
+
+
+def _interactive_delete(opts: Opts) -> bool:
+    """A --delete run whose confirmations are answered at an interactive prompt
+    (not --yes, not a non-interactive all-no). Such a run must execute its
+    entries serially on the main thread - see run_entries(serial=...)."""
+    return opts.delete and resolve_answer_mode(yes=opts.yes) is AnswerMode.ASK
 
 
 # =============================================================================
@@ -758,7 +783,9 @@ def main(argv: list[str] | None = None) -> int:
         else:
             resolved = resolve_entry_files(cfg, positional, "push")
         _validate_distinct_entries(resolved, "push")
-        return _run_resolved_entries(cmd_push, cfg, resolved, opts)
+        return _run_resolved_entries(
+            cmd_push, cfg, resolved, opts, serial=_interactive_delete(opts)
+        )
 
     elif subcmd == "pull":
         if opt_all:
@@ -767,7 +794,9 @@ def main(argv: list[str] | None = None) -> int:
             resolved = resolve_entry_files(cfg, positional, "pull")
         _validate_distinct_entries(resolved, "pull")
         _validate_pull_destinations(cfg, resolved)
-        return _run_resolved_entries(cmd_pull, cfg, resolved, opts)
+        return _run_resolved_entries(
+            cmd_pull, cfg, resolved, opts, serial=_interactive_delete(opts)
+        )
 
     elif subcmd == "status":
         if opt_all:

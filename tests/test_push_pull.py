@@ -1451,3 +1451,46 @@ def test_push_delete_without_tty_keeps_kind_conflict_object(ws):
     os.symlink("elsewhere", ws.root / "data" / "f.txt")
     ws.run("push", "--delete", "data", expect_rc=0)
     assert "data/f.txt" in ws.keys()  # kept: every answer is no
+
+
+def test_pull_checksum_skips_the_size_mtime_gate(ws, monkeypatch):
+    # --checksum ignores the size+mtime gate, so a real --checksum pull must not
+    # pay for the (potentially millions of lstats) gate walk under it.
+    from s3bak import commands
+
+    ws.write("data/a.txt", "alpha")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    dest = ws.root / "out"
+
+    calls: list[int] = []
+    real = commands._manifest_matches_local
+    monkeypatch.setattr(
+        commands,
+        "_manifest_matches_local",
+        lambda *a, **k: (calls.append(1), real(*a, **k))[1],
+    )
+    ws.run("pull", "data", "--checksum", "-o", str(dest), expect_rc=0)
+    assert calls == []  # gate walk skipped under a real --checksum pull
+
+    calls.clear()
+    ws.run("pull", "data", "-o", str(dest), expect_rc=0)
+    assert calls  # a plain pull still runs the gate
+
+
+def test_subpath_push_records_ancestor_directory_mtime_drift(ws):
+    # A leaf sub-path push must record a drifted ancestor-directory mtime (adding
+    # the child bumps it), not just a mode change - otherwise pull restores the
+    # stale directory mtime (docs/journal.md).
+    ws.write("data/sub/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    ws.write("data/sub/b.txt", "b")
+    subdir = ws.root / "data" / "sub"
+    os.utime(subdir, (1_600_000_000, 1_600_000_000))  # a distinct ancestor mtime
+    ws.run("push", "data/sub/b.txt", expect_rc=0)
+
+    dest = ws.root / "out"
+    ws.run("pull", "data", "-o", str(dest), expect_rc=0)
+    assert os.stat(dest / "sub").st_mtime_ns == 1_600_000_000_000_000_000

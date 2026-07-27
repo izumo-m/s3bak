@@ -27,8 +27,11 @@ _warning_count = 0
 
 
 def err(msg: str) -> None:
-    sys.stderr.write(f"{PROG}: {msg}\n")
-    sys.stderr.flush()
+    # Share the output lock with write_output/write_stderr so a worker thread's
+    # error line cannot interleave with another thread's output under --all.
+    with _output_lock:
+        sys.stderr.write(f"{PROG}: {msg}\n")
+        sys.stderr.flush()
 
 
 def die(msg: str) -> NoReturn:

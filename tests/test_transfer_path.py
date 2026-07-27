@@ -174,3 +174,104 @@ def test_delete_objects_reports_only_actually_deleted_keys(ws, monkeypatch):
     assert "data/a" in result.stdout  # actually deleted
     assert "data/b" not in result.stdout  # NOT claimed deleted
     assert "data/b" in result.stderr  # reported as failed
+
+
+def test_delete_objects_fails_batch_on_unattributable_error(ws, monkeypatch):
+    # A DeleteObjects error whose Key is missing cannot be tied to a requested
+    # key, so we cannot prove any key was deleted: fail the batch instead of
+    # claiming a phantom success (which would orphan the object on S3 while the
+    # manifest record was dropped).
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    store = _store(ws)
+    monkeypatch.setattr(
+        store._client,
+        "delete_objects",
+        lambda **kw: {"Errors": [{"Code": "AccessDenied", "Message": "denied"}]},
+    )
+    res = store.delete_objects(["a/b"])
+    assert res.returncode == 1
+    assert "delete:" not in res.stdout  # never claim a success we cannot prove
+    assert "a/b" in res.stderr
+
+
+def test_delete_objects_fails_batch_on_unknown_key(ws, monkeypatch):
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    store = _store(ws)
+    monkeypatch.setattr(
+        store._client,
+        "delete_objects",
+        lambda **kw: {"Errors": [{"Key": "totally/other", "Code": "AccessDenied"}]},
+    )
+    res = store.delete_objects(["a/b"])
+    assert res.returncode == 1
+    assert "delete:" not in res.stdout
+
+
+def test_delete_objects_reports_only_attributable_failures(ws, monkeypatch):
+    # An ordinary per-key error keyed to a requested object still lets the other
+    # keys report as deleted (unchanged behaviour).
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    store = _store(ws)
+    api_b = store._api_key("b")
+    monkeypatch.setattr(
+        store._client,
+        "delete_objects",
+        lambda **kw: {"Errors": [{"Key": api_b, "Code": "AccessDenied"}]},
+    )
+    res = store.delete_objects(["a", "b", "c"])
+    assert res.returncode == 1
+    assert "/a" in res.stdout and "/c" in res.stdout
+    assert "/b:" in res.stderr
+
+
+def test_iter_objects_rejects_unordered_listing(ws, monkeypatch):
+    from boto3_s3 import Boto3S3Error
+
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    store = _store(ws)
+    prefix = store._api_key("data") + "/"
+
+    class FakePaginator:
+        def paginate(self, **kw):
+            yield {
+                "Contents": [
+                    {"Key": prefix + "b", "Size": 1},
+                    {"Key": prefix + "a", "Size": 1},  # regresses below "b"
+                ]
+            }
+
+    monkeypatch.setattr(store._client, "get_paginator", lambda name: FakePaginator())
+    with pytest.raises(Boto3S3Error, match="ascending key order"):
+        list(store.iter_objects("data"))
+
+
+def test_get_object_forces_glacier_transfer_on_large_downloads(ws, monkeypatch):
+    # A large download goes through S3.cp, which WARN-skips a GLACIER source and
+    # returns as if it succeeded. get_object must force the transfer so an
+    # archived object fails loudly instead of leaving a phantom success.
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    store = _store(ws)
+    captured: dict = {}
+
+    def fake_cp(src, dest, **opts):
+        captured.update(opts)
+        open(dest, "wb").close()
+
+    monkeypatch.setattr(store._s3, "cp", fake_cp)
+    dest = str(ws.root / "big.out")
+    assert store.get_object("big", dest, size=store._small_limit) is True
+    assert captured.get("force_glacier_transfer") is True
+
+
+def test_get_object_propagates_a_glacier_transfer_failure(ws, monkeypatch):
+    from boto3_s3 import Boto3S3Error
+
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    store = _store(ws)
+
+    def fake_cp(src, dest, **opts):
+        raise Boto3S3Error("InvalidObjectState: object is archived")
+
+    monkeypatch.setattr(store._s3, "cp", fake_cp)
+    with pytest.raises(Boto3S3Error):
+        store.get_object("big", str(ws.root / "x.out"), size=store._small_limit)

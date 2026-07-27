@@ -80,6 +80,13 @@ def reset_confirmations() -> None:
     _summary_shown = False
 
 
+def is_aborted() -> bool:
+    """Whether a q answer has aborted the whole command. The serial interactive
+    runner checks this between entries so a q stops the entries that have not run
+    yet, not only the ones that reach a further confirmation."""
+    return _abort.is_set()
+
+
 class DeleteConfirmer:
     """Per-entry y/n/a/d/q decider carrying the a/d sticky state.
 

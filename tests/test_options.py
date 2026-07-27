@@ -738,3 +738,49 @@ def test_resolve_pull_destination_treats_native_sep_as_container():
     assert got == os.path.join("/restore", "data")
     # -o is exact: no append, even with a trailing separator
     assert restore.resolve_pull_destination("data", None, None, f"/out{os.sep}") == f"/out{os.sep}"
+
+
+def test_post_hook_stdin_is_detached_from_terminal(ws, monkeypatch):
+    # Entries push concurrently and a --delete confirmation may be reading stdin
+    # on another thread; a hook must not steal that answer. _run_hook detaches
+    # the hook's stdin (subprocess.DEVNULL).
+    import subprocess
+
+    from s3bak import commands
+
+    captured: dict = {}
+
+    def spy(cmd, **kwargs):
+        captured["stdin"] = kwargs.get("stdin")
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(commands.subprocess, "run", spy)
+    ws.write("data/a.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data"), "post_hook": ["true"]}})
+    ws.run("push", "data", expect_rc=0)
+    assert captured["stdin"] is subprocess.DEVNULL
+
+
+def test_interactive_q_stops_later_upload_only_entries(ws, answers):
+    # push --all --delete runs interactively and serially: a q at the first
+    # (sorted) entry's deletion prompt aborts the whole command, so a later entry
+    # that would only upload must not run (its new file is never pushed).
+    ws.write("a_del/keep.txt", "k")
+    ws.write("a_del/gone.txt", "g")
+    ws.write("b_new/only.txt", "o")
+    ws.config(
+        {
+            "a_del": {"path": str(ws.root / "a_del")},
+            "b_new": {"path": str(ws.root / "b_new")},
+        }
+    )
+    ws.run("push", "--all", expect_rc=0)
+
+    (ws.root / "a_del" / "gone.txt").unlink()  # a_del now has a deletion to confirm
+    ws.write("b_new/fresh.txt", "new")  # b_new would upload this
+    answers.feed("q")
+    res = ws.run("push", "--all", "--delete")
+
+    assert "aborted" in res.err
+    assert "b_new/only.txt" in ws.keys()  # from the initial push
+    assert "b_new/fresh.txt" not in ws.keys()  # the abort stopped the later entry

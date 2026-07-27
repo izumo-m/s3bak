@@ -97,15 +97,19 @@ memory bounded by one directory level rather than the whole tree:
   files, and unreadable entries before filtering. s3bak customizes only exclude
   subtree pruning; boto3-s3 emits each directory record in-stream just before
   its children. An unreadable directory keeps its own record and loses its
-  children; the manifest-writing walk reports that gap as a warning (exit 2),
-  while the read-only diff walks stay silent (their comparison fails safe).
+  children; every walk reports that gap as a warning (exit 2) — the
+  manifest-writing walk and the read-only status / diff walks alike — so a
+  local-only file hidden behind an unreadable directory is never mistaken for a
+  clean comparison.
 - **The writer** streams walk → temp file → upload; it never buffers the whole
   manifest.
 - **The status / pull `--delete` diff** (`merge_join`) pairs the manifest
   stream against a fresh walk on their shared sort keys with a one-record
-  lookahead per side — both-sides pairs are compared (M), manifest-only
-  records report D, local-only paths report A / become delete candidates — so
-  a manifest far larger than RAM still diffs in one pass.
+  lookahead per side — a both-sides pair of the same type is compared (M), a
+  both-sides pair whose type changed reports D (it is a replacement, not a
+  metadata edit), a manifest-only record reports D, and a local-only path
+  reports A / becomes a delete candidate — so a manifest far larger than RAM
+  still diffs in one pass.
 - **The push rewrite** (`merge_journal`) applies the push journal to the old
   manifest: a 2-way streaming merge in which a key with no event copies its
   old record verbatim (preserving any unknown keys), `+` / `!` copy the event
@@ -156,10 +160,13 @@ against either side of a sync without materializing it.
 ## Versioning and migration
 
 The version bumps when the format changes incompatibly. There is no in-code
-migration and no multi-version reader: to move to a new format, re-run
-`push --all`, which regenerates every manifest. This is the same migration the
-very first push performs — with no manifest on S3, every pair transfers and a
-fresh manifest is written.
+migration and no multi-version reader: a manifest whose version is not the one
+this s3bak reads is rejected at download, exactly like a damaged one, so it
+blocks a plain `push` as well. To move to a new format, first remove the old
+manifest objects (`aws s3 rm` each `<entry>-manifest.jsonl`, or all at once with
+`aws s3 rm --recursive --exclude '*' --include '*-manifest.jsonl'`), then run
+`push --all`: with no manifest on S3 each entry transfers every pair and writes
+a fresh one, exactly as a first push does.
 
 An old manifest object left behind after a filename change (e.g. a pre-v3
 `<entry>-ls-l.txt`) is removed manually with the aws-cli command `aws s3 rm`;

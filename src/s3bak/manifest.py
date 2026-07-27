@@ -127,6 +127,13 @@ def _fsencodable(s: str) -> bool:
         return False
 
 
+# A recorded size beyond a signed 64-bit off_t is not a real file size; it is a
+# damaged/hostile manifest. Rejecting it here keeps the human-readable size
+# formatting (compare.py divides by a unit threshold) from an OverflowError on a
+# value too large to convert to float.
+_MAX_SIZE = (1 << 63) - 1
+
+
 def parse_entry(line: str) -> ManifestEntry | None:
     """Parse one record, returning ``None`` for invalid input.
 
@@ -157,21 +164,34 @@ def parse_entry(line: str) -> ManifestEntry | None:
             or mode < 0
             or mode > 0o177777
             or not (size is None or (isinstance(size, int) and not isinstance(size, bool)))
-            or (isinstance(size, int) and size < 0)
+            # A negative or absurdly-large size is a damaged record; the upper
+            # bound also keeps compare.py's float size formatting from overflowing.
+            or (isinstance(size, int) and not 0 <= size <= _MAX_SIZE)
             or not (
                 mtime_ns is None or (isinstance(mtime_ns, int) and not isinstance(mtime_ns, bool))
             )
-            # A NUL or non-fsencodable link target survives every type check but
-            # raises ValueError/UnicodeEncodeError deep in os.symlink/os.path.isdir
-            # on restore, which run() does not catch - and only AFTER _place_symlink
-            # removed the existing file (data loss + traceback). Reject it here so
-            # a damaged manifest fails closed at download.
+            # A NUL, empty, or non-fsencodable link target survives every type
+            # check but raises ValueError/UnicodeEncodeError/FileNotFoundError deep
+            # in os.symlink/os.path.isdir on restore, which run() does not catch -
+            # and only AFTER _place_symlink removed the existing file (data loss +
+            # traceback). A symlink record with no target at all is equally
+            # unrestorable. Reject both here so a damaged manifest fails closed.
             or not (
                 link is None
-                or (isinstance(link, str) and "\x00" not in link and _fsencodable(link))
+                or (
+                    isinstance(link, str)
+                    and link != ""
+                    and "\x00" not in link
+                    and _fsencodable(link)
+                )
             )
+            or (stat_mod.S_ISLNK(mode) and link is None)
+            # owner/group are display-only, but a lone surrogate here is not
+            # UTF-8-encodable and crashes ls-remote's stdout write; reject it.
             or not isinstance(owner, str)
+            or not _fsencodable(owner)
             or not isinstance(group, str)
+            or not _fsencodable(group)
         ):
             return None
         return ManifestEntry(
@@ -183,14 +203,18 @@ def parse_entry(line: str) -> ManifestEntry | None:
             mtime_ns=mtime_ns,
             sym_target=link,
         )
-    except (json.JSONDecodeError, KeyError, ValueError, TypeError):
+    except (json.JSONDecodeError, KeyError, ValueError, TypeError, RecursionError):
+        # RecursionError: a deeply-nested JSON value in an unknown field.
+        # ValueError also covers an integer literal too long to convert.
         return None
 
 
 def _check_header(line: str) -> None:
     try:
         obj = json.loads(line)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, ValueError, RecursionError):
+        # A malformed header, an over-long integer literal, or a deeply-nested
+        # value: a damaged manifest, not a Python traceback for the CLI user.
         obj = None
     if not isinstance(obj, dict) or _HEADER_KEY not in obj:
         raise ManifestError("not an s3bak v3 manifest (bad or missing header line)")

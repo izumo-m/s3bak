@@ -264,7 +264,17 @@ def local_keyed(
     local-only file sits behind it. pull's apply/--delete lanes pass None: a gap
     there is judged by the direct-lstat fallback (apply) or safely left un-deleted
     (--delete)."""
-    if not os.path.lexists(outpath):
+    try:
+        os.lstat(outpath)
+    except FileNotFoundError:
+        return  # missing locally: status degrades to reporting every record D
+    except OSError as e:
+        # An unreadable outpath (an unsearchable parent, say) is NOT "absent":
+        # os.path.lexists would swallow the error and status would then print
+        # every record D and exit 0, hiding that the comparison never happened.
+        # Report it as a walk gap so status warns and the run exits 2.
+        if warn is not None:
+            warn(f"cannot read {outpath}: {e}")
         return
     if sub is not None:
         prune, _skip = manifest.split_excludes(excludes)

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import stat as stat_mod
 import subprocess
 import tempfile
@@ -97,15 +98,21 @@ def _run_hook(
     if not hook:
         return 0
     if opts.dryrun:
-        print(f"(dry-run) would run {name}: {hook!r}")
+        write_output(f"(dry-run) would run {name}: {hook!r}\n")
         return 0
     if opts.verbose:
         write_stderr(f"+ {name}: {hook!r}\n")
+    # Hooks are non-interactive: entries push concurrently and a --delete
+    # confirmation may be reading stdin on another thread, so a hook that also
+    # read stdin would steal the answer. Detach it from the terminal.
     if journal_path is None:
-        rc = subprocess.run(hook, shell=False).returncode
+        rc = subprocess.run(hook, shell=False, stdin=subprocess.DEVNULL).returncode
     else:
         rc = subprocess.run(
-            hook, shell=False, env={**os.environ, "S3BAK_JOURNAL": journal_path}
+            hook,
+            shell=False,
+            stdin=subprocess.DEVNULL,
+            env={**os.environ, "S3BAK_JOURNAL": journal_path},
         ).returncode
     if rc == 0:
         return 0
@@ -131,7 +138,7 @@ def upload_manifest(
     post_hook: list[str] | None = cfg.entries[entry].get("post_hook")
 
     if opts.dryrun:
-        print(f"(dry-run) would update manifest: {manifest.manifest_key(entry)}")
+        write_output(f"(dry-run) would update manifest: {manifest.manifest_key(entry)}\n")
         # The walk and merge write only a local temp file: run them so the
         # rehearsal emits the same structural warnings as the real push,
         # skipping only the upload.
@@ -523,7 +530,7 @@ def _push_sub(
                     # and always re-records - naming the path is the
                     # instruction to back up its current state.
                     if opts.dryrun:
-                        print(f"(dry-run) upload: {local_sub} -> {s3_sub_path}")
+                        write_output(f"(dry-run) upload: {local_sub} -> {s3_sub_path}\n")
                         did_work = True
                     else:
                         result = cfg.store.put_object(sub_rel, local_sub, verbose=opts.verbose)
@@ -1135,7 +1142,14 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         #    between the user and the content comparison.
         window_ns = cfg.window_ns_for(entry)
         excludes: list[str] = entry_cfg.get("excludes", []) if entry_cfg else []
-        manifest_matches = _manifest_matches_local(manifest_path, outpath, is_dir, sub, window_ns)
+        # --checksum ignores this gate (see below), so on a real --checksum pull
+        # skip the whole size+mtime walk under it - on a large tree that is
+        # millions of wasted lstats before the content compare even starts. A
+        # --checksum --dry-run still computes it: it is a preview (not the hot
+        # path) and the dry-run metadata stand-in line below reads manifest_matches.
+        manifest_matches = (opts.dryrun or not opts.checksum) and _manifest_matches_local(
+            manifest_path, outpath, is_dir, sub, window_ns
+        )
         if manifest_matches and not opts.checksum:
             if not opts.meta_only and opts.delete and is_dir:
                 return _mirror_extras(
@@ -1587,7 +1601,12 @@ def _run_diff(left: str, right: str, label: str, opts: Opts) -> int:
         ]
     )
     echo_command(opts.verbose, cmd)
-    return subprocess.run(cmd).returncode
+    rc = subprocess.run(cmd).returncode
+    if rc == -signal.SIGPIPE:
+        # The reader closed the pipe (e.g. `s3bak diff | head`): let run() map
+        # this to the documented 141 instead of collapsing it to a plain 1.
+        raise BrokenPipeError
+    return rc
 
 
 def _write_leaf_type_diff(label: str, backup: str, local: str) -> None:
@@ -1645,13 +1664,19 @@ def diff_single_file(
         os.unlink(tmppath)
 
 
-def _symlinked_ancestor(root: str, rel: str) -> bool:
-    """True if ``root`` itself, or any ancestor directory of ``root/rel`` (up to
-    but excluding the final component), is not a real accessible directory - a
-    symlink, a non-directory, or inaccessible. Reading local content through such
-    a path - verify --checksum's hash, diff's content compare, a single-file
-    status/diff/verify stat - would touch a file the record does not describe (an
-    entry-outside target in the worst case). Read-only lstat probe."""
+def _ancestor_block_reason(root: str, rel: str) -> str | None:
+    """Why ``root/rel``'s parent chain (``root`` itself plus every ancestor up to
+    but excluding the final component) cannot be safely read through, or ``None``
+    if it can:
+
+    - ``"structural"`` - a symlink or non-directory ancestor would redirect the
+      read to a file the record does not describe (an entry-outside target in the
+      worst case). This is a local type change, not a backup defect.
+    - ``"inaccessible"`` - an ancestor could not be stat'd (EACCES/ELOOP), so
+      reachability is undeterminable and the content simply cannot be read.
+
+    A missing ancestor is not blocking (``None``): the caller reports the leaf as
+    absent, not as unreachable. Read-only lstat probe."""
     acc = root
     to_check = [root]
     for part in rel.split("/")[:-1]:
@@ -1661,13 +1686,22 @@ def _symlinked_ancestor(root: str, rel: str) -> bool:
         try:
             st = os.lstat(path)
         except FileNotFoundError:
-            return False  # a missing ancestor: the file is simply absent locally -
-            # let the caller report it as missing, not as unreachable
+            return None
         except OSError:
-            return True  # inaccessible (EACCES/ELOOP): not safely reachable
+            return "inaccessible"
         if not stat_mod.S_ISDIR(st.st_mode):
-            return True  # a symlink or non-directory: would redirect or not resolve
-    return False
+            return "structural"
+    return None
+
+
+def _symlinked_ancestor(root: str, rel: str) -> bool:
+    """True if ``root/rel``'s parent chain cannot be safely read through - a
+    symlink, a non-directory, or an inaccessible ancestor. Reading local content
+    through such a path - verify --checksum's hash, diff's content compare, a
+    single-file status/diff/verify stat - would touch a file the record does not
+    describe. Callers that must tell an access error apart from a structural
+    change (to warn rather than silently skip) use _ancestor_block_reason."""
+    return _ancestor_block_reason(root, rel) is not None
 
 
 def diff_backup(
@@ -2191,16 +2225,21 @@ def _verify_dir(
                             f"size mismatch: {cfg.prefix}/{rel_base}/{obj.key}"
                             f" (manifest {record.size}, S3 {obj.size})"
                         )
-                    elif (
-                        checker is not None
-                        and not archived
-                        and not _symlinked_ancestor(local_base, key)
-                    ):
-                        # A symlinked ancestor would make the hash read a file
-                        # the record does not describe (a local structural
-                        # change, not a backup defect): skip, like a type change.
-                        local_path = os.path.join(local_base, *key.split("/"))
-                        checker.check(f"{rel_base}/{key}", local_path, record, obj)
+                    elif checker is not None and not archived:
+                        reason = _ancestor_block_reason(local_base, key)
+                        if reason == "inaccessible":
+                            # An unreadable ancestor: the content cannot be hashed,
+                            # so warn (rc 2) rather than silently pass as OK.
+                            report.warn(
+                                "cannot read local file for --checksum: "
+                                f"{os.path.join(local_base, *key.split('/'))}"
+                            )
+                        elif reason is None:
+                            local_path = os.path.join(local_base, *key.split("/"))
+                            checker.check(f"{rel_base}/{key}", local_path, record, obj)
+                        # reason == "structural": a symlinked/non-directory ancestor
+                        # redirects to a file the record does not describe (a local
+                        # type change, not a backup defect): skip, like a type change.
                 else:
                     kind = "symlink" if record.sym_target is not None else "special file"
                     report.error(
@@ -2297,10 +2336,11 @@ def cmd_verify(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
         if not download_manifest(cfg, entry, manifest_path, opts.verbose):
             # No manifest: an unrecorded backup (interrupted push, --data-only)
             # and no backup at all are different emergencies - tell them apart.
-            has_data = cfg.store.head_object(entry, verbose=opts.verbose) is not None or (
-                next(iter(cfg.store.iter_objects(entry, verbose=opts.verbose)), None) is not None
-            )
-            if has_data:
+            # Count the stray objects (streaming) so the summary's object tally
+            # reflects what was actually found instead of a misleading 0.
+            report.objects = 1 if cfg.store.head_object(entry, verbose=opts.verbose) else 0
+            report.objects += sum(1 for _ in cfg.store.iter_objects(entry, verbose=opts.verbose))
+            if report.objects:
                 report.error(
                     "data objects exist but no manifest records them"
                     " (interrupted push? a push records them)"
@@ -2320,6 +2360,14 @@ def cmd_verify(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
                 return 1
             rel_key = f"{entry}/{sub}"
             local_path = os.path.join(base_path, *sub.split("/"))
+            # An unreadable ancestor of the sub root means --checksum cannot read
+            # any local content: warn (rc 2) rather than silently report OK. A
+            # structural (symlinked/non-dir) ancestor is a local type change and
+            # is skipped silently. Either way the content compare is off.
+            sub_reason = _ancestor_block_reason(base_path, sub)
+            if opts.checksum and sub_reason == "inaccessible":
+                report.warn(f"cannot read local files for --checksum through: {local_path}")
+            content_reachable = sub_reason is None
             if kind == "dir":
                 _report_restore_conflict(report, manifest_path, sub)
                 _verify_dir(
@@ -2330,7 +2378,7 @@ def cmd_verify(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
                     sub,
                     opts,
                     local_path,
-                    content_reachable=not _symlinked_ancestor(base_path, sub),
+                    content_reachable=content_reachable,
                 )
             elif kind == "file":
                 record = next(
@@ -2346,7 +2394,7 @@ def cmd_verify(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
                     rel_key,
                     local_path,
                     opts,
-                    content_reachable=not _symlinked_ancestor(base_path, sub),
+                    content_reachable=content_reachable,
                 )
             else:
                 kind_name = "symlink" if kind == "symlink" else "special file"

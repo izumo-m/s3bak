@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import os
 import re
+import signal
+import subprocess
+
+import pytest
 
 MTIME_DETAIL = re.compile(r"mtime: remote=(.+) [<>] local=(.+) \((.+)\)")
 
@@ -375,3 +379,35 @@ def test_diff_of_unpushed_single_file_reports_error(ws):
     res = ws.run("diff", str(ws.root / "data" / "new.txt"))
     assert res.rc == 1
     assert "not found on s3" in res.err.lower()
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs an unsearchable parent")
+def test_status_warns_when_entry_path_is_unreadable(ws):
+    # An unreadable entry path (unsearchable parent) is not "absent": status must
+    # not silently report every record D and exit 0 - it warns that the
+    # comparison could not be made.
+    ws.write("locked/data/a.txt", "alpha")
+    ws.config({"data": {"path": str(ws.root / "locked" / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    locked = ws.root / "locked"
+    os.chmod(locked, 0o000)
+    try:
+        res = ws.run("status", "data")
+        assert "cannot read" in res.err
+    finally:
+        os.chmod(locked, 0o755)
+
+
+def test_run_diff_maps_sigpipe_to_broken_pipe(monkeypatch):
+    # A reader that closes the pipe (`s3bak diff | head`) makes the diff child die
+    # with SIGPIPE; that maps to the documented 141, not a plain 1.
+    from s3bak import commands
+    from s3bak.config import Opts
+
+    monkeypatch.setattr(
+        commands.subprocess,
+        "run",
+        lambda cmd, **kw: subprocess.CompletedProcess(cmd, -signal.SIGPIPE),
+    )
+    with pytest.raises(BrokenPipeError):
+        commands._run_diff("a", "b", "label", Opts())

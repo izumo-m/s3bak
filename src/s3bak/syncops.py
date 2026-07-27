@@ -168,7 +168,7 @@ def patch_manifest_subtree(
             )
         _validate_before_publish(entry, new_path)
         if opts.dryrun:
-            print(f"(dry-run) would patch manifest: {key} (sub={sub})")
+            write_output(f"(dry-run) would patch manifest: {key} (sub={sub})\n")
         else:
             write_stderr(f"Updating {cfg.prefix}/{key}\n")
             assert cfg.store is not None
@@ -540,14 +540,21 @@ class PushJournal:
         self._emit_new(manifest.JOURNAL_ADD, ".", st, None)
 
     def record_ancestor(self, rel: str, st: os.stat_result) -> None:
-        """A sub-path push's parent directory: journal only a drift (a
-        missing or mode-changed record) - every record needs a recorded
-        directory parent, but re-recording an unchanged ancestor was the old
-        pipeline's walked-path-wins artifact, not a requirement."""
+        """A sub-path push's parent directory: journal only a drift (a missing
+        record, or a mode/mtime change) - every record needs a recorded directory
+        parent, but re-recording an unchanged ancestor was the old pipeline's
+        walked-path-wins artifact, not a requirement. A directory's own mtime is
+        tracked like _journal_nonfile's dir branch, so a sub-path push that
+        changed the ancestor's mtime (adding the new child does) refreshes it
+        instead of leaving a stale value for pull to restore."""
         old = self._advance(rel + "/")
         if old is None:
             self._emit_new(manifest.JOURNAL_ADD, f"./{rel}", st, None)
-        elif mode_differs(old[0], st):
+        elif (
+            mode_differs(old[0], st)
+            or old[0].mtime_ns is None
+            or abs(st.st_mtime_ns - old[0].mtime_ns) > self._window_ns
+        ):
             self._emit_new(manifest.JOURNAL_REPLACE, f"./{rel}", st, None)
 
     def record_target(self, rel: str, st: os.stat_result, sym_target: str | None) -> None:
@@ -588,7 +595,7 @@ def publish_journal_manifest(
             manifest.merge_journal(f, old_manifest, journal_path, warn=note_warning)
         _validate_before_publish(entry, tmp)
         if opts.dryrun:
-            print(f"(dry-run) would update manifest: {key}")
+            write_output(f"(dry-run) would update manifest: {key}\n")
         else:
             write_stderr(f"Updating {cfg.prefix}/{key}\n")
             assert cfg.store is not None

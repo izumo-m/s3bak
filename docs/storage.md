@@ -52,11 +52,17 @@ a later push refreshes it.
 ## Unrecorded objects
 
 Push maintains a correspondence: every regular-file record has its data
-object, and every data object has its record. The pair is created, kept, and
-deleted together — a `--delete` answer covers both, and a record whose object
-is already gone (an interrupted deletion) is dropped by the next
-`push --delete` merge. Directory, symlink, and special-file records stand
-alone by design, as described above.
+object, and every data object has its record. The pair is created and kept
+together, and a `--delete` answer covers both.
+
+Retiring an object is a deletion, so it waits for `--delete` — this is the one
+seam in the correspondence. When a regular file is replaced by a symlink or a
+special file, a plain push records the new (objectless) kind but keeps the old
+data object, which is now unreferenced: `verify` flags it as a type conflict,
+and the next `push --delete` retires it. A record whose object is already gone
+(an interrupted deletion) is likewise settled by the next `push --delete` merge.
+Directory, symlink, and special-file records stand alone by design, as described
+above.
 
 The correspondence has one gap s3bak cannot close: a data object the manifest
 never recorded — uploaded out-of-band with other S3 tooling, or the fresh

@@ -110,6 +110,66 @@ def test_iter_manifest_rejects_damaged_lines(tmp_path):
         list(manifest.iter_manifest(str(p)))
 
 
+def test_iter_manifest_rejects_empty_symlink_target(tmp_path):
+    # os.symlink("", target) fails mid-restore after _place_symlink already
+    # removed the existing file; reject it at download instead.
+    p = tmp_path / "m.jsonl"
+    p.write_text('{"s3bak_manifest":3}\n{"path":"./ln","mode":"120777","mtime_ns":0,"link":""}\n')
+    with pytest.raises(manifest.ManifestError):
+        list(manifest.iter_manifest(str(p)))
+
+
+def test_iter_manifest_rejects_symlink_without_target(tmp_path):
+    p = tmp_path / "m.jsonl"
+    p.write_text('{"s3bak_manifest":3}\n{"path":"./ln","mode":"120777","mtime_ns":0}\n')
+    with pytest.raises(manifest.ManifestError):
+        list(manifest.iter_manifest(str(p)))
+
+
+def test_iter_manifest_rejects_oversized_size(tmp_path):
+    # A size past off_t max is a damaged record and would overflow compare.py's
+    # float size formatting.
+    big = 1 << 63
+    p = tmp_path / "m.jsonl"
+    p.write_text(
+        f'{{"s3bak_manifest":3}}\n{{"path":"./a","mode":"100644","size":{big},"mtime_ns":0}}\n'
+    )
+    with pytest.raises(manifest.ManifestError):
+        list(manifest.iter_manifest(str(p)))
+
+
+def test_iter_manifest_rejects_surrogate_owner(tmp_path):
+    # A lone surrogate in owner/group is not UTF-8-encodable and crashes
+    # ls-remote's stdout write; reject the record at parse time.
+    p = tmp_path / "m.jsonl"
+    p.write_text(
+        '{"s3bak_manifest":3}\n'
+        '{"path":".","mode":"40755","owner":"\\ud800","group":"g","mtime_ns":0}\n'
+    )
+    with pytest.raises(manifest.ManifestError):
+        list(manifest.iter_manifest(str(p)))
+
+
+def test_iter_manifest_rejects_deeply_nested_json(tmp_path):
+    # A deeply-nested value makes json.loads raise RecursionError; it must
+    # become a ManifestError, not an uncaught traceback.
+    deep = "[" * 100000 + "]" * 100000
+    p = tmp_path / "m.jsonl"
+    p.write_text(
+        '{"s3bak_manifest":3}\n'
+        '{"path":"./a","mode":"100644","size":1,"mtime_ns":0,"x":' + deep + "}\n"
+    )
+    with pytest.raises(manifest.ManifestError):
+        list(manifest.iter_manifest(str(p)))
+
+
+def test_iter_manifest_rejects_overlong_version_integer(tmp_path):
+    p = tmp_path / "m.jsonl"
+    p.write_text('{"s3bak_manifest":' + "1" * 5000 + "}\n")
+    with pytest.raises(manifest.ManifestError):
+        list(manifest.iter_manifest(str(p)))
+
+
 def test_validate_manifest_rejects_header_only_file(tmp_path):
     p = tmp_path / "m.jsonl"
     p.write_text('{"s3bak_manifest":3}\n')

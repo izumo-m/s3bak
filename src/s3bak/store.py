@@ -337,9 +337,23 @@ class Boto3S3Store:
         if verbose:
             write_stderr(f"+ (boto3) list objects s3://{self.bucket}/{prefix}\n")
         paginator = self._client.get_paginator("list_objects_v2")
+        prev_key: str | None = None
         for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
             for item in page.get("Contents", []):
                 key = item.get("Key", "")
+                # The merge-join against the manifest relies on strict ascending
+                # key order, which standard S3 and MinIO guarantee (UTF-8 byte
+                # order). A bucket that does not - an S3 Express directory bucket,
+                # or a broken S3-compatible endpoint - would silently make verify
+                # report phantom missing/unrecorded objects, so fail loudly.
+                if prev_key is not None and key <= prev_key:
+                    from boto3_s3 import Boto3S3Error
+
+                    raise Boto3S3Error(
+                        f"S3 listing under {prefix} is not in ascending key order "
+                        f"({prev_key!r} then {key!r}); s3bak needs an order-preserving bucket"
+                    )
+                prev_key = key
                 yield ObjectMeta(
                     key=key[len(prefix) :],
                     size=int(item.get("Size", 0)),
@@ -391,7 +405,13 @@ class Boto3S3Store:
             if verbose:
                 write_stderr(f"+ (boto3-s3) cp {self._s3_url(rel_key)} {dest_path}\n")
             try:
-                self._s3.cp(self._s3_loc(rel_key), dest_path)
+                # force_glacier_transfer: without it cp WARN-skips a GLACIER /
+                # DEEP_ARCHIVE source and returns as if it succeeded, so pull would
+                # apply the record's metadata over stale (or absent) local content
+                # and exit 0. Forcing the transfer makes an archived-not-restored
+                # object fail loudly (InvalidObjectState) - matching the small
+                # object path's direct GetObject - and lets a restored one through.
+                self._s3.cp(self._s3_loc(rel_key), dest_path, force_glacier_transfer=True)
                 return True
             except NotFoundError:
                 return False
@@ -471,13 +491,33 @@ class Boto3S3Store:
                 Bucket=self.bucket,
                 Delete={"Objects": [{"Key": self._api_key(rel)} for rel in batch], "Quiet": True},
             )
-            # Per-key failures (Object Lock, a per-object policy): only the keys
-            # NOT in Errors were actually deleted, so only they get a delete:
-            # line - emitting it eagerly for every queued key would claim a
-            # failed key was deleted while stderr says it failed.
-            failed: dict[str, str] = {
-                item.get("Key", ""): item.get("Code", "delete failed")
-                for item in response.get("Errors", [])
+            # Per-key failures (Object Lock, a per-object policy): with Quiet=True
+            # only failures come back, so a key absent from Errors was deleted -
+            # emit its delete: line only then, never eagerly (that would claim a
+            # failed key was deleted while stderr says it failed).
+            requested = {self._api_key(rel) for rel in batch}
+            error_items = response.get("Errors", [])
+            unattributable = [item for item in error_items if item.get("Key") not in requested]
+            if unattributable:
+                # An error with a missing or unknown Key cannot be tied to a
+                # requested key, so we cannot prove ANY key in this batch was
+                # deleted. Fail the whole batch rather than report a phantom
+                # success: a false success would drop the manifest record (the
+                # caller stops before publishing on a non-zero result) while the
+                # object survives on S3 as an unrecorded orphan.
+                detail = "; ".join(
+                    str(item.get("Message") or item.get("Code") or "delete failed")
+                    for item in unattributable
+                )
+                for rel in batch:
+                    errors.append(f"{self._s3_url(rel)}: delete failed ({detail})")
+                batch.clear()
+                return
+            # Every remaining error is attributable (its Key is a requested key).
+            failed = {
+                key: item.get("Code", "delete failed")
+                for item in error_items
+                if (key := item.get("Key")) is not None
             }
             for rel in batch:
                 code = failed.get(self._api_key(rel))
