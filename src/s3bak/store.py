@@ -216,41 +216,63 @@ class Boto3S3Store:
         so printing straight from on_result - which runs on s3transfer worker
         threads - is safe; `results` (the SUCCEEDED/DRYRUN count) still needs
         its own lock since the increment itself is not.
+
+        s3transfer calls on_result as a transfer's "done" callback and, in its
+        own futures.py (`_run_callback`), catches any exception the callback
+        raises and only logs it at debug level - it never propagates past
+        s3transfer. A closed stdout (``s3bak push data | head``) makes
+        write_output raise BrokenPipeError, which would otherwise vanish
+        right there: the documented exit 141 would silently become 0, and
+        the transfer would look complete (post_hook would even run) though
+        nothing after the closed pipe was ever reported. So on_result catches
+        BrokenPipeError itself, remembers it in `broken_pipe`, and this
+        method re-raises it once `op` returns - after the transfer/delete
+        engine has actually finished, same as the pre-streaming code (which
+        raised BrokenPipeError from its post-sync print, once `op` had
+        already completed) so a concurrent Boto3S3Error never masks it.
         """
         from boto3_s3 import Boto3S3Error, OpOutcome, TransferType
 
         if verbose:
             write_stderr(f"+ (boto3-s3) {label}\n")
         results = 0
+        broken_pipe = False
         lock = threading.Lock()
 
         def on_result(r: OpResult) -> None:
-            nonlocal results
-            if r.outcome in (OpOutcome.SUCCEEDED, OpOutcome.DRYRUN):
-                pre = "(dry-run) " if r.outcome is OpOutcome.DRYRUN else ""
-                if r.transfer_type is TransferType.DELETE:
-                    # A delete record's src is the display endpoint
-                    # (s3://bucket/key), matching aws-cli's delete line.
-                    line = f"{pre}delete: {r.src}"
-                elif r.src is not None and r.dest is not None:
-                    line = f"{pre}{r.transfer_type.value}: {r.src} to {r.dest}"
-                else:
-                    return
-                write_output(f"{line}\n")
-                with lock:
-                    results += 1
-            elif r.outcome is OpOutcome.FAILED:
-                write_stderr(f"{r.compare_key}: {r.error}\n")
-            elif r.outcome is OpOutcome.WARNED:
-                note_warning(
-                    f"warning: {r.error}" if r.error else f"warning: skipped {r.compare_key}"
-                )
-            elif r.outcome is OpOutcome.NOTICE:
-                if r.error:
-                    write_stderr(f"{r.error}\n")
-            # CANCELLED (a fatal elsewhere revoked the item) is dropped, like
-            # aws-cli, which omits cancelled items from its output; the fatal
-            # itself surfaces through the Boto3S3Error the operation raises.
+            nonlocal results, broken_pipe
+            try:
+                if r.outcome in (OpOutcome.SUCCEEDED, OpOutcome.DRYRUN):
+                    pre = "(dry-run) " if r.outcome is OpOutcome.DRYRUN else ""
+                    if r.transfer_type is TransferType.DELETE:
+                        # A delete record's src is the display endpoint
+                        # (s3://bucket/key), matching aws-cli's delete line.
+                        line = f"{pre}delete: {r.src}"
+                    elif r.src is not None and r.dest is not None:
+                        line = f"{pre}{r.transfer_type.value}: {r.src} to {r.dest}"
+                    else:
+                        return
+                    # Count before printing: the transfer already happened, so
+                    # the tally must stand even if the print below is what
+                    # discovers the broken pipe.
+                    with lock:
+                        results += 1
+                    write_output(f"{line}\n")
+                elif r.outcome is OpOutcome.FAILED:
+                    write_stderr(f"{r.compare_key}: {r.error}\n")
+                elif r.outcome is OpOutcome.WARNED:
+                    note_warning(
+                        f"warning: {r.error}" if r.error else f"warning: skipped {r.compare_key}"
+                    )
+                elif r.outcome is OpOutcome.NOTICE:
+                    if r.error:
+                        write_stderr(f"{r.error}\n")
+                # CANCELLED (a fatal elsewhere revoked the item) is dropped,
+                # like aws-cli, which omits cancelled items from its output;
+                # the fatal itself surfaces through the Boto3S3Error the
+                # operation raises.
+            except BrokenPipeError:
+                broken_pipe = True
 
         try:
             op(on_result)
@@ -258,6 +280,8 @@ class Boto3S3Store:
         except Boto3S3Error as e:
             rc = 1
             write_stderr(f"{e}\n")
+        if broken_pipe:
+            raise BrokenPipeError
         return TransferResult(returncode=rc, results=results)
 
     # --- Public API --------------------------------------------------------

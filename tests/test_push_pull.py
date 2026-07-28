@@ -503,6 +503,44 @@ def test_push_with_unreadable_file_warns_and_exits_2(ws, monkeypatch):
     assert "data/bad.txt" not in ws.keys()
 
 
+def test_push_broken_pipe_from_transfer_output_maps_to_141(ws, monkeypatch):
+    # F1 regression: on_result runs as s3transfer's "done" callback, and
+    # s3transfer's own futures.py wraps that callback in a bare `except
+    # Exception` that only logs - it never re-raises. Without _transfer's own
+    # catch/reraise, a closed stdout during a transfer (`s3bak push data |
+    # head -n 0`) would make write_output's BrokenPipeError vanish inside
+    # s3transfer instead of surfacing: the run would look like a clean
+    # success (exit 0) instead of the documented exit 141, like the
+    # sigpipe-mapping tests below (test_run_diff_maps_sigpipe_to_broken_pipe
+    # in test_status_diff.py) already cover for the diff child process.
+    import signal
+
+    from s3bak import cli
+    from s3bak import store as store_mod
+
+    ws.write("data/a.txt", "alpha")
+    ws.write("data/b.txt", "beta")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+
+    def broken_write_output(text: str) -> None:
+        raise BrokenPipeError
+
+    monkeypatch.setattr(store_mod, "write_output", broken_write_output)
+    monkeypatch.setattr("sys.argv", ["s3bak", "push", "data"])
+    saved = signal.getsignal(signal.SIGINT)
+    try:
+        rc = cli.run()
+    finally:
+        signal.signal(signal.SIGINT, saved)
+
+    assert rc == 141
+    # The uploads themselves ran to completion before their result line's
+    # print discovered the broken pipe - only the reporting was lost, not the
+    # transfer.
+    assert "data/a.txt" in ws.keys()
+    assert "data/b.txt" in ws.keys()
+
+
 def test_pull_delete_removes_extra_symlink_to_dir(ws):
     ws.write("data/keep.txt", "k")
     ws.config({"data": {"path": str(ws.root / "data")}})
