@@ -112,7 +112,14 @@ known limits, as input for choosing what to back up:
   fails on such records. On a case-insensitive filesystem, two recorded paths
   that differ only by case land in one local file, the last download winning
   silently (the destination-overlap check guards distinct pull targets, not
-  paths within one entry).
+  paths within one entry). The same folding can also split ONE path between
+  the manifest and the local walk instead: a name-folding filesystem (case-
+  insensitive Windows/macOS, Win32's trailing dot/space trim, macOS NFC/NFD
+  Unicode normalization) can store a file under a different byte spelling
+  than the manifest recorded it under, so a fresh local walk reports it at
+  that other spelling. `pull --delete` recognizes this - the local name folds
+  onto the recorded one - and excludes it from removal with a warning rather
+  than treating it as an extra it just restored.
 - **A filename must be valid UTF-8 to become an S3 key.** POSIX exposes
   undecodable filename bytes as surrogate code points; the manifest can
   round-trip them, but the S3 request encoding cannot, so pushing such a name

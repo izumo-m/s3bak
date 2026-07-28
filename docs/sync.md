@@ -485,9 +485,16 @@ names).
   before their own directory - in the same ascending S3-key order as
   everything else, not one global deepest-first pass. Keeping an item
   silently keeps every extra directory still open above it too — their
-  `rmdir` could only fail — and is a choice, not a failure. A failed removal
-  makes the command fail instead of reporting a successful mirror while an
-  extra remains. The pass runs after the metadata apply and
+  `rmdir` could only fail — and is a choice, not a failure. A local name
+  that a name-folding filesystem (case-insensitive Windows/macOS, Win32's
+  trailing dot/space trim, macOS NFC/NFD Unicode normalization) may fold
+  onto a path the manifest records under a different spelling is excluded
+  from removal the same way, even though it does not itself match any
+  record byte-for-byte — it may be the very file the pull just restored
+  under its recorded spelling — and reported as a warning (exit 2) instead
+  of a delete line. A failed removal makes the command fail instead of
+  reporting a successful mirror while an extra remains. The pass runs after
+  the metadata apply and
   is skipped when that apply failed — extras diffed against a tree that is
   not in its recorded state are not trustworthy deletion candidates. Each
   removal bumps its parent directory's mtime, so when anything was removed

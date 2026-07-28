@@ -229,6 +229,28 @@ def test_pull_rejects_destinations_that_differ_only_by_case(ws):
     assert "inner" in res.err
 
 
+def test_pull_rejects_destinations_differing_only_by_trailing_dot(ws):
+    # Win32 drops a trailing dot (or space) from a path's final component, so
+    # ".../data" and ".../data." can land on the SAME directory there even
+    # though they are two different paths on POSIX (W-F4). The
+    # destination-overlap check folds it out on every platform (see
+    # restore.fs_alias_key), so this is caught here - not discovered as a
+    # live overlap the first time both entries run --delete.
+    ws.config(
+        {
+            "outer": {"path": str(ws.root / "data")},
+            "inner": {"path": str(ws.root / "data." / "sub")},
+        }
+    )
+
+    res = ws.run("pull", "outer", "inner")
+
+    assert res.rc == 1
+    assert "restore destinations overlap" in res.err.lower()
+    assert "outer" in res.err
+    assert "inner" in res.err
+
+
 def test_ls_remote_rejects_data_only(cfg_ws):
     res = cfg_ws.run("ls-remote", "--data-only")
     assert res.rc == 1

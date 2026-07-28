@@ -44,6 +44,7 @@ from s3bak.console import (
     IS_WINDOWS,
     echo_command,
     err,
+    is_junction,
     normalize_local_path,
     note_warning,
     write_output,
@@ -51,6 +52,7 @@ from s3bak.console import (
 )
 from s3bak.manifest import ManifestEntry
 from s3bak.restore import (
+    ExtraStreamItem,
     apply_manifest,
     local_keyed,
     manifest_keyed,
@@ -314,12 +316,12 @@ def _delete_exact_root_object(
 
 def _reject_symlinked_sub_ancestors(base: str, sub: str) -> str | None:
     """Return an error message if ``base`` itself or any ancestor of ``sub`` (the
-    components between ``base`` and the final one) is a symlink, other
-    non-directory, or otherwise inaccessible, else None. ``base`` is checked
-    first, then each ancestor shallowest-first, so the outermost symlink is
-    caught before any lstat resolves through it - including a relocated entry
-    root (``base`` a symlink), through which `pull entry/file` would otherwise
-    write outside the entry.
+    components between ``base`` and the final one) is a symlink, a Windows
+    directory junction, another non-directory, or otherwise inaccessible, else
+    None. ``base`` is checked first, then each ancestor shallowest-first, so
+    the outermost symlink is caught before any lstat resolves through it -
+    including a relocated entry root (``base`` a symlink), through which
+    `pull entry/file` would otherwise write outside the entry.
 
     A *genuinely missing* component (ENOENT) is not an error (no local state to
     read, nothing resolves through it; the caller's own existence checks and the
@@ -339,9 +341,13 @@ def _reject_symlinked_sub_ancestors(base: str, sub: str) -> str | None:
             return None
         except OSError as e:
             return f"cannot access sub path ancestor {path}: {e}"
+        # A junction lstats as an ordinary directory (Windows does not model
+        # it as a symlink), so it needs its own check alongside S_ISLNK -
+        # otherwise it would sail through as if it were a real directory.
+        if stat_mod.S_ISLNK(st.st_mode) or is_junction(st):
+            return f"sub path crosses a symlink or junction ancestor, not allowed: {path}"
         if not stat_mod.S_ISDIR(st.st_mode):
-            kind = "a symlink" if stat_mod.S_ISLNK(st.st_mode) else "a non-directory"
-            return f"sub path crosses {kind} ancestor, not allowed: {path}"
+            return f"sub path crosses a non-directory ancestor, not allowed: {path}"
     # The ancestors are accessible directories; probe the final target too (its
     # type is unrestricted). This catches a deepest ancestor that lstat'd fine
     # but is itself unsearchable (mode 000), whose EACCES would otherwise only
@@ -1140,6 +1146,11 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         swap_done = False  # the old root was moved aside AND the new root swapped in
         replaced_root: str | None = None  # where the swapped-out old root now lives
         prep: list[tuple[str, int]] = []
+        # True once something has already re-applied the recorded mode over
+        # every prepped path (a clean apply_manifest does this itself, as an
+        # ordinary part of the repair) - so the outer finally's restore below
+        # is skipped there and only fires on a path that never got that far.
+        prep_repaired = False
         if has_data and not opts.meta_only and os.path.lexists(outpath):
             if is_dir:
                 conflict = os.path.islink(outpath) or not os.path.isdir(outpath)
@@ -1206,8 +1217,8 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                     if isinstance(compare, manifest.ManifestFilter):
                         compare.close()
                 if rc != 0:
-                    if IS_WINDOWS:
-                        windows_restore_modes(prep)
+                    # The Windows writable prep is restored by the outer
+                    # finally below, whichever way this function now returns.
                     return rc
                 if stage_dir is not None:
                     # The download is complete: swap in two atomic renames with
@@ -1242,11 +1253,10 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             #    time onto it, the file lane leaves the write time) and gets its
             #    recorded mtime back; a stamp landing inside the mtime window is a
             #    match and stays, like any other within-window drift. The gate also
-            #    re-applies the recorded modes over the writable prep - no separate
-            #    restore needed. Skipped with --data-only.
+            #    re-applies the recorded modes over the writable prep on success -
+            #    the outer finally below covers every other case. Skipped with
+            #    --data-only, which never touches the prep itself either way.
             if opts.data_only:
-                if IS_WINDOWS and not opts.meta_only:
-                    windows_restore_modes(prep)
                 # --data-only skips apply_manifest, so run its presence+size
                 # integrity check directly - but only after a real download (a
                 # dry run placed nothing; a symlink/special sub has no data).
@@ -1274,6 +1284,15 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                     excludes=excludes,
                     enforce_size=not opts.meta_only,
                 )
+                if st == 0:
+                    # A clean apply already re-chmod'd every prepped path to its
+                    # recorded mode (the write bit prep added made it mismatch
+                    # its record, so apply_manifest corrected it) - nothing left
+                    # for the outer finally to do. A failure can leave one
+                    # unrepaired (its own record's apply bailed out before
+                    # reaching the chmod, e.g. a missing file or a failed
+                    # symlink placement), so only then does it still apply.
+                    prep_repaired = True
 
             if not opts.meta_only and opts.delete and is_dir:
                 if st != 0:
@@ -1307,10 +1326,11 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             return st
         except BaseException:
             # An exception (S3 error, local I/O, SIGINT) skips the normal
-            # mode-restoring exits; put the Windows writable prep back before it
-            # propagates. If the old root was moved into the stage (even mid-swap,
-            # before the assignment completed), keep it - the finally below only
-            # removes a stage that is NOT holding the stranded old root.
+            # return paths; the outer finally below still restores the Windows
+            # writable prep, and runs before this propagates. If the old root
+            # was moved into the stage (even mid-swap, before the assignment
+            # completed), keep it - the finally's stage cleanup only removes a
+            # stage that is NOT holding the stranded old root.
             if replaced_root is not None:
                 stage_holds_old_root = True
                 if os.path.lexists(replaced_root):
@@ -1318,10 +1338,17 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                         f"{entry}: pull failed after replacing {outpath};"
                         f" the previous {outpath} is preserved at {replaced_root}"
                     )
-            if IS_WINDOWS:
-                windows_restore_modes(prep)
             raise
         finally:
+            # Put every prepped path back to its original mode on every exit
+            # this function did not already resolve on its own (download
+            # failure, --data-only, a failed apply_manifest, an early
+            # conflict-clearing return, or an exception) - never after a clean
+            # apply, which already re-chmod'd them itself (prep_repaired,
+            # above). This is the one place that restores the prep, so it can
+            # never double up with another restore.
+            if IS_WINDOWS and not prep_repaired:
+                windows_restore_modes(prep)
             if stage_dir is not None:
                 # Preserve the stage ONLY while it actually holds the stranded old
                 # root (the swap did not cleanly retire or roll it back); on
@@ -1366,10 +1393,15 @@ def _delete_extras(
     non-interactive run without --yes answers no, i.e. removes nothing).
     Returns ``(status, removals)``.
 
-    The local-only lane of the merge-join streams straight into
-    ``remove_extras`` (never materialized as a list), which settles the
-    post-order removal itself with an ancestor stack - memory bounded by the
-    depth of directories currently open, not by how many extras exist."""
+    Both lanes of the merge-join - local-only (removal candidates) and
+    manifest-only (the alias markers ``remove_extras`` needs to recognize a
+    local name a name-folding filesystem may only coincidentally not
+    byte-match a recorded sibling; see W-F3 in restore.remove_extras) -
+    stream straight into ``remove_extras`` (never materialized as a list),
+    already in the ascending order the SAME merge-join loop produces them,
+    which settles the post-order removal itself with an ancestor stack -
+    memory bounded by the depth of directories currently open, not by how
+    many extras exist."""
     confirmer: DeleteConfirmer | None = None
     if not opts.dryrun:
         mode = resolve_answer_mode(yes=opts.yes)
@@ -1378,14 +1410,20 @@ def _delete_extras(
         if mode is AnswerMode.ASK:
             confirmer = DeleteConfirmer(mode, entry)
 
-    def extras() -> Iterator[tuple[str, str, bool]]:
+    def extras() -> Iterator[ExtraStreamItem]:
         for _key, m, loc in manifest.merge_join(
             manifest_keyed(manifest_path, sub), local_keyed(outpath, excludes, sub)
         ):
             if m is None and loc is not None:
                 rel, st, _sym = loc
                 if rel != ".":
-                    yield rel, os.path.join(outpath, rel), stat_mod.S_ISDIR(st.st_mode)
+                    yield ExtraStreamItem(
+                        rel, True, os.path.join(outpath, rel), stat_mod.S_ISDIR(st.st_mode)
+                    )
+            elif loc is None and m is not None:
+                rel, _entry = m
+                if rel != ".":
+                    yield ExtraStreamItem(rel, False)
 
     errors, removed = remove_extras(extras(), dryrun=opts.dryrun, confirm=confirmer)
     return (1 if errors else 0), removed
@@ -1566,7 +1604,9 @@ def _run_diff(left: str, right: str, label: str, opts: Opts) -> int:
     )
     echo_command(opts.verbose, cmd)
     rc = subprocess.run(cmd).returncode
-    if rc == -signal.SIGPIPE:
+    # signal.SIGPIPE does not exist on Windows, and this check is evaluated
+    # unconditionally regardless of rc, so guard on platform before touching it.
+    if not IS_WINDOWS and rc == -signal.SIGPIPE:
         # The reader closed the pipe (e.g. `s3bak diff | head`): let run() map
         # this to the documented 141 instead of collapsing it to a plain 1.
         raise BrokenPipeError
@@ -1633,9 +1673,10 @@ def _ancestor_block_reason(root: str, rel: str) -> str | None:
     but excluding the final component) cannot be safely read through, or ``None``
     if it can:
 
-    - ``"structural"`` - a symlink or non-directory ancestor would redirect the
-      read to a file the record does not describe (an entry-outside target in the
-      worst case). This is a local type change, not a backup defect.
+    - ``"structural"`` - a symlink, a Windows directory junction, or another
+      non-directory ancestor would redirect the read to a file the record does
+      not describe (an entry-outside target in the worst case). This is a
+      local type change, not a backup defect.
     - ``"inaccessible"`` - an ancestor could not be stat'd (EACCES/ELOOP), so
       reachability is undeterminable and the content simply cannot be read.
 
@@ -1653,7 +1694,10 @@ def _ancestor_block_reason(root: str, rel: str) -> str | None:
             return None
         except OSError:
             return "inaccessible"
-        if not stat_mod.S_ISDIR(st.st_mode):
+        # A junction lstats as an ordinary directory (Windows does not model
+        # it as a symlink); without this check it would pass the S_ISDIR test
+        # below as if it were a real directory.
+        if not stat_mod.S_ISDIR(st.st_mode) or is_junction(st):
             return "structural"
     return None
 

@@ -519,3 +519,21 @@ def test_run_diff_maps_sigpipe_to_broken_pipe(monkeypatch):
     )
     with pytest.raises(BrokenPipeError):
         commands._run_diff("a", "b", "label", Opts())
+
+
+def test_run_diff_on_windows_does_not_touch_sigpipe(monkeypatch):
+    # signal.SIGPIPE does not exist on Windows. Simulate that by both flipping
+    # IS_WINDOWS and removing the attribute, so a fix that merely reorders the
+    # check without actually branching on IS_WINDOWS still raises AttributeError
+    # here and fails the test.
+    from s3bak import commands
+    from s3bak.config import Opts
+
+    monkeypatch.setattr(commands, "IS_WINDOWS", True)
+    monkeypatch.delattr(signal, "SIGPIPE", raising=False)
+    monkeypatch.setattr(
+        commands.subprocess,
+        "run",
+        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0),
+    )
+    assert commands._run_diff("a", "b", "label", Opts()) == 0

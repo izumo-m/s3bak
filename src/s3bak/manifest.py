@@ -302,6 +302,19 @@ def validate_manifest(manifest_path: str) -> str:
                     f"manifest path component contains a backslash,"
                     f" unrestorable on Windows: {entry.path!r}"
                 )
+            # A component like "C:" is an ordinary POSIX filename but a
+            # Windows drive spec; os.path.join drops every earlier segment
+            # once it reaches one (cli.py's sub-path resolution rejects the
+            # same shape on CLI input, via the same os.path.splitdrive check,
+            # for the same reason), so a restore would discard the restore
+            # root entirely and land at the drive-qualified path instead. Fail
+            # closed there before any transfer; on POSIX os.path.splitdrive is
+            # identity, so this is a no-op, like the backslash check above.
+            if os.name == "nt" and any(os.path.splitdrive(part)[0] for part in parts):
+                raise ManifestError(
+                    f"manifest path component is drive-qualified,"
+                    f" unrestorable on Windows: {entry.path!r}"
+                )
             parent = tuple(parts[:-1])
             while directory_stack and len(directory_stack[-1]) > len(parent):
                 directory_stack.pop()

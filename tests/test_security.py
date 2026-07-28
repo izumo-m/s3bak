@@ -360,6 +360,38 @@ def test_validate_rejects_backslash_path_component_on_windows(ws, monkeypatch):
     assert not (ws.root / "out_win").exists()  # failed closed before any transfer
 
 
+def test_validate_rejects_drive_qualified_path_component_on_windows(ws, monkeypatch):
+    # "C:" is a legal POSIX filename component but a Windows drive spec; a
+    # record like "./C:/win.ini" makes os.path.join drop the restore root
+    # entirely and land at the drive-qualified path instead (the same shape
+    # cli.py's sub-path resolution already rejects on CLI input). Validation
+    # must accept it on POSIX and fail closed on Windows.
+    import ntpath
+
+    from s3bak import manifest
+
+    _put_manifest(
+        ws,
+        "data",
+        [_line("40755", "."), _line("40755", "./C:"), _line("100644", "./C:/win.ini", size=1)],
+    )
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/C:/win.ini", Body=b"x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+
+    ws.run("pull", "data", "-o", str(ws.root / "out_posix"), expect_rc=0)  # legal on POSIX
+
+    monkeypatch.setattr(manifest.os, "name", "nt")  # simulate Windows
+    # os.path is resolved to posixpath at interpreter startup on this (real
+    # POSIX) test host, so os.name alone does not make os.path.splitdrive
+    # behave like Windows; swap in ntpath's (platform-independent, pure
+    # string logic) implementation for the duration of this simulation.
+    monkeypatch.setattr(manifest.os.path, "splitdrive", ntpath.splitdrive)
+    res = ws.run("pull", "data", "-o", str(ws.root / "out_win"))
+    assert res.rc == 1
+    assert "drive" in res.err.lower()
+    assert not (ws.root / "out_win").exists()  # failed closed before any transfer
+
+
 def test_pull_handles_unrepresentable_mtime_ns(ws):
     # A damaged manifest with an out-of-range mtime_ns must fail cleanly (exit 1),
     # not crash pull with an uncaught OverflowError from os.utime.
@@ -553,7 +585,8 @@ def test_remove_extras_reports_deletion_failure(tmp_path, monkeypatch, capfd):
 
     monkeypatch.setattr(restore.os, "remove", fail_remove)
 
-    assert restore.remove_extras(iter([("extra.txt", str(extra), False)])) == (1, 0)
+    item = restore.ExtraStreamItem("extra.txt", True, str(extra), False)
+    assert restore.remove_extras(iter([item])) == (1, 0)
     assert extra.exists()
     assert "delete failed" in capfd.readouterr().err
 
@@ -614,3 +647,159 @@ def test_pull_resettles_directory_mtime_after_symlink_replaces_nested_dir(ws):
     assert (dest / "sub" / "link").is_symlink()
     assert not stale.exists()
     assert os.lstat(dest / "sub").st_mtime_ns == SUB_MTIME_NS
+
+
+# --- filesystem-alias defenses (W-F3 / W-F4) --------------------------------
+#
+# A name-folding filesystem (Windows/macOS case-insensitive, Win32's trailing
+# dot/space trim, macOS NFC/NFD) can make one physical file answer to two
+# byte-different spellings. W-F4 is the destination-overlap guard missing one
+# such fold; W-F3 is pull --delete treating the resulting manifest/local
+# spelling split as an extra it just restored. Linux cannot host a real
+# folding filesystem, so these tests pin restore.fs_alias_key itself (the
+# folding rule) and drive restore.remove_extras directly with a hand-built
+# stream shaped like what a folding filesystem's merge-join would produce -
+# exactly what the module comment above remove_extras says a real repro
+# would need.
+
+
+def test_fs_alias_key_folds_case_dot_space_and_unicode_normalization():
+    # Case-insensitive filesystems (Windows, default macOS).
+    assert restore.fs_alias_key("Report.txt") == restore.fs_alias_key("report.txt")
+    # Win32 drops a trailing dot/space from a path's final component.
+    assert restore.fs_alias_key("report.") == restore.fs_alias_key("report")
+    assert restore.fs_alias_key("name ") == restore.fs_alias_key("name")
+    assert restore.fs_alias_key("name. . ") == restore.fs_alias_key("name")
+    # macOS normalizes filenames to NFD; a manifest written on a NFC-producing
+    # platform (most of POSIX) must still fold onto the NFD spelling.
+    nfc = "café"  # "é" as one code point
+    nfd = "café"  # "e" + combining acute accent
+    assert restore.fs_alias_key(nfc) == restore.fs_alias_key(nfd)
+
+
+def test_fs_alias_key_does_not_collide_unrelated_names():
+    assert restore.fs_alias_key("report.txt") != restore.fs_alias_key("reports.txt")
+    assert restore.fs_alias_key("a") != restore.fs_alias_key("b")
+
+
+def test_canonical_restore_comparison_path_folds_trailing_dot_on_final_component(tmp_path):
+    a = str(tmp_path / "data")
+    b = str(tmp_path / "data.")
+    assert restore.canonical_restore_comparison_path(
+        a
+    ) == restore.canonical_restore_comparison_path(b)
+
+
+def test_canonical_restore_comparison_path_folds_dot_on_an_intermediate_component(tmp_path):
+    # W-F4: the guard must not only special-case the LAST component - a
+    # Win32 path creation drops a trailing dot/space from every component it
+    # creates, not only the final one.
+    a = str(tmp_path / "data" / "sub")
+    b = str(tmp_path / "data." / "sub")
+    assert restore.canonical_restore_comparison_path(
+        a
+    ) == restore.canonical_restore_comparison_path(b)
+
+
+def test_canonical_restore_comparison_path_distinguishes_unrelated_paths(tmp_path):
+    a = str(tmp_path / "data")
+    b = str(tmp_path / "other")
+    assert restore.canonical_restore_comparison_path(
+        a
+    ) != restore.canonical_restore_comparison_path(b)
+
+
+def test_remove_extras_keeps_local_extra_aliased_by_a_later_manifest_only_record(tmp_path, capfd):
+    # W-F3, alias sorting AFTER the extra: "report." (manifest) sorts after
+    # "report" (local) - a short string sorts before one it prefixes. Unless
+    # the decision is deferred to the pop of the enclosing directory, the
+    # extra would be judged (and removed) before its alias partner is ever
+    # seen.
+    report = tmp_path / "a" / "report"
+    report.parent.mkdir()
+    report.write_text("restored content")
+
+    items = [
+        restore.ExtraStreamItem("a/report", True, str(report), False),
+        restore.ExtraStreamItem("a/report.", False),
+    ]
+    errors, removed = restore.remove_extras(iter(items))
+
+    assert (errors, removed) == (0, 0)
+    assert report.exists()
+    err = capfd.readouterr().err
+    assert "warning" in err.lower()
+    assert "not removed" in err.lower()
+
+
+def test_remove_extras_keeps_local_extra_aliased_by_an_earlier_manifest_only_record(
+    tmp_path, capfd
+):
+    # W-F3, alias sorting BEFORE the extra: "B.txt" (manifest) sorts before
+    # "b.txt" (local) - uppercase sorts before lowercase in byte order.
+    b = tmp_path / "a" / "b.txt"
+    b.parent.mkdir()
+    b.write_text("restored content")
+
+    items = [
+        restore.ExtraStreamItem("a/B.txt", False),
+        restore.ExtraStreamItem("a/b.txt", True, str(b), False),
+    ]
+    errors, removed = restore.remove_extras(iter(items))
+
+    assert (errors, removed) == (0, 0)
+    assert b.exists()
+    err = capfd.readouterr().err
+    assert "warning" in err.lower()
+    assert "not removed" in err.lower()
+
+
+def test_remove_extras_still_removes_an_unaliased_extra_next_to_a_manifest_only_record(
+    tmp_path, capfd
+):
+    # An unrelated manifest-only record in the same directory (an ordinary
+    # local deletion the manifest still remembers) must not make the alias
+    # check over-conservative: a local-only name that does NOT fold onto it
+    # is removed exactly as before.
+    extra = tmp_path / "a" / "unrelated.txt"
+    extra.parent.mkdir()
+    extra.write_text("delete me")
+
+    items = [
+        restore.ExtraStreamItem("a/deleted-elsewhere.txt", False),
+        restore.ExtraStreamItem("a/unrelated.txt", True, str(extra), False),
+    ]
+    errors, removed = restore.remove_extras(iter(items))
+
+    assert (errors, removed) == (0, 1)
+    assert not extra.exists()
+    assert "not removed" not in capfd.readouterr().err.lower()
+
+
+def test_remove_extras_regression_nested_post_order_still_removes_plain_extras(tmp_path, capfd):
+    # No manifest-only records at all here - a plain regression check that
+    # ordinary (non-aliased) extras are still removed, deepest-first within
+    # each subtree, exactly as before this fix.
+    (tmp_path / "extradir" / "sub").mkdir(parents=True)
+    deep = tmp_path / "extradir" / "sub" / "deep.txt"
+    deep.write_text("d")
+    zzz = tmp_path / "zzz.txt"
+    zzz.write_text("z")
+
+    items = [
+        restore.ExtraStreamItem("extradir", True, str(tmp_path / "extradir"), True),
+        restore.ExtraStreamItem("extradir/sub", True, str(tmp_path / "extradir" / "sub"), True),
+        restore.ExtraStreamItem("extradir/sub/deep.txt", True, str(deep), False),
+        restore.ExtraStreamItem("zzz.txt", True, str(zzz), False),
+    ]
+    errors, removed = restore.remove_extras(iter(items))
+
+    assert (errors, removed) == (0, 4)
+    out = capfd.readouterr().out
+    deletes = [ln.removeprefix("delete: ") for ln in out.splitlines() if ln.startswith("delete: ")]
+    assert deletes == [
+        str(deep),
+        str(tmp_path / "extradir" / "sub"),
+        str(tmp_path / "extradir"),
+        str(zzz),
+    ]

@@ -17,12 +17,12 @@ import stat as stat_mod
 import tempfile
 import unicodedata
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from s3bak import localwalk, manifest
 from s3bak.compare import SYMLINK_MTIME_SUPPORTED, compare_to_stat
 from s3bak.confirm import DeleteConfirmer
-from s3bak.console import err, write_output
+from s3bak.console import IS_WINDOWS, err, is_junction, note_warning, write_output
 from s3bak.manifest import ManifestEntry
 
 # =============================================================================
@@ -66,10 +66,39 @@ def canonical_restore_path(path: str) -> str:
     return os.path.normcase(resolved)
 
 
+def fs_alias_key(name: str) -> str:
+    """Fold one path COMPONENT (a single basename, never a full path) into
+    the form under which a name-folding filesystem could confuse it with a
+    differently-spelled sibling: NFD-normalize, casefold, and strip trailing
+    dots/spaces.
+
+    All three folds are applied unconditionally, on every platform, not only
+    where the corresponding filesystem behaviour actually lives (casefold
+    for a case-insensitive filesystem; the dot/space strip for Win32, which
+    drops them from a path's final component): every caller wants a
+    conservative "these COULD be confused for one another" identity, and
+    over-folding on a platform where a given fold does not apply only makes
+    the check more conservative, never wrong - the same reasoning that
+    already applies NFD/casefold everywhere below.
+
+    Shared by ``canonical_restore_comparison_path`` (reject overlapping pull
+    destinations) and ``remove_extras`` (recognize a local extra that a
+    name-folding filesystem may only coincidentally not match its manifest
+    spelling, so ``pull --delete`` does not remove what it just restored)."""
+    return unicodedata.normalize("NFD", name.rstrip(". ")).casefold()
+
+
 def canonical_restore_comparison_path(path: str) -> str:
-    """Conservative identity used to reject possibly overlapping restores."""
+    """Conservative identity used to reject possibly overlapping restores.
+
+    Folds every path COMPONENT with ``fs_alias_key`` - not just the whole
+    string - so two destinations a name-folding filesystem might collapse
+    onto one path (differing only by case, Unicode normalization, or a
+    Win32-trimmed trailing dot/space on any component, not only the last
+    one) compare equal here, even on a platform where the fold does not
+    actually apply (see ``fs_alias_key``)."""
     canonical = canonical_restore_path(path)
-    return unicodedata.normalize("NFD", canonical).casefold()
+    return os.sep.join(fs_alias_key(part) for part in canonical.split(os.sep))
 
 
 def resolve_manifest_rel(rel_field: str, sub: str | None) -> str | None:
@@ -120,15 +149,17 @@ def within_root(root_real: str, target: str) -> bool:
 
 
 def prepare_dir_conflicts(outpath: str, manifest_path: str, sub: str | None) -> int:
-    """Replace a local symlink sitting where the manifest records a directory,
-    BEFORE the data sync runs: the sync opens ``dir/file`` paths through
-    whatever is at ``dir``, so a pre-existing symlink there would route the
-    downloads outside the restore tree. The metadata apply would repair the
-    type anyway - this makes the repair happen before any bytes move. Other
-    conflicting types stay untouched here: a write through a regular file
-    fails loudly instead of escaping, and apply_manifest settles it after the
-    download. Symlinks are removed as links, never followed. Returns the
-    number of conflicts that could not be cleared (each reported)."""
+    """Replace a local symlink or Windows directory junction sitting where the
+    manifest records a directory, BEFORE the data sync runs: the sync opens
+    ``dir/file`` paths through whatever is at ``dir``, so a pre-existing
+    symlink or junction there would route the downloads outside the restore
+    tree. The metadata apply would repair the type anyway - this makes the
+    repair happen before any bytes move. Other conflicting types stay
+    untouched here: a write through a regular file fails loudly instead of
+    escaping, and apply_manifest settles it after the download. A symlink is
+    removed as a link, never followed; a junction is removed the way Windows
+    requires (as an empty directory, since it is not a symlink there). Returns
+    the number of conflicts that could not be cleared (each reported)."""
     errors = 0
     root_real = canonical_restore_path(outpath)
     for entry in manifest.iter_manifest(manifest_path):
@@ -139,19 +170,29 @@ def prepare_dir_conflicts(outpath: str, manifest_path: str, sub: str | None) -> 
             continue  # the pull corrects the restore root itself
         target = os.path.join(outpath, rel)
         # Records arrive parents-first, so by the time a child is checked its
-        # ancestors are real directories and one islink test per record is
-        # enough (a link behind a fixed parent cannot survive to this point).
-        if not os.path.islink(target):
+        # ancestors are real directories and one lstat per record is enough (a
+        # link or junction behind a fixed parent cannot survive to this point).
+        try:
+            st = os.lstat(target)
+        except OSError:
+            continue
+        is_symlink = stat_mod.S_ISLNK(st.st_mode)
+        # A junction lstats as an ordinary directory (Windows does not model
+        # it as a symlink), so it needs its own check alongside S_ISLNK.
+        if not is_symlink and not is_junction(st):
             continue
         if not within_root(root_real, target):
             err(f"manifest path escapes restore root, skipped: {entry.path}")
             errors += 1
             continue
         try:
-            os.remove(target)
+            if is_symlink:
+                os.remove(target)
+            else:
+                os.rmdir(target)  # a junction is removed like an (empty) directory
             os.makedirs(target, exist_ok=True)
         except OSError as e:
-            err(f"cannot replace symlink with recorded directory: {target}: {e}")
+            err(f"cannot replace symlink or junction with recorded directory: {target}: {e}")
             errors += 1
     return errors
 
@@ -159,21 +200,28 @@ def prepare_dir_conflicts(outpath: str, manifest_path: str, sub: str | None) -> 
 def windows_collect_writable_prep(
     outpath: str, is_dir: bool, manifest_path: str, sub: str | None
 ) -> list[tuple[str, int]]:
-    # Windows only. Walk the manifest, find existing local files that are:
-    #   - regular files (not dir / not symlink)
+    # Windows only. Walk EVERY manifest record - not just regular-file
+    # records - and prep any existing LOCAL path that is:
+    #   - a regular file (not dir / not symlink)
     #   - read-only (owner write bit clear)
-    # Temporarily add owner-write so `boto3-s3 sync`/`cp` can overwrite them.
-    # Every read-only file is prepped, not just size+mtime-check failures: the
-    # sync's copy decision can be broader than the local size+mtime check (remote
-    # size drift; any content difference under --checksum), and prep must
-    # never under-approximate what the sync may overwrite. apply_manifest
-    # re-applies the recorded modes afterwards (or windows_restore_modes on
-    # the failure/--data-only paths). Returns [(path, original_mode), ...].
+    # What needs prepping is decided by the LOCAL state, never by what the
+    # record itself says belongs there: apply clears a conflicting local type
+    # before writing the recorded one (os.remove + makedirs for a directory
+    # record, os.remove/os.replace via _place_symlink for a symlink record),
+    # and a read-only regular file blocks those calls with PermissionError
+    # exactly as it would block a same-type overwrite - so a directory or
+    # symlink record needs this walked too, whenever a read-only regular file
+    # happens to sit at its path. Every read-only file is prepped, not just
+    # size+mtime-check failures: the sync's copy decision can itself be
+    # broader than the local size+mtime check (remote size drift; any content
+    # difference under --checksum), and prep must never under-approximate
+    # what apply may need to overwrite, remove, or replace. Temporarily add
+    # owner-write so that can proceed; apply_manifest re-applies the recorded
+    # modes afterwards (or windows_restore_modes on the failure/--data-only
+    # paths). Returns [(path, original_mode), ...].
     targets: list[tuple[str, int]] = []
     try:
         for entry in manifest.iter_manifest(manifest_path):
-            if entry.sym_target is not None or not entry.is_file:
-                continue
             res = manifest_target(entry, outpath, is_dir, sub)
             if res is None:
                 continue
@@ -318,6 +366,15 @@ def _lstat_readlink(target: str) -> tuple[os.stat_result | None, str | None]:
     return st, local_sym
 
 
+def _resolve_symlink_target(target: str, sym_target: str) -> str:
+    """The filesystem path a recorded symlink's own target string names, for
+    probing what kind of thing it points at (file vs. directory). A relative
+    ``sym_target`` is resolved against the link's OWN parent - the same base
+    the OS itself would use once the link exists at ``target``."""
+    parent = os.path.dirname(target)
+    return sym_target if os.path.isabs(sym_target) else os.path.join(parent or ".", sym_target)
+
+
 def _place_symlink(
     target: str, st: os.stat_result | None, sym_target: str, mtime_ns: int | None
 ) -> bool:
@@ -340,7 +397,7 @@ def _place_symlink(
     parent = os.path.dirname(target)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    resolved = sym_target if os.path.isabs(sym_target) else os.path.join(parent or ".", sym_target)
+    resolved = _resolve_symlink_target(target, sym_target)
     is_dir_link = os.path.isdir(resolved)
 
     def _free_adjacent_name(suffix: str) -> str:
@@ -506,11 +563,31 @@ def _apply_record(
     this record; signaled back as ``defer_symlink=True`` so the caller flags
     the record's currently open parent frame (its stack top) for a
     post-placement re-settle, since that deferred placement dirties the
-    parent's mtime again after the stack has already settled it."""
+    parent's mtime again after the stack has already settled it. On Windows, a
+    symlink whose own recorded target does not exist locally yet is deferred
+    the same way - see the placement branch below."""
     if m_entry.sym_target is not None:
         if compare_to_stat(m_entry, st, local_sym, window_ns=window_ns).is_match:
             return _ApplyOutcome(0)
         if st is not None and stat_mod.S_ISDIR(st.st_mode):
+            deferred_symlinks.append((target, m_entry))
+            return _ApplyOutcome(0, defer_symlink=True)
+        if IS_WINDOWS and not os.path.exists(_resolve_symlink_target(target, m_entry.sym_target)):
+            # Windows distinguishes a file symlink from a directory symlink by
+            # a flag given at creation time, decided (like _place_symlink
+            # itself) from a probe of what the link's own recorded target
+            # resolves to. If that target has not been created yet - e.g. this
+            # symlink sorts before an empty directory (no S3 object of its
+            # own) that it points at, in manifest key order - the probe cannot
+            # tell file from directory, and guessing "file" would create a
+            # link that cannot be used as a directory. Defer to stream end,
+            # the same way a symlink replacing a local directory is deferred
+            # above: every manifest directory has been created (only its
+            # mode/mtime settle is deferred, never its makedirs) once the
+            # stream is fully consumed, so the probe is accurate there. This
+            # adds at most one deferred entry per symlink whose target is not
+            # yet resolvable - bounded the same way as the directory-conflict
+            # deferral above, never by tree size.
             deferred_symlinks.append((target, m_entry))
             return _ApplyOutcome(0, defer_symlink=True)
         return _ApplyOutcome(
@@ -596,7 +673,12 @@ def apply_manifest(
     since that placement can dirty its own parent directory's mtime again,
     the parent's frame is flagged at defer time and, instead of being settled
     at pop time, is queued to be re-settled once more after deferred symlinks
-    are placed.
+    are placed. On Windows, a symlink whose own recorded target does not
+    exist locally yet - e.g. it sorts before an empty directory it points at -
+    is deferred the same way, since only once every directory has been
+    created can the probe that picks a file vs. directory symlink be trusted;
+    this adds at most one deferred entry per such symlink, the same bounded
+    allowance as the directory-conflict deferral above.
 
     ``enforce_size`` (True after a real data sync) makes a regular file whose
     on-disk size differs from its record a hard error - the object does not
@@ -724,52 +806,120 @@ def apply_manifest(
 
 
 @dataclass
-class _ExtraFrame:
-    """One open extra directory on ``remove_extras``' ancestor stack, waiting
-    for the stream to leave its subtree before it is removed (or skipped, if
-    something inside it was kept)."""
+class ExtraStreamItem:
+    """One item on the stream ``remove_extras`` consumes: either a
+    local-only removal candidate (``is_extra=True``, ``path``/``is_dir``
+    set from the lstat) or a manifest-only marker (``is_extra=False``) that
+    only names a record the manifest holds at ``rel`` with no local
+    counterpart. The caller (``commands._delete_extras``) interleaves both
+    kinds straight out of the SAME merge-join loop, in one shared ascending
+    sort-key order, so no separate merge is needed here.
+
+    A manifest-only item exists purely so ``remove_extras`` can recognize a
+    local-only extra that a name-folding filesystem may only coincidentally
+    not byte-match a recorded sibling (W-F3: e.g. manifest ``Report.txt`` /
+    disk ``report.txt``) - it is never itself a removal candidate, so
+    ``path``/``is_dir`` are meaningless on it."""
 
     rel: str
-    path: str
+    is_extra: bool
+    path: str = ""
+    is_dir: bool = False
+
+
+@dataclass
+class _ExtraFrame:
+    """One open directory scope on ``remove_extras``' ancestor stack.
+
+    Two kinds share this type. ``is_extra_dir=True`` is an actual removal
+    candidate (a local-only directory absent from the manifest): ``path`` is
+    set, and the frame is popped and settled - removed, kept, or aliased -
+    like before. ``is_extra_dir=False`` is a lazily-pushed placeholder for an
+    ORDINARY (matched) directory that merely contains a tracked child: it is
+    never removed, but a leaf extra or a manifest-only marker still needs
+    somewhere to accumulate until the stream proves it has seen every one of
+    that directory's siblings - which, for a directory that is not itself an
+    extra, would otherwise never happen (it has no frame of its own in the
+    OLD stack, which only ever held extra directories). The bottom-of-stack
+    root frame (``rel="."``) is this same placeholder, permanently present
+    for items directly under the walked root; ``_is_ancestor(".", x)`` is
+    always true, so it only ever pops once, in the final flush.
+
+    ``alias_keys`` holds ``fs_alias_key(basename)`` for every manifest-only
+    record directly under this directory - the pop-time defense against
+    W-F3. ``pending`` holds this directory's own leaf (non-directory) local-
+    only extras, deferred here instead of decided on arrival: an alias
+    partner can sort on EITHER side of the extra within the same directory
+    (``B.txt`` before ``b.txt``, but ``report.`` after ``report``), so
+    whether one exists is only certain once the stream leaves the
+    directory - exactly when this frame pops."""
+
+    rel: str
+    is_extra_dir: bool
+    path: str = ""
     kept: bool = False
+    alias_keys: set[str] = field(default_factory=set)
+    pending: list[str] = field(default_factory=list)
 
 
 def remove_extras(
-    extras: Iterator[tuple[str, str, bool]],
+    extras: Iterator[ExtraStreamItem],
     *,
     dryrun: bool = False,
     confirm: DeleteConfirmer | None = None,
 ) -> tuple[int, int]:
-    """Remove local extras (pull ``--delete``): an ascending ``(rel, path,
-    is_dir)`` stream - the local-only lane of the status/--delete merge-join,
-    in S3 key order, ``rel`` sub-relative and root-free (the caller drops
-    "."). ``is_dir`` is the lstat kind, so a symlink - even one pointing at a
-    directory - is unlinked, never rmdir'd.
+    """Remove local extras (pull ``--delete``): an ascending
+    ``ExtraStreamItem`` stream - the local-only lane of the status/--delete
+    merge-join tagged with that same merge's manifest-only lane, in S3 key
+    order, ``rel`` sub-relative and root-free (the caller drops "."). A
+    local-only item's ``is_dir`` is the lstat kind, so a symlink - even one
+    pointing at a directory - is unlinked, never rmdir'd.
 
     A directory extra is not removed as it arrives - it is pushed onto an
     ancestor stack and popped (and only then removed) once the stream proves
     it has left that subtree (see the module comment above ``_is_ancestor``),
     which guarantees every removal inside a directory finishes before the
-    ``rmdir`` that needs it gone. Memory stays bounded by the depth of
-    directories currently open, not by the number of extras. Confirmation and
-    output order is therefore subtree by subtree - children before their own
-    directory - in the same ascending order as everything else, not one
-    global deepest-first pass. A removal failure (e.g. a non-empty directory
-    that lost a child to an exclude) is reported so a requested mirror
-    restore cannot return success while extras remain.
+    ``rmdir`` that needs it gone. A leaf extra is deferred the same way, to
+    the pop of its own immediate parent directory's frame - pushed lazily as
+    a placeholder if that parent is not itself an extra (see ``_ExtraFrame``)
+    - so a manifest-only sibling recorded under a spelling the local
+    filesystem folds onto the extra (case, NFC/NFD, a Win32-trimmed trailing
+    dot/space) is always seen before the extra is judged: such an extra is
+    NOT removed (it may be the file `pull` just restored under its recorded
+    spelling), a warning is printed (exit 2 via ``note_warning``), and no
+    confirmation is asked for it. This is a choice, not a failure - like a
+    kept item, it silently keeps every extra directory still open above it
+    too (their ``rmdir`` could only fail on a directory that still holds it).
+    Memory stays bounded by the depth of directories currently open, each
+    holding only that one directory's own pending extras and manifest-only
+    keys (the declared per-directory allowance, see docs/overview.md), not
+    by the number of extras or the size of the tree.
 
-    ``dryrun`` reports each candidate in the same order without removing it.
-    ``confirm`` asks per extra, in the same order; keeping an item silently
-    keeps every extra directory still open above it too (their ``rmdir``
-    could only fail) without asking - a kept item is a choice, not a failure.
-    An ``rmdir``/``remove`` failure does not extend to the item's still-open
-    ancestors (unlike a "no" answer): a directory's own ``rmdir`` reports its
-    own error rather than blaming its parent. Returns ``(failed_removals,
-    removals)`` - the second drives the caller's directory-metadata
-    re-settle, since every removal bumps its parent directory's mtime."""
+    Confirmation and output order is therefore subtree by subtree - children
+    before their own directory, and a directory's own leaf extras decided
+    together with it at its pop - in ascending key order between subtrees,
+    not one global deepest-first pass. A removal failure (e.g. a non-empty
+    directory that lost a child to an exclude) is reported so a requested
+    mirror restore cannot return success while extras remain.
+
+    ``dryrun`` reports each surviving candidate (after the alias check) in
+    the same order without removing it. ``confirm`` asks per surviving
+    candidate, in the same order; keeping an item silently keeps every extra
+    directory still open above it too, without asking. An ``rmdir``/
+    ``remove`` failure does not extend to the item's still-open ancestors
+    (unlike a "no" answer or an alias skip): a directory's own ``rmdir``
+    reports its own error rather than blaming its parent. Returns
+    ``(failed_removals, removals)`` - the second drives the caller's
+    directory-metadata re-settle, since every removal bumps its parent
+    directory's mtime. An aliased extra counts as neither: it is not
+    removed, but - like a kept item - it is not a failure either."""
     errors = 0
     removed = 0
-    stack: list[_ExtraFrame] = []
+    # The root frame is a permanent placeholder (see _ExtraFrame): it never
+    # pops via the ancestor check ("." is every rel's ancestor), only in the
+    # final flush below, so it is always present as stack[-1]'s ultimate
+    # fallback and every scope lookup can assume `stack` is non-empty.
+    stack: list[_ExtraFrame] = [_ExtraFrame(rel=".", is_extra_dir=False)]
 
     def finish(path: str, is_dir_entry: bool) -> None:
         nonlocal errors, removed
@@ -784,37 +934,77 @@ def remove_extras(
             err(f"delete failed: {path}: {e}")
             errors += 1
 
-    def keep_open_ancestors() -> None:
-        # Whatever remains on the stack at this point is exactly the open
-        # ancestors of the item just refused: everything popped as a
-        # non-ancestor above it is already gone, closed on its own merits.
-        for frame in stack:
-            frame.kept = True
+    def keep(frame: _ExtraFrame) -> None:
+        # `frame` itself has already been popped off `stack` by the time this
+        # runs, so it is marked directly; whatever remains on `stack` is
+        # exactly the still-open ancestors above it - everything popped as a
+        # non-ancestor earlier is already gone, closed on its own merits.
+        frame.kept = True
+        for f in stack:
+            f.kept = True
 
-    def close(frame: _ExtraFrame) -> None:
-        if frame.kept:
-            return  # a kept descendant forces keeping the directory too - no confirm, no rmdir
-        if dryrun:
-            write_output(f"(dry-run) delete: {frame.path}\n")
-            return
-        if confirm is not None and not confirm.confirm(frame.path):
-            keep_open_ancestors()
-            return
-        finish(frame.path, True)
+    def basename_of(rel: str) -> str:
+        return rel.rsplit("/", 1)[-1]
 
-    for rel, path, is_dir_entry in extras:
-        while stack and not _is_ancestor(stack[-1].rel, rel):
-            close(stack.pop())
-        if is_dir_entry:
-            stack.append(_ExtraFrame(rel, path))
-            continue
+    def warn_alias(path: str) -> None:
+        note_warning(
+            f"warning: not removed (a local name the filesystem may fold onto"
+            f" a recorded path): {path}"
+        )
+
+    def decide(path: str, is_dir_entry: bool, frame: _ExtraFrame, alias_name: str) -> None:
+        # Shared by a directory frame's own removal decision (alias_name is
+        # its own basename, checked against its PARENT's alias_keys - `frame`
+        # there is the parent) and one of a frame's pending leaf extras
+        # (alias_name is the leaf's basename, checked against `frame`'s own
+        # alias_keys - `frame` there is the leaf's immediate parent).
+        if fs_alias_key(alias_name) in frame.alias_keys:
+            warn_alias(path)
+            keep(frame)
+            return
         if dryrun:
             write_output(f"(dry-run) delete: {path}\n")
-            continue
+            return
         if confirm is not None and not confirm.confirm(path):
-            keep_open_ancestors()
-            continue
-        finish(path, False)
+            keep(frame)
+            return
+        finish(path, is_dir_entry)
+
+    def close(frame: _ExtraFrame) -> None:
+        # This directory's own leaf extras first - deferred exactly to this
+        # point so every manifest-only sibling (added to frame.alias_keys
+        # while the frame was open) was seen before any of them is judged.
+        # A refusal or alias skip here calls keep(frame) itself, so the
+        # frame's own decision below sees it via frame.kept.
+        for path in frame.pending:
+            decide(path, False, frame, os.path.basename(path))
+        if not frame.is_extra_dir:
+            return  # a placeholder scope for a matched directory: nothing to remove
+        if frame.kept:
+            return  # a kept/aliased descendant forces keeping the directory too
+        # `frame` has already been popped by the caller, so stack[-1] is now
+        # its immediate parent scope - always present (the root frame never
+        # pops here; only a non-root frame reaches this branch).
+        decide(frame.path, True, stack[-1], basename_of(frame.rel))
+
+    def scope(rel: str) -> _ExtraFrame:
+        """Return the (possibly newly pushed placeholder) frame for the
+        directory ``rel``, after closing whatever the stream has now left."""
+        while stack and not _is_ancestor(stack[-1].rel, rel):
+            close(stack.pop())
+        if stack[-1].rel != rel:
+            stack.append(_ExtraFrame(rel=rel, is_extra_dir=False))
+        return stack[-1]
+
+    for item in extras:
+        parent_rel = "." if "/" not in item.rel else item.rel.rsplit("/", 1)[0]
+        frame = scope(parent_rel)
+        if not item.is_extra:
+            frame.alias_keys.add(fs_alias_key(basename_of(item.rel)))
+        elif item.is_dir:
+            stack.append(_ExtraFrame(rel=item.rel, is_extra_dir=True, path=item.path))
+        else:
+            frame.pending.append(item.path)
 
     while stack:
         close(stack.pop())

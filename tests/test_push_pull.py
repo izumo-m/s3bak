@@ -767,23 +767,30 @@ def test_pull_delete_without_tty_keeps_extras_and_succeeds(ws):
 
 
 def test_pull_delete_interactive_keeps_ancestors_of_kept_items(ws, answers):
-    # Post-order prompting follows the ascending S3-key stream: "extra.txt"
-    # sorts before the "extradir/" subtree (`.` < `d`), so it is asked first;
-    # extradir/inner.txt is asked once the stream is inside that subtree, and
-    # keeping it makes the closing extradir frame unremovable, so extradir is
-    # kept without a prompt of its own.
+    # "extra.txt" sorts before the "extradir/" subtree (`.` < `d`), but its
+    # decision is deferred to the pop of its own parent scope (the walked
+    # root) - which, since "." is every rel's ancestor, only happens once the
+    # whole stream is exhausted (see remove_extras' root frame: this is what
+    # lets a root-level alias be caught too, the same as any nested one).
+    # extradir/inner.txt is therefore asked FIRST, at extradir's own pop
+    # (which happens as soon as the stream leaves that subtree); keeping it
+    # makes the closing extradir frame unremovable, so extradir is kept
+    # without a prompt of its own. extra.txt is asked last, in the final
+    # flush.
     ws.write("data/keep.txt", "k")
     ws.config({"data": {"path": str(ws.root / "data")}})
     ws.run("push", "data", expect_rc=0)
     ws.write("data/extradir/inner.txt", "i")
     ws.write("data/extra.txt", "e")
 
-    answers.feed("y", "n")  # delete extra.txt, keep extradir/inner.txt
+    answers.feed("n", "y")  # keep extradir/inner.txt, delete extra.txt
     ws.run("pull", "--delete", "data", expect_rc=0)
 
     assert len(answers.prompts) == 2
-    assert "extra.txt" in answers.prompts[0]
-    assert "extradir" in answers.prompts[1] and "inner.txt" in answers.prompts[1]
+    assert "extradir" in answers.prompts[0] and "inner.txt" in answers.prompts[0]
+    assert "extra.txt" in answers.prompts[1]
+    assert (ws.root / "data" / "extradir" / "inner.txt").exists()
+    assert not (ws.root / "data" / "extra.txt").exists()
     assert (ws.root / "data" / "extradir" / "inner.txt").exists()
     assert not (ws.root / "data" / "extra.txt").exists()
 
