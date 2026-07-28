@@ -3,10 +3,14 @@ since the suite only runs on Linux/macOS CI.
 
 Covers: a directory junction fooling the ancestor guards and the pre-sync
 directory-conflict cleanup (both lstat as an ordinary directory, since
-Windows does not model a junction as a symlink); the writable prep being
-scoped to the manifest's own recorded type instead of local reality; a
-symlink's file-vs-directory kind probe running before its target directory
-exists; and the writable prep surviving a metadata-apply failure.
+Windows does not model a junction as a symlink); is_junction itself; the
+writable prep being scoped to the manifest's own recorded type instead of
+local reality, and skipped entirely when a conflicting root is repaired via
+a staged swap; a symlink's file-vs-directory kind probe running before its
+target directory exists, and the deferred placement's own re-settle of its
+parent directory's mtime; the writable prep surviving both a metadata-apply
+failure and an exception raised out of the pull; and windows_restore_modes
+itself restoring a prepped path's original mode.
 """
 
 from __future__ import annotations
@@ -15,7 +19,9 @@ import json
 import os
 import stat
 
-from s3bak import commands, restore
+import pytest
+
+from s3bak import commands, console, restore
 
 MTIME_NS = 1_600_000_000 * 1_000_000_000
 
@@ -52,6 +58,25 @@ class _FakeReparseStat:
 
     def __getattr__(self, name: str):
         return getattr(self._real, name)
+
+
+def test_is_junction_true_only_for_a_mount_point_reparse_tag(tmp_path):
+    real_dir = tmp_path / "d"
+    real_dir.mkdir()
+    st = os.lstat(real_dir)
+
+    # An ordinary directory has no st_reparse_tag attribute at all (POSIX, and
+    # non-reparse-point directories on Windows too) - getattr's default keeps
+    # this False rather than raising.
+    assert console.is_junction(st) is False
+
+    # The default fake tag matches IO_REPARSE_TAG_MOUNT_POINT (a junction).
+    assert console.is_junction(_FakeReparseStat(st)) is True
+
+    # A different reparse tag (e.g. a symlink reparse point, 0xA000000C) is a
+    # reparse point but NOT a mount point, so this must stay False - is_junction
+    # is specifically the mount-point tag, not "any reparse point".
+    assert console.is_junction(_FakeReparseStat(st, reparse_tag=0xA000000C)) is False
 
 
 # --- W-F1: a Windows directory junction lstats as an ordinary directory -----
@@ -330,3 +355,140 @@ def test_windows_pull_does_not_re_restore_prep_after_a_clean_apply(ws, monkeypat
     ws.run("pull", "data", "-o", str(dest), expect_rc=0)
 
     assert restored == []
+
+
+def test_windows_pull_restores_writable_prep_when_apply_manifest_raises(ws, monkeypatch):
+    # The mirror image of the return-1 test above, on the OTHER exit the
+    # outer finally must cover: an exception escaping the try block (an S3
+    # error, a local I/O failure, SIGINT, ...) rather than an ordinary
+    # non-zero return. cmd_pull's `except BaseException: ... raise` still lets
+    # the finally run before the exception propagates - this pins that the
+    # writable prep is restored there too, not only on a clean return path.
+    monkeypatch.setattr(commands, "IS_WINDOWS", True)
+    ws.write("data/a.txt", "hello")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    dest = ws.root / "out"
+    dest.mkdir()
+    target = dest / "a.txt"
+    target.write_text("stale content, different size than the backup")
+    os.chmod(target, stat.S_IREAD)  # read-only: windows_collect_writable_prep must find it
+
+    collected: list[list[tuple[str, int]]] = []
+    real_collect = commands.windows_collect_writable_prep
+
+    def spy_collect(*args, **kwargs):
+        prep = real_collect(*args, **kwargs)
+        collected.append(prep)
+        return prep
+
+    restored: list[list[tuple[str, int]]] = []
+    monkeypatch.setattr(commands, "windows_collect_writable_prep", spy_collect)
+    monkeypatch.setattr(commands, "windows_restore_modes", lambda prep: restored.append(list(prep)))
+
+    def _raise_apply_manifest(*args, **kwargs):
+        raise RuntimeError("boom: simulated apply_manifest crash")
+
+    monkeypatch.setattr(commands, "apply_manifest", _raise_apply_manifest)
+
+    # A single resolved entry calls cmd_pull directly (cli.run_entries), so the
+    # exception is not converted to an exit code here - it propagates all the
+    # way out of cli.main, same as test_security.py's own symlink-privilege
+    # exception test.
+    with pytest.raises(RuntimeError, match="boom"):
+        ws.run("pull", "data", "-o", str(dest))
+
+    assert len(collected) == 1 and collected[0], "prep must have found the read-only file"
+    assert len(restored) == 1, "windows_restore_modes must run even when apply_manifest raises"
+    assert restored[0] == collected[0]
+
+
+def test_windows_pull_skips_writable_prep_when_swapping_a_conflicting_root(ws, monkeypatch):
+    # A conflicting root type (a plain file sitting where the manifest records
+    # a directory) is repaired by downloading into a fresh stage directory and
+    # swapping it in, never by mutating outpath in place - so the writable
+    # prep, which walks the EXISTING outpath, must not run at all: a fresh
+    # stage has no stale read-only files, and outpath itself is about to be
+    # replaced wholesale, not written into.
+    monkeypatch.setattr(commands, "IS_WINDOWS", True)
+    ws.write("data/a.txt", "hello")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    dest = ws.root / "out"
+    dest.write_text("a plain file where the manifest records a directory")
+
+    collected: list[list[tuple[str, int]]] = []
+    real_collect = commands.windows_collect_writable_prep
+
+    def spy_collect(*args, **kwargs):
+        prep = real_collect(*args, **kwargs)
+        collected.append(prep)
+        return prep
+
+    monkeypatch.setattr(commands, "windows_collect_writable_prep", spy_collect)
+
+    res = ws.run("pull", "data", "-o", str(dest))
+
+    assert res.rc == 0
+    assert collected == [], "the writable prep must not walk a root about to be swapped wholesale"
+    assert dest.is_dir()
+    assert (dest / "a.txt").read_text() == "hello"
+
+
+# --- windows_restore_modes itself: the chmod-back, not just that it ran -----
+
+
+def test_windows_restore_modes_restores_the_original_mode(tmp_path):
+    target = tmp_path / "f.txt"
+    target.write_text("x")
+    original_mode = os.lstat(target).st_mode
+    os.chmod(target, original_mode | stat.S_IWRITE)  # simulate the prep's write-bit add
+
+    restore.windows_restore_modes([(str(target), original_mode)])
+
+    assert os.lstat(target).st_mode == original_mode
+
+
+def test_windows_restore_modes_skips_a_missing_path_and_still_restores_the_rest(tmp_path):
+    # One prepped path can vanish before the restore pass (e.g. a manifest
+    # record whose data sync removed and replaced it); that must not abort the
+    # restore of every OTHER prepped path still queued behind it.
+    missing = str(tmp_path / "gone.txt")
+    present = tmp_path / "present.txt"
+    present.write_text("x")
+    original_mode = os.lstat(present).st_mode
+    os.chmod(present, original_mode | stat.S_IWRITE)
+
+    restore.windows_restore_modes([(missing, 0o100644), (str(present), original_mode)])
+
+    assert os.lstat(present).st_mode == original_mode
+
+
+# --- the deferred Windows symlink placement re-settles its parent dir ------
+
+
+def test_apply_manifest_resettles_parent_dir_mtime_after_deferred_windows_symlink_placement(
+    tmp_path, monkeypatch
+):
+    # Placing the deferred symlink (see the kind-probe tests above) adds a new
+    # directory entry under the restore root, which bumps the root's own mtime
+    # again - AFTER the root's directory frame was already popped once at
+    # end-of-stream. `resettle` is what re-applies the root's recorded (stale)
+    # mtime a second time, after that placement; without it the root would be
+    # left at whatever mtime the symlink creation happened to leave it at,
+    # never matching the manifest again under an exact (window_ns=0) compare.
+    manifest_path = tmp_path / "m.jsonl"
+    _empty_dir_symlink_manifest(manifest_path)
+    outpath = tmp_path / "out"
+
+    monkeypatch.setattr(restore, "IS_WINDOWS", True)
+
+    st = restore.apply_manifest(str(outpath), True, str(manifest_path), window_ns=0)
+
+    assert st == 0
+    # Exact match against the manifest's recorded (deliberately stale) MTIME_NS
+    # - only possible if the root was settled a second time after the deferred
+    # symlink placement dirtied it, not just once at the first pop.
+    assert os.lstat(outpath).st_mtime_ns == MTIME_NS

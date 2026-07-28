@@ -30,16 +30,30 @@ def test_status_all_is_clean_after_push_all(ws):
 
 
 def test_push_meta_only_updates_manifest_not_data(ws):
-    ws.write("data/a.txt", "a")
+    ws.write("data/a.txt", "original-content")
     ws.config({"data": {"path": str(ws.root / "data")}})
     ws.run("push", "data", expect_rc=0)
+    original_body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/a.txt")["Body"].read()
 
+    # Drift the already-pushed file's content (a real content+size change, not
+    # just a new untracked path) and add a brand-new file.
+    ws.write("data/a.txt", "edited-locally-and-never-pushed")
     ws.write("data/new.txt", "new")
     ws.run("push", "--meta-only", "data", expect_rc=0)
 
-    assert "data/new.txt" not in ws.keys()  # data was not uploaded
-    body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl")["Body"].read()
-    assert "new.txt" in body.decode()  # but it is recorded in the manifest
+    assert "data/new.txt" not in ws.keys()  # the new file was not uploaded either
+    body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/a.txt")["Body"].read()
+    assert body == original_body  # the existing object still holds the OLD bytes
+    manifest_body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl")[
+        "Body"
+    ].read()
+    assert "new.txt" in manifest_body.decode()  # but it is recorded in the manifest
+
+    # The refresh is a fresh local walk (docs/sync.md): it now records a.txt's
+    # edited size/mtime too, so --meta-only "asserts S3 matches local without
+    # making it true" - status goes clean even though the object is stale.
+    res = ws.run("status", "data", expect_rc=0)
+    assert res.out.strip() == ""
 
 
 def test_meta_only_records_mode_change_and_clears_status(ws):
@@ -347,19 +361,92 @@ def test_pull_allows_disjoint_destinations_from_trailing_slash(ws):
     assert (restore_root / "b" / "source-b.txt").read_text() == "b"
 
 
-def test_pull_meta_only_restores_mode_without_download(ws):
-    f = ws.write("data/a.txt", "a")
+def test_pull_meta_only_restores_mode_without_download(ws, monkeypatch):
+    import botocore.client
+
+    f = ws.write("data/a.txt", "recorded-content")
     ws.config({"data": {"path": str(ws.root / "data")}})
     os.chmod(f, 0o640)
+    ws.run("push", "data", expect_rc=0)
+    recorded_mtime_ns = os.stat(f).st_mtime_ns
+
+    dest = ws.root / "restore"
+    dest.mkdir()
+    # Content, size, and mtime all disagree with the backup - the exact
+    # condition under which a plain pull is certain to re-download (see
+    # test_pull_without_meta_only_downloads_the_same_drift below). If
+    # --meta-only ever ran the data lane, this local content would be
+    # overwritten with "recorded-content".
+    (dest / "a.txt").write_text("locally-drifted-content-of-a-different-length")
+    os.utime(dest / "a.txt", (1_000_000_000, 1_000_000_000))
+    os.chmod(dest / "a.txt", 0o600)  # the mode is wrong too
+
+    calls: list[tuple[str, dict]] = []
+    original_make_api_call = botocore.client.BaseClient._make_api_call
+
+    def spy(self, operation_name, api_params):
+        calls.append((operation_name, dict(api_params)))
+        return original_make_api_call(self, operation_name, api_params)
+
+    monkeypatch.setattr(botocore.client.BaseClient, "_make_api_call", spy)
+    ws.run("pull", "--meta-only", "data", "-o", str(dest), expect_rc=0)
+
+    # Never downloaded: the local (wrong) content survives untouched.
+    assert (dest / "a.txt").read_text() == "locally-drifted-content-of-a-different-length"
+    # But the recorded metadata IS applied: mode and the file's own mtime.
+    assert (os.stat(dest / "a.txt").st_mode & 0o777) == 0o640
+    assert os.stat(dest / "a.txt").st_mtime_ns == recorded_mtime_ns
+
+    # Direct observation of the data lane, not just its absence of effect:
+    # the data object's key is never fetched. (The manifest key IS fetched
+    # by every pull, --meta-only included - a distinct GetObject this does
+    # not, and must not, assert away.)
+    data_key = f"{ws.prefix}/data/a.txt"
+    assert not any(
+        op in ("GetObject", "HeadObject") and params.get("Key") == data_key for op, params in calls
+    )
+
+
+def test_pull_without_meta_only_downloads_the_same_drift(ws):
+    # Contrast for the test above: the identical local/backup mismatch,
+    # without --meta-only, is certainly re-downloaded - proving that scenario
+    # is not something the size+mtime no-op gate would have skipped anyway.
+    ws.write("data/a.txt", "recorded-content")
+    ws.config({"data": {"path": str(ws.root / "data")}})
     ws.run("push", "data", expect_rc=0)
 
     dest = ws.root / "restore"
     dest.mkdir()
-    (dest / "a.txt").write_text("a")  # content already matches
-    os.chmod(dest / "a.txt", 0o600)  # but the mode is wrong
-    ws.run("pull", "--meta-only", "data", "-o", str(dest), expect_rc=0)
+    (dest / "a.txt").write_text("locally-drifted-content-of-a-different-length")
+    os.utime(dest / "a.txt", (1_000_000_000, 1_000_000_000))
 
-    assert (os.stat(dest / "a.txt").st_mode & 0o777) == 0o640  # mode applied, no download
+    ws.run("pull", "data", "-o", str(dest), expect_rc=0)
+
+    assert (dest / "a.txt").read_text() == "recorded-content"
+
+
+def test_pull_meta_only_repairs_dir_mode_and_symlink_target(ws):
+    # --meta-only's gated apply covers more than a file's mode: a directory's
+    # own mode/mtime and a symlink's target are also repaired - both
+    # objectless records, so there was never data to download for them either
+    # way, but this pins that --meta-only still reaches them.
+    ws.write("data/sub/keep.txt", "keep")
+    os.symlink("keep.txt", ws.root / "data" / "sub" / "link")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    sub = ws.root / "data" / "sub"
+    link = ws.root / "data" / "sub" / "link"
+    recorded_dir_mode = os.stat(sub).st_mode & 0o777
+
+    os.chmod(sub, 0o700 if recorded_dir_mode != 0o700 else 0o750)
+    os.remove(link)
+    os.symlink("nope.txt", link)  # wrong target
+
+    ws.run("pull", "--meta-only", "data", expect_rc=0)
+
+    assert (os.stat(sub).st_mode & 0o777) == recorded_dir_mode
+    assert os.readlink(link) == "keep.txt"
 
 
 def test_pull_data_only_downloads_without_metadata(ws):
