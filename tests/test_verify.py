@@ -101,7 +101,7 @@ def test_verify_type_conflict_at_entry_root(ws):
     assert f"{ws.prefix}/data (manifest records a directory" in res.err
 
 
-def test_verify_archived_storage_class_is_an_error(ws):
+def test_verify_archived_storage_class_is_a_warning(ws):
     _push_tree(ws)
     ws.s3.put_object(
         Bucket=ws.bucket,
@@ -109,8 +109,9 @@ def test_verify_archived_storage_class_is_an_error(ws):
         Body=b"alpha",
         StorageClass="GLACIER",
     )
-    res = ws.run("verify", "data", expect_rc=1)
-    assert "storage class GLACIER blocks restore" in res.err and "a.txt" in res.err
+    res = ws.run("verify", "data", expect_rc=0)  # cli.main; cli.run maps warnings to 2
+    assert "archived storage class GLACIER" in res.err and "a.txt" in res.err
+    assert "0 error(s), 1 warning(s)" in res.out
 
 
 def test_verify_checksum_flags_silent_divergence(ws):

@@ -2208,16 +2208,16 @@ def _report_folder_object(report: _VerifyReport, url: str, obj: ObjectMeta) -> N
         )
 
 
-def _check_archived(report: _VerifyReport, url: str, obj: ObjectMeta) -> bool:
-    """Flag an object pull cannot download. Applies to every listed object -
-    pull's listing-driven sync fetches unrecorded objects too."""
+def _check_archived(report: _VerifyReport, url: str, obj: ObjectMeta) -> None:
+    """Advise that an object sits in an archive storage tier - not a defect in
+    the backup, just a fact about where it currently lives. Applies to every
+    listed object - pull's listing-driven sync fetches unrecorded objects
+    too."""
     if obj.storage_class in _ARCHIVED_CLASSES:
-        report.error(
-            f"storage class {obj.storage_class} blocks restore: {url}"
-            f" (get_object fails until the object is restored from the archive)"
+        report.warn(
+            f"archived storage class {obj.storage_class}: {url}"
+            f" (a pull cannot fetch it until RestoreObject completes)"
         )
-        return True
-    return False
 
 
 def _report_restore_conflict(report: _VerifyReport, manifest_path: str, sub: str | None) -> None:
@@ -2296,10 +2296,9 @@ def _verify_dir(
                     else:
                         settle(w, conflict=key == w.key + "/" and record is not None)
                 waiting = still
-            archived = False
             if obj is not None:
                 report.objects += 1
-                archived = _check_archived(report, f"{cfg.prefix}/{rel_base}/{obj.key}", obj)
+                _check_archived(report, f"{cfg.prefix}/{rel_base}/{obj.key}", obj)
             if record is not None and obj is not None:
                 if key.endswith("/"):
                     # Only a directory record carries the trailing slash, and
@@ -2312,7 +2311,7 @@ def _verify_dir(
                             f"size mismatch: {cfg.prefix}/{rel_base}/{obj.key}"
                             f" (manifest {record.size}, S3 {obj.size})"
                         )
-                    elif checker is not None and not archived:
+                    elif checker is not None:
                         reason = _ancestor_block_reason(local_base, key)
                         if reason == "inaccessible":
                             # An unreadable ancestor: the content cannot be hashed,
@@ -2379,8 +2378,7 @@ def _verify_file_record(
         report.error(f"missing data object: {cfg.prefix}/{rel_key} (pull cannot restore it)")
         return
     report.objects += 1
-    if _check_archived(report, f"{cfg.prefix}/{rel_key}", head):
-        return
+    _check_archived(report, f"{cfg.prefix}/{rel_key}", head)
     if record.size != head.size:
         report.error(
             f"size mismatch: {cfg.prefix}/{rel_key} (manifest {record.size}, S3 {head.size})"

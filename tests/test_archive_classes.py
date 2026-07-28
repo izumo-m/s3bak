@@ -1,11 +1,11 @@
 """Archive storage class (GLACIER / DEEP_ARCHIVE) behaviour.
 
 Before this file, exactly one test each in test_verify.py and
-test_transfer_path.py pinned this - the check that catches "the backup does
-not actually restore" before a real pull hits it. This file pins the fuller
-matrix: (GLACIER, DEEP_ARCHIVE) x (directory entry, single-file entry), plus
-the contrast against storage classes that sound archived but are not, plus
-what `pull` itself does when it meets an unrestored archived object.
+test_transfer_path.py pinned this - verify's advisory that an object sits in
+an archive storage tier, and what `pull` itself does when it meets an
+unrestored archived object. This file pins the fuller matrix: (GLACIER,
+DEEP_ARCHIVE) x (directory entry, single-file entry), plus the contrast
+against storage classes that sound archived but are not.
 
 Those two pre-existing tests stay where they are; this file does not
 duplicate them.
@@ -13,6 +13,7 @@ duplicate them.
 
 from __future__ import annotations
 
+import os
 import signal
 
 import pytest
@@ -32,11 +33,11 @@ def _push_single_file_entry(ws, name: str = "solo.txt", content: str = "content"
     ws.run("push", name, expect_rc=0)
 
 
-# --- verify: an archived object is always an error, in either entry shape -
+# --- verify: an archived object is always a warning, in either entry shape -
 
 
 @pytest.mark.parametrize("storage_class", _ARCHIVED_CLASSES)
-def test_verify_dir_entry_archived_object_is_an_error(ws, storage_class):
+def test_verify_dir_entry_archived_object_is_a_warning(ws, storage_class):
     _push_dir_entry(ws)
     ws.s3.put_object(
         Bucket=ws.bucket,
@@ -44,14 +45,14 @@ def test_verify_dir_entry_archived_object_is_an_error(ws, storage_class):
         Body=b"alpha",
         StorageClass=storage_class,
     )
-    res = ws.run("verify", "data", expect_rc=1)
-    assert f"storage class {storage_class} blocks restore" in res.err
+    res = ws.run("verify", "data", expect_rc=0)  # cli.main; cli.run maps warnings to 2
+    assert f"archived storage class {storage_class}" in res.err
     assert f"{ws.prefix}/data/a.txt" in res.err
-    assert "1 error(s)" in res.out
+    assert "0 error(s), 1 warning(s)" in res.out
 
 
 @pytest.mark.parametrize("storage_class", _ARCHIVED_CLASSES)
-def test_verify_single_file_entry_archived_object_is_an_error(ws, storage_class):
+def test_verify_single_file_entry_archived_object_is_a_warning(ws, storage_class):
     _push_single_file_entry(ws)
     ws.s3.put_object(
         Bucket=ws.bucket,
@@ -59,23 +60,24 @@ def test_verify_single_file_entry_archived_object_is_an_error(ws, storage_class)
         Body=b"content",
         StorageClass=storage_class,
     )
-    res = ws.run("verify", "solo.txt", expect_rc=1)
-    assert f"storage class {storage_class} blocks restore" in res.err
+    res = ws.run("verify", "solo.txt", expect_rc=0)  # cli.main; cli.run maps warnings to 2
+    assert f"archived storage class {storage_class}" in res.err
     assert f"{ws.prefix}/solo.txt" in res.err
-    assert "1 error(s)" in res.out
+    assert "0 error(s), 1 warning(s)" in res.out
 
 
 # --- verify: the check runs on every listed object, recorded or not -------
 
 
 @pytest.mark.parametrize("storage_class", _ARCHIVED_CLASSES)
-def test_verify_unrecorded_archived_object_in_dir_entry_is_still_an_error(ws, storage_class):
+def test_verify_unrecorded_archived_object_in_dir_entry_is_still_flagged(ws, storage_class):
     """store.iter_objects feeds _verify_dir's merge-join every listed object,
     and _check_archived runs unconditionally whenever an object is present -
     before the record/no-record branch that decides "unrecorded object". A
-    stray out-of-band upload that happens to be archived is not exempted:
-    pull's own listing-driven download would try to fetch it too (see
-    docs/verify.md, "Archived storage class")."""
+    stray out-of-band upload that happens to be archived is not exempted from
+    either finding: it gets both the archived-storage-class warning and the
+    unrecorded-object warning, since pull's own listing-driven download would
+    try to fetch it too (see docs/verify.md, "Archived storage class")."""
     _push_dir_entry(ws)
     ws.s3.put_object(
         Bucket=ws.bucket,
@@ -83,11 +85,11 @@ def test_verify_unrecorded_archived_object_in_dir_entry_is_still_an_error(ws, st
         Body=b"stray",
         StorageClass=storage_class,
     )
-    res = ws.run("verify", "data", expect_rc=1)
-    assert f"storage class {storage_class} blocks restore" in res.err
+    res = ws.run("verify", "data", expect_rc=0)  # cli.main; cli.run maps warnings to 2
+    assert f"archived storage class {storage_class}" in res.err
     assert "data/stray.bin" in res.err
     assert "unrecorded object" in res.err and "data/stray.bin" in res.err
-    assert "1 error(s), 1 warning(s)" in res.out
+    assert "0 error(s), 2 warning(s)" in res.out
 
 
 # --- verify: storage classes that are not archived must not false-positive
@@ -135,7 +137,7 @@ def test_verify_single_file_entry_non_archived_storage_classes_do_not_error(ws, 
 # --- verify vs. a completed restore: current behaviour, not a design sign-off
 
 
-def test_verify_ignores_a_completed_restore_and_still_reports_the_archived_error(ws):
+def test_verify_ignores_a_completed_restore_and_still_warns_about_the_archived_storage_class(ws):
     """Not an endorsement of this as correct - a note of what actually
     happens today.
 
@@ -144,7 +146,7 @@ def test_verify_ignores_a_completed_restore_and_still_reports_the_archived_error
     finds nothing); _check_archived looks only at StorageClass, which AWS
     (and moto) leaves at GLACIER/DEEP_ARCHIVE even after a restore completes -
     the restored copy is a separate, temporary, non-archived copy layered on
-    top. So verify keeps reporting the archived-storage-class error for an
+    top. So verify keeps warning about the archived storage class for an
     object a pull could, in fact, now download - true here because
     store.sync_down forces the glacier transfer (see
     test_pull_dir_entry_over_restored_archived_object_succeeds), so this
@@ -172,8 +174,88 @@ def test_verify_ignores_a_completed_restore_and_still_reports_the_archived_error
     assert 'ongoing-request="false"' in head.get("Restore", "")  # moto: restore already complete
     assert head.get("StorageClass") == "GLACIER"  # ...yet the storage class never moved
 
-    res = ws.run("verify", "data", expect_rc=1)
-    assert "storage class GLACIER blocks restore" in res.err
+    res = ws.run("verify", "data", expect_rc=0)  # cli.main; cli.run maps warnings to 2
+    assert "archived storage class GLACIER" in res.err
+
+
+# --- verify: the demotion itself - a warning, never an error --------------
+
+
+def test_verify_archived_storage_class_alone_exits_2_not_1(ws, monkeypatch, capfd):
+    """Pins the demotion this file is named for: an archived object with
+    nothing else wrong must map to exit 2 (a warning) via cli.run, never exit
+    1 (an error), and the per-entry summary line must report zero errors."""
+    from s3bak import cli
+
+    _push_dir_entry(ws)
+    ws.s3.put_object(
+        Bucket=ws.bucket,
+        Key=f"{ws.prefix}/data/a.txt",
+        Body=b"alpha",
+        StorageClass="GLACIER",
+    )
+    capfd.readouterr()  # drain the push output above before capturing this run
+    monkeypatch.setattr("sys.argv", ["s3bak", "verify", "data"])
+    saved = signal.getsignal(signal.SIGINT)
+    try:
+        rc = cli.run()
+    finally:
+        signal.signal(signal.SIGINT, saved)
+    captured = capfd.readouterr()
+    assert rc == 2
+    assert "0 error(s), 1 warning(s)" in captured.out
+
+
+# --- verify: an archived object no longer short-circuits the other checks -
+
+
+@pytest.mark.parametrize("storage_class", _ARCHIVED_CLASSES)
+def test_verify_single_file_entry_archived_and_size_mismatch_reports_both(ws, storage_class):
+    """Before the demotion, _check_archived's early return short-circuited
+    _verify_file_record entirely: an archived object's size was never compared
+    against the manifest, so a genuine size mismatch on an archived object was
+    invisible. HeadObject succeeds on archived objects (it does not validate
+    storage class - true on real AWS and on moto), so the size comparison can
+    and now does still run: both findings surface, and the size mismatch (a
+    genuine error, unlike the archived warning) still fails the run."""
+    _push_single_file_entry(ws)
+    ws.s3.put_object(
+        Bucket=ws.bucket,
+        Key=f"{ws.prefix}/solo.txt",
+        Body=b"a different length entirely",
+        StorageClass=storage_class,
+    )
+    res = ws.run("verify", "solo.txt", expect_rc=1)
+    assert f"archived storage class {storage_class}" in res.err
+    assert "size mismatch" in res.err
+    assert "1 error(s), 1 warning(s)" in res.out
+
+
+def test_verify_checksum_flags_silent_divergence_on_archived_object(ws):
+    """Before the demotion, `elif checker is not None and not archived` in
+    _verify_dir skipped the content check entirely for an archived object.
+    --checksum hashes the LOCAL file and compares it against the S3 ETag the
+    listing already delivered (see docs/verify.md, "The content check") - zero
+    extra S3 calls, no GetObject - so an ETag is unaffected by storage class
+    and the check works fine on an archived object too. Modelled on
+    test_verify_checksum_flags_silent_divergence in test_verify.py: a
+    same-size content change so the size check passes and only --checksum
+    catches the divergence."""
+    _push_dir_entry(ws)
+    ws.s3.put_object(
+        Bucket=ws.bucket,
+        Key=f"{ws.prefix}/data/a.txt",
+        Body=b"alpha",
+        StorageClass="GLACIER",
+    )
+    target = ws.root / "data" / "a.txt"
+    st = target.stat()
+    target.write_text("gamma")  # same size as "alpha"
+    os.utime(target, ns=(st.st_atime_ns, st.st_mtime_ns))  # mtime-preserving edit
+
+    res = ws.run("verify", "--checksum", "data", expect_rc=1)
+    assert "content differs but size+mtime match" in res.err
+    assert "archived storage class GLACIER" in res.err
 
 
 # --- pull: an unrestored archived object must not succeed silently --------
