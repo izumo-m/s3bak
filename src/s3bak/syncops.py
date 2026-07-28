@@ -11,11 +11,12 @@ the seam between the pure manifest format (manifest.py), the S3 backend
 from __future__ import annotations
 
 import itertools
+import json
 import os
 import stat as stat_mod
 import tempfile
 from collections.abc import Iterator
-from typing import TYPE_CHECKING
+from typing import IO, TYPE_CHECKING
 
 from boto3_s3 import LocalFileInfo
 
@@ -273,8 +274,14 @@ class PushJournal:
         # Kind-conflict pairs seen under --delete: a local non-file occupies a
         # key holding a real S3 object, so the object pairs (update lane)
         # instead of orphaning (delete lane). Offered out-of-lane after the
-        # sync: (entry-relative key, whether a file record owned the object).
-        self.pending_object_deletes: list[tuple[str, bool]] = []
+        # sync (entry-relative key, whether a file record owned the object) -
+        # spooled to disk (_pending_object_deletes_spool), not held in a
+        # list, so memory stays independent of tree size even in the
+        # pathological case (a huge tree entirely replaced by symlinks).
+        # This counter is the only in-memory trace; iter_pending_object_deletes
+        # replays the spool.
+        self.pending_object_deletes = 0
+        self._pending_object_deletes_spool: IO[str] | None = None
 
     @property
     def has_events(self) -> bool:
@@ -362,6 +369,38 @@ class PushJournal:
             self._gap(f"Skipping file {info.key}. File/Directory is not readable.")
             return False
 
+    def _record_pending_object_delete(self, key: str, recorded: bool) -> None:
+        """Spool one kind-conflict delete candidate to disk (JSON-encoded,
+        one per line - a key can contain a newline, so round-tripping it
+        needs an encoding, not just a delimiter). Lazily opened on first use:
+        an anonymous, auto-deleting temp file that also works on Windows.
+        Lane decisions are serial and ascending (the class docstring), and
+        this is their only writer, so no lock is needed."""
+        if self._pending_object_deletes_spool is None:
+            self._pending_object_deletes_spool = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
+        self._pending_object_deletes_spool.write(json.dumps([key, recorded]) + "\n")
+        self.pending_object_deletes += 1
+
+    def iter_pending_object_deletes(self) -> Iterator[tuple[str, bool]]:
+        """Replay the spooled kind-conflict delete candidates: both call
+        sites check ``pending_object_deletes`` only after ``close()`` (see
+        its docstring), so the spool must outlive close() and this is where
+        it finally goes - fully drained or the generator abandoned early,
+        the spool is closed (which also deletes it) and forgotten either
+        way."""
+        spool = self._pending_object_deletes_spool
+        if spool is None:
+            return
+        try:
+            spool.flush()
+            spool.seek(0)
+            for line in spool:
+                key, recorded = json.loads(line)
+                yield key, recorded
+        finally:
+            spool.close()
+            self._pending_object_deletes_spool = None
+
     # --- lane filters -------------------------------------------------------
     def update_filter(self, pair: SyncPair) -> bool:
         """The update lane: a both-sides pair (local item x S3 object)."""
@@ -379,7 +418,7 @@ class PushJournal:
             # side as usual and offer the object out-of-lane under --delete.
             self._journal_nonfile(key, st, src, old)
             if self._delete_mode:
-                self.pending_object_deletes.append((key, old is not None and old[0].is_file))
+                self._record_pending_object_delete(key, old is not None and old[0].is_file)
             return False
         e = old[0] if old is not None else None
         if self._content is not None:
@@ -570,7 +609,9 @@ class PushJournal:
 
     def close(self) -> None:
         """Drain the cursor (trailing records are skip-overs) and flush the
-        journal so it can be merged. Idempotent."""
+        journal so it can be merged. Idempotent. Leaves the pending-object-
+        delete spool untouched - both call sites read it only after close(),
+        through iter_pending_object_deletes, which owns its lifetime."""
         while self._head is not None:
             self._skip_over(self._head)
             self._head = next(self._records, None)
@@ -630,16 +671,6 @@ def drop_subtree_records(
         os.unlink(journal_path)
 
 
-def _print_transfer_lines(stdout: str) -> bool:
-    """Print the transfer-result lines. Returns True if any line was printed.
-    ``stdout`` is TransferResult.stdout: the store builds it line by line from
-    on_result callbacks, so it is already clean (no progress noise to filter)."""
-    if not stdout:
-        return False
-    write_output(f"{stdout}\n")
-    return True
-
-
 def download_from_s3(
     cfg: Config,
     entry: str,
@@ -679,10 +710,8 @@ def download_from_s3(
                 except OSError:
                     break
         if result.returncode != 0:
-            if result.stderr:
-                write_stderr(result.stderr)
             return result.returncode, False
-        return 0, _print_transfer_lines(result.stdout)
+        return 0, result.results > 0
 
     # Single file: a transfer always happens (we only reach here on a manifest
     # mismatch), so a successful download counts as changed - which keeps the

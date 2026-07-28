@@ -235,6 +235,30 @@ def test_pull_restores_directory_mtime_and_settles(ws):
     assert res.out.strip() == ""
 
 
+def test_pull_settles_every_directory_through_a_deep_nested_tree(ws):
+    # Coverage for apply_manifest's ancestor stack across several nesting
+    # levels open at once, not just one directory deep: every level's own
+    # mode and mtime must converge, from the leaf back up to the root.
+    ws.write("data/a.txt", "a")
+    ws.write("data/l1/b.txt", "b")
+    ws.write("data/l1/l2/c.txt", "c")
+    ws.write("data/l1/l2/l3/d.txt", "d")
+    levels = (".", "l1", "l1/l2", "l1/l2/l3")
+    for rel, mode in zip(levels, (0o750, 0o751, 0o752, 0o753), strict=True):
+        os.chmod(ws.root / "data" / rel, mode)
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    recorded = {rel: os.lstat(ws.root / "data" / rel) for rel in levels}
+
+    dest = ws.root / "restore"
+    ws.run("pull", "data", "-o", str(dest), expect_rc=0)
+
+    for rel, src_st in recorded.items():
+        dst_st = os.lstat(dest if rel == "." else dest / rel)
+        assert dst_st.st_mode & 0o777 == src_st.st_mode & 0o777
+        assert dst_st.st_mtime_ns == src_st.st_mtime_ns
+
+
 def test_push_skips_directory_mtime_drift_within_window(ws):
     ws.write("data/a.txt", "a")
     ws.config({"data": {"path": str(ws.root / "data")}}, mtime_window=2)
@@ -660,6 +684,34 @@ def test_pull_delete_removes_extra_directory_tree(ws):
     assert (dest / "keep.txt").read_text() == "k"
 
 
+def test_pull_delete_removes_extras_in_post_order(ws):
+    # Removal is streamed subtree by subtree in ascending S3-key order, not
+    # one global deepest-first pass: extradir's children are removed before
+    # extradir itself, and the whole extradir subtree finishes streaming
+    # before the later sibling zzz.txt is even looked at.
+    ws.write("data/keep.txt", "k")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    dest = ws.root / "restore"
+    (dest / "extradir" / "sub").mkdir(parents=True)
+    (dest / "extradir" / "sub" / "deep.txt").write_text("d")
+    (dest / "keep.txt").write_text("k")
+    (dest / "zzz.txt").write_text("z")
+
+    res = ws.run("pull", "data", "-o", str(dest), "--delete", "--yes", expect_rc=0)
+
+    deletes = [
+        ln.removeprefix("delete: ") for ln in res.out.splitlines() if ln.startswith("delete: ")
+    ]
+    assert deletes == [
+        str(dest / "extradir" / "sub" / "deep.txt"),
+        str(dest / "extradir" / "sub"),
+        str(dest / "extradir"),
+        str(dest / "zzz.txt"),
+    ]
+
+
 # --- pull --delete (confirmed removals) ----------------------------------------
 
 
@@ -677,22 +729,44 @@ def test_pull_delete_without_tty_keeps_extras_and_succeeds(ws):
 
 
 def test_pull_delete_interactive_keeps_ancestors_of_kept_items(ws, answers):
-    # Deepest-first prompting: the nested file is asked first; keeping it makes
-    # its ancestor extra dir unremovable, so the dir is kept without a prompt.
+    # Post-order prompting follows the ascending S3-key stream: "extra.txt"
+    # sorts before the "extradir/" subtree (`.` < `d`), so it is asked first;
+    # extradir/inner.txt is asked once the stream is inside that subtree, and
+    # keeping it makes the closing extradir frame unremovable, so extradir is
+    # kept without a prompt of its own.
     ws.write("data/keep.txt", "k")
     ws.config({"data": {"path": str(ws.root / "data")}})
     ws.run("push", "data", expect_rc=0)
     ws.write("data/extradir/inner.txt", "i")
     ws.write("data/extra.txt", "e")
 
-    answers.feed("n", "y")  # keep extradir/inner.txt, delete extra.txt
+    answers.feed("y", "n")  # delete extra.txt, keep extradir/inner.txt
     ws.run("pull", "--delete", "data", expect_rc=0)
 
     assert len(answers.prompts) == 2
-    assert "extradir" in answers.prompts[0] and "inner.txt" in answers.prompts[0]
-    assert "extra.txt" in answers.prompts[1]
+    assert "extra.txt" in answers.prompts[0]
+    assert "extradir" in answers.prompts[1] and "inner.txt" in answers.prompts[1]
     assert (ws.root / "data" / "extradir" / "inner.txt").exists()
     assert not (ws.root / "data" / "extra.txt").exists()
+
+
+def test_pull_delete_interactive_rejecting_a_grandchild_keeps_every_open_ancestor(ws, answers):
+    # Denying the deepest item never prompts for either directory still open
+    # above it: keeping a child forces keeping its whole open ancestor chain,
+    # not just its immediate parent.
+    ws.write("data/keep.txt", "k")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.write("data/extradir/child/grandchild.txt", "g")
+
+    answers.feed("n")  # keep the grandchild
+    ws.run("pull", "--delete", "data", expect_rc=0)
+
+    assert len(answers.prompts) == 1
+    assert "grandchild.txt" in answers.prompts[0]
+    assert (ws.root / "data" / "extradir" / "child" / "grandchild.txt").exists()
+    assert (ws.root / "data" / "extradir" / "child").is_dir()
+    assert (ws.root / "data" / "extradir").is_dir()
 
 
 def test_pull_delete_interactive_prompts_for_empty_extra_dir(ws, answers):
@@ -715,13 +789,13 @@ def test_pull_delete_interactive_q_aborts(ws, answers):
     ws.write("data/extra1.txt", "1")
     ws.write("data/extra2.txt", "2")
 
-    answers.feed("y", "q")  # extras prompt deepest-first: extra2 then extra1
+    answers.feed("y", "q")  # ascending order: extra1.txt then extra2.txt
     res = ws.run("pull", "--delete", "data")
 
     assert res.rc == 1
     assert "aborted" in res.err
-    assert not (ws.root / "data" / "extra2.txt").exists()
-    assert (ws.root / "data" / "extra1.txt").exists()
+    assert not (ws.root / "data" / "extra1.txt").exists()
+    assert (ws.root / "data" / "extra2.txt").exists()
 
 
 def test_pull_delete_confirms_on_the_clean_tree_short_circuit_too(ws, answers):
@@ -788,7 +862,7 @@ def test_pull_keeps_conflicting_file_root_when_dir_download_fails(ws, monkeypatc
     monkeypatch.setattr(
         Boto3S3Store,
         "sync_down",
-        lambda self, *a, **k: TransferResult(returncode=1, stderr="injected failure"),
+        lambda self, *a, **k: TransferResult(returncode=1),
     )
     res = ws.run("pull", "data", "-o", str(dest))
     assert res.rc == 1
@@ -1451,6 +1525,69 @@ def test_push_delete_without_tty_keeps_kind_conflict_object(ws):
     os.symlink("elsewhere", ws.root / "data" / "f.txt")
     ws.run("push", "--delete", "data", expect_rc=0)
     assert "data/f.txt" in ws.keys()  # kept: every answer is no
+
+
+def test_push_delete_retires_every_kind_conflict_object_and_counts_them(ws, monkeypatch):
+    # PushJournal spools kind-conflict delete candidates to disk instead of
+    # holding a list (memory independent of tree size); with several
+    # candidates in one run, every one of them must still be offered and
+    # deleted - not just the first - and pending_object_deletes must behave
+    # as a plain counter of what was spooled, not a list length.
+    from s3bak import commands
+
+    names = ("f1.txt", "f2.txt", "f3.txt")
+    for name in names:
+        ws.write(f"data/{name}", "was a file")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    for name in names:
+        (ws.root / "data" / name).unlink()
+        os.symlink("elsewhere", ws.root / "data" / name)
+    ws.run("push", "data", expect_rc=0)  # records the symlinks; the objects stay
+    for name in names:
+        assert f"data/{name}" in ws.keys()
+
+    seen_counts: list[int] = []
+    real = commands._delete_conflict_objects
+
+    def spy(cfg, entry, plan, journal, opts):
+        seen_counts.append(journal.pending_object_deletes)
+        return real(cfg, entry, plan, journal, opts)
+
+    monkeypatch.setattr(commands, "_delete_conflict_objects", spy)
+    ws.run("push", "--delete", "--yes", "data", expect_rc=0)
+
+    assert seen_counts == [3]  # the counter matched all three spooled candidates
+    for name in names:
+        assert f"data/{name}" not in ws.keys()  # every shielded object retired
+    body = _manifest_body(ws, "data")
+    assert body.count('"link":"elsewhere"') == 3  # every symlink record survives
+
+
+def test_pending_object_delete_spool_round_trips_a_newline_in_the_key(tmp_path):
+    # The spool JSON-encodes each candidate rather than using a plain
+    # delimiter, precisely so a key containing a newline round-trips whole
+    # instead of splitting into two spool lines. A local tree with such a
+    # name is fragile to build portably, so this exercises PushJournal's
+    # spool directly - the escape hatch this class of test is meant to use.
+    from s3bak import localwalk
+    from s3bak.syncops import PushJournal
+
+    walker = localwalk.ManifestWalker([], [], "./")
+    journal = PushJournal(str(tmp_path / "j.journal"), None, window_ns=0, walker=walker)
+    assert journal.pending_object_deletes == 0  # unset: no spool created yet
+
+    journal._record_pending_object_delete("a\nb.txt", True)
+    journal._record_pending_object_delete("plain.txt", False)
+    assert journal.pending_object_deletes == 2  # a counter, not a list length
+
+    journal.close()
+    assert list(journal.iter_pending_object_deletes()) == [
+        ("a\nb.txt", True),
+        ("plain.txt", False),
+    ]
+    assert list(journal.iter_pending_object_deletes()) == []  # spool closed, forgotten
 
 
 def test_pull_checksum_skips_the_size_mtime_gate(ws, monkeypatch):

@@ -21,7 +21,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from s3bak.console import note_warning, write_stderr
+from s3bak.console import note_warning, write_output, write_stderr
 
 if TYPE_CHECKING:
     from boto3_s3 import (
@@ -56,11 +56,13 @@ class ObjectMeta:
 
 @dataclass
 class TransferResult:
-    """Result of a sync/copy operation that may print CLI output."""
+    """Result of a sync/copy operation. The operation's own output (upload /
+    download / delete lines, failures) is printed as it happens - see
+    `Boto3S3Store._transfer` - so this carries only the outcome: `returncode`
+    (0/1), and `results`, the count of SUCCEEDED/DRYRUN lines printed."""
 
     returncode: int
-    stdout: str = ""
-    stderr: str = ""
+    results: int = 0
 
 
 class Boto3S3Store:
@@ -203,23 +205,27 @@ class Boto3S3Store:
     def _transfer(
         self, verbose: bool, label: str, op: Callable[[ResultCallback], None]
     ) -> TransferResult:
-        """Run a boto3-s3 transfer op, collecting aws-style result lines.
+        """Run a boto3-s3 transfer op, printing aws-style result lines as they
+        arrive.
 
         `op(on_result)` calls the S3 method with the given result callback;
-        SUCCEEDED/DRYRUN items become 'upload:'/'download:'/'delete:' stdout
-        lines, failures become stderr lines, and any boto3-s3 error sets
-        returncode 1. on_result runs on s3transfer worker threads, so a lock
-        guards the result lists.
+        SUCCEEDED/DRYRUN items print immediately as 'upload:'/'download:'/
+        'delete:' stdout lines, failures print immediately to stderr, and any
+        boto3-s3 error also prints to stderr and sets returncode 1.
+        `write_output`/`write_stderr` serialize by line (console._output_lock),
+        so printing straight from on_result - which runs on s3transfer worker
+        threads - is safe; `results` (the SUCCEEDED/DRYRUN count) still needs
+        its own lock since the increment itself is not.
         """
         from boto3_s3 import Boto3S3Error, OpOutcome, TransferType
 
         if verbose:
             write_stderr(f"+ (boto3-s3) {label}\n")
-        lines: list[str] = []
-        errs: list[str] = []
+        results = 0
         lock = threading.Lock()
 
         def on_result(r: OpResult) -> None:
+            nonlocal results
             if r.outcome in (OpOutcome.SUCCEEDED, OpOutcome.DRYRUN):
                 pre = "(dry-run) " if r.outcome is OpOutcome.DRYRUN else ""
                 if r.transfer_type is TransferType.DELETE:
@@ -230,11 +236,11 @@ class Boto3S3Store:
                     line = f"{pre}{r.transfer_type.value}: {r.src} to {r.dest}"
                 else:
                     return
+                write_output(f"{line}\n")
                 with lock:
-                    lines.append(line)
+                    results += 1
             elif r.outcome is OpOutcome.FAILED:
-                with lock:
-                    errs.append(f"{r.compare_key}: {r.error}")
+                write_stderr(f"{r.compare_key}: {r.error}\n")
             elif r.outcome is OpOutcome.WARNED:
                 note_warning(
                     f"warning: {r.error}" if r.error else f"warning: skipped {r.compare_key}"
@@ -251,8 +257,8 @@ class Boto3S3Store:
             rc = 0
         except Boto3S3Error as e:
             rc = 1
-            errs.append(str(e))
-        return TransferResult(returncode=rc, stdout="\n".join(lines), stderr="\n".join(errs))
+            write_stderr(f"{e}\n")
+        return TransferResult(returncode=rc, results=results)
 
     # --- Public API --------------------------------------------------------
     def head_object(self, rel_key: str, *, verbose: bool = False) -> ObjectMeta | None:
@@ -468,19 +474,24 @@ class Boto3S3Store:
     ) -> TransferResult:
         """Delete the objects at ``rel_keys`` (entry-relative), streaming.
 
-        DeleteObjects batches stay within S3's 1,000-key limit; service-level
-        per-key failures are returned as a failed result. ``dryrun`` reports
-        the would-be deletions without calling S3.
+        DeleteObjects batches stay within S3's 1,000-key limit; a batch's
+        ``delete:`` lines print (and its per-key failures, if any) as soon as
+        it flushes - single-threaded (no worker callback here), so no lock is
+        needed around the running tallies. ``dryrun`` reports the would-be
+        deletions without calling S3.
         """
-        lines: list[str] = []
-        errors: list[str] = []
+        results = 0
+        had_error = False
         batch: list[str] = []  # entry-relative rels queued for the current request
 
         def flush() -> None:
+            nonlocal results, had_error
             if not batch:
                 return
             if dryrun:
-                lines.extend(f"(dry-run) delete: {self._s3_url(rel)}" for rel in batch)
+                for rel in batch:
+                    write_output(f"(dry-run) delete: {self._s3_url(rel)}\n")
+                    results += 1
                 batch.clear()
                 return
             if verbose:
@@ -493,7 +504,7 @@ class Boto3S3Store:
             )
             # Per-key failures (Object Lock, a per-object policy): with Quiet=True
             # only failures come back, so a key absent from Errors was deleted -
-            # emit its delete: line only then, never eagerly (that would claim a
+            # print its delete: line only then, never eagerly (that would claim a
             # failed key was deleted while stderr says it failed).
             requested = {self._api_key(rel) for rel in batch}
             error_items = response.get("Errors", [])
@@ -510,7 +521,8 @@ class Boto3S3Store:
                     for item in unattributable
                 )
                 for rel in batch:
-                    errors.append(f"{self._s3_url(rel)}: delete failed ({detail})")
+                    write_stderr(f"{self._s3_url(rel)}: delete failed ({detail})\n")
+                had_error = True
                 batch.clear()
                 return
             # Every remaining error is attributable (its Key is a requested key).
@@ -522,9 +534,11 @@ class Boto3S3Store:
             for rel in batch:
                 code = failed.get(self._api_key(rel))
                 if code is None:
-                    lines.append(f"delete: {self._s3_url(rel)}")
+                    write_output(f"delete: {self._s3_url(rel)}\n")
+                    results += 1
                 else:
-                    errors.append(f"{self._s3_url(rel)}: {code}")
+                    write_stderr(f"{self._s3_url(rel)}: {code}\n")
+                    had_error = True
             batch.clear()
 
         for rel in rel_keys:
@@ -532,11 +546,7 @@ class Boto3S3Store:
             if len(batch) == 1000:
                 flush()
         flush()
-        return TransferResult(
-            returncode=1 if errors else 0,
-            stdout="\n".join(lines),
-            stderr="\n".join(errors),
-        )
+        return TransferResult(returncode=1 if had_error else 0, results=results)
 
     def delete_subtree(
         self, rel_key: str, *, dryrun: bool = False, verbose: bool = False
@@ -626,8 +636,8 @@ class Boto3S3Store:
                 f"cp {src_path} {dst}",
                 lambda cb: self._s3.cp(src_path, loc, on_result=cb),
             )
-        # Small file: a single PutObject, and synthesize the result line the
-        # s3transfer callback would have produced (see _transfer.on_result).
+        # Small file: a single PutObject, and print the result line the
+        # s3transfer callback would have printed (see _transfer.on_result).
         from botocore.exceptions import ClientError
 
         if verbose:
@@ -636,8 +646,10 @@ class Boto3S3Store:
             with open(src_path, "rb") as f:
                 self._client.put_object(Bucket=self.bucket, Key=self._api_key(rel_key), Body=f)
         except ClientError as e:
-            return TransferResult(returncode=1, stderr=str(e))
-        return TransferResult(returncode=0, stdout=f"upload: {src_path} to {dst}")
+            write_stderr(f"{e}\n")
+            return TransferResult(returncode=1, results=0)
+        write_output(f"upload: {src_path} to {dst}\n")
+        return TransferResult(returncode=0, results=1)
 
     def sync_up(
         self,

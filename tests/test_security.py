@@ -19,13 +19,20 @@ from s3bak import restore
 MTIME_NS = 1_600_000_000 * 1_000_000_000
 
 
-def _line(mode: str, rel: str, *, size: int | None = None, link: str | None = None) -> str:
+def _line(
+    mode: str,
+    rel: str,
+    *,
+    size: int | None = None,
+    link: str | None = None,
+    mtime_ns: int = MTIME_NS,
+) -> str:
     obj: dict[str, object] = {"path": rel, "mode": mode, "owner": "o", "group": "g"}
     if size is not None:
         obj["size"] = size
     if link is not None:
         obj["link"] = link
-    obj["mtime_ns"] = MTIME_NS
+    obj["mtime_ns"] = mtime_ns
     return json.dumps(obj)
 
 
@@ -546,7 +553,7 @@ def test_remove_extras_reports_deletion_failure(tmp_path, monkeypatch, capfd):
 
     monkeypatch.setattr(restore.os, "remove", fail_remove)
 
-    assert restore.remove_extras([(str(extra), False)]) == (1, 0)
+    assert restore.remove_extras(iter([("extra.txt", str(extra), False)])) == (1, 0)
     assert extra.exists()
     assert "delete failed" in capfd.readouterr().err
 
@@ -570,3 +577,40 @@ def test_pull_replaces_inner_symlink_directory_without_writing_through_it(ws):
     assert not (dest / "sub").is_symlink()
     assert (dest / "sub" / "f.txt").read_text() == "backup"
     assert not (victim / "f.txt").exists()
+
+
+SUB_MTIME_NS = 1_650_000_000 * 1_000_000_000
+
+
+def test_pull_resettles_directory_mtime_after_symlink_replaces_nested_dir(ws):
+    # apply_manifest's ancestor stack pops (and would settle) a directory's
+    # frame as soon as the stream proves it has left that subtree - here,
+    # right after "./sub/link" is seen, because the later sibling "./zzz"
+    # is not one of "./sub"'s descendants. But "./sub/link" is a symlink
+    # replacing a local DIRECTORY, so its placement (move-aside + rmtree) is
+    # deferred until the whole manifest stream is consumed - well after
+    # "./sub" would already have been popped and settled. That placement
+    # dirties "./sub"'s own mtime again; without the resettle flag this test
+    # pins, that drift would survive the pull.
+    _put_manifest(
+        ws,
+        "data",
+        [
+            _line("40755", "."),
+            _line("40755", "./sub", mtime_ns=SUB_MTIME_NS),
+            _line("120777", "./sub/link", link="../outside.txt"),
+            _line("40755", "./zzz"),
+        ],
+    )
+    ws.config({"data": {"path": str(ws.root / "data")}})
+
+    dest = ws.root / "out"
+    stale = dest / "sub" / "link" / "stale.txt"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("stale")
+
+    ws.run("pull", "data", "-o", str(dest), expect_rc=0)
+
+    assert (dest / "sub" / "link").is_symlink()
+    assert not stale.exists()
+    assert os.lstat(dest / "sub").st_mtime_ns == SUB_MTIME_NS

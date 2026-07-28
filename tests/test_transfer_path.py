@@ -48,16 +48,19 @@ def test_small_object_download_issues_no_head_object(ws):
     assert calls["HeadObject"] == 0  # no pre-transfer probe
 
 
-def test_small_object_upload_is_a_single_put_object(ws):
+def test_small_object_upload_is_a_single_put_object(ws, capfd):
     ws.write("solo.txt", "x" * 100)
     f = ws.root / "solo.txt"
     ws.config({"solo.txt": {"path": str(f)}})
 
     store = _store(ws)
     calls = _api_counter(store)
+    capfd.readouterr()
     res = store.put_object("solo.txt", str(f))
+    out = capfd.readouterr().out
     assert res.returncode == 0
-    assert "upload:" in res.stdout and "solo.txt" in res.stdout
+    assert res.results == 1
+    assert "upload:" in out and "solo.txt" in out
     assert calls["PutObject"] == 1
     body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/solo.txt")["Body"].read()
     assert body == b"x" * 100
@@ -82,7 +85,7 @@ def test_direct_get_creates_missing_parent_dirs(ws):
     assert dest.read_text() == "deep"
 
 
-def test_large_object_takes_the_cp_multipart_path(ws, monkeypatch):
+def test_large_object_takes_the_cp_multipart_path(ws, monkeypatch, capfd):
     # Force the large path with a tiny limit instead of an 8 MiB fixture: a
     # size >= _small_limit must route through S3.cp, whose upload/download still
     # round-trips correctly. (ETag stays multipart-or-not per real size; here
@@ -95,9 +98,12 @@ def test_large_object_takes_the_cp_multipart_path(ws, monkeypatch):
     monkeypatch.setattr(store, "_small_limit", 4)  # everything is "large" now
 
     src = ws.root / "data" / "a.txt"
+    capfd.readouterr()
     res = store.put_object("data/a.txt", str(src))
+    out = capfd.readouterr().out
     assert res.returncode == 0
-    assert "upload:" in res.stdout
+    assert res.results == 1
+    assert "upload:" in out
 
     dest = ws.root / "back.txt"
     assert store.get_object("data/a.txt", str(dest), size=999) is True
@@ -151,7 +157,7 @@ def test_direct_download_preserves_existing_file_mode(ws):
     assert os.stat(dest).st_mode & 0o777 == 0o640
 
 
-def test_delete_objects_reports_only_actually_deleted_keys(ws, monkeypatch):
+def test_delete_objects_reports_only_actually_deleted_keys(ws, monkeypatch, capfd):
     # A per-key DeleteObjects failure (Object Lock, a per-object policy) must not
     # be printed as a successful `delete:` line: only keys absent from the
     # response's Errors were actually deleted.
@@ -168,15 +174,18 @@ def test_delete_objects_reports_only_actually_deleted_keys(ws, monkeypatch):
         return {"Errors": errors}
 
     monkeypatch.setattr(store._client, "delete_objects", fake_delete_objects)
+    capfd.readouterr()
     result = store.delete_objects(["data/a", "data/b"])
+    captured = capfd.readouterr()
 
     assert result.returncode == 1
-    assert "data/a" in result.stdout  # actually deleted
-    assert "data/b" not in result.stdout  # NOT claimed deleted
-    assert "data/b" in result.stderr  # reported as failed
+    assert result.results == 1
+    assert "data/a" in captured.out  # actually deleted
+    assert "data/b" not in captured.out  # NOT claimed deleted
+    assert "data/b" in captured.err  # reported as failed
 
 
-def test_delete_objects_fails_batch_on_unattributable_error(ws, monkeypatch):
+def test_delete_objects_fails_batch_on_unattributable_error(ws, monkeypatch, capfd):
     # A DeleteObjects error whose Key is missing cannot be tied to a requested
     # key, so we cannot prove any key was deleted: fail the batch instead of
     # claiming a phantom success (which would orphan the object on S3 while the
@@ -188,13 +197,16 @@ def test_delete_objects_fails_batch_on_unattributable_error(ws, monkeypatch):
         "delete_objects",
         lambda **kw: {"Errors": [{"Code": "AccessDenied", "Message": "denied"}]},
     )
+    capfd.readouterr()
     res = store.delete_objects(["a/b"])
+    captured = capfd.readouterr()
     assert res.returncode == 1
-    assert "delete:" not in res.stdout  # never claim a success we cannot prove
-    assert "a/b" in res.stderr
+    assert res.results == 0
+    assert "delete:" not in captured.out  # never claim a success we cannot prove
+    assert "a/b" in captured.err
 
 
-def test_delete_objects_fails_batch_on_unknown_key(ws, monkeypatch):
+def test_delete_objects_fails_batch_on_unknown_key(ws, monkeypatch, capfd):
     ws.config({"data": {"path": str(ws.root / "data")}})
     store = _store(ws)
     monkeypatch.setattr(
@@ -202,12 +214,15 @@ def test_delete_objects_fails_batch_on_unknown_key(ws, monkeypatch):
         "delete_objects",
         lambda **kw: {"Errors": [{"Key": "totally/other", "Code": "AccessDenied"}]},
     )
+    capfd.readouterr()
     res = store.delete_objects(["a/b"])
+    captured = capfd.readouterr()
     assert res.returncode == 1
-    assert "delete:" not in res.stdout
+    assert res.results == 0
+    assert "delete:" not in captured.out
 
 
-def test_delete_objects_reports_only_attributable_failures(ws, monkeypatch):
+def test_delete_objects_reports_only_attributable_failures(ws, monkeypatch, capfd):
     # An ordinary per-key error keyed to a requested object still lets the other
     # keys report as deleted (unchanged behaviour).
     ws.config({"data": {"path": str(ws.root / "data")}})
@@ -218,10 +233,51 @@ def test_delete_objects_reports_only_attributable_failures(ws, monkeypatch):
         "delete_objects",
         lambda **kw: {"Errors": [{"Key": api_b, "Code": "AccessDenied"}]},
     )
+    capfd.readouterr()
     res = store.delete_objects(["a", "b", "c"])
+    captured = capfd.readouterr()
     assert res.returncode == 1
-    assert "/a" in res.stdout and "/c" in res.stdout
-    assert "/b:" in res.stderr
+    assert res.results == 2
+    assert "/a" in captured.out and "/c" in captured.out
+    assert "/b:" in captured.err
+
+
+def test_transfer_lines_print_as_each_item_completes(ws, monkeypatch):
+    # F1: a sync's result lines print from on_result as each item finishes,
+    # not accumulated and flushed once as a single write after the whole sync
+    # completes - the old shape, which held O(transfer count) lines in memory
+    # and stayed silent until the very end. Wrapping write_output itself (not
+    # just counting output lines) proves the store issues one print call per
+    # transferred file, rather than one big join.
+    from s3bak import store as store_mod
+
+    for i in range(5):
+        ws.write(f"data/f{i}.txt", f"payload-{i}")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    store = _store(ws)
+
+    calls: list[str] = []
+    real_write_output = store_mod.write_output
+    monkeypatch.setattr(
+        store_mod, "write_output", lambda text: (calls.append(text), real_write_output(text))[0]
+    )
+
+    # sync_up's create lane defaults to "copy every new local entry" - directories
+    # included (LocalStorage enumerates the complete tree, docs/journal.md); a
+    # real push vetoes those through PushJournal, so here a plain regular-file
+    # filter stands in for it.
+    def files_only(info) -> bool:
+        return os.path.isfile(info.key.replace("/", os.sep))
+
+    result = store.sync_up(str(ws.root / "data"), "data", create=files_only)
+
+    assert result.returncode == 0
+    assert result.results == 5
+    upload_calls = [c for c in calls if c.startswith("upload:")]
+    # One write_output call per uploaded file, each carrying exactly its own
+    # line - never one call joining every line after the sync finished.
+    assert len(upload_calls) == 5
+    assert all(c.count("\n") == 1 for c in upload_calls)
 
 
 def test_iter_objects_rejects_unordered_listing(ws, monkeypatch):

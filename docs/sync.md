@@ -426,17 +426,30 @@ Deleting is opt-in and confirmed:
    single-file lane leaves the write time - and gets its recorded mtime
    applied; a stamp that already lands inside the window is a match and
    stays, the same bounded tolerance every match gets. Directory mode/mtime
-   is applied deepest-first after all child mutations and re-checked fresh
-   then, so a directory dirtied only by the downloads themselves converges in
-   the same pull. The walk prunes the entry's excludes (an excluded subtree
-   is never scanned) but serves purely as a stat cache: a record it did not
-   pair up is judged from a direct lstat, so a record under an excluded path
-   - pull's data sync is exclude-blind - is still repaired. Mismatches repair
-   as before: symlinks are recreated (restoring their own recorded mtime with
+   settles through an ancestor stack kept over the ascending merge-join: a
+   directory pushes a frame when its own record is seen, and the frame is
+   popped and settled - from a fresh lstat, re-checked against the record -
+   as soon as the stream proves it has left that subtree, which is always
+   after every child mutation (downloads ran before apply; symlink recreation
+   and dir creation bump parent mtimes, and sort order puts them first). This
+   keeps the whole apply streaming, with memory bounded by the depth of
+   directories currently open rather than the tree size, and a directory
+   dirtied only by the downloads themselves still converges in the same pull.
+   A symlink replacing a local directory cannot settle inline (see below) and
+   is deferred until the whole stream is consumed; since placing it can dirty
+   its own parent directory's mtime again, that parent's frame is flagged
+   when the symlink is deferred and, instead of settling at pop time, is
+   re-settled once more after deferred symlinks are placed. The walk prunes
+   the entry's excludes (an excluded subtree is never scanned) but serves
+   purely as a stat cache: a record it did not pair up is judged from a
+   direct lstat, so a record under an excluded path - pull's data sync is
+   exclude-blind - is still repaired. Mismatches repair as before: symlinks
+   are recreated (restoring their own recorded mtime with
    `os.utime(..., follow_symlinks=False)` where the platform supports setting
    it without following the link) and empty directories are recreated, and
    mode / mtime set on entries whose local filesystem type matches the
-   record. Directory and symlink conflicts are recreated from the manifest; a
+   record. Directory and symlink conflicts are recreated from the manifest
+   (a symlink replacing a local directory as the deferred placement above); a
    regular-file conflict is reported instead of following a hostile local
    symlink. A regular file the manifest records but that no object placed is
    reported missing (exit 1), rather than silently created as a directory.
@@ -455,15 +468,22 @@ names).
 - **`--data-only`** downloads data without applying mode / mtime / symlinks.
 - **`--delete`** removes local files not present in the manifest (a mirror
   restore), behind the same per-item confirmation as push: each extra is
-  prompted `y/n/a/d/q/?` deepest-first (the removal order), `--yes` answers
-  yes to everything, and a non-TTY run without `--yes` answers no (removes
-  nothing, still exits 0). Keeping an item silently keeps its ancestor extra
-  directories too — their `rmdir` could only fail — and is a choice, not a
-  failure. Candidates are the local-only lane of the same manifest×walk
-  merge-join `status` runs; only the extras themselves are held in memory, and
-  they are removed deepest-first so directories empty out before their `rmdir`.
-  A failed removal makes the command fail instead of reporting a successful
-  mirror while an extra remains. The pass runs after the metadata apply and
+  prompted `y/n/a/d/q/?`, `--yes` answers yes to everything, and a non-TTY run
+  without `--yes` answers no (removes nothing, still exits 0). Candidates are
+  the local-only lane of the same manifest×walk merge-join `status` runs,
+  streamed straight into the removal - never materialized as a list - through
+  an ancestor stack: a directory extra is not removed as it arrives but
+  pushed as an open frame, and popped (and only then removed) once the stream
+  proves it has left that subtree, so every removal inside a directory
+  finishes before the `rmdir` that needs it gone. Memory stays bounded by the
+  depth of directories currently open, not by how many extras exist.
+  Confirmation and removal order is therefore subtree by subtree - children
+  before their own directory - in the same ascending S3-key order as
+  everything else, not one global deepest-first pass. Keeping an item
+  silently keeps every extra directory still open above it too — their
+  `rmdir` could only fail — and is a choice, not a failure. A failed removal
+  makes the command fail instead of reporting a successful mirror while an
+  extra remains. The pass runs after the metadata apply and
   is skipped when that apply failed — extras diffed against a tree that is
   not in its recorded state are not trustworthy deletion candidates. Each
   removal bumps its parent directory's mtime, so when anything was removed

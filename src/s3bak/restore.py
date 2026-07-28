@@ -17,6 +17,7 @@ import stat as stat_mod
 import tempfile
 import unicodedata
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 
 from s3bak import localwalk, manifest
 from s3bak.compare import SYMLINK_MTIME_SUPPORTED, compare_to_stat
@@ -389,6 +390,100 @@ def _place_symlink(
     return True
 
 
+# =============================================================================
+# Ancestor-stack post-order (docs/manifest.md#ordering)
+# =============================================================================
+#
+# Every stream here (manifest_keyed / local_keyed and their merge-join) is
+# ascending in S3 key byte order, parent before child - so a post-order
+# operation (settling a directory's own metadata only after every child
+# mutation; rmdir only after every child is gone) cannot just consume the
+# stream in order. Both apply_manifest (directory settle) and remove_extras
+# (extras removal) solve this the same way: keep a stack of the directories
+# still "open" (their record seen, their subtree not yet proven finished),
+# and pop - deepest first, for free, by construction - whichever suffix of
+# the stack is NOT an ancestor of the next incoming item, each time the
+# stream advances. Memory stays bounded by the depth of directories
+# currently open, not by tree size or extras count.
+
+
+def _is_ancestor(anc_rel: str, rel: str) -> bool:
+    """True iff the directory at ``anc_rel`` is ``rel`` itself or one of its
+    ancestors. Judged on the sub-relative rel STRING ("." for the walked
+    root, "x/y" below it) - never on an OS path sort, which would mis-order
+    Windows' "\\" separator against other printable characters. "." is every
+    other rel's ancestor (the walked root)."""
+    if anc_rel == ".":
+        return True
+    return rel == anc_rel or rel.startswith(anc_rel + "/")
+
+
+@dataclass
+class _DirFrame:
+    """One open directory record on ``apply_manifest``'s ancestor stack,
+    waiting for the stream to leave its subtree before its mode/mtime is
+    settled."""
+
+    rel: str
+    target: str
+    m_entry: ManifestEntry
+    # Set when a deferred symlink placement (see _apply_record) will dirty
+    # this directory's mtime again AFTER the whole stream is consumed -
+    # settling now would just be re-dirtied, so the pop below routes this
+    # frame to post_symlink_dirs instead of settling it in place.
+    resettle: bool = False
+
+
+def _settle_dir(target: str, m_entry: ManifestEntry, window_ns: int) -> int:
+    """Re-check one directory's mode/mtime against a fresh lstat and apply it
+    if it drifted. Shared by the ancestor stack's pop-time settle (the common
+    case) and the small resettle list a deferred symlink placement dirties
+    again afterwards. The stream-time stat is stale by the time a directory
+    is settled - its children's mutations ran after it was observed - so this
+    always re-lstats rather than trusting an earlier one."""
+    st, _sym = _lstat_readlink(target)
+    if st is None or not stat_mod.S_ISDIR(st.st_mode):
+        err(f"expected {m_entry.path} to be a directory: {target}")
+        return 1
+    if compare_to_stat(m_entry, st, None, window_ns=window_ns).is_match:
+        return 0
+    write_output(f"{m_entry.perm_str} {target}\n")
+    return 0 if _apply_meta(target, m_entry.perm_bits, m_entry.mtime_ns) else 1
+
+
+def _pop_dir_frames(
+    stack: list[_DirFrame],
+    rel: str | None,
+    post_symlink_dirs: list[tuple[str, ManifestEntry]],
+    window_ns: int,
+) -> int:
+    """Pop and settle every frame the stream has now left: everything on
+    ``stack`` that is not ``rel`` itself or one of its ancestors (``rel=None``
+    at stream end pops the whole stack). A frame flagged ``resettle`` is not
+    settled here - it is queued in ``post_symlink_dirs`` for after deferred
+    symlinks are placed, since that placement would just dirty it again."""
+    errors = 0
+    while stack and (rel is None or not _is_ancestor(stack[-1].rel, rel)):
+        frame = stack.pop()
+        if frame.resettle:
+            post_symlink_dirs.append((frame.target, frame.m_entry))
+            continue
+        errors += _settle_dir(frame.target, frame.m_entry, window_ns)
+    return errors
+
+
+@dataclass
+class _ApplyOutcome:
+    """What ``apply_manifest`` must do after ``_apply_record`` handled one
+    record, beyond the error count: push a new directory frame, or flag the
+    record's open parent frame (the ancestor stack's top) for a
+    post-placement re-settle."""
+
+    errors: int
+    push_dir: bool = False
+    defer_symlink: bool = False
+
+
 def _apply_record(
     m_entry: ManifestEntry,
     target: str,
@@ -397,25 +492,30 @@ def _apply_record(
     *,
     window_ns: int,
     is_dir_entry: bool,
-    deferred_dirs: list[tuple[str, ManifestEntry]],
     deferred_symlinks: list[tuple[str, ManifestEntry]],
     enforce_size: bool,
-) -> int:
+) -> _ApplyOutcome:
     """Repair one manifest record against its local lstat; a record whose
     local state already matches (the shared ``compare_to_stat`` predicate) is
-    left untouched. Returns the error count (0 or 1). Directory records are
-    only structurally fixed here; their mode/mtime is deferred - and
-    re-checked - by ``apply_manifest`` after every child mutation. A symlink
+    left untouched. Directory records are only structurally fixed here
+    (conflicting-type removal, ``makedirs``); their mode/mtime is settled by
+    ``apply_manifest``'s ancestor stack after every child mutation - signaled
+    back as ``push_dir=True`` so the caller pushes the frame. A symlink
     replacing a local directory is deferred too: removing a subtree the lazy
     walk may not have descended into yet would crash the very stream feeding
-    this record."""
+    this record; signaled back as ``defer_symlink=True`` so the caller flags
+    the record's currently open parent frame (its stack top) for a
+    post-placement re-settle, since that deferred placement dirties the
+    parent's mtime again after the stack has already settled it."""
     if m_entry.sym_target is not None:
         if compare_to_stat(m_entry, st, local_sym, window_ns=window_ns).is_match:
-            return 0
+            return _ApplyOutcome(0)
         if st is not None and stat_mod.S_ISDIR(st.st_mode):
             deferred_symlinks.append((target, m_entry))
-            return 0
-        return 0 if _place_symlink(target, st, m_entry.sym_target, m_entry.mtime_ns) else 1
+            return _ApplyOutcome(0, defer_symlink=True)
+        return _ApplyOutcome(
+            0 if _place_symlink(target, st, m_entry.sym_target, m_entry.mtime_ns) else 1
+        )
 
     # Symlinks are handled above; the recorded type distinguishes a
     # directory (including an empty one, which has no S3 object) from a
@@ -429,20 +529,19 @@ def _apply_record(
             st = None
         if st is None:
             os.makedirs(target, exist_ok=True)
-        deferred_dirs.append((target, m_entry))
-        return 0
+        return _ApplyOutcome(0, push_dir=True)
 
     if compare_to_stat(m_entry, st, local_sym, window_ns=window_ns).is_match:
-        return 0
+        return _ApplyOutcome(0)
     if st is None:
         err(f"expected file missing (sync did not place it): {target}")
-        return 1
+        return _ApplyOutcome(1)
     if stat_mod.S_IFMT(st.st_mode) != stat_mod.S_IFMT(m_entry.mode):
         # In particular, never chmod/utime through a local symlink where a
         # regular file is recorded: --meta-only must not mutate the link's
         # target outside the restore tree.
         err(f"expected {m_entry.path} to have its recorded file type: {target}")
-        return 1
+        return _ApplyOutcome(1)
     if enforce_size and m_entry.is_file and m_entry.size is not None and st.st_size != m_entry.size:
         # After the data sync a regular file must have its recorded size: the
         # ManifestFilter re-downloads any pair whose size drifted, so a surviving
@@ -457,9 +556,9 @@ def _apply_record(
             f"restored size does not match manifest ({st.st_size} != {m_entry.size}),"
             f" the stored object does not match the record: {target}"
         )
-        return 1
+        return _ApplyOutcome(1)
     write_output(f"{m_entry.perm_str} {target}\n")
-    return 0 if _apply_meta(target, m_entry.perm_bits, m_entry.mtime_ns) else 1
+    return _ApplyOutcome(0 if _apply_meta(target, m_entry.perm_bits, m_entry.mtime_ns) else 1)
 
 
 def apply_manifest(
@@ -484,13 +583,29 @@ def apply_manifest(
     record under an excluded path - pull's data sync is exclude-blind - is
     still repaired, and a genuinely missing file still errors.
 
+    Directory records settle their mode/mtime through an ancestor stack (see
+    the module comment above ``_is_ancestor``): a directory pushes its frame
+    when its own record is processed and the frame is popped - and settled,
+    from a fresh lstat - as soon as the ascending stream proves it has left
+    that subtree, which is always after every child mutation (downloads ran
+    before apply; symlink recreation and dir creation bump parent mtimes, and
+    sort order puts them first). Memory stays bounded by the depth of
+    directories currently open. A symlink record replacing a local directory
+    cannot run inline - the lazy walk may not have descended into that
+    subtree yet - so it is placed only after the whole stream is consumed;
+    since that placement can dirty its own parent directory's mtime again,
+    the parent's frame is flagged at defer time and, instead of being settled
+    at pop time, is queued to be re-settled once more after deferred symlinks
+    are placed.
+
     ``enforce_size`` (True after a real data sync) makes a regular file whose
     on-disk size differs from its record a hard error - the object does not
     match the backup. ``--meta-only`` passes False: it applies metadata over
     whatever data is already present and must not fail on a size it never
     downloaded."""
-    deferred_dirs: list[tuple[str, ManifestEntry]] = []
     deferred_symlinks: list[tuple[str, ManifestEntry]] = []
+    dir_stack: list[_DirFrame] = []
+    post_symlink_dirs: list[tuple[str, ManifestEntry]] = []
     errors = 0
     # A manifest is downloaded from S3 and may be corrupt or hostile. Only a
     # directory entry joins record-controlled paths onto outpath, so only it can
@@ -510,6 +625,20 @@ def apply_manifest(
         for _key, m, loc in manifest.merge_join(
             manifest_keyed(manifest_path, sub), local_keyed(outpath, excludes or [], sub)
         ):
+            # Pop (and settle) every directory frame the stream has now left,
+            # BEFORE this item is processed: the item's own rel (the manifest
+            # side when present, the local-only side otherwise) is the
+            # stream's forward progress, and proves the stack's non-ancestor
+            # suffix is done even when this particular item is not one apply
+            # touches (a local-only extra is pull --delete's lane, below).
+            if m is not None:
+                item_rel: str | None = m[0]
+            elif loc is not None:
+                item_rel = loc[0]
+            else:
+                item_rel = None
+            if item_rel is not None:
+                errors += _pop_dir_frames(dir_stack, item_rel, post_symlink_dirs, window_ns)
             if m is None:
                 continue  # local-only: pull --delete's lane, not apply's
             rel, m_entry = m
@@ -524,17 +653,28 @@ def apply_manifest(
                     errors += 1
                     continue
                 st, local_sym = _lstat_readlink(target)
-            errors += _apply_record(
+            outcome = _apply_record(
                 m_entry,
                 target,
                 st,
                 local_sym,
                 window_ns=window_ns,
                 is_dir_entry=True,
-                deferred_dirs=deferred_dirs,
                 deferred_symlinks=deferred_symlinks,
                 enforce_size=enforce_size,
             )
+            errors += outcome.errors
+            if outcome.defer_symlink and dir_stack:
+                # This record's own directory parent is always the current
+                # stack top - every record has a recorded directory parent
+                # (validate_manifest), and the pop above already closed
+                # everything that is not an ancestor of it. Flag it so its
+                # pop-time settle is skipped in favor of the post-placement
+                # re-settle below.
+                dir_stack[-1].resettle = True
+            if outcome.push_dir:
+                dir_stack.append(_DirFrame(rel, target, m_entry))
+        errors += _pop_dir_frames(dir_stack, None, post_symlink_dirs, window_ns)
     else:
         for m_entry in manifest.iter_manifest(manifest_path):
             res = manifest_target(m_entry, outpath, is_dir, sub)
@@ -542,17 +682,17 @@ def apply_manifest(
                 continue
             target, _rel = res
             st, local_sym = _lstat_readlink(target)
-            errors += _apply_record(
+            outcome = _apply_record(
                 m_entry,
                 target,
                 st,
                 local_sym,
                 window_ns=window_ns,
                 is_dir_entry=False,
-                deferred_dirs=deferred_dirs,
                 deferred_symlinks=deferred_symlinks,
                 enforce_size=enforce_size,
             )
+            errors += outcome.errors
 
     # Symlink-over-directory replacements ran into nothing above (the lazy
     # walk may still have needed the subtree); the stream is exhausted now, so
@@ -564,22 +704,16 @@ def apply_manifest(
         if not _place_symlink(target, st, m_entry.sym_target, m_entry.mtime_ns):
             errors += 1
 
-    # Directory mode/mtime goes deepest-first, after every child mutation (the
-    # downloads ran before apply; symlink recreation and dir creation above
-    # bump parent dir mtimes). The stream-time stat is stale by then, so each
-    # directory is re-checked fresh - and skipped when it already matches.
-    deferred_dirs.sort(key=lambda x: x[0], reverse=True)
-    for target, m_entry in deferred_dirs:
-        st, _sym = _lstat_readlink(target)
-        if st is None or not stat_mod.S_ISDIR(st.st_mode):
-            err(f"expected {m_entry.path} to be a directory: {target}")
-            errors += 1
-            continue
-        if compare_to_stat(m_entry, st, None, window_ns=window_ns).is_match:
-            continue
-        write_output(f"{m_entry.perm_str} {target}\n")
-        if not _apply_meta(target, m_entry.perm_bits, m_entry.mtime_ns):
-            errors += 1
+    # The only mutation left once every directory frame has settled is the
+    # deferred symlink placement just above: it can dirty its own immediate
+    # parent's mtime again (move-aside + rmtree, or os.replace, touch the
+    # directory entry). post_symlink_dirs holds exactly the frames that
+    # placement can still dirty - at most one per such conflict, so this list
+    # stays small regardless of tree size - so settle them once more,
+    # deepest-first.
+    post_symlink_dirs.sort(key=lambda x: x[0], reverse=True)
+    for target, m_entry in post_symlink_dirs:
+        errors += _settle_dir(target, m_entry, window_ns)
 
     return 1 if errors else 0
 
@@ -589,43 +723,56 @@ def apply_manifest(
 # =============================================================================
 
 
+@dataclass
+class _ExtraFrame:
+    """One open extra directory on ``remove_extras``' ancestor stack, waiting
+    for the stream to leave its subtree before it is removed (or skipped, if
+    something inside it was kept)."""
+
+    rel: str
+    path: str
+    kept: bool = False
+
+
 def remove_extras(
-    extras: list[tuple[str, bool]], *, dryrun: bool = False, confirm: DeleteConfirmer | None = None
+    extras: Iterator[tuple[str, str, bool]],
+    *,
+    dryrun: bool = False,
+    confirm: DeleteConfirmer | None = None,
 ) -> tuple[int, int]:
-    """Remove local extras (pull ``--delete``): ``(path, is_dir)`` pairs the
-    status/--delete merge-join found on the local side only. ``is_dir`` is the
-    lstat kind, so a symlink - even one pointing at a directory - is unlinked,
-    never rmdir'd. Deepest-first (reverse path order), so a directory's
-    children go before the rmdir that needs them gone; a failure (e.g. a
-    non-empty directory that lost a child to an exclude) is reported so a
-    requested mirror restore cannot return success while extras remain.
+    """Remove local extras (pull ``--delete``): an ascending ``(rel, path,
+    is_dir)`` stream - the local-only lane of the status/--delete merge-join,
+    in S3 key order, ``rel`` sub-relative and root-free (the caller drops
+    "."). ``is_dir`` is the lstat kind, so a symlink - even one pointing at a
+    directory - is unlinked, never rmdir'd.
+
+    A directory extra is not removed as it arrives - it is pushed onto an
+    ancestor stack and popped (and only then removed) once the stream proves
+    it has left that subtree (see the module comment above ``_is_ancestor``),
+    which guarantees every removal inside a directory finishes before the
+    ``rmdir`` that needs it gone. Memory stays bounded by the depth of
+    directories currently open, not by the number of extras. Confirmation and
+    output order is therefore subtree by subtree - children before their own
+    directory - in the same ascending order as everything else, not one
+    global deepest-first pass. A removal failure (e.g. a non-empty directory
+    that lost a child to an exclude) is reported so a requested mirror
+    restore cannot return success while extras remain.
+
     ``dryrun`` reports each candidate in the same order without removing it.
-    ``confirm`` asks per extra, in the same deepest-first order; keeping an
-    item silently keeps its ancestor directories too (their rmdir could only
-    fail), and a kept item is a choice, not a failure. Returns
-    ``(failed_removals, removals)`` - the second drives the caller's
-    directory-metadata re-settle, since every removal bumps its parent
-    directory's mtime."""
+    ``confirm`` asks per extra, in the same order; keeping an item silently
+    keeps every extra directory still open above it too (their ``rmdir``
+    could only fail) without asking - a kept item is a choice, not a failure.
+    An ``rmdir``/``remove`` failure does not extend to the item's still-open
+    ancestors (unlike a "no" answer): a directory's own ``rmdir`` reports its
+    own error rather than blaming its parent. Returns ``(failed_removals,
+    removals)`` - the second drives the caller's directory-metadata
+    re-settle, since every removal bumps its parent directory's mtime."""
     errors = 0
     removed = 0
-    extras.sort(key=lambda x: x[0], reverse=True)
-    # A set rather than a "last kept path" cursor: on Windows the reverse path
-    # order can interleave siblings between a directory and its descendants
-    # (`\` sorts above many printable characters).
-    kept_ancestors: set[str] = set()
-    for path, is_dir_entry in extras:
-        if dryrun:
-            write_output(f"(dry-run) delete: {path}\n")
-            continue
-        if confirm is not None:
-            if is_dir_entry and path in kept_ancestors:
-                continue  # keeping the child forces keeping the directory
-            if not confirm.confirm(path):
-                parent = os.path.dirname(path)
-                while parent and parent not in kept_ancestors:
-                    kept_ancestors.add(parent)
-                    parent = os.path.dirname(parent)
-                continue
+    stack: list[_ExtraFrame] = []
+
+    def finish(path: str, is_dir_entry: bool) -> None:
+        nonlocal errors, removed
         try:
             if is_dir_entry:
                 os.rmdir(path)
@@ -636,4 +783,40 @@ def remove_extras(
         except OSError as e:
             err(f"delete failed: {path}: {e}")
             errors += 1
+
+    def keep_open_ancestors() -> None:
+        # Whatever remains on the stack at this point is exactly the open
+        # ancestors of the item just refused: everything popped as a
+        # non-ancestor above it is already gone, closed on its own merits.
+        for frame in stack:
+            frame.kept = True
+
+    def close(frame: _ExtraFrame) -> None:
+        if frame.kept:
+            return  # a kept descendant forces keeping the directory too - no confirm, no rmdir
+        if dryrun:
+            write_output(f"(dry-run) delete: {frame.path}\n")
+            return
+        if confirm is not None and not confirm.confirm(frame.path):
+            keep_open_ancestors()
+            return
+        finish(frame.path, True)
+
+    for rel, path, is_dir_entry in extras:
+        while stack and not _is_ancestor(stack[-1].rel, rel):
+            close(stack.pop())
+        if is_dir_entry:
+            stack.append(_ExtraFrame(rel, path))
+            continue
+        if dryrun:
+            write_output(f"(dry-run) delete: {path}\n")
+            continue
+        if confirm is not None and not confirm.confirm(path):
+            keep_open_ancestors()
+            continue
+        finish(path, False)
+
+    while stack:
+        close(stack.pop())
+
     return errors, removed

@@ -282,6 +282,114 @@ def test_diff_subpath_file(ws):
     assert "+v2" in res.out
 
 
+def test_diff_output_interleaves_record_types_in_manifest_key_order(ws):
+    # diff_backup is one streaming merge-join over the manifest and a fresh
+    # local walk (docs/manifest.md's Ordering invariant), so a regular file,
+    # a symlink, and a local-only addition must come out in S3 key order, not
+    # batched by record type (files, then symlinks, then local-only, as the
+    # old three-dict implementation produced them).
+    ws.write("data/z_file", "v1\n")
+    os.symlink("nowhere1", ws.root / "data" / "a_link")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    os.remove(ws.root / "data" / "a_link")
+    os.symlink("nowhere2", ws.root / "data" / "a_link")  # retarget: symlink diff
+    (ws.root / "data" / "z_file").write_text("v2\n")  # content diff, sorts last
+    (ws.root / "data" / "m_extra").write_text("new\n")  # local-only, sorts between
+
+    res = ws.run("diff", "data")
+    assert res.rc == 1
+
+    pos_link = res.out.index("a_link")
+    pos_extra = res.out.index("m_extra")
+    pos_file = res.out.index("z_file")
+    assert pos_link < pos_extra < pos_file
+
+
+def test_diff_stages_at_most_one_downloaded_object_at_a_time(ws, monkeypatch):
+    # diff_backup downloads recorded regular files one at a time into a fixed
+    # per-run staging name, removing each right after its own compare - so
+    # disk use never grows with the number of changed files. Wrap get_object
+    # to observe the staging directory just before each download starts: any
+    # object left over from a previous record would show up here.
+    from s3bak.store import Boto3S3Store
+
+    ws.write("data/a.txt", "aaa\n")
+    ws.write("data/b.txt", "bbb\n")
+    ws.write("data/c.txt", "ccc\n")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "a.txt").write_text("AAA\n")
+    (ws.root / "data" / "b.txt").write_text("BBB\n")
+    (ws.root / "data" / "c.txt").write_text("CCC\n")
+
+    pre_counts: list[int] = []
+    original_get_object = Boto3S3Store.get_object
+
+    def wrapped_get_object(self, rel_key, dest_path, **kwargs):
+        if os.path.basename(dest_path) == "object":  # diff_backup's staging name
+            pre_counts.append(len(os.listdir(os.path.dirname(dest_path))))
+        return original_get_object(self, rel_key, dest_path, **kwargs)
+
+    monkeypatch.setattr(Boto3S3Store, "get_object", wrapped_get_object)
+
+    res = ws.run("diff", "data")
+    assert res.rc == 1
+    assert len(pre_counts) == 3  # one download per changed regular file
+    assert pre_counts == [0, 0, 0]  # nothing left staged from a prior record
+
+
+def test_diff_regular_file_replaced_by_directory_reports_type_diff(ws):
+    # A manifest file record's sort key ("a.txt") never pairs with a local
+    # directory of the same name (sort key "a.txt/") in the merge-join, so
+    # the walk lane comes back empty for this record - not because the path
+    # is missing, but because its key shape changed. diff_backup must fall
+    # back to a direct lstat and report the type change, not misread the
+    # unpaired record as "locally gone" and dump the whole backup content
+    # against /dev/null.
+    ws.write("data/a.txt", "hello\n")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "a.txt").unlink()
+    (ws.root / "data" / "a.txt").mkdir()
+
+    res = ws.run("diff", "data")
+    assert res.rc == 1
+    assert "-regular file" in res.out
+    assert "+directory" in res.out
+    assert "-hello" not in res.out  # not a devnull content dump
+
+
+def test_diff_compares_excluded_recorded_file_against_real_local_content(ws):
+    # An exclude pattern hides a path from local_keyed's walk, but a manifest
+    # record for it can still exist (recorded before the exclude was added).
+    # "not walked" must not be read as "locally missing" - apply_manifest
+    # already relies on the same direct-lstat fallback for excluded paths it
+    # still has to repair (restore.py's apply_manifest), and diff must follow
+    # the same principle: compare the excluded file's real content, not
+    # report it as removed.
+    ws.write("data/old.log", "same\n")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)  # old.log recorded before any exclude
+
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["*.log"]}})
+
+    # Unchanged content, now excluded: still identical -> clean diff, proving
+    # the real file was compared rather than treated as absent.
+    clean = ws.run("diff", "data", expect_rc=0)
+    assert clean.out == ""
+
+    # Changed content, still excluded: a real content diff, not a "missing".
+    (ws.root / "data" / "old.log").write_text("changed\n")
+    res = ws.run("diff", "data")
+    assert res.rc == 1
+    assert "-same" in res.out
+    assert "+changed" in res.out
+
+
 def test_show_streams_file_to_stdout(ws):
     ws.write("data/a.txt", "hello\n")
     ws.config({"data": {"path": str(ws.root / "data")}})
