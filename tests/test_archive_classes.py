@@ -145,8 +145,12 @@ def test_verify_ignores_a_completed_restore_and_still_reports_the_archived_error
     (and moto) leaves at GLACIER/DEEP_ARCHIVE even after a restore completes -
     the restored copy is a separate, temporary, non-archived copy layered on
     top. So verify keeps reporting the archived-storage-class error for an
-    object a pull could, in fact, now download. Confirmed against moto
-    5.2.2: restore_object here immediately reports
+    object a pull could, in fact, now download - true here because
+    store.sync_down forces the glacier transfer (see
+    test_pull_dir_entry_over_restored_archived_object_succeeds), so this
+    same restored directory entry is exactly what that test pulls
+    successfully. Confirmed against moto 5.2.2: restore_object here
+    immediately reports
     ongoing-request="false" (moto's ManagedState default "immediate"
     progression skips any transient in-progress state), so this test only
     exercises the completed-restore case, not an in-progress one - trying to
@@ -178,15 +182,15 @@ def test_verify_ignores_a_completed_restore_and_still_reports_the_archived_error
 @pytest.mark.parametrize("storage_class", _ARCHIVED_CLASSES)
 def test_pull_dir_entry_over_unrestored_archived_object_fails_closed(ws, storage_class):
     """A directory pull's data transfer is store.sync_down -> S3.sync, which
-    (unlike store.get_object's large-file cp call) does not pass
-    force_glacier_transfer - so boto3-s3's own glacier gate WARN-skips the
-    archived source instead of raising. That alone would risk exactly the
-    silent "declared success, nothing downloaded" failure mode
-    force_glacier_transfer exists to prevent elsewhere. It stays safe here
-    only because apply_manifest's enforce_size gate then finds the file the
-    sync was supposed to place and did not, and turns that into a hard error
-    - confirmed empirically below, not merely inferred from the
-    force_glacier_transfer comment (which is about a different code path)."""
+    passes force_glacier_transfer (matching store.get_object's large-file cp
+    call), so boto3-s3's glacier gate never gets a chance to WARN-skip the
+    archived source - the sync forwards the GetObject straight to S3 and lets
+    it decide. An unrestored GLACIER/DEEP_ARCHIVE source is rejected there
+    with InvalidObjectState, which S3.sync reports as a per-key failure and
+    then a summary BatchError ("N of M operations failed"), both landing on
+    stderr; sync_down's TransferResult carries that nonzero returncode back
+    through download_from_s3, which returns it immediately - before
+    apply_manifest (and its enforce_size gate) ever runs."""
     _push_dir_entry(ws)
     ws.s3.put_object(
         Bucket=ws.bucket,
@@ -197,15 +201,17 @@ def test_pull_dir_entry_over_unrestored_archived_object_fails_closed(ws, storage
     dest = ws.root / "fresh"
     res = ws.run("pull", "data", "-o", str(dest), expect_rc=1)
     assert not (dest / "a.txt").exists()
-    assert "expected file missing" in res.err
+    assert "InvalidObjectState" in res.err
 
 
 def test_pull_data_only_over_unrestored_archived_object_fails_closed(ws):
-    """The same WARN-skip, caught by a different net. --data-only never runs
-    apply_manifest, so the enforce_size gate above cannot be what saves it;
-    _verify_restored_sizes is the parallel check that covers this lane. Pinned
-    separately because a single test on the default lane would leave the
-    impression that one gate protects both."""
+    """The same failure as above, pinned again with --data-only: that flag
+    only skips apply_manifest (and, with it, _verify_restored_sizes), it does
+    not change how the data is fetched. The forced sync still hits
+    InvalidObjectState at the GetObject and download_from_s3 still returns
+    the sync's nonzero rc immediately, so --data-only is not a bypass for
+    this failure. Pinned separately because a single test on the default
+    lane would leave that open."""
     _push_dir_entry(ws)
     ws.s3.put_object(
         Bucket=ws.bucket,
@@ -216,7 +222,7 @@ def test_pull_data_only_over_unrestored_archived_object_fails_closed(ws):
     dest = ws.root / "fresh"
     res = ws.run("pull", "--data-only", "data", "-o", str(dest), expect_rc=1)
     assert not (dest / "a.txt").exists()
-    assert "expected file missing" in res.err
+    assert "InvalidObjectState" in res.err
 
 
 @pytest.mark.parametrize("storage_class", _ARCHIVED_CLASSES)
@@ -252,3 +258,59 @@ def test_pull_single_file_entry_over_unrestored_archived_object_fails_closed(
     assert rc == 1
     assert not dest.exists()
     assert "InvalidObjectState" in captured.err
+
+
+# --- pull: a restored archived object now downloads (the fix) -------------
+
+
+@pytest.mark.parametrize("storage_class", _ARCHIVED_CLASSES)
+def test_pull_dir_entry_over_restored_archived_object_succeeds(ws, storage_class):
+    """Pins the actual fix: store.sync_down now passes force_glacier_transfer
+    to S3.sync, alongside store.get_object's large-file cp call. Before that
+    flag was wired onto sync_down, this exact restore-then-pull sequence
+    failed permanently - the gate has no HeadObject to read `Restore` from
+    during a recursive listing, so it could not see the completed restore and
+    WARN-skipped the object regardless (see
+    test_pull_dir_entry_over_unrestored_archived_object_fails_closed); a
+    directory pull could never download a restored GLACIER/DEEP_ARCHIVE
+    object, no matter how carefully it had been restored. Forcing the
+    transfer removes that client-side guess and lets S3 decide for real: a
+    completed restore now downloads."""
+    _push_dir_entry(ws)
+    key = f"{ws.prefix}/data/a.txt"
+    ws.s3.put_object(Bucket=ws.bucket, Key=key, Body=b"alpha", StorageClass=storage_class)
+    ws.s3.restore_object(
+        Bucket=ws.bucket,
+        Key=key,
+        RestoreRequest={"Days": 5, "GlacierJobParameters": {"Tier": "Standard"}},
+    )
+    dest = ws.root / "fresh"
+    ws.run("pull", "data", "-o", str(dest), expect_rc=0)
+    assert (dest / "a.txt").exists()
+    assert (dest / "a.txt").read_text() == "alpha"
+
+
+def test_pull_dir_entry_partial_archive_failure_still_downloads_ordinary_files(ws):
+    """A per-object failure must not abort the whole sync. S3.sync's engine
+    keeps every other transfer running and only tallies the archived key as
+    failed (the BatchError counts failed vs. succeeded transfers, not an
+    all-or-nothing outcome), so a directory holding one unrestored archived
+    object alongside ordinary ones still delivers the ordinary files - and
+    still exits 1, since the archived one never came down."""
+    ws.write("data/a.txt", "alpha")
+    ws.write("data/b.txt", "bravo")
+    ws.write("data/c.txt", "charlie")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.s3.put_object(
+        Bucket=ws.bucket,
+        Key=f"{ws.prefix}/data/a.txt",
+        Body=b"alpha",
+        StorageClass="GLACIER",
+    )
+    dest = ws.root / "fresh"
+    res = ws.run("pull", "data", "-o", str(dest), expect_rc=1)
+    assert not (dest / "a.txt").exists()
+    assert (dest / "b.txt").read_text() == "bravo"
+    assert (dest / "c.txt").read_text() == "charlie"
+    assert "InvalidObjectState" in res.err

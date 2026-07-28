@@ -634,6 +634,15 @@ class Boto3S3Store:
                 dryrun=dryrun,
                 update_filter=compare,
                 on_result=cb,
+                # force_glacier_transfer: the gate that would otherwise WARN-skip
+                # a GLACIER / DEEP_ARCHIVE source checks info.head["Restore"], but
+                # a recursive listing never populates a HeadObject - so a directory
+                # sync can't see a completed restore and skips the object anyway,
+                # no matter how it was restored. Forcing the transfer drops that
+                # client-side guess and lets S3 decide: a restored object comes
+                # down, an unrestored one fails loudly (InvalidObjectState) -
+                # matching the single-object cp path above.
+                force_glacier_transfer=True,
             ),
         )
 
