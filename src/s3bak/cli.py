@@ -83,6 +83,17 @@ __all__ = [
 # Parallel runner
 # =============================================================================
 
+# Default cap on how many entries a multi-entry command runs at once, when
+# entry_concurrency is not configured (a configured value replaces this
+# default outright, it does not further narrow it). Each entry worker's own
+# sync/cp already drives s3transfer's own transfer pool (~10 threads by
+# default), so 4 entries at once already means roughly 40 transfers in
+# flight - enough to saturate typical bandwidth well before entry count would
+# need to grow further. The cap also bounds how many clients (store.clone,
+# below) and threads run_entries builds up front, which otherwise scales
+# with entry count alone (one of each per entry, sight unseen).
+_DEFAULT_ENTRY_CONCURRENCY = 4
+
 
 def run_entries(
     fn: Callable[[Config, str, Opts], int],
@@ -111,10 +122,10 @@ def run_entries(
             statuses.append(fn(cfg, entry, opts))
         return next((status for status in statuses if status), 0)
 
-    # One thread per entry by default; cap at entry_concurrency when configured.
-    workers = len(entries)
-    if cfg.entry_concurrency is not None:
-        workers = min(workers, cfg.entry_concurrency)
+    # One thread per entry, capped at _DEFAULT_ENTRY_CONCURRENCY unless
+    # entry_concurrency overrides that default (see the constant above).
+    cap = cfg.entry_concurrency if cfg.entry_concurrency is not None else _DEFAULT_ENTRY_CONCURRENCY
+    workers = min(len(entries), cap)
 
     # boto3-s3's concurrency contract: transfers running on different threads
     # must not share a client, and clients must be built sequentially up

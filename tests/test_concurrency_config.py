@@ -220,10 +220,10 @@ def test_run_entries_caps_at_entry_concurrency():
     assert peak == 2  # never more than the configured cap, and it reaches it
 
 
-def test_run_entries_unbounded_when_unset():
-    rc, peak = _peak_concurrency(entry_concurrency=None, n_entries=4)
+def test_run_entries_default_cap_is_four():
+    rc, peak = _peak_concurrency(entry_concurrency=None, n_entries=6)
     assert rc == 0
-    assert peak == 4  # one thread per entry by default
+    assert peak == 4  # capped at _DEFAULT_ENTRY_CONCURRENCY, not one thread per entry
 
 
 def test_run_entries_cap_above_count_runs_all():
@@ -326,6 +326,62 @@ def test_run_entries_gives_concurrent_tasks_distinct_stores():
     assert run_entries(fn, cfg, ["one", "two"], Opts()) == 0
     assert len(seen) == 2 and seen[0] != seen[1]
     assert all(name == "MainThread" for name in FakeStore.built_on)
+
+
+def test_run_entries_default_cap_limits_clones():
+    # entry_concurrency unset: workers must cap at _DEFAULT_ENTRY_CONCURRENCY
+    # (4) regardless of how many entries are given, so a large entry list
+    # does not build one store (and thread) per entry up front.
+    from s3bak.cli import _DEFAULT_ENTRY_CONCURRENCY, run_entries
+    from s3bak.config import Config, Opts
+
+    clones = {"n": 0}
+
+    class FakeStore:
+        def clone(self):
+            clones["n"] += 1
+            return FakeStore()
+
+    cfg = Config(
+        profile="p",
+        prefix="s3://b/x",
+        bucket="b",
+        path_prefix="x",
+        entries={},
+        store=FakeStore(),  # type: ignore[arg-type]
+    )
+    rc = run_entries(lambda cfg_, entry, opts_: 0, cfg, [f"e{i}" for i in range(6)], Opts())
+    assert rc == 0
+    # workers = min(6, 4) = 4 -> 3 clones (one store built up front, the rest cloned).
+    assert clones["n"] == _DEFAULT_ENTRY_CONCURRENCY - 1
+
+
+def test_entry_concurrency_replaces_default_cap():
+    # A configured entry_concurrency REPLACES the built-in default cap, it
+    # does not further narrow it - the same min-with-configured-value
+    # semantics as before this change.
+    from s3bak.cli import run_entries
+    from s3bak.config import Config, Opts
+
+    clones = {"n": 0}
+
+    class FakeStore:
+        def clone(self):
+            clones["n"] += 1
+            return FakeStore()
+
+    cfg = Config(
+        profile="p",
+        prefix="s3://b/x",
+        bucket="b",
+        path_prefix="x",
+        entries={},
+        entry_concurrency=2,
+        store=FakeStore(),  # type: ignore[arg-type]
+    )
+    rc = run_entries(lambda cfg_, entry, opts_: 0, cfg, [f"e{i}" for i in range(6)], Opts())
+    assert rc == 0
+    assert clones["n"] == 1  # workers = min(6, 2) = 2 -> 1 clone
 
 
 def test_run_entries_propagates_broken_pipe():

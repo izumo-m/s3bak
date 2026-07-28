@@ -130,11 +130,15 @@ files is exactly what its machinery is for.
 
 ## Concurrency
 
-- Multi-entry commands run entries through a thread pool, one thread per entry
-  by default, capped at `entry_concurrency`. This includes explicit target
-  lists and `--all`. For push and pull, each entry's own `cp` / `sync` then
-  spawns s3transfer's transfer threads (`max_concurrency`); the compare
-  itself is serial (push's journal needs ordered decisions).
+- Multi-entry commands run entries through a thread pool, capped at 4 by
+  default; `entry_concurrency` replaces that default (not a further cap on
+  top of it) when set. This includes explicit target lists and `--all`. For
+  push and pull, each entry's own `cp` / `sync` then spawns s3transfer's
+  transfer threads (`max_concurrency`, ~10 by default) - so the default of 4
+  concurrent entries already means around 40 transfers in flight, enough to
+  saturate typical bandwidth; the cap also bounds how many clients and
+  threads are built up front for entries that have not started yet. The
+  compare itself is serial (push's journal needs ordered decisions).
 
 Each entry worker slot gets its own S3 client, all constructed sequentially
 before the entry pool starts (boto3-s3 forbids sharing a client across

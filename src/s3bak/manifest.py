@@ -40,6 +40,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import os
+import re
 import stat as stat_mod
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
@@ -667,11 +668,58 @@ def path_match(path: str, pattern: str) -> bool:
     # fnmatchcase is platform-neutral and, because it matches plain strings
     # rather than filesystem components, ``*`` also matches ``/``. Its mature
     # translator handles malformed/range-heavy bracket expressions without the
-    # regex compilation failures a hand-rolled translator can introduce.
+    # regex compilation failures a hand-rolled translator can introduce. This
+    # is also PathMatcher's reference semantics (below) - the two must agree.
     return fnmatch.fnmatchcase(path, pattern)
 
 
-def split_excludes(excludes: list[str]) -> tuple[list[str], list[str]]:
+class PathMatcher:
+    """A precompiled ``any(fnmatch.fnmatchcase(path, p) for p in patterns)``.
+
+    An exclude check runs once per walked path against every configured
+    pattern (localwalk's per-child prune/skip test, restore's sub-ancestor
+    test); scanning the pattern list with ``path_match`` costs one fnmatch
+    call per pattern per path - O(paths x patterns). Splitting the patterns
+    once at construction avoids that:
+
+    - a **literal** pattern (no ``*`` / ``?`` / ``[``) goes into a
+      ``frozenset``, an O(1) membership test;
+    - every **wildcard** pattern is translated with ``fnmatch.translate`` -
+      the same mature translator ``path_match`` relies on, so a malformed or
+      range-heavy bracket expression (an unterminated ``[``, an invalid
+      ``[z-a]`` range) still translates to a safe regex rather than failing
+      to compile - and every translation is OR'd into ONE compiled regex, so
+      matching costs one ``.match()`` call regardless of how many wildcard
+      patterns there are.
+
+    ``match`` is exactly ``any(path_match(path, p) for p in patterns)``: a
+    literal pattern under fnmatchcase is a plain equality test, which the
+    frozenset lookup replicates; each wildcard pattern's own
+    ``fnmatch.translate`` output keeps its trailing ``\\Z`` full-string
+    anchor inside the alternation, so one alternative reaching past the end
+    of ``path`` can never make a different, shorter alternative "match" -
+    the combined regex accepts iff at least one original pattern would have.
+    An empty pattern list matches nothing.
+    """
+
+    def __init__(self, patterns: Iterable[str]) -> None:
+        literals: set[str] = set()
+        translated: list[str] = []
+        for p in patterns:
+            if any(c in p for c in "*?["):
+                translated.append(fnmatch.translate(p))
+            else:
+                literals.add(p)
+        self._literals = frozenset(literals)
+        self._regex = re.compile("|".join(f"(?:{t})" for t in translated)) if translated else None
+
+    def match(self, path: str) -> bool:
+        if path in self._literals:
+            return True
+        return self._regex is not None and self._regex.match(path) is not None
+
+
+def split_excludes(excludes: list[str]) -> tuple[PathMatcher, PathMatcher]:
     prune_patterns: list[str] = []
     skip_patterns: list[str] = []
     for ex in excludes:
@@ -679,7 +727,7 @@ def split_excludes(excludes: list[str]) -> tuple[list[str], list[str]]:
             prune_patterns.append(f"./{ex[:-2]}")
         else:
             skip_patterns.append(f"./{ex}")
-    return prune_patterns, skip_patterns
+    return PathMatcher(prune_patterns), PathMatcher(skip_patterns)
 
 
 # =============================================================================

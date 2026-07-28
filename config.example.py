@@ -29,9 +29,10 @@ prefix = "s3://my-bucket/backup"
 #                      sync compare itself runs serially: push's journal needs
 #                      its decisions in key order.)
 #   entry_concurrency  how many entries run at once in a multi-entry command
-#                      (default: all of them, one thread each). Each entry also
-#                      opens its own transfer pool, so cap this when you have
-#                      many entries to bound the total thread count.
+#                      (default: 4). Each entry also opens its own transfer
+#                      pool (max_concurrency threads, default ~10), so 4
+#                      entries already means around 40 transfers in flight;
+#                      set this explicitly to raise or lower that ceiling.
 #   mtime_window       size+mtime-check tolerance in seconds (fractional ok,
 #                      default 0.01 = 10ms, 0 = exact st_mtime_ns match). The
 #                      default absorbs the rounding of NTFS (100ns) and exFAT

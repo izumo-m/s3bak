@@ -290,7 +290,7 @@ def local_keyed(
         parts = sub.split("/")
         for depth in range(len(parts)):
             ancestor = "./" + "/".join(parts[: depth + 1])
-            if any(manifest.path_match(ancestor, p) for p in prune):
+            if prune.match(ancestor):
                 return
     root_rel = "." if sub is None else f"./{sub}"
     rel_prefix = "./" if sub is None else f"./{sub}/"

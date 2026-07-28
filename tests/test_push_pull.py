@@ -1574,7 +1574,7 @@ def test_pending_object_delete_spool_round_trips_a_newline_in_the_key(tmp_path):
     from s3bak import localwalk
     from s3bak.syncops import PushJournal
 
-    walker = localwalk.ManifestWalker([], [], "./")
+    walker = localwalk.sync_walker([])
     journal = PushJournal(str(tmp_path / "j.journal"), None, window_ns=0, walker=walker)
     assert journal.pending_object_deletes == 0  # unset: no spool created yet
 

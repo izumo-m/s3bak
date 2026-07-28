@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING
 from boto3_s3 import LocalFileGenerator, LocalStorage, WalkChild
 from boto3_s3.types import FileKind
 
-from s3bak.manifest import path_match, split_excludes
+from s3bak.manifest import PathMatcher, split_excludes
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -72,7 +72,7 @@ class ManifestWalker(LocalFileGenerator):
     symlink racing away before its readlink).
     """
 
-    def __init__(self, prune: list[str], skip: list[str], rel_prefix: str) -> None:
+    def __init__(self, prune: PathMatcher, skip: PathMatcher, rel_prefix: str) -> None:
         self._prune = prune
         self._skip = skip
         self._rel_prefix = rel_prefix
@@ -114,14 +114,14 @@ class ManifestWalker(LocalFileGenerator):
             assert child.info.compare_key is not None  # stamped by scan_children
             rel = self._rel_prefix + child.info.compare_key
             if child.info.kind == FileKind.DIRECTORY:
-                if any(path_match(rel[:-1], p) for p in self._prune):
+                if self._prune.match(rel[:-1]):
                     continue
             else:
-                if any(path_match(rel, p) for p in self._skip):
+                if self._skip.match(rel):
                     continue
                 # A symlink named like a pruned directory is excluded too (it
                 # occupies the name the pattern targets).
-                if child.info.is_symlink and any(path_match(rel, p) for p in self._prune):
+                if child.info.is_symlink and self._prune.match(rel):
                     continue
             kept.append(child)
         return self.normalize_sort(kept)
