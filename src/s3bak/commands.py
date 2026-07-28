@@ -52,8 +52,8 @@ from s3bak.console import (
 )
 from s3bak.manifest import ManifestEntry
 from s3bak.restore import (
-    ExtraStreamItem,
     apply_manifest,
+    fs_alias_key,
     local_keyed,
     manifest_keyed,
     manifest_target,
@@ -1379,6 +1379,56 @@ def _single_file_size(manifest_path: str) -> int | None:
 # metadata apply consumes.
 
 
+def _collect_extra_aliases(
+    manifest_path: str, outpath: str, sub: str | None, excludes: list[str]
+) -> set[tuple[str, str]]:
+    """The alias set ``remove_extras`` checks a candidate against: one
+    ``(parent_rel, fs_alias_key(basename))`` pair per manifest-only record
+    whose recorded spelling a name-folding filesystem (case, NFC/NFD, a
+    Win32-trimmed trailing dot/space) could fold onto some local path - the
+    W-F3 defense (pushing from POSIX and pulling on Windows or macOS splits
+    one file into a manifest-only record plus a local-only extra with a
+    different byte spelling; without this, the extras pass would delete the
+    file the same pull just restored).
+
+    Runs the SAME merge-join ``_delete_extras`` runs, a second time,
+    read-only, purely to collect this set BEFORE the removal stream starts.
+    This cannot be folded into ``apply_manifest``'s own merge-join instead:
+    ``_mirror_extras`` (the caller two levels up) is invoked from two call
+    sites in ``cmd_pull`` - one of them a no-op short-circuit where
+    ``apply_manifest`` never runs at all (the "manifest already matches
+    local" fast path) - and ``--data-only`` skips ``apply_manifest`` too; all
+    three of those paths must get alias protection uniformly, so collecting
+    it has to be self-contained here, independent of whether or how apply
+    ran.
+
+    A manifest-only record only becomes an alias candidate when
+    ``os.path.lexists`` finds something at its OWN recorded spelling - which
+    a plain byte-different local walk would never do, but a name-folding
+    filesystem's own path resolution does (case-insensitive lookup, NFC/NFD
+    equivalence, or the Win32 trailing dot/space trim), the same fold that
+    produced the manifest-only/local-only split in the first place. So the
+    set stays empty on an ordinary tree, and its size is bounded by the
+    number of records the filesystem actually folded - the same "bounded by
+    actual conflicts" allowance ``apply_manifest``'s deferred-symlink list
+    gets (see docs/overview.md). Cost is one extra lstat per manifest-only
+    record, on top of the merge-join this already re-runs."""
+    aliases: set[tuple[str, str]] = set()
+    for _key, m, loc in manifest.merge_join(
+        manifest_keyed(manifest_path, sub), local_keyed(outpath, excludes, sub)
+    ):
+        if m is None or loc is not None:
+            continue
+        rel, _m_entry = m
+        if rel == ".":
+            continue
+        if os.path.lexists(os.path.join(outpath, rel)):
+            parent = "." if "/" not in rel else rel.rsplit("/", 1)[0]
+            name = rel.rsplit("/", 1)[-1]
+            aliases.add((parent, fs_alias_key(name)))
+    return aliases
+
+
 def _delete_extras(
     manifest_path: str,
     outpath: str,
@@ -1393,15 +1443,13 @@ def _delete_extras(
     non-interactive run without --yes answers no, i.e. removes nothing).
     Returns ``(status, removals)``.
 
-    Both lanes of the merge-join - local-only (removal candidates) and
-    manifest-only (the alias markers ``remove_extras`` needs to recognize a
-    local name a name-folding filesystem may only coincidentally not
-    byte-match a recorded sibling; see W-F3 in restore.remove_extras) -
-    stream straight into ``remove_extras`` (never materialized as a list),
-    already in the ascending order the SAME merge-join loop produces them,
-    which settles the post-order removal itself with an ancestor stack -
-    memory bounded by the depth of directories currently open, not by how
-    many extras exist."""
+    The local-only lane of the merge-join streams straight into
+    ``remove_extras`` (never materialized as a list), which settles the
+    post-order removal itself with an ancestor stack - memory bounded by the
+    depth of directories currently open, not by how many extras exist.
+    ``_collect_extra_aliases`` runs first (its own, separate pass over the
+    same merge-join) so the W-F3 alias set is complete before any candidate
+    is judged."""
     confirmer: DeleteConfirmer | None = None
     if not opts.dryrun:
         mode = resolve_answer_mode(yes=opts.yes)
@@ -1410,22 +1458,20 @@ def _delete_extras(
         if mode is AnswerMode.ASK:
             confirmer = DeleteConfirmer(mode, entry)
 
-    def extras() -> Iterator[ExtraStreamItem]:
+    aliases = _collect_extra_aliases(manifest_path, outpath, sub, excludes)
+
+    def extras() -> Iterator[tuple[str, str, bool]]:
         for _key, m, loc in manifest.merge_join(
             manifest_keyed(manifest_path, sub), local_keyed(outpath, excludes, sub)
         ):
             if m is None and loc is not None:
                 rel, st, _sym = loc
                 if rel != ".":
-                    yield ExtraStreamItem(
-                        rel, True, os.path.join(outpath, rel), stat_mod.S_ISDIR(st.st_mode)
-                    )
-            elif loc is None and m is not None:
-                rel, _entry = m
-                if rel != ".":
-                    yield ExtraStreamItem(rel, False)
+                    yield rel, os.path.join(outpath, rel), stat_mod.S_ISDIR(st.st_mode)
 
-    errors, removed = remove_extras(extras(), dryrun=opts.dryrun, confirm=confirmer)
+    errors, removed = remove_extras(
+        extras(), aliases=aliases, dryrun=opts.dryrun, confirm=confirmer
+    )
     return (1 if errors else 0), removed
 
 

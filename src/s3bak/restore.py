@@ -17,7 +17,7 @@ import stat as stat_mod
 import tempfile
 import unicodedata
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from s3bak import localwalk, manifest
 from s3bak.compare import SYMLINK_MTIME_SUPPORTED, compare_to_stat
@@ -806,120 +806,72 @@ def apply_manifest(
 
 
 @dataclass
-class ExtraStreamItem:
-    """One item on the stream ``remove_extras`` consumes: either a
-    local-only removal candidate (``is_extra=True``, ``path``/``is_dir``
-    set from the lstat) or a manifest-only marker (``is_extra=False``) that
-    only names a record the manifest holds at ``rel`` with no local
-    counterpart. The caller (``commands._delete_extras``) interleaves both
-    kinds straight out of the SAME merge-join loop, in one shared ascending
-    sort-key order, so no separate merge is needed here.
-
-    A manifest-only item exists purely so ``remove_extras`` can recognize a
-    local-only extra that a name-folding filesystem may only coincidentally
-    not byte-match a recorded sibling (W-F3: e.g. manifest ``Report.txt`` /
-    disk ``report.txt``) - it is never itself a removal candidate, so
-    ``path``/``is_dir`` are meaningless on it."""
-
-    rel: str
-    is_extra: bool
-    path: str = ""
-    is_dir: bool = False
-
-
-@dataclass
 class _ExtraFrame:
-    """One open directory scope on ``remove_extras``' ancestor stack.
-
-    Two kinds share this type. ``is_extra_dir=True`` is an actual removal
-    candidate (a local-only directory absent from the manifest): ``path`` is
-    set, and the frame is popped and settled - removed, kept, or aliased -
-    like before. ``is_extra_dir=False`` is a lazily-pushed placeholder for an
-    ORDINARY (matched) directory that merely contains a tracked child: it is
-    never removed, but a leaf extra or a manifest-only marker still needs
-    somewhere to accumulate until the stream proves it has seen every one of
-    that directory's siblings - which, for a directory that is not itself an
-    extra, would otherwise never happen (it has no frame of its own in the
-    OLD stack, which only ever held extra directories). The bottom-of-stack
-    root frame (``rel="."``) is this same placeholder, permanently present
-    for items directly under the walked root; ``_is_ancestor(".", x)`` is
-    always true, so it only ever pops once, in the final flush.
-
-    ``alias_keys`` holds ``fs_alias_key(basename)`` for every manifest-only
-    record directly under this directory - the pop-time defense against
-    W-F3. ``pending`` holds this directory's own leaf (non-directory) local-
-    only extras, deferred here instead of decided on arrival: an alias
-    partner can sort on EITHER side of the extra within the same directory
-    (``B.txt`` before ``b.txt``, but ``report.`` after ``report``), so
-    whether one exists is only certain once the stream leaves the
-    directory - exactly when this frame pops."""
+    """One open extra directory on ``remove_extras``' ancestor stack, waiting
+    for the stream to leave its subtree before it is removed (or skipped, if
+    something inside it was kept)."""
 
     rel: str
-    is_extra_dir: bool
-    path: str = ""
+    path: str
     kept: bool = False
-    alias_keys: set[str] = field(default_factory=set)
-    pending: list[str] = field(default_factory=list)
 
 
 def remove_extras(
-    extras: Iterator[ExtraStreamItem],
+    extras: Iterator[tuple[str, str, bool]],
     *,
+    aliases: set[tuple[str, str]],
     dryrun: bool = False,
     confirm: DeleteConfirmer | None = None,
 ) -> tuple[int, int]:
-    """Remove local extras (pull ``--delete``): an ascending
-    ``ExtraStreamItem`` stream - the local-only lane of the status/--delete
-    merge-join tagged with that same merge's manifest-only lane, in S3 key
-    order, ``rel`` sub-relative and root-free (the caller drops "."). A
-    local-only item's ``is_dir`` is the lstat kind, so a symlink - even one
-    pointing at a directory - is unlinked, never rmdir'd.
+    """Remove local extras (pull ``--delete``): an ascending ``(rel, path,
+    is_dir)`` stream - the local-only lane of the status/--delete merge-join,
+    in S3 key order, ``rel`` sub-relative and root-free (the caller drops
+    "."). ``is_dir`` is the lstat kind, so a symlink - even one pointing at a
+    directory - is unlinked, never rmdir'd.
 
     A directory extra is not removed as it arrives - it is pushed onto an
     ancestor stack and popped (and only then removed) once the stream proves
     it has left that subtree (see the module comment above ``_is_ancestor``),
     which guarantees every removal inside a directory finishes before the
-    ``rmdir`` that needs it gone. A leaf extra is deferred the same way, to
-    the pop of its own immediate parent directory's frame - pushed lazily as
-    a placeholder if that parent is not itself an extra (see ``_ExtraFrame``)
-    - so a manifest-only sibling recorded under a spelling the local
-    filesystem folds onto the extra (case, NFC/NFD, a Win32-trimmed trailing
-    dot/space) is always seen before the extra is judged: such an extra is
-    NOT removed (it may be the file `pull` just restored under its recorded
-    spelling), a warning is printed (exit 2 via ``note_warning``), and no
-    confirmation is asked for it. This is a choice, not a failure - like a
-    kept item, it silently keeps every extra directory still open above it
-    too (their ``rmdir`` could only fail on a directory that still holds it).
-    Memory stays bounded by the depth of directories currently open, each
-    holding only that one directory's own pending extras and manifest-only
-    keys (the declared per-directory allowance, see docs/overview.md), not
-    by the number of extras or the size of the tree.
+    ``rmdir`` that needs it gone. Memory stays bounded by the depth of
+    directories currently open, not by the number of extras. Confirmation and
+    output order is therefore subtree by subtree - children before their own
+    directory - in the same ascending order as everything else, not one
+    global deepest-first pass. A removal failure (e.g. a non-empty directory
+    that lost a child to an exclude) is reported so a requested mirror
+    restore cannot return success while extras remain.
 
-    Confirmation and output order is therefore subtree by subtree - children
-    before their own directory, and a directory's own leaf extras decided
-    together with it at its pop - in ascending key order between subtrees,
-    not one global deepest-first pass. A removal failure (e.g. a non-empty
-    directory that lost a child to an exclude) is reported so a requested
-    mirror restore cannot return success while extras remain.
+    ``aliases`` is the set of ``(parent_rel, fs_alias_key(basename))`` pairs
+    the caller (``commands._delete_extras``) already collected in one
+    preliminary pass over the same merge-join, before this stream even
+    starts: every manifest-only record whose recorded spelling a
+    name-folding filesystem (case, NFC/NFD, a Win32-trimmed trailing dot or
+    space) could fold onto some local path (W-F3 - e.g. manifest
+    ``Report.txt`` / disk ``report.txt``). Because the set is complete up
+    front, a leaf extra (checked on arrival) and a directory extra (checked
+    at its own pop) both look themselves up in it the instant they are
+    judged - no deferral needed. A hit is NOT removed (it may be the very
+    file ``pull`` just restored under its recorded spelling), a warning is
+    printed (exit 2 via ``note_warning``), and no confirmation is asked for
+    it. This is a choice, not a failure - like a kept item, it silently
+    keeps every extra directory still open above it too (their ``rmdir``
+    could only fail on a directory that still holds it).
 
     ``dryrun`` reports each surviving candidate (after the alias check) in
     the same order without removing it. ``confirm`` asks per surviving
     candidate, in the same order; keeping an item silently keeps every extra
-    directory still open above it too, without asking. An ``rmdir``/
-    ``remove`` failure does not extend to the item's still-open ancestors
-    (unlike a "no" answer or an alias skip): a directory's own ``rmdir``
-    reports its own error rather than blaming its parent. Returns
+    directory still open above it too (their ``rmdir`` could only fail)
+    without asking - a kept item is a choice, not a failure. An
+    ``rmdir``/``remove`` failure does not extend to the item's still-open
+    ancestors (unlike a "no" answer or an alias skip): a directory's own
+    ``rmdir`` reports its own error rather than blaming its parent. Returns
     ``(failed_removals, removals)`` - the second drives the caller's
     directory-metadata re-settle, since every removal bumps its parent
     directory's mtime. An aliased extra counts as neither: it is not
     removed, but - like a kept item - it is not a failure either."""
     errors = 0
     removed = 0
-    # The root frame is a permanent placeholder (see _ExtraFrame): it never
-    # pops via the ancestor check ("." is every rel's ancestor), only in the
-    # final flush below, so it is always present as stack[-1]'s ultimate
-    # fallback and every scope lookup can assume `stack` is non-empty.
-    stack: list[_ExtraFrame] = [_ExtraFrame(rel=".", is_extra_dir=False)]
+    stack: list[_ExtraFrame] = []
 
     def finish(path: str, is_dir_entry: bool) -> None:
         nonlocal errors, removed
@@ -934,77 +886,50 @@ def remove_extras(
             err(f"delete failed: {path}: {e}")
             errors += 1
 
-    def keep(frame: _ExtraFrame) -> None:
-        # `frame` itself has already been popped off `stack` by the time this
-        # runs, so it is marked directly; whatever remains on `stack` is
-        # exactly the still-open ancestors above it - everything popped as a
-        # non-ancestor earlier is already gone, closed on its own merits.
-        frame.kept = True
-        for f in stack:
-            f.kept = True
+    def keep_open_ancestors() -> None:
+        # Whatever remains on the stack at this point is exactly the open
+        # ancestors of the item just refused: everything popped as a
+        # non-ancestor above it is already gone, closed on its own merits.
+        for frame in stack:
+            frame.kept = True
+
+    def parent_of(rel: str) -> str:
+        return "." if "/" not in rel else rel.rsplit("/", 1)[0]
 
     def basename_of(rel: str) -> str:
         return rel.rsplit("/", 1)[-1]
 
-    def warn_alias(path: str) -> None:
-        note_warning(
-            f"warning: not removed (a local name the filesystem may fold onto"
-            f" a recorded path): {path}"
-        )
-
-    def decide(path: str, is_dir_entry: bool, frame: _ExtraFrame, alias_name: str) -> None:
-        # Shared by a directory frame's own removal decision (alias_name is
-        # its own basename, checked against its PARENT's alias_keys - `frame`
-        # there is the parent) and one of a frame's pending leaf extras
-        # (alias_name is the leaf's basename, checked against `frame`'s own
-        # alias_keys - `frame` there is the leaf's immediate parent).
-        if fs_alias_key(alias_name) in frame.alias_keys:
-            warn_alias(path)
-            keep(frame)
+    def decide(rel: str, path: str, is_dir_entry: bool) -> None:
+        # Shared by a leaf (judged on arrival) and a directory frame's own
+        # removal decision (judged at its pop, below) - both look up their
+        # OWN (parent, basename) in the pre-collected alias set the same way.
+        if (parent_of(rel), fs_alias_key(basename_of(rel))) in aliases:
+            note_warning(
+                f"warning: not removed (a local name the filesystem may fold onto"
+                f" a recorded path): {path}"
+            )
+            keep_open_ancestors()
             return
         if dryrun:
             write_output(f"(dry-run) delete: {path}\n")
             return
         if confirm is not None and not confirm.confirm(path):
-            keep(frame)
+            keep_open_ancestors()
             return
         finish(path, is_dir_entry)
 
     def close(frame: _ExtraFrame) -> None:
-        # This directory's own leaf extras first - deferred exactly to this
-        # point so every manifest-only sibling (added to frame.alias_keys
-        # while the frame was open) was seen before any of them is judged.
-        # A refusal or alias skip here calls keep(frame) itself, so the
-        # frame's own decision below sees it via frame.kept.
-        for path in frame.pending:
-            decide(path, False, frame, os.path.basename(path))
-        if not frame.is_extra_dir:
-            return  # a placeholder scope for a matched directory: nothing to remove
         if frame.kept:
-            return  # a kept/aliased descendant forces keeping the directory too
-        # `frame` has already been popped by the caller, so stack[-1] is now
-        # its immediate parent scope - always present (the root frame never
-        # pops here; only a non-root frame reaches this branch).
-        decide(frame.path, True, stack[-1], basename_of(frame.rel))
+            return  # a kept descendant forces keeping the directory too - no confirm, no rmdir
+        decide(frame.rel, frame.path, True)
 
-    def scope(rel: str) -> _ExtraFrame:
-        """Return the (possibly newly pushed placeholder) frame for the
-        directory ``rel``, after closing whatever the stream has now left."""
+    for rel, path, is_dir_entry in extras:
         while stack and not _is_ancestor(stack[-1].rel, rel):
             close(stack.pop())
-        if stack[-1].rel != rel:
-            stack.append(_ExtraFrame(rel=rel, is_extra_dir=False))
-        return stack[-1]
-
-    for item in extras:
-        parent_rel = "." if "/" not in item.rel else item.rel.rsplit("/", 1)[0]
-        frame = scope(parent_rel)
-        if not item.is_extra:
-            frame.alias_keys.add(fs_alias_key(basename_of(item.rel)))
-        elif item.is_dir:
-            stack.append(_ExtraFrame(rel=item.rel, is_extra_dir=True, path=item.path))
-        else:
-            frame.pending.append(item.path)
+        if is_dir_entry:
+            stack.append(_ExtraFrame(rel, path))
+            continue
+        decide(rel, path, False)
 
     while stack:
         close(stack.pop())

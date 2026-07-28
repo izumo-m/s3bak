@@ -585,8 +585,8 @@ def test_remove_extras_reports_deletion_failure(tmp_path, monkeypatch, capfd):
 
     monkeypatch.setattr(restore.os, "remove", fail_remove)
 
-    item = restore.ExtraStreamItem("extra.txt", True, str(extra), False)
-    assert restore.remove_extras(iter([item])) == (1, 0)
+    item = ("extra.txt", str(extra), False)
+    assert restore.remove_extras(iter([item]), aliases=set()) == (1, 0)
     assert extra.exists()
     assert "delete failed" in capfd.readouterr().err
 
@@ -658,9 +658,8 @@ def test_pull_resettles_directory_mtime_after_symlink_replaces_nested_dir(ws):
 # spelling split as an extra it just restored. Linux cannot host a real
 # folding filesystem, so these tests pin restore.fs_alias_key itself (the
 # folding rule) and drive restore.remove_extras directly with a hand-built
-# stream shaped like what a folding filesystem's merge-join would produce -
-# exactly what the module comment above remove_extras says a real repro
-# would need.
+# ``aliases`` set shaped like what commands._collect_extra_aliases's
+# preliminary pass would produce for such a split.
 
 
 def test_fs_alias_key_folds_case_dot_space_and_unicode_normalization():
@@ -709,21 +708,21 @@ def test_canonical_restore_comparison_path_distinguishes_unrelated_paths(tmp_pat
     ) != restore.canonical_restore_comparison_path(b)
 
 
-def test_remove_extras_keeps_local_extra_aliased_by_a_later_manifest_only_record(tmp_path, capfd):
-    # W-F3, alias sorting AFTER the extra: "report." (manifest) sorts after
-    # "report" (local) - a short string sorts before one it prefixes. Unless
-    # the decision is deferred to the pop of the enclosing directory, the
-    # extra would be judged (and removed) before its alias partner is ever
-    # seen.
+def test_remove_extras_keeps_local_extra_whose_manifest_alias_would_sort_after_it(tmp_path, capfd):
+    # W-F3, "report." vs "report": a short name sorts before one it
+    # prefixes, so a manifest-only "report." record would sort AFTER the
+    # local-only "report" extra in raw merge-join order. commands
+    # ._collect_extra_aliases collects the alias set in its own preliminary
+    # pass, complete before remove_extras ever runs - so which side the
+    # manifest-only partner would have sorted on makes no difference here,
+    # unlike the deferred pop-time decision this replaced.
     report = tmp_path / "a" / "report"
     report.parent.mkdir()
     report.write_text("restored content")
 
-    items = [
-        restore.ExtraStreamItem("a/report", True, str(report), False),
-        restore.ExtraStreamItem("a/report.", False),
-    ]
-    errors, removed = restore.remove_extras(iter(items))
+    items = [("a/report", str(report), False)]
+    aliases = {("a", restore.fs_alias_key("report."))}
+    errors, removed = restore.remove_extras(iter(items), aliases=aliases)
 
     assert (errors, removed) == (0, 0)
     assert report.exists()
@@ -732,20 +731,18 @@ def test_remove_extras_keeps_local_extra_aliased_by_a_later_manifest_only_record
     assert "not removed" in err.lower()
 
 
-def test_remove_extras_keeps_local_extra_aliased_by_an_earlier_manifest_only_record(
-    tmp_path, capfd
-):
-    # W-F3, alias sorting BEFORE the extra: "B.txt" (manifest) sorts before
-    # "b.txt" (local) - uppercase sorts before lowercase in byte order.
+def test_remove_extras_keeps_local_extra_whose_manifest_alias_would_sort_before_it(tmp_path, capfd):
+    # W-F3, "B.txt" vs "b.txt": uppercase sorts before lowercase in byte
+    # order, so a manifest-only "B.txt" record would sort BEFORE the
+    # local-only "b.txt" extra - the other direction from the test above,
+    # protected the same way by the same pre-collected set.
     b = tmp_path / "a" / "b.txt"
     b.parent.mkdir()
     b.write_text("restored content")
 
-    items = [
-        restore.ExtraStreamItem("a/B.txt", False),
-        restore.ExtraStreamItem("a/b.txt", True, str(b), False),
-    ]
-    errors, removed = restore.remove_extras(iter(items))
+    items = [("a/b.txt", str(b), False)]
+    aliases = {("a", restore.fs_alias_key("B.txt"))}
+    errors, removed = restore.remove_extras(iter(items), aliases=aliases)
 
     assert (errors, removed) == (0, 0)
     assert b.exists()
@@ -754,22 +751,35 @@ def test_remove_extras_keeps_local_extra_aliased_by_an_earlier_manifest_only_rec
     assert "not removed" in err.lower()
 
 
-def test_remove_extras_still_removes_an_unaliased_extra_next_to_a_manifest_only_record(
-    tmp_path, capfd
-):
-    # An unrelated manifest-only record in the same directory (an ordinary
-    # local deletion the manifest still remembers) must not make the alias
-    # check over-conservative: a local-only name that does NOT fold onto it
-    # is removed exactly as before.
+def test_remove_extras_keeps_an_aliased_extra_directory_too(tmp_path, capfd):
+    # The alias check applies to a directory extra just as much as a leaf -
+    # checked at the directory's own pop, against ITS OWN (parent, basename),
+    # never its children's.
+    d = tmp_path / "a" / "b"
+    d.mkdir(parents=True)
+
+    items = [("a/b", str(d), True)]
+    aliases = {("a", restore.fs_alias_key("B"))}
+    errors, removed = restore.remove_extras(iter(items), aliases=aliases)
+
+    assert (errors, removed) == (0, 0)
+    assert d.exists()
+    err = capfd.readouterr().err
+    assert "warning" in err.lower()
+    assert "not removed" in err.lower()
+
+
+def test_remove_extras_still_removes_an_unaliased_extra_next_to_an_alias_entry(tmp_path, capfd):
+    # An alias entry for one name in a directory must not make the check
+    # over-conservative: an unrelated local-only name in the same directory,
+    # not itself in the alias set, is removed exactly as before.
     extra = tmp_path / "a" / "unrelated.txt"
     extra.parent.mkdir()
     extra.write_text("delete me")
 
-    items = [
-        restore.ExtraStreamItem("a/deleted-elsewhere.txt", False),
-        restore.ExtraStreamItem("a/unrelated.txt", True, str(extra), False),
-    ]
-    errors, removed = restore.remove_extras(iter(items))
+    items = [("a/unrelated.txt", str(extra), False)]
+    aliases = {("a", restore.fs_alias_key("deleted-elsewhere.txt"))}
+    errors, removed = restore.remove_extras(iter(items), aliases=aliases)
 
     assert (errors, removed) == (0, 1)
     assert not extra.exists()
@@ -777,9 +787,9 @@ def test_remove_extras_still_removes_an_unaliased_extra_next_to_a_manifest_only_
 
 
 def test_remove_extras_regression_nested_post_order_still_removes_plain_extras(tmp_path, capfd):
-    # No manifest-only records at all here - a plain regression check that
-    # ordinary (non-aliased) extras are still removed, deepest-first within
-    # each subtree, exactly as before this fix.
+    # No aliases at all here - a plain regression check that ordinary extras
+    # are still removed, deepest-first within each subtree, exactly as
+    # before the W-F3 fix.
     (tmp_path / "extradir" / "sub").mkdir(parents=True)
     deep = tmp_path / "extradir" / "sub" / "deep.txt"
     deep.write_text("d")
@@ -787,12 +797,12 @@ def test_remove_extras_regression_nested_post_order_still_removes_plain_extras(t
     zzz.write_text("z")
 
     items = [
-        restore.ExtraStreamItem("extradir", True, str(tmp_path / "extradir"), True),
-        restore.ExtraStreamItem("extradir/sub", True, str(tmp_path / "extradir" / "sub"), True),
-        restore.ExtraStreamItem("extradir/sub/deep.txt", True, str(deep), False),
-        restore.ExtraStreamItem("zzz.txt", True, str(zzz), False),
+        ("extradir", str(tmp_path / "extradir"), True),
+        ("extradir/sub", str(tmp_path / "extradir" / "sub"), True),
+        ("extradir/sub/deep.txt", str(deep), False),
+        ("zzz.txt", str(zzz), False),
     ]
-    errors, removed = restore.remove_extras(iter(items))
+    errors, removed = restore.remove_extras(iter(items), aliases=set())
 
     assert (errors, removed) == (0, 4)
     out = capfd.readouterr().out
@@ -803,3 +813,54 @@ def test_remove_extras_regression_nested_post_order_still_removes_plain_extras(t
         str(tmp_path / "extradir"),
         str(zzz),
     ]
+
+
+def test_delete_extras_collects_alias_via_a_name_folding_lexists_probe(
+    tmp_path, monkeypatch, capfd
+):
+    # End-to-end through commands._delete_extras (not restore.remove_extras
+    # directly): pins that the alias SET ITSELF ties back to a real
+    # name-folding filesystem signal, not a hand-built set. On such a
+    # filesystem, os.path.lexists(the manifest's OWN recorded spelling)
+    # succeeds even though a plain directory listing enumerates the same
+    # file under a different local spelling - the fold happens inside the
+    # OS's own path resolution. Linux has no such filesystem, so the fold is
+    # simulated by monkeypatching os.path.lexists for exactly that spelling;
+    # everything else (the walk, the merge-join, remove_extras) runs for
+    # real.
+    from s3bak import commands
+    from s3bak.config import Opts
+
+    dest = tmp_path / "out"
+    dest.mkdir()
+    content = "restored content"
+    (dest / "report.txt").write_text(content)
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text(
+        "\n".join(
+            [
+                '{"s3bak_manifest":3}',
+                _line("40755", "."),
+                _line("100644", "./Report.txt", size=len(content)),
+            ]
+        )
+        + "\n"
+    )
+
+    folded = os.path.join(str(dest), "Report.txt")
+    real_lexists = os.path.lexists
+
+    def fake_lexists(path):
+        return True if path == folded else real_lexists(path)
+
+    monkeypatch.setattr(commands.os.path, "lexists", fake_lexists)
+
+    status, removed = commands._delete_extras(
+        str(manifest_path), str(dest), None, [], opts=Opts(yes=True), entry="data"
+    )
+
+    assert (status, removed) == (0, 0)
+    assert (dest / "report.txt").read_text() == content
+    err = capfd.readouterr().err
+    assert "warning" in err.lower()
+    assert "not removed" in err.lower()

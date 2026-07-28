@@ -475,29 +475,33 @@ names).
   prompted `y/n/a/d/q/?`, `--yes` answers yes to everything, and a non-TTY run
   without `--yes` answers no (removes nothing, still exits 0). Candidates are
   the local-only lane of the same manifest×walk merge-join `status` runs,
-  streamed straight into the removal - never materialized as a list - through
-  an ancestor stack: a directory extra is not removed as it arrives but
-  pushed as an open frame, and popped (and only then removed) once the stream
-  proves it has left that subtree, so every removal inside a directory
-  finishes before the `rmdir` that needs it gone. Memory stays bounded by the
-  depth of directories currently open, not by how many extras exist.
-  Confirmation and removal order is therefore subtree by subtree - children
-  before their own directory - in the same ascending S3-key order as
-  everything else, not one global deepest-first pass. Keeping an item
-  silently keeps every extra directory still open above it too — their
-  `rmdir` could only fail — and is a choice, not a failure. A local name
-  that a name-folding filesystem (case-insensitive Windows/macOS, Win32's
-  trailing dot/space trim, macOS NFC/NFD Unicode normalization) may fold
-  onto a path the manifest records under a different spelling is excluded
-  from removal the same way, even though it does not itself match any
-  record byte-for-byte — it may be the very file the pull just restored
-  under its recorded spelling — and reported as a warning (exit 2) instead
-  of a delete line. A failed removal makes the command fail instead of
-  reporting a successful mirror while an extra remains. The pass runs after
-  the metadata apply and
-  is skipped when that apply failed — extras diffed against a tree that is
-  not in its recorded state are not trustworthy deletion candidates. Each
-  removal bumps its parent directory's mtime, so when anything was removed
+  streamed straight into the removal - never materialized as a list. A leaf
+  extra is judged the moment it arrives, in the same order `status` would
+  report it; a directory extra, by contrast, is not removed as it arrives but
+  pushed as an open frame on an ancestor stack, and popped (and only then
+  removed) once the stream proves it has left that subtree, so every removal
+  inside a directory finishes before the `rmdir` that needs it gone. Memory
+  stays bounded by the depth of directories currently open, not by how many
+  extras exist. Confirmation and removal order is therefore subtree by
+  subtree - children before their own directory - in the same ascending
+  S3-key order as everything else, not one global deepest-first pass. Keeping
+  an item silently keeps every extra directory still open above it too —
+  their `rmdir` could only fail — and is a choice, not a failure. A local
+  name that a name-folding filesystem (case-insensitive Windows/macOS,
+  Win32's trailing dot/space trim, macOS NFC/NFD Unicode normalization) may
+  fold onto a path the manifest records under a different spelling is
+  excluded from removal the same way, even though it does not itself match
+  any record byte-for-byte — it may be the very file the pull just restored
+  under its recorded spelling. This alias set is collected in one
+  preliminary pass over the same merge-join, before the removal stream even
+  starts, so a leaf and a directory extra alike check it the instant each is
+  judged - no deferral needed; a hit is reported as a warning (exit 2)
+  instead of a delete line. A failed removal makes the command fail instead
+  of reporting a successful mirror while an extra remains. The pass runs
+  after the metadata apply and is skipped when that apply failed — extras
+  diffed against a tree that is not in its recorded state are not
+  trustworthy deletion candidates. Each removal bumps its parent directory's
+  mtime, so when anything was removed
   the manifest metadata is applied once more, re-settling exactly the
   directories the removals dirtied. An extra is judged solely by the manifest,
   so **an extra can be the only copy of real data**: a file never pushed, or
