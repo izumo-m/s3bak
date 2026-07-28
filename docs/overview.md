@@ -112,6 +112,9 @@ their most common source (see [storage.md](storage.md)).
   rewrite it drives.
 - **[Verification model](verify.md)** — the read-only manifest ↔ S3 integrity
   check, its finding severities, and the suggested verification routine.
+- **[Interruption and recovery](recovery.md)** — what an unfinished command
+  leaves behind, which run converges it, and the residues a hard kill needs
+  resolved by hand.
 - **[CLI contract](cli.md)** — argument resolution, explicit option handling,
   concurrent result aggregation, and exit codes.
 - **[Internal architecture](architecture.md)** — module responsibilities,
