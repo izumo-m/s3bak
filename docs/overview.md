@@ -73,6 +73,32 @@ tool itself, for example:
 s3bak does not detect or guard against these conditions; avoiding them is
 the operator's responsibility.
 
+### Trust boundary
+
+s3bak trusts its own bucket and its own local filesystem. Neither is treated
+as attacker-controlled input, and s3bak does not try to defend against one
+that is — because at that point there is nothing left to defend:
+
+- **An attacker who can write the bucket already owns the backup.** They can
+  rewrite any recorded object and the manifest itself, and a pull faithfully
+  restores what the backup says. Elaborate paths such as escaping the restore
+  root through a symlink gain them nothing they could not get by editing the
+  target file's own object. This is solved one layer down, with AWS-side
+  access control — a bucket policy, source-IP restriction, SSO-issued
+  short-lived credentials — not inside s3bak.
+- **An attacker who can write the local tree does not need s3bak at all.**
+  Racing a check against its use, to make s3bak write a file on their behalf,
+  is a detour around simply writing that file.
+
+So a guard is only worth having here when it holds with **no attacker at
+all**. Confinement to the restore destination is one of those: a pull that
+writes outside the tree the operator named is a blast-radius bug in ordinary
+single-operator use, reachable through nothing more hostile than a symlink,
+an interrupted push's unrecorded object, or a filesystem that spells a name
+differently than the manifest does. Those are treated as correctness bugs,
+on the same footing as any other, and cross-platform restore fidelity is
+their most common source (see [storage.md](storage.md)).
+
 ## Design documents
 
 - **[Storage model](storage.md)** — how local trees, data objects, and manifests
