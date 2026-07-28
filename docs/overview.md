@@ -34,8 +34,24 @@ evaluated separately.
 
 ### Performance and scalability
 
-I/O, memory use, S3 access, and concurrency should continue to improve so
-s3bak remains practical as backup sets grow, without compromising correctness.
+Everything that processes a tree streams. The manifest, the local walk, and
+the S3 listing all ascend in S3 key byte order, so every multi-record
+operation is a merge-join with a bounded lookahead — memory stays independent
+of file count. The invariant is precise about its allowances:
+
+- an **ancestor stack** bounded by directory depth, for the operations that
+  are inherently post-order (settling a directory's metadata after its
+  children; removing children before their directory);
+- a **per-directory sort** bounded by one directory's direct entries (key
+  order has to be produced from an unsorted readdir);
+- **deferred work** bounded by the number of actual type conflicts, never by
+  tree size.
+
+Disk use follows the same rule: content is staged at most one object at a
+time, and intermediate state that could grow with the tree spools to
+temporary files. I/O, S3 access, and concurrency should continue to improve
+within this invariant, without compromising correctness. See
+[manifest.md](manifest.md) for the ordering contract the merge-joins rely on.
 
 ### Maintainable evolution
 
