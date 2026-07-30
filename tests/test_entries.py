@@ -115,18 +115,22 @@ def test_push_delete_offers_excluded_objects_as_orphans(ws, answers):
     # An exclude added after a push must not strand the pushed objects: the
     # local side no longer lists cache/, so its S3 objects surface as ordinary
     # delete candidates - recorded ones, so no "(not in manifest)" flag - and
-    # the confirmed deletion drops object and record together.
+    # the confirmed deletion drops object and record together. Once everything
+    # beneath it is gone, the excluded directory's own record (invisible to
+    # the walk, so an orphan too) is offered post-order and retired as well.
     _push_then_exclude_cache(ws)
 
-    answers.feed("y")
+    answers.feed("y", "y")
     res = ws.run("push", "--delete", "data", expect_rc=0)
 
-    assert len(answers.prompts) == 1
+    assert len(answers.prompts) == 2
     assert "cache/c.txt" in answers.prompts[0]
     assert "(not in manifest)" not in answers.prompts[0]
+    assert "data/cache/ (directory record)" in answers.prompts[1]
     assert "delete:" in res.out
+    assert "delete record:" in res.out
     assert "data/cache/c.txt" not in ws.keys()
-    assert "./cache/c.txt" not in _manifest_paths(ws)
+    assert _manifest_paths(ws) == [".", "./keep.txt"]
     assert (ws.root / "data" / "cache" / "c.txt").read_text() == "c"  # local untouched
 
 
@@ -219,16 +223,19 @@ def test_subpath_push_delete_offers_excluded_objects(ws, answers):
     ws.run("push", "data", expect_rc=0)
     ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["sub/cache/*"]}})
 
-    answers.feed("y")
+    answers.feed("y", "y")
     ws.run("push", "--delete", "data/sub", expect_rc=0)
 
-    assert len(answers.prompts) == 1
+    assert len(answers.prompts) == 2
     assert "sub/cache/c.txt" in answers.prompts[0]
+    assert "data/sub/cache/ (directory record)" in answers.prompts[1]
     keys = ws.keys()
     assert "data/sub/cache/c.txt" not in keys
     assert "data/sub/a.txt" in keys
-    assert "./sub/cache/c.txt" not in _manifest_paths(ws)
-    assert "./sub/a.txt" in _manifest_paths(ws)
+    paths = _manifest_paths(ws)
+    assert "./sub/cache/c.txt" not in paths
+    assert "./sub/cache" not in paths
+    assert "./sub/a.txt" in paths
 
 
 def test_subpath_push_of_excluded_subtree_backs_it_up(ws):

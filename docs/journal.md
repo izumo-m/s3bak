@@ -83,22 +83,25 @@ immediately, on a push where no hook fires).
 
 ```
 +{"path":"./docs/new.txt","mode":"100644","owner":"iz","group":"iz","size":12,"mtime_ns":1789000000000000001}
-!{"path":"./src/main.py","mode":"100644","owner":"iz","group":"iz","size":2048,"mtime_ns":1789000000000000002}
+ {"path":"./old","mode":"40755","owner":"iz","group":"iz","mtime_ns":1700000000000000000}
 -{"path":"./old/report.txt","mode":"100644","owner":"iz","group":"iz","size":900,"mtime_ns":1700000000000000000}
+!{"path":"./src/main.py","mode":"100644","owner":"iz","group":"iz","size":2048,"mtime_ns":1789000000000000002}
 ```
 
-| Marker | Payload        | Meaning                                                    |
-| ------ | -------------- | ---------------------------------------------------------- |
-| `+`    | the NEW record | the sort key is absent from the old manifest (an addition) |
-| `!`    | the NEW record | the sort key is present (a replacement)                    |
-| `-`    | the OLD record | drop the old record                                        |
+| Marker      | Payload        | Meaning                                                    |
+| ----------- | -------------- | ---------------------------------------------------------- |
+| `+`         | the NEW record | the sort key is absent from the old manifest (an addition) |
+| `!`         | the NEW record | the sort key is present (a replacement)                    |
+| `-`         | the OLD record | drop the old record                                        |
+| ` ` (space) | the OLD record | no change: keep the old record as-is                       |
 
 - **The marker reflects the old manifest at the key, not the lane that
   produced the event.** A create-lane upload whose record already exists (a
   recorded file whose S3 object went missing) journals `!`; a file ↔ symlink
   type change shares one sort key and journals `!` too.
 - An event's payload always carries the walked stat — the lstat the compare
-  judged — with owner/group resolved at event time.
+  judged — with owner/group resolved at event time. A `-` / ` ` payload is
+  the old record verbatim.
 - A filename containing a newline stays inside one line (JSON escaping), so
   the format remains line-oriented.
 
@@ -107,8 +110,8 @@ immediately, on a push where no hook fires).
 - Lines are **strictly ascending by sort key, at most one line per key**. A
   `-` plus `+` at one key is an emitter bug (it must be `!`) and fails.
 - The marker is cross-checked against the old manifest, fail closed: a `+`
-  whose key exists, or a `!` / `-` whose key does not, is a `ManifestError`.
-  A `-` payload must match the old record it drops.
+  whose key exists, or a `!` / `-` / ` ` whose key does not, is a
+  `ManifestError`. A `-` / ` ` payload must match the old record.
 - Payloads pass the same record validation as manifest lines, and the merged
   output passes the full pre-publish validation every manifest write runs.
 
@@ -126,14 +129,31 @@ immediately, on a push where no hook fires).
   directory or special-file own-mtime drift; objectless additions (empty
   directory, symlink, special file); the root record when its metadata
   drifted.
-- **`-`**: only on `--delete` runs — a confirmed deletion (the object and its
-  record travel together), a stale old-only file record with no object behind
-  it, and, under the `--yes` mirror, objectless records whose local
-  counterpart is gone (seen as cursor skip-overs). An orphan answered `n`
-  writes nothing: the record stays. Once the walk warns about real
-  tree content (`scan_incomplete`), the emitter writes no further `-` — the
-  partial-view gate that refuses deletions; drops journaled before the gap
-  were decided on sound data and stand.
+- **`-`**: only on `--delete` runs — a confirmed object deletion (the object
+  and its record travel together), a stale old-only file record with no
+  object behind it (dropped silently: the record restores nothing), a
+  confirmed record-only drop (a vanished symlink or special-file record,
+  asked as its skip-over arrives; a vanished directory record, decided
+  post-order through its ` ` line — next bullet), and, under the `--yes`
+  mirror, every vanished record at arrival (the mirror needs no frames or
+  questions). An orphan answered `n` writes nothing: the record stays. Once
+  the walk warns about real tree content (`scan_incomplete`), the emitter
+  writes no further `-` — the partial-view gate that refuses deletions;
+  drops journaled before the gap were decided on sound data and stand.
+- **` ` (no change)**: the reserved line of a directory-record delete
+  candidate. The decision is post-order — ask only once everything beneath
+  the directory resolved deleted, keep it silently (no question) the moment
+  anything beneath survives — the same ancestor-stack pattern `pull
+  --delete` uses for local extras ([sync.md](sync.md#deleting-backups---delete---yes)).
+  But the journal is strictly ascending, and a directory's line belongs
+  before its children's, where the answer is not yet known. So the emitter
+  writes the candidate as a no-change line the moment the cursor skips over
+  it, remembers the offset (one open frame per ancestor directory, memory
+  bounded by depth), and, when the drop is confirmed at the subtree's close,
+  flips that line's marker byte to `-` in place — ` ` and `-` are the same
+  one byte, so nothing shifts, and the journal is well-formed at every
+  moment. A kept candidate simply remains a no-op line; no cleanup pass
+  exists or is needed.
 
 ## The merge
 
@@ -143,12 +163,17 @@ journal, both in ascending key order:
 - a key with no event — the old record is copied **verbatim** (unknown keys
   preserved, no re-serialization);
 - `+` / `!` — the payload is copied byte-for-byte, marker stripped;
-- `-` — the old record is skipped.
+- `-` — the old record is skipped;
+- ` ` — the old record is copied verbatim, exactly like a key with no event
+  (a kept delete candidate).
 
-**The rewrite condition is "the journal is non-empty", nothing else.** A
-first push journals `+` for everything including the root, so "no manifest
-yet" needs no special case; a pure no-op push produces an empty journal and
-rewrites nothing.
+**The rewrite condition is "the journal holds at least one `+` / `!` /
+`-`".** A first push journals `+` for everything including the root, so "no
+manifest yet" needs no special case; a pure no-op push produces an empty
+journal and rewrites nothing, and a `--delete` run whose directory-record
+candidates were all kept leaves only ` ` lines — no real event, so nothing
+is rewritten or re-uploaded (a cron all-no run must not republish an
+identical manifest forever).
 
 Every keep/drop policy — keep-by-default, the `--delete` confirmation, the
 `--yes` mirror, the incomplete-scan gate — lives in the emitter as "write a

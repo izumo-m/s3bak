@@ -483,6 +483,7 @@ def test_merge_journal_applies_events_and_copies_the_rest_verbatim(tmp_path):
         [
             '+{"path":"./added.txt","mode":"100644","size":2,"mtime_ns":1}',
             "-" + _OLD_LINES[1],  # gone.txt: a confirmed deletion drops its record
+            " " + _OLD_LINES[2],  # keep.txt: a kept delete candidate is a no-op
             '!{"path":"./link","mode":"120777","mtime_ns":0,"link":"added.txt"}',
         ],
     )
@@ -491,7 +492,7 @@ def test_merge_journal_applies_events_and_copies_the_rest_verbatim(tmp_path):
         manifest.merge_journal(out, str(old), journal)
     entries = [json.loads(ln) for ln in out_path.read_text().splitlines()[1:]]
     assert [e["path"] for e in entries] == [".", "./added.txt", "./keep.txt", "./link"]
-    assert entries[2]["future"] == "kept"  # untouched record copied verbatim
+    assert entries[2]["future"] == "kept"  # " " copies the old record verbatim
     assert entries[3]["link"] == "added.txt"  # ! replaced the record
     assert manifest.validate_manifest(str(out_path)) == "dir"
 
@@ -517,11 +518,14 @@ def test_merge_journal_without_old_manifest_is_the_first_push(tmp_path):
         ('!{"path":"./zzz.txt","mode":"100644","size":1,"mtime_ns":0}', "unrecorded"),
         ('-{"path":"./zzz.txt","mode":"100644","size":1,"mtime_ns":0}', "unrecorded"),
         ('-{"path":"./keep.txt","mode":"100644","size":9,"mtime_ns":7}', "does not match"),
+        (' {"path":"./zzz.txt","mode":"100644","size":1,"mtime_ns":0}', "unrecorded"),
+        (' {"path":"./keep.txt","mode":"100644","size":9,"mtime_ns":7}', "does not match"),
     ],
 )
 def test_merge_journal_marker_mismatch_fails_closed(tmp_path, event, message):
-    # A + whose key exists, a ! / - whose key does not, or a - payload that
-    # differs from the record it drops is an emitter bug, never absorbed.
+    # A + whose key exists, a ! / - / " " whose key does not, or a - / " "
+    # payload that differs from the old record is an emitter bug, never
+    # absorbed.
     old = tmp_path / "old.jsonl"
     old.write_text(_manifest_text(_OLD_LINES))
     journal = _write_journal(tmp_path, [event])

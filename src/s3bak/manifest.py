@@ -29,10 +29,10 @@ pull compare (ManifestFilter), and the status / pull ``--delete`` diff
 
 The push journal (docs/journal.md) is the diff a push's single scan emits:
 one line per manifest change, a one-character marker (``+`` add / ``!``
-replace / ``-`` drop) followed by a manifest record line, in sort-key order.
-``merge_journal`` applies it to the old manifest; the emitter
-(syncops.PushJournal) holds every policy decision, so the merge is a pure
-apply.
+replace / ``-`` drop / ``" "`` no change) followed by a manifest record line,
+in sort-key order. ``merge_journal`` applies it to the old manifest; the
+emitter (syncops.PushJournal) holds every policy decision, so the merge is a
+pure apply.
 """
 
 from __future__ import annotations
@@ -584,6 +584,13 @@ def write_merged(
 JOURNAL_ADD = "+"
 JOURNAL_REPLACE = "!"
 JOURNAL_DROP = "-"
+# No change: the record is kept as-is. The emitter writes it as the reserved
+# line of a directory-record delete candidate - the post-order decision (ask
+# only once everything beneath is gone) arrives after the children's lines,
+# so the candidate's line position is claimed up front and the one-byte
+# marker is flipped in place to JOURNAL_DROP when the drop is confirmed. A
+# kept candidate simply stays a no-op line; the merge needs no cleanup pass.
+JOURNAL_KEEP = " "
 
 
 def iter_journal(journal_path: str) -> Iterator[tuple[str, str, ManifestEntry, str]]:
@@ -599,7 +606,7 @@ def iter_journal(journal_path: str) -> Iterator[tuple[str, str, ManifestEntry, s
         with open(journal_path, encoding="utf-8") as f:
             for line_number, line in enumerate(f, start=1):
                 marker, payload = line[:1], line[1:]
-                if marker not in (JOURNAL_ADD, JOURNAL_REPLACE, JOURNAL_DROP):
+                if marker not in (JOURNAL_ADD, JOURNAL_REPLACE, JOURNAL_DROP, JOURNAL_KEEP):
                     raise ManifestError(f"invalid journal marker at line {line_number}")
                 e = parse_entry(payload)
                 if e is None:
@@ -627,14 +634,17 @@ def merge_journal(
     The 2-way streaming merge of the journal design: a key with no event
     copies its old record verbatim (unknown keys preserved), ``+`` / ``!``
     copy the event payload byte-for-byte (marker stripped, no
-    re-serialization), ``-`` skips the old record. The merge applies events
-    and knows no policy - every keep/drop decision was the emitter's.
+    re-serialization), ``-`` skips the old record, and ``" "`` (no change, a
+    kept delete candidate) copies the old record verbatim exactly like a key
+    with no event. The merge applies events and knows no policy - every
+    keep/drop decision was the emitter's.
 
     Markers are cross-checked against the old manifest, fail closed: a ``+``
-    whose key exists, a ``!`` / ``-`` whose key does not, or a ``-`` payload
-    that differs from the record it drops is an emitter bug and raises
-    ``ManifestError`` rather than publishing a manifest built on it. ``warn``
-    receives the same restorability message as ``write_merged``.
+    whose key exists, a ``!`` / ``-`` / ``" "`` whose key does not, or a
+    ``-`` / ``" "`` payload that differs from the old record is an emitter
+    bug and raises ``ManifestError`` rather than publishing a manifest built
+    on it. ``warn`` receives the same restorability message as
+    ``write_merged``.
     """
     out.write(_header_line() + "\n")
     warner = _RestorabilityWarner(out, warn)
@@ -665,6 +675,12 @@ def merge_journal(
             if old is None:
                 raise ManifestError(f"journal replaces an unrecorded path: {e.path!r}")
             warner.emit(rel, e.is_dir, payload + "\n")
+        elif marker == JOURNAL_KEEP:
+            if old is None:
+                raise ManifestError(f"journal keeps an unrecorded path: {e.path!r}")
+            if payload != old[2]:
+                raise ManifestError(f"journal keep does not match the record at {e.path!r}")
+            warner.emit(rel, e.is_dir, old[2] + "\n")
         else:  # JOURNAL_DROP
             if old is None:
                 raise ManifestError(f"journal drops an unrecorded path: {e.path!r}")

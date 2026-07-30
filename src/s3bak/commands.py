@@ -16,7 +16,7 @@ import stat as stat_mod
 import subprocess
 import tempfile
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -165,9 +165,12 @@ def upload_manifest(
 
 @dataclass
 class _PushDeletePlan:
-    """How this push treats S3 orphans: the sync's delete-lane value. What
-    each answer means for the manifest is the journal emitter's business (a
-    confirmed deletion journals its record's drop at the decision point)."""
+    """How this push treats S3 orphans: the sync's delete-lane value, plus
+    the confirmation for objectless record orphans (``record_delete``, the
+    journal emitter's callback for a vanished directory / symlink / special
+    file whose record is the whole backup). What each answer means for the
+    manifest is the journal emitter's business (a confirmed deletion journals
+    its record's drop at the decision point)."""
 
     lane: bool | FileFilter  # sync_up delete=: False | True | per-orphan callable
     confirmer: DeleteConfirmer | None  # --delete without --yes (asked or auto-n)
@@ -175,6 +178,7 @@ class _PushDeletePlan:
     walker: localwalk.ManifestWalker | None = None  # the sync's local walker (--delete only)
     old_manifest: str | None = None  # set by the caller once downloaded
     refused: int = 0  # candidates refused because the local scan was incomplete
+    record_delete: Callable[[str, ManifestEntry], bool] | None = None
     _files: manifest.RecordedFiles | None = None
 
     def _scan_incomplete(self) -> bool:
@@ -205,6 +209,21 @@ class _PushDeletePlan:
             self._files.close()
 
 
+def _record_candidate_display(cfg: Config, entry: str, rel: str, e: ManifestEntry) -> str:
+    """How a record-only delete candidate is shown (prompt and delete line):
+    a directory record carries a trailing slash, like the S3 key its children
+    would sort under."""
+    return f"{cfg.prefix}/{entry}/{rel}/" if e.is_dir else f"{cfg.prefix}/{entry}/{rel}"
+
+
+def _record_candidate_kind(e: ManifestEntry) -> str:
+    if e.is_dir:
+        return "directory record"
+    if e.sym_target is not None:
+        return "symlink record"
+    return "special-file record"
+
+
 def _plan_push_deletes(
     cfg: Config, entry: str, sub: str | None, opts: Opts, walker: localwalk.ManifestWalker
 ) -> _PushDeletePlan:
@@ -216,6 +235,19 @@ def _plan_push_deletes(
         # dryrun too (the library invokes a callable there as well).
         plan = _PushDeletePlan(lane=True, confirmer=None, mirror=opts.yes, walker=walker)
         plan.lane = lambda info: plan.allow()
+
+        def report_record(rel: str, e: ManifestEntry) -> bool:
+            # Reached only on a dry run without --yes: --yes mirrors, so the
+            # emitter drops vanished records at arrival and never asks. The
+            # dry-run line matches the lane's per-object dry-run reporting.
+            if not plan.allow():
+                return False
+            write_output(
+                f"(dry-run) delete record: {_record_candidate_display(cfg, entry, rel, e)}\n"
+            )
+            return True
+
+        plan.record_delete = report_record
         return plan
     # ASK and ALL_NO both run the lane through a confirmer. ALL_NO never
     # prompts, but its auto-n answers still record every existing orphan -
@@ -235,7 +267,21 @@ def _plan_push_deletes(
         note = "" if plan.recorded(rel) else " (not in manifest)"
         return confirmer.confirm(f"{cfg.prefix}/{entry}/{rel}{note}")
 
+    def confirm_record(rel: str, e: ManifestEntry) -> bool:
+        # A record with no object: the record IS the backup, so the prompt
+        # says what kind it is. Confirmed drops print a delete line (the
+        # store prints one for each deleted object; records have no store
+        # call, so the emitter's confirmation is where it belongs).
+        if not plan.allow():
+            return False
+        display = _record_candidate_display(cfg, entry, rel, e)
+        if not confirmer.confirm(f"{display} ({_record_candidate_kind(e)})"):
+            return False
+        write_output(f"delete record: {display}\n")
+        return True
+
     plan = _PushDeletePlan(lane=decide, confirmer=confirmer, mirror=False, walker=walker)
+    plan.record_delete = confirm_record
     return plan
 
 
@@ -476,6 +522,7 @@ def _push_sub(
                 content=cfg.store.content_compare() if opts.checksum else None,
                 delete_mode=opts.delete and is_dir_sub,
                 mirror=opts.delete and opts.yes and is_dir_sub,
+                record_delete=plan.record_delete,
             )
             try:
                 if old_manifest is None:
@@ -789,6 +836,7 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                     content=cfg.store.content_compare() if opts.checksum else None,
                     delete_mode=opts.delete,
                     mirror=opts.delete and opts.yes,
+                    record_delete=plan.record_delete,
                 )
                 try:
                     delete_lane: bool | FileFilter = (

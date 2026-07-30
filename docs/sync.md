@@ -93,8 +93,8 @@ in memory, so a manifest far larger than RAM still works. Excluded paths are
 invisible on the local side of the diff: never compared, never an A — so a
 record left in the manifest by a later-added exclude reads D until a
 `push --delete` retires it together with its object. The excluded
-directory's own record is objectless, so it outlives that cleanup and keeps
-reading D — like every directory record, only the `--yes` mirror prunes it.
+directory's own record is objectless; the same `push --delete` offers it
+post-order, once everything beneath it is gone (see "Deleting backups").
 
 ## The transfer path: direct client call vs. `S3.cp`
 
@@ -219,12 +219,14 @@ which is exactly what a `--data-only` hook needs to know.
    `merge_journal` applies them to the old manifest and the result is
    validated and uploaded. Records with no event — the backups of locally
    vanished files included — survive verbatim; a `--delete` run journals the
-   drops of confirmed deletions and of stale file records whose object was
-   already gone (how an interrupted deletion self-heals). A record kept under
+   drops of confirmed deletions (object-owning and record-only alike) and of
+   stale file records whose object was already gone (how an interrupted
+   deletion self-heals). A record kept under
    a path that is no longer a directory (the local tree replaced a directory
    with a same-named file) makes the entry unrestorable as a tree; the merge
-   detects this and warns (exit 2), and a `push --delete --yes` prunes such
-   records. Journaling objectless changes makes empty-directory,
+   detects this and warns (exit 2), and a `push --delete` prunes such
+   records — the shadowed objects first, then their now-empty directory
+   record. Journaling objectless changes makes empty-directory,
    symlink-only, and permission
    changes restorable even though they move no data: a `chmod` refreshes the
    manifest without re-uploading anything, settling exactly the mode
@@ -306,11 +308,24 @@ Deleting is opt-in and confirmed:
   together — and shows up as `D` in `status` until a later `--delete` removes
   it. Prompts of parallel `--all` entries are serialized and carry the entry
   name.
-- **Only regular files are ever asked** — theirs are the S3 objects the
-  delete lane sees. Directory, symlink, and special-file records have no
-  object and no question, so no confirmation can drop them: they survive
-  every `--delete` short of the `--yes` mirror. (For a locally deleted
-  symlink or empty directory, the record IS the backup.)
+- **A record with no object is offered as the record itself.** A locally
+  vanished regular file is offered through its S3 object (above); a locally
+  vanished symlink, special file, or directory left only its manifest
+  record — and that record IS the backup — so `--delete` asks about it
+  directly, the prompt flagged `(symlink record)` / `(special-file record)`
+  / `(directory record)`, and a confirmed drop prints a `delete record:`
+  line (there is no S3 object to print its own). Symlink and special-file
+  records are asked as they arrive. A directory record is decided
+  **post-order** — the ancestor-stack pattern `pull --delete` uses for local
+  extras: it is asked only once every object and record beneath it resolved
+  deleted (children before their own directory, in the same ascending key
+  order as everything else), and the moment anything beneath survives — an
+  object answered n keeps its record too — the directory record is kept
+  silently, with no question of its own, because dropping it would strand
+  the surviving records (every record needs its recorded directory parent).
+  A vanished *empty* directory is the vacuous case: nothing beneath, so its
+  record is asked as soon as the stream moves past its key. The `a` / `d`
+  answers stay sticky across candidate kinds, objects and records alike.
 - **A candidate the manifest does not record** — an out-of-band upload, or
   the residue of a push interrupted before its manifest write — is flagged
   `(not in manifest)` in the prompt. Answering n keeps the object but cannot
@@ -325,8 +340,8 @@ Deleting is opt-in and confirmed:
   leftovers, and a confirmed deletion drops each object and its file record
   together. Answering n keeps both, and the local file — excluded, so
   invisible to the walk — stays untouched either way. The excluded
-  directory's own record follows the rule above: objectless, never asked,
-  kept until a `--yes` mirror.
+  directory's own record follows the rule above: a directory record, offered
+  post-order once everything beneath it is retired.
 - **A kind-conflict object is offered out-of-lane.** A pushed file since
   replaced locally by a symlink or special file occupies its key in the
   complete-view walk, so the S3 object forms an update pair instead of an
@@ -338,8 +353,9 @@ Deleting is opt-in and confirmed:
 - **An incomplete local scan refuses deletions.** Once the walk warns about
   real tree content — an unopenable directory, a path that vanished
   mid-walk, an unreadable file the compare wanted to transfer — every later
-  delete candidate is kept, the journal writes no further drops (records
-  travel with their objects), and the push
+  delete candidate is kept, object and record-only candidates alike, the
+  journal writes no further drops (records travel with their objects), and
+  the push
   warns (exit 2): an orphan decision built on a partial local view could
   delete a good backup. Candidates already confirmed before the gap were
   decided on sound data and stand, their record drops already journaled;
@@ -384,7 +400,8 @@ Deleting is opt-in and confirmed:
   file, surfacing its warnings) — runs for real, making exactly the calls
   the real run would make (never a substitute call, whose permissions could
   differ), so a rehearsal fails or warns where the real command would. With
-  `--delete` it lists every deletion candidate without prompting; with
+  `--delete` it lists every deletion candidate without prompting —
+  record-only candidates as `(dry-run) delete record:` lines; with
   `--data-only` it previews the unrecorded-upload warning as "would upload".
   Applies to pull too (see below).
 

@@ -579,9 +579,10 @@ def test_push_delete_interactive_a_deletes_the_rest(ws, answers):
 
     assert len(answers.prompts) == 1
     assert ws.keys() == {"data/keep.txt", "data-manifest.jsonl"}
-    # ./sub survives: a directory record has no object, so no confirmation can
-    # drop it - only the --yes mirror prunes objectless records.
-    assert _manifest_paths(ws) == [".", "./keep.txt", "./sub"]
+    # a is sticky across candidate kinds: ./sub's directory record - asked
+    # post-order, once its children resolved deleted - drops without another
+    # question.
+    assert _manifest_paths(ws) == [".", "./keep.txt"]
 
 
 def test_push_delete_interactive_d_keeps_the_rest(ws, answers):
@@ -686,27 +687,179 @@ def test_push_all_delete_yes_mirrors_every_entry(ws):
     assert "d2/b.txt" in keys
 
 
-def test_push_delete_interactive_never_drops_objectless_records(ws, answers):
-    # Symlinks and empty dirs have no S3 object, hence no delete question:
-    # their records must survive an interactive --delete whatever the answers.
+def _objectless_orphans(ws) -> None:
+    """Push a tree, then delete a file, a symlink, and an empty directory
+    locally: the file's object is an ordinary delete candidate, and the two
+    objectless records become record-only candidates (the record IS their
+    backup). Candidate order is ascending by key: emptydir/, gone.txt, link."""
     ws.write("data/keep.txt", "k")
     ws.write("data/gone.txt", "g")
     (ws.root / "data" / "emptydir").mkdir()
     os.symlink("keep.txt", ws.root / "data" / "link")
     ws.config({"data": {"path": str(ws.root / "data")}})
     ws.run("push", "data", expect_rc=0)
-
     (ws.root / "data" / "gone.txt").unlink()
     (ws.root / "data" / "link").unlink()
     (ws.root / "data" / "emptydir").rmdir()
-    answers.feed("n")  # the only question: gone.txt's object
-    ws.run("push", "--delete", "data", expect_rc=0)
 
-    assert len(answers.prompts) == 1
+
+def test_push_delete_interactive_offers_objectless_records(ws, answers):
+    # A vanished symlink or empty directory leaves a record with no object,
+    # so --delete asks about the record itself: the symlink on arrival, the
+    # directory at its pop (vacuously "everything beneath is gone" here).
+    # Each prompt names the record kind; n keeps each record.
+    _objectless_orphans(ws)
+
+    answers.feed("n", "n", "n")
+    res = ws.run("push", "--delete", "data", expect_rc=0)
+
+    assert len(answers.prompts) == 3
+    assert "data/emptydir/ (directory record)" in answers.prompts[0]
+    assert "data/gone.txt" in answers.prompts[1]
+    assert "data/link (symlink record)" in answers.prompts[2]
+    assert "delete record:" not in res.out
     paths = _manifest_paths(ws)
     assert "./gone.txt" in paths
     assert "./link" in paths
     assert "./emptydir" in paths
+
+
+def test_push_delete_interactive_drops_objectless_records_on_y(ws, answers):
+    _objectless_orphans(ws)
+
+    answers.feed("y", "y", "y")
+    res = ws.run("push", "--delete", "data", expect_rc=0)
+
+    assert res.out.count("delete record:") == 2  # emptydir/ and link
+    assert _manifest_paths(ws) == [".", "./keep.txt"]
+    # The retired records stay retired: nothing left to ask, nothing to D.
+    second = ws.run("push", "--delete", "data", expect_rc=0)
+    assert second.out == ""
+    status = ws.run("status", "data", expect_rc=0)
+    assert "D " not in status.out
+
+
+def _nested_orphan_tree(ws) -> None:
+    """Push a nested tree, then delete the whole `skills/` subtree locally.
+    Candidates arrive in ascending key order; directory records resolve
+    post-order, each once the stream has left its subtree."""
+    ws.write("data/keep.txt", "k")
+    ws.write("data/skills/top.txt", "t")
+    ws.write("data/skills/evals/e1.txt", "e")
+    ws.write("data/skills/evals/deep/d1.txt", "d")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    shutil.rmtree(ws.root / "data" / "skills")
+
+
+def test_push_delete_offers_directory_records_post_order(ws, answers):
+    # The order is subtree by subtree - children before their own directory,
+    # in the same ascending key order as everything else (the push twin of
+    # pull --delete's extras removal): d1.txt, deep/, e1.txt, evals/,
+    # top.txt, skills/. All-y empties the backup of the vanished subtree.
+    _nested_orphan_tree(ws)
+
+    answers.feed("y", "y", "y", "y", "y", "y")
+    ws.run("push", "--delete", "data", expect_rc=0)
+
+    probes = [
+        "skills/evals/deep/d1.txt",
+        "data/skills/evals/deep/ (directory record)",
+        "skills/evals/e1.txt",
+        "data/skills/evals/ (directory record)",
+        "skills/top.txt",
+        "data/skills/ (directory record)",
+    ]
+    assert len(answers.prompts) == len(probes)
+    for prompt, probe in zip(answers.prompts, probes, strict=True):
+        assert probe in prompt
+    assert _manifest_paths(ws) == [".", "./keep.txt"]
+    assert ws.keys() == {"data/keep.txt", "data-manifest.jsonl"}
+    status = ws.run("status", "data", expect_rc=0)
+    assert "D " not in status.out
+    # Converged: nothing left to offer, nothing to rewrite.
+    second = ws.run("push", "--delete", "data", expect_rc=0)
+    assert len(answers.prompts) == len(probes)
+    assert second.out == ""
+    assert "Updating" not in second.err
+
+
+def test_push_delete_keeping_a_grandchild_keeps_every_open_ancestor_record(ws, answers):
+    # n on the deepest file pins the whole ancestor chain: every directory
+    # record still open above it is kept silently - no question of its own -
+    # so the published manifest keeps the parent chain the validator demands.
+    _nested_orphan_tree(ws)
+
+    answers.feed("n", "y", "y")
+    ws.run("push", "--delete", "data", expect_rc=0)
+
+    assert len(answers.prompts) == 3  # d1.txt, e1.txt, top.txt - no dir prompts
+    assert "d1.txt" in answers.prompts[0]
+    assert "e1.txt" in answers.prompts[1]
+    assert "top.txt" in answers.prompts[2]
+    assert _manifest_paths(ws) == [
+        ".",
+        "./keep.txt",
+        "./skills",
+        "./skills/evals",
+        "./skills/evals/deep",
+        "./skills/evals/deep/d1.txt",
+    ]
+    assert "data/skills/evals/deep/d1.txt" in ws.keys()
+    res = ws.run("verify", "data", expect_rc=0)
+    assert "data: OK" in res.out
+
+
+def test_push_delete_dry_run_lists_record_candidates(ws):
+    # The dry run reports every candidate the completeness gate admits -
+    # record-only candidates included, one "(dry-run) delete record:" line
+    # each - and changes nothing: the rehearsal merge runs to a temp file.
+    _nested_orphan_tree(ws)
+
+    res = ws.run("push", "--delete", "--dry-run", "data", expect_rc=0)
+
+    assert res.out.count("(dry-run) delete record:") == 3
+    assert "(dry-run) delete record: " + f"s3://{ws.bucket}/{ws.prefix}/data/skills/" in res.out
+    assert "(dry-run) would update manifest" in res.out
+    keys = ws.keys()
+    assert "data/skills/top.txt" in keys  # nothing deleted
+    paths = _manifest_paths(ws)
+    assert "./skills/evals/deep/d1.txt" in paths  # nothing dropped
+
+
+def test_push_delete_all_no_run_skips_the_manifest_rewrite(ws):
+    # A non-TTY --delete answers no to everything: the directory-record
+    # candidates leave only no-change placeholder lines in the journal, and a
+    # journal without one real event must not rewrite (or re-upload) the
+    # manifest - a cron run would otherwise republish it forever.
+    _nested_orphan_tree(ws)
+    ws.run("push", "data", expect_rc=0)  # settle the root-mtime drift first
+
+    res = ws.run("push", "--delete", "data", expect_rc=0)
+
+    assert res.out == ""
+    assert "Updating" not in res.err
+    assert "./skills/evals/deep/d1.txt" in _manifest_paths(ws)
+
+
+def test_push_delete_prunes_records_kept_under_a_file(ws, answers):
+    # dir -> file replacement, records kept (the restorability warning case):
+    # once --delete retires the shadowed objects, the loser directory record
+    # is offered too, and the warning goes with it.
+    ws.write("data/d/x.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    shutil.rmtree(ws.root / "data" / "d")
+    (ws.root / "data" / "d").write_text("now a file")
+    res = ws.run("push", "data", expect_rc=0)
+    assert "non-directory" in res.err
+
+    answers.feed("y", "y")
+    res = ws.run("push", "--delete", "data", expect_rc=0)
+
+    assert "non-directory" not in res.err
+    assert "data/d/ (directory record)" in answers.prompts[1]
+    assert _manifest_paths(ws) == [".", "./d"]
 
 
 def test_push_delete_with_all_answers_no_converges(ws):
