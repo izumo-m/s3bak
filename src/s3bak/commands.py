@@ -174,7 +174,6 @@ class _PushDeletePlan:
 
     lane: bool | FileFilter  # sync_up delete=: False | True | per-orphan callable
     confirmer: DeleteConfirmer | None  # --delete without --yes (asked or auto-n)
-    mirror: bool  # --delete --yes: every record follows its object
     walker: localwalk.ManifestWalker | None = None  # the sync's local walker (--delete only)
     old_manifest: str | None = None  # set by the caller once downloaded
     refused: int = 0  # candidates refused because the local scan was incomplete
@@ -228,24 +227,23 @@ def _plan_push_deletes(
     cfg: Config, entry: str, sub: str | None, opts: Opts, walker: localwalk.ManifestWalker
 ) -> _PushDeletePlan:
     if not opts.delete:
-        return _PushDeletePlan(lane=False, confirmer=None, mirror=False)
+        return _PushDeletePlan(lane=False, confirmer=None)
     if opts.dryrun or resolve_answer_mode(yes=opts.yes) is AnswerMode.ALL_YES:
         # Report (dry run) or delete (--yes) every candidate the completeness
         # gate admits. The gate callable never prompts, so it is safe under
         # dryrun too (the library invokes a callable there as well).
-        plan = _PushDeletePlan(lane=True, confirmer=None, mirror=opts.yes, walker=walker)
+        plan = _PushDeletePlan(lane=True, confirmer=None, walker=walker)
         plan.lane = lambda info: plan.allow()
 
         def report_record(rel: str, e: ManifestEntry) -> bool:
-            # Reached only on a dry run: a real --yes run mirrors (the
-            # emitter drops vanished records at arrival and never asks),
-            # while every rehearsal - --yes included - takes the frame path
-            # so record-only candidates are listed like the lane's
-            # per-object dry-run lines.
+            # --yes auto-confirms, a dry run reports; both drop the candidate
+            # through this one path, so the unattended run and its rehearsal
+            # cannot diverge (there is no separate mirror lane).
             if not plan.allow():
                 return False
+            marker = "(dry-run) " if opts.dryrun else ""
             write_output(
-                f"(dry-run) delete record: {_record_candidate_display(cfg, entry, rel, e)}\n"
+                f"{marker}delete record: {_record_candidate_display(cfg, entry, rel, e)}\n"
             )
             return True
 
@@ -282,7 +280,7 @@ def _plan_push_deletes(
         write_output(f"delete record: {display}\n")
         return True
 
-    plan = _PushDeletePlan(lane=decide, confirmer=confirmer, mirror=False, walker=walker)
+    plan = _PushDeletePlan(lane=decide, confirmer=confirmer, walker=walker)
     plan.record_delete = confirm_record
     return plan
 
@@ -526,7 +524,6 @@ def _push_sub(
                 sub=sub,
                 content=cfg.store.content_compare() if opts.checksum else None,
                 delete_mode=opts.delete and is_dir_sub,
-                mirror=opts.delete and opts.yes and is_dir_sub and not opts.dryrun,
                 record_delete=plan.record_delete,
             )
             # False until the journal's stream truly completed: a sync that
@@ -853,7 +850,6 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                     walker=walker,
                     content=cfg.store.content_compare() if opts.checksum else None,
                     delete_mode=opts.delete,
-                    mirror=opts.delete and opts.yes and not opts.dryrun,
                     record_delete=plan.record_delete,
                 )
                 sync_ok = False

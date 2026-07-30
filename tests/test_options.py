@@ -535,6 +535,7 @@ def test_push_delete_yes_mirrors_unattended(ws, answers):
 
     assert answers.prompts == []
     assert "delete:" in res.out
+    assert "delete record:" in res.out  # ./sub's directory record, auto-confirmed
     keys = ws.keys()
     assert "data/sub/x.txt" not in keys
     assert "data/sub/y.txt" not in keys
@@ -884,9 +885,9 @@ def test_push_delete_offers_special_file_record(ws, answers):
 
 
 def test_push_delete_dry_run_yes_lists_record_candidates(ws):
-    # The unattended mirror's rehearsal must list record-only candidates
-    # like any other dry run: only a REAL --yes run takes the ask-nothing
-    # mirror shortcut.
+    # --yes and its rehearsal share one path: the real run prints the same
+    # delete record: lines unmarked, the dry run marks them (dry-run) and
+    # deletes nothing.
     _nested_orphan_tree(ws)
 
     res = ws.run("push", "--delete", "--yes", "--dry-run", "data", expect_rc=0)
@@ -934,6 +935,33 @@ def test_push_delete_gate_counts_suppressed_record_candidates(ws):
     assert res.rc == 0  # cli.main; cli.run maps the warnings to exit 2
     assert "kept 1 deletion candidate(s)" in res.err
     assert "./zlink" in _manifest_paths(ws)
+
+
+def test_push_delete_yes_keeps_directory_record_pinned_by_a_shadowed_record(ws):
+    # A key can hold a real S3 object AND a non-file record (a pushed file
+    # later replaced by a symlink keeps its object until a --delete). When
+    # the directory then vanishes locally, --yes deletes the object but must
+    # keep the symlink record and its ancestor directory record - dropping
+    # ./d would strand ./d/x.txt and fail the pre-publish validation after
+    # the object was already gone. The next run retires the pair cleanly.
+    ws.write("data/keep.txt", "k")
+    ws.write("data/d/x.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    (ws.root / "data" / "d" / "x.txt").unlink()
+    os.symlink("gone", ws.root / "data" / "d" / "x.txt")
+    ws.run("push", "data", expect_rc=0)  # records the symlink; the object stays
+    shutil.rmtree(ws.root / "data" / "d")
+
+    ws.run("push", "--delete", "--yes", "data", expect_rc=0)
+
+    assert "data/d/x.txt" not in ws.keys()  # the shadowed object went
+    paths = _manifest_paths(ws)
+    assert "./d" in paths
+    assert "./d/x.txt" in paths  # the surviving record pinned its parent
+
+    ws.run("push", "--delete", "--yes", "data", expect_rc=0)
+    assert _manifest_paths(ws) == [".", "./keep.txt"]  # converged
 
 
 def test_push_delete_directory_record_flip_crosses_the_write_buffer(ws, answers):

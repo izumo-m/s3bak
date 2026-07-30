@@ -272,7 +272,6 @@ class PushJournal:
         sub: str | None = None,
         content: PairFilter | None = None,
         delete_mode: bool = False,
-        mirror: bool = False,
         record_delete: Callable[[str, ManifestEntry], bool] | None = None,
     ) -> None:
         # Binary, because a confirmed directory-record drop seeks back and
@@ -295,7 +294,6 @@ class PushJournal:
         self._sub = sub
         self._content = content
         self._delete_mode = delete_mode
-        self._mirror = mirror
         self._record_delete = record_delete
         # Open directory-record delete candidates, innermost last - the same
         # ancestor-stack post-order pull --delete uses for local extras, so
@@ -368,12 +366,13 @@ class PushJournal:
         """A record the pair stream never keyed: nothing exists at its key on
         either side (an S3 object would have formed a delete-lane pair, a
         local item an update/create pair). Keep-by-default keeps it. A
-        ``--delete`` run retires it by kind: the ``--yes`` mirror drops every
-        vanished record at arrival; a stale file record drops silently (its
-        object is already gone, the interrupted-deletion self-heal); a
-        directory record opens a frame whose drop is decided post-order (see
-        ``_resolve_frame``); a symlink or special-file record is confirmed on
-        arrival through ``record_delete``. All of it only while the scan is
+        ``--delete`` run retires it by kind: a stale file record drops
+        silently (its object is already gone, the interrupted-deletion
+        self-heal); a directory record opens a frame whose drop is decided
+        post-order (see ``_resolve_frame``); a symlink or special-file
+        record is confirmed on arrival through ``record_delete``. ``--yes``
+        is not a separate lane: it auto-confirms the same candidates through
+        the same paths without prompting. All of it only while the scan is
         complete (a record the walk may simply have failed to see is not
         stale) - a gated or kept record pins every open ancestor frame.
 
@@ -397,7 +396,7 @@ class PushJournal:
                 self.refused_records += 1
             self._mark_record_kept()
             return
-        if self._mirror or e.is_file:
+        if e.is_file:
             self._emit(manifest.JOURNAL_DROP, line)
             return
         if e.is_dir:
@@ -610,7 +609,7 @@ class PushJournal:
 
     def observe_delete(self, inner: FileFilter) -> FileFilter:
         """Wrap the delete lane's decision (the --delete confirmation, or the
-        mirror/dry-run gate): a confirmed deletion drops the owning file
+        --yes/dry-run gate): a confirmed deletion drops the owning file
         record with its object - the two travel together. A non-file record
         at the key (objectless by definition) is never dropped by a
         confirmation, and an unrecorded object has nothing to drop. Any

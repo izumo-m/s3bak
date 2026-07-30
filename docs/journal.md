@@ -131,15 +131,18 @@ immediately, on a push where no hook fires).
   drifted.
 - **`-`**: only on `--delete` runs — a confirmed object deletion (the object
   and its record travel together), a stale old-only file record with no
-  object behind it (dropped silently: the record restores nothing), a
+  object behind it (dropped silently: the record restores nothing), and a
   confirmed record-only drop (a vanished symlink or special-file record,
   asked as its skip-over arrives; a vanished directory record, decided
-  post-order through its ` ` line — next bullet), and, under the `--yes`
-  mirror, every vanished record at arrival (the mirror needs no frames or
-  questions). An orphan answered `n` writes nothing: the record stays. Once
-  the walk warns about real tree content (`scan_incomplete`), the emitter
-  writes no further `-` — the partial-view gate that refuses deletions;
-  drops journaled before the gap were decided on sound data and stand.
+  post-order through its ` ` line — next bullet). `--yes` is not a separate
+  lane: it auto-confirms the same candidates through the same paths without
+  prompting, so an unattended run and its `--dry-run` rehearsal cannot
+  diverge. An orphan answered `n` writes nothing: the record stays. Once
+  the walk warns about real tree content (`scan_incomplete`) — or the sync
+  itself stopped mid-stream, parking the cursor over records it never
+  reached — the emitter writes no further `-` — the partial-view gate that
+  refuses deletions; drops journaled before the gap were decided on sound
+  data and stand.
 - **` ` (no change)**: the reserved line of a directory-record delete
   candidate. The decision is post-order — ask only once everything beneath
   the directory resolved deleted, keep it silently (no question) the moment
@@ -176,8 +179,8 @@ is rewritten or re-uploaded (a cron all-no run must not republish an
 identical manifest forever).
 
 Every keep/drop policy — keep-by-default, the `--delete` confirmation, the
-`--yes` mirror, the incomplete-scan gate — lives in the emitter as "write a
-`-` or don't"; the merge applies events and knows no policy. (The
+`--yes` auto-confirmation, the incomplete-scan gate — lives in the emitter as
+"write a `-` or don't"; the merge applies events and knows no policy. (The
 `--meta-only` rewrite is the one non-journal writer left: `write_merged`, a
 keep-everything merge of a fresh walk.)
 

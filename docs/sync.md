@@ -358,7 +358,10 @@ Deleting is opt-in and confirmed:
   journal writes no further drops (records travel with their objects), and
   the push
   warns (exit 2): an orphan decision built on a partial local view could
-  delete a good backup. Candidates already confirmed before the gap were
+  delete a good backup. A sync that stops mid-stream (an error or an
+  interrupt) engages the same gate: the manifest records it never reached
+  are not evidence of deletion, so the emitter's final drain keeps them all
+  without a question. Candidates already confirmed before the gap were
   decided on sound data and stand, their record drops already journaled;
   re-run `push --delete` after fixing the cause.
 - **A single-file entry sweeps `entry/` explicitly.** Its push has no sync
