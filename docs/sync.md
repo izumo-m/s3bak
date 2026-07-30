@@ -317,12 +317,13 @@ Deleting is opt-in and confirmed:
   line (there is no S3 object to print its own). Symlink and special-file
   records are asked as they arrive. A directory record is decided
   **post-order** — the ancestor-stack pattern `pull --delete` uses for local
-  extras: it is asked only once every object and record beneath it resolved
-  deleted (children before their own directory, in the same ascending key
-  order as everything else), and the moment anything beneath survives — an
-  object answered n keeps its record too — the directory record is kept
-  silently, with no question of its own, because dropping it would strand
-  the surviving records (every record needs its recorded directory parent).
+  extras: it is asked only once every record beneath it resolved deleted
+  (children before their own directory, in the same ascending key order as
+  everything else), and the moment a record beneath survives — an object
+  answered n keeps its record too — the directory record is kept silently,
+  with no question of its own, because dropping it would strand the
+  surviving records (every record needs its recorded directory parent). A
+  kept *unrecorded* object pins nothing: no record constrains the manifest.
   A vanished *empty* directory is the vacuous case: nothing beneath, so its
   record is asked as soon as the stream moves past its key. The `a` / `d`
   answers stay sticky across candidate kinds, objects and records alike.

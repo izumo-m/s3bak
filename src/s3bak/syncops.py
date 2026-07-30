@@ -301,7 +301,12 @@ class PushJournal:
         # ancestor-stack post-order pull --delete uses for local extras, so
         # memory stays bounded by directory depth, never tree size.
         self._frames: list[_DirFrame] = []
+        self._closed = False
         self.events = 0
+        # Record-only candidates the completeness gate suppressed before any
+        # question could be asked; folded into the kept-candidates warning
+        # (object candidates are counted at the lane's own gate check).
+        self.refused_records = 0
         # Uploads with no owning file record - the birth (create lane) and
         # re-upload (update lane) faces of an unrecorded object. Read by the
         # push --data-only warning, so it repeats while the object stays
@@ -384,6 +389,12 @@ class PushJournal:
         if self._sub is not None and not rel.startswith(self._sub + "/"):
             return
         if self._walker.scan_incomplete:
+            if not e.is_file:
+                # A record-only candidate kept without a question: count it,
+                # or a record-only run would keep silently with no warning
+                # at all. (A gated stale file record is not a candidate -
+                # nothing would have been asked - and stays uncounted.)
+                self.refused_records += 1
             self._mark_record_kept()
             return
         if self._mirror or e.is_file:
@@ -715,11 +726,14 @@ class PushJournal:
         """Drain the cursor (trailing records are skip-overs), resolve the
         directory frames still open (the stream ending is the proof their
         subtrees hold nothing more), and flush the journal so it can be
-        merged. Idempotent. The journal handle closes even when a
+        merged. Idempotent - a second call returns at once, even after a
+        first call that raised. The journal handle closes even when a
         confirmation aborts mid-drain (q raises), so the file can always be
         unlinked. Leaves the pending-object-delete spool untouched - both
         call sites read it only after close(), through
         iter_pending_object_deletes, which owns its lifetime."""
+        if self._closed:
+            return
         try:
             while self._head is not None:
                 record = self._head
@@ -729,6 +743,7 @@ class PushJournal:
             while self._frames:
                 self._resolve_frame(self._frames.pop())
         finally:
+            self._closed = True
             closer = getattr(self._records, "close", None)
             if callable(closer):
                 closer()

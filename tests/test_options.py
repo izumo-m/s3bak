@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import os
 import shutil
+from types import SimpleNamespace
 
+import pytest
+
+from s3bak import store
 from s3bak.cli import _resolve_use_color
 
 
@@ -860,6 +864,95 @@ def test_push_delete_prunes_records_kept_under_a_file(ws, answers):
     assert "non-directory" not in res.err
     assert "data/d/ (directory record)" in answers.prompts[1]
     assert _manifest_paths(ws) == [".", "./d"]
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no mkfifo on this platform")
+def test_push_delete_offers_special_file_record(ws, answers):
+    ws.write("data/keep.txt", "k")
+    os.mkfifo(ws.root / "data" / "fifo")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    (ws.root / "data" / "fifo").unlink()
+
+    answers.feed("y")
+    res = ws.run("push", "--delete", "data", expect_rc=0)
+
+    assert len(answers.prompts) == 1
+    assert "data/fifo (special-file record)" in answers.prompts[0]
+    assert "delete record:" in res.out
+    assert _manifest_paths(ws) == [".", "./keep.txt"]
+
+
+def test_push_delete_dry_run_yes_lists_record_candidates(ws):
+    # The unattended mirror's rehearsal must list record-only candidates
+    # like any other dry run: only a REAL --yes run takes the ask-nothing
+    # mirror shortcut.
+    _nested_orphan_tree(ws)
+
+    res = ws.run("push", "--delete", "--yes", "--dry-run", "data", expect_rc=0)
+
+    assert res.out.count("(dry-run) delete record:") == 3
+    assert "data/skills/top.txt" in ws.keys()  # nothing deleted
+
+
+def test_push_delete_failed_sync_asks_nothing_in_the_drain(ws, answers, monkeypatch):
+    # A sync that stops mid-stream (an error, an interrupt) parks the
+    # manifest cursor; the records it never reached are not evidence of
+    # deletion. close()'s drain must keep them all without a question or a
+    # "delete record:" line - the completeness gate, not a judgment call.
+    _nested_orphan_tree(ws)
+
+    def failed_sync(self, *args, **kwargs):
+        return SimpleNamespace(returncode=1, results=0)
+
+    monkeypatch.setattr(store.Boto3S3Store, "sync_up", failed_sync)
+    res = ws.run("push", "--delete", "data", expect_rc=1)
+
+    assert answers.prompts == []
+    assert "delete record:" not in res.out
+    assert "./skills/evals/deep/d1.txt" in _manifest_paths(ws)  # nothing dropped
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs an unreadable directory")
+def test_push_delete_gate_counts_suppressed_record_candidates(ws):
+    # Once the walk warns, a record-only candidate is kept without a
+    # question - and must still count in the kept-candidates warning, which
+    # would otherwise not fire at all on a record-only run.
+    ws.write("data/keep.txt", "k")
+    (ws.root / "data" / "aa").mkdir()  # sorts first: its warning precedes zlink's skip-over
+    os.symlink("keep.txt", ws.root / "data" / "zlink")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "zlink").unlink()
+    os.chmod(ws.root / "data" / "aa", 0)
+    try:
+        res = ws.run("push", "--delete", "--yes", "data")
+    finally:
+        os.chmod(ws.root / "data" / "aa", 0o755)
+
+    assert res.rc == 0  # cli.main; cli.run maps the warnings to exit 2
+    assert "kept 1 deletion candidate(s)" in res.err
+    assert "./zlink" in _manifest_paths(ws)
+
+
+def test_push_delete_directory_record_flip_crosses_the_write_buffer(ws, answers):
+    # The placeholder flip seeks back to an offset that has long left the
+    # journal's 8 KiB write buffer: ~120 dropped children put well over
+    # 20 KiB between the directory's line and its flip. The published
+    # manifest proves the one-byte overwrite landed on the marker.
+    ws.write("data/keep.txt", "k")
+    for i in range(120):
+        ws.write(f"data/big/file-{i:04d}-{'x' * 60}.txt", "d")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    shutil.rmtree(ws.root / "data" / "big")
+
+    answers.feed("a")
+    ws.run("push", "--delete", "data", expect_rc=0)
+
+    assert len(answers.prompts) == 1
+    assert _manifest_paths(ws) == [".", "./keep.txt"]
 
 
 def test_push_delete_with_all_answers_no_converges(ws):

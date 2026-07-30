@@ -237,9 +237,11 @@ def _plan_push_deletes(
         plan.lane = lambda info: plan.allow()
 
         def report_record(rel: str, e: ManifestEntry) -> bool:
-            # Reached only on a dry run without --yes: --yes mirrors, so the
-            # emitter drops vanished records at arrival and never asks. The
-            # dry-run line matches the lane's per-object dry-run reporting.
+            # Reached only on a dry run: a real --yes run mirrors (the
+            # emitter drops vanished records at arrival and never asks),
+            # while every rehearsal - --yes included - takes the frame path
+            # so record-only candidates are listed like the lane's
+            # per-object dry-run lines.
             if not plan.allow():
                 return False
             write_output(
@@ -285,13 +287,16 @@ def _plan_push_deletes(
     return plan
 
 
-def _warn_refused_deletes(entry: str, plan: _PushDeletePlan) -> None:
+def _warn_refused_deletes(entry: str, plan: _PushDeletePlan, journal: PushJournal) -> None:
     """After the sync: say why deletion candidates were kept when the local
-    scan was incomplete (see _PushDeletePlan.allow)."""
-    if plan.refused:
+    scan was incomplete (see _PushDeletePlan.allow). The journal counts the
+    record-only candidates its own gate suppressed before they could reach
+    the plan's callback."""
+    refused = plan.refused + journal.refused_records
+    if refused:
         note_warning(
             f"warning: {entry}: the local scan skipped unreadable or vanished paths;"
-            f" kept {plan.refused} deletion candidate(s) and every manifest record"
+            f" kept {refused} deletion candidate(s) and every manifest record"
         )
 
 
@@ -521,9 +526,15 @@ def _push_sub(
                 sub=sub,
                 content=cfg.store.content_compare() if opts.checksum else None,
                 delete_mode=opts.delete and is_dir_sub,
-                mirror=opts.delete and opts.yes and is_dir_sub,
+                mirror=opts.delete and opts.yes and is_dir_sub and not opts.dryrun,
                 record_delete=plan.record_delete,
             )
+            # False until the journal's stream truly completed: a sync that
+            # errored or an exception mid-push parks the cursor mid-manifest,
+            # and close()'s drain must not judge (or offer) the unreached
+            # tail. Only the directory branch runs delete_mode, but the flag
+            # is kept honest for every branch.
+            stream_complete = False
             try:
                 if old_manifest is None:
                     # First-ever manifest born from a sub-path push: record the
@@ -543,6 +554,7 @@ def _push_sub(
                 if is_link:
                     # symlink: upload nothing; the manifest record IS the backup.
                     journal.record_target(sub, st, os.readlink(local_sub))
+                    stream_complete = True
                 elif is_dir_sub:
                     delete_lane: bool | FileFilter = (
                         journal.observe_delete(plan.lane) if callable(plan.lane) else plan.lane
@@ -557,6 +569,7 @@ def _push_sub(
                         dryrun=opts.dryrun,
                         verbose=opts.verbose,
                     )
+                    stream_complete = result.returncode == 0
                     if result.returncode != 0:
                         return result.returncode
                     if result.results > 0:
@@ -576,7 +589,12 @@ def _push_sub(
                         if result.results > 0:
                             did_work = True
                     journal.record_target(sub, st, None)
+                    stream_complete = True
             finally:
+                if not stream_complete:
+                    # Gate close()'s drain: the unreached records are no
+                    # evidence of deletion (see the directory push's twin).
+                    walker.scan_incomplete = True
                 journal.close()
             if journal.pending_object_deletes > 0:
                 st_del, conflict_deleted = _delete_conflict_objects(cfg, entry, plan, journal, opts)
@@ -584,7 +602,7 @@ def _push_sub(
                     return st_del
             # After the conflict candidates: their refusals (incomplete scan)
             # must count in the summary too.
-            _warn_refused_deletes(entry, plan)
+            _warn_refused_deletes(entry, plan, journal)
             if journal.has_events and not opts.data_only:
                 publish_journal_manifest(cfg, entry, old_manifest, journal_path, opts)
                 did_work = True
@@ -835,9 +853,10 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                     walker=walker,
                     content=cfg.store.content_compare() if opts.checksum else None,
                     delete_mode=opts.delete,
-                    mirror=opts.delete and opts.yes,
+                    mirror=opts.delete and opts.yes and not opts.dryrun,
                     record_delete=plan.record_delete,
                 )
+                sync_ok = False
                 try:
                     delete_lane: bool | FileFilter = (
                         journal.observe_delete(plan.lane) if callable(plan.lane) else plan.lane
@@ -852,7 +871,15 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                         dryrun=opts.dryrun,
                         verbose=opts.verbose,
                     )
+                    sync_ok = result.returncode == 0
                 finally:
+                    if not sync_ok:
+                        # The sync stopped mid-stream (an error or an
+                        # interrupt, not a walk warning), so the cursor's
+                        # unreached tail is no evidence of deletion. Gate
+                        # close()'s drain like any other partial view: it
+                        # must keep - and ask about - nothing.
+                        walker.scan_incomplete = True
                     # Flush the journal (and release the old-manifest handle the
                     # cursor holds open - an open file cannot be removed on
                     # Windows) whether or not the sync succeeded.
@@ -876,10 +903,12 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                     conflict_deleted = conflict_deleted or root_deleted
                 # After the conflict candidates: their refusals (incomplete
                 # scan) must count in the summary too.
-                _warn_refused_deletes(entry, plan)
-                # The rewrite condition is "the journal is non-empty", nothing
-                # else: a first push journals everything (the root included),
-                # a pure no-op push journals nothing.
+                _warn_refused_deletes(entry, plan, journal)
+                # The rewrite condition: at least one real event (+/!/-). A
+                # first push journals everything (the root included); a pure
+                # no-op push journals nothing; a --delete run whose record
+                # candidates were all kept leaves only no-change lines, which
+                # must not republish an identical manifest.
                 if journal.has_events and not opts.data_only:
                     publish_journal_manifest(
                         cfg,
