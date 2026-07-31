@@ -1,7 +1,7 @@
 # Verification model (verify)
 
 `verify` answers the question the other commands cannot: **does the backup
-itself hold what the manifest promises, so that a pull would restore it?**
+itself hold what the manifest promises?**
 `status` compares the local tree against the manifest (what a push would do);
 `diff` downloads content to compare it against local files. Neither ever
 checks the manifest against the stored objects — until a restore fails,
@@ -44,11 +44,15 @@ storage class, so none of these checks costs an extra S3 call:
   form is skipped by the data sync and is reported as noise to remove; one
   carrying data cannot restore to any local path and is an error.
 - **Archived storage class** — an object in `GLACIER` or `DEEP_ARCHIVE`
-  rejects `get_object` until manually restored, so a pull over it fails. This
-  is checked for every listed object, recorded or not, since pull's
-  listing-driven download fetches unrecorded objects too. (An
-  `INTELLIGENT_TIERING` object in an archive tier fails the same way but is
-  indistinguishable in a listing — a known limit.)
+  rejects `get_object` until manually restored via `RestoreObject`, so a pull
+  cannot fetch it yet. The manifest and the object still agree; only the
+  storage tier differs, and it can change on its own (a lifecycle transition,
+  a completed restore, a restore expiring) without the backup changing at
+  all — so this is reported as a warning, not an error. This is checked for
+  every listed object, recorded or not, since pull's listing-driven download
+  fetches unrecorded objects too. (An `INTELLIGENT_TIERING` object in an
+  archive tier fails the same way but is indistinguishable in a listing — a
+  known limit.)
 - **Missing backup** — a configured entry with no manifest. Data objects
   without any manifest (a push interrupted before its manifest write) are
   distinguished from an entry that was never pushed at all.
@@ -66,7 +70,8 @@ The listing check can only prove the manifest and S3 agree with each other —
 both can agree and still be stale. On a machine that holds the local tree,
 `--checksum` additionally compares every recorded file's local content against
 the S3 ETag the listing already delivered (the same reconstruction as
-`push --checksum`, same `compare_workers` pool, zero extra S3 calls). A
+`push --checksum`, hashed on a pool sized by `max_concurrency`, zero extra S3
+calls). A
 mismatch is split by the manifest stat, and the split is the point:
 
 - **Content differs but size+mtime match** — an error. The default push skips
@@ -96,13 +101,13 @@ top-level object. One command inventories the whole backup area.
 
 Findings map onto the standard [exit codes](cli.md#exit-codes):
 
-- **Errors (exit 1)** — the backup does not restore what the manifest
-  promises: missing object, size mismatch, type conflict, data-carrying
-  folder object, archived storage class, silent content divergence, missing
-  backup, damaged manifest.
-- **Warnings (exit 2)** — the recorded backup restores, but something sits
-  outside it: unrecorded objects, zero-byte folder objects, everything the
-  `--all` sweep reports.
+- **Errors (exit 1)** — the backup does not hold what the manifest promises:
+  missing object, size mismatch, type conflict, data-carrying folder object,
+  silent content divergence, missing backup, damaged manifest.
+- **Warnings (exit 2)** — the backup itself is not in question, only
+  something around it: an object sitting outside the recorded backup
+  (unrecorded objects, zero-byte folder objects, everything the `--all` sweep
+  reports), or a recorded object that is intact but currently archived.
 - **Informational** — pending changes (`--checksum`); no exit-code effect.
 
 Every entry also prints a one-line summary (`OK` or finding counts, with

@@ -9,6 +9,10 @@ import shutil
 import pytest
 
 from s3bak import cli
+from s3bak.compare import SYMLINK_MTIME_SUPPORTED
+
+_NO_SYMLINK_MTIME_REASON = "platform cannot set a symlink's own mtime without following it"
+_DRIFTED_LINK_MTIME_NS = 1_700_000_000_000_000_000
 
 
 def _manifest_body(ws, entry: str) -> str:
@@ -122,6 +126,149 @@ def test_push_ignores_symlink_permission_drift(ws):
     res = ws.run("push", "data", expect_rc=0)
 
     assert "Updating" not in res.err  # symlink perm bits are never compared
+
+
+@pytest.mark.skipif(not SYMLINK_MTIME_SUPPORTED, reason=_NO_SYMLINK_MTIME_REASON)
+def test_push_tracks_symlink_own_mtime_drift(ws):
+    # A symlink's own mtime (not its target) drifting is a real change to
+    # track, same as a directory's or special file's own mtime.
+    ws.write("data/a.txt", "a")
+    link = ws.root / "data" / "link"
+    os.symlink("a.txt", link)
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    os.utime(link, ns=(_DRIFTED_LINK_MTIME_NS, _DRIFTED_LINK_MTIME_NS), follow_symlinks=False)
+
+    res = ws.run("push", "data", expect_rc=0)
+
+    assert "upload:" not in res.out  # an own-mtime drift re-transfers no data
+    assert "Updating" in res.err
+    assert f'"mtime_ns":{_DRIFTED_LINK_MTIME_NS}' in _manifest_body(ws, "data")
+    assert ws.run("status", "data", expect_rc=0).out.strip() == ""
+
+
+@pytest.mark.skipif(not SYMLINK_MTIME_SUPPORTED, reason=_NO_SYMLINK_MTIME_REASON)
+def test_pull_restores_symlink_own_mtime_and_settles(ws):
+    # status has no -o/--output (it always reads the entry's configured
+    # path), so the empty destination here is that same configured path,
+    # wiped first - the pull then restores into it from nothing.
+    ws.write("data/a.txt", "a")
+    link = ws.root / "data" / "link"
+    os.symlink("a.txt", link)
+    os.utime(link, ns=(_DRIFTED_LINK_MTIME_NS, _DRIFTED_LINK_MTIME_NS), follow_symlinks=False)
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    shutil.rmtree(ws.root / "data")
+
+    ws.run("pull", "data", expect_rc=0)
+
+    restored = os.lstat(ws.root / "data" / "link")
+    assert restored.st_mtime_ns == _DRIFTED_LINK_MTIME_NS
+
+    res = ws.run("status", "data", expect_rc=0)
+    assert res.out.strip() == ""
+
+
+def test_status_reports_directory_mtime_drift(ws):
+    # Creating and then removing a file inside a directory bumps the
+    # directory's own mtime - a real drift status now reports, no longer
+    # suppressed.
+    ws.write("data/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data")}}, mtime_window=0)
+    ws.run("push", "data", expect_rc=0)
+
+    tmp = ws.root / "data" / "tmp.txt"
+    tmp.write_text("x")
+    tmp.unlink()
+
+    res = ws.run("status", "data", expect_rc=0)
+    assert any(ln.startswith("M") and "mtime" in ln for ln in res.out.splitlines())
+
+
+def test_push_tracks_directory_mtime_drift(ws):
+    # A directory's own mtime drifting (children added/removed since the last
+    # push) is a real change to track, same as a symlink's or special file's.
+    ws.write("data/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data")}}, mtime_window=0)
+    ws.run("push", "data", expect_rc=0)
+
+    tmp = ws.root / "data" / "tmp.txt"
+    tmp.write_text("x")
+    tmp.unlink()
+    actual_ns = os.lstat(ws.root / "data").st_mtime_ns
+
+    res = ws.run("push", "data", expect_rc=0)
+
+    assert "upload:" not in res.out  # a directory mtime drift re-transfers no data
+    assert "Updating" in res.err
+    body = _manifest_body(ws, "data")
+    record = next(
+        json.loads(line) for line in body.splitlines()[1:] if json.loads(line)["path"] == "."
+    )
+    assert record["mtime_ns"] == actual_ns  # the drifted mtime is now recorded
+    assert ws.run("status", "data", expect_rc=0).out.strip() == ""  # no perpetual M
+
+
+def test_pull_restores_directory_mtime_and_settles(ws):
+    # status has no -o/--output (it always reads the entry's configured
+    # path), so the empty destination here is that same configured path,
+    # wiped first - the pull then restores into it from nothing.
+    ws.write("data/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data")}}, mtime_window=0)
+    ws.run("push", "data", expect_rc=0)
+
+    tmp = ws.root / "data" / "tmp.txt"
+    tmp.write_text("x")
+    tmp.unlink()
+    ws.run("push", "data", expect_rc=0)  # records the drifted directory mtime
+    recorded_ns = os.lstat(ws.root / "data").st_mtime_ns
+
+    shutil.rmtree(ws.root / "data")
+
+    ws.run("pull", "data", expect_rc=0)
+
+    assert os.lstat(ws.root / "data").st_mtime_ns == recorded_ns
+
+    res = ws.run("status", "data", expect_rc=0)
+    assert res.out.strip() == ""
+
+
+def test_pull_settles_every_directory_through_a_deep_nested_tree(ws):
+    # Coverage for apply_manifest's ancestor stack across several nesting
+    # levels open at once, not just one directory deep: every level's own
+    # mode and mtime must converge, from the leaf back up to the root.
+    ws.write("data/a.txt", "a")
+    ws.write("data/l1/b.txt", "b")
+    ws.write("data/l1/l2/c.txt", "c")
+    ws.write("data/l1/l2/l3/d.txt", "d")
+    levels = (".", "l1", "l1/l2", "l1/l2/l3")
+    for rel, mode in zip(levels, (0o750, 0o751, 0o752, 0o753), strict=True):
+        os.chmod(ws.root / "data" / rel, mode)
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    recorded = {rel: os.lstat(ws.root / "data" / rel) for rel in levels}
+
+    dest = ws.root / "restore"
+    ws.run("pull", "data", "-o", str(dest), expect_rc=0)
+
+    for rel, src_st in recorded.items():
+        dst_st = os.lstat(dest if rel == "." else dest / rel)
+        assert dst_st.st_mode & 0o777 == src_st.st_mode & 0o777
+        assert dst_st.st_mtime_ns == src_st.st_mtime_ns
+
+
+def test_push_skips_directory_mtime_drift_within_window(ws):
+    ws.write("data/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data")}}, mtime_window=2)
+    ws.run("push", "data", expect_rc=0)
+
+    ns = os.lstat(ws.root / "data").st_mtime_ns + 1_000_000_000  # +1s: inside the 2s window
+    os.utime(ws.root / "data", ns=(ns, ns))
+
+    res = ws.run("push", "data", expect_rc=0)
+    assert "Updating" not in res.err  # inside the window: no journal event
 
 
 def test_single_file_push_refreshes_manifest_on_mode_change(ws):
@@ -356,6 +503,44 @@ def test_push_with_unreadable_file_warns_and_exits_2(ws, monkeypatch):
     assert "data/bad.txt" not in ws.keys()
 
 
+def test_push_broken_pipe_from_transfer_output_maps_to_141(ws, monkeypatch):
+    # F1 regression: on_result runs as s3transfer's "done" callback, and
+    # s3transfer's own futures.py wraps that callback in a bare `except
+    # Exception` that only logs - it never re-raises. Without _transfer's own
+    # catch/reraise, a closed stdout during a transfer (`s3bak push data |
+    # head -n 0`) would make write_output's BrokenPipeError vanish inside
+    # s3transfer instead of surfacing: the run would look like a clean
+    # success (exit 0) instead of the documented exit 141, like the
+    # sigpipe-mapping tests below (test_run_diff_maps_sigpipe_to_broken_pipe
+    # in test_status_diff.py) already cover for the diff child process.
+    import signal
+
+    from s3bak import cli
+    from s3bak import store as store_mod
+
+    ws.write("data/a.txt", "alpha")
+    ws.write("data/b.txt", "beta")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+
+    def broken_write_output(text: str) -> None:
+        raise BrokenPipeError
+
+    monkeypatch.setattr(store_mod, "write_output", broken_write_output)
+    monkeypatch.setattr("sys.argv", ["s3bak", "push", "data"])
+    saved = signal.getsignal(signal.SIGINT)
+    try:
+        rc = cli.run()
+    finally:
+        signal.signal(signal.SIGINT, saved)
+
+    assert rc == 141
+    # The uploads themselves ran to completion before their result line's
+    # print discovered the broken pipe - only the reporting was lost, not the
+    # transfer.
+    assert "data/a.txt" in ws.keys()
+    assert "data/b.txt" in ws.keys()
+
+
 def test_pull_delete_removes_extra_symlink_to_dir(ws):
     ws.write("data/keep.txt", "k")
     ws.config({"data": {"path": str(ws.root / "data")}})
@@ -401,19 +586,27 @@ def test_push_after_local_delete_keeps_backup_by_default(ws):
     assert (dest / "b.txt").read_text() == "b"
 
 
-def test_push_with_only_a_local_delete_does_not_touch_the_manifest(ws):
-    # Nothing to transfer and the kept record is not a structural change, so
-    # the push is a full no-op (no manifest re-upload, no output).
+def test_push_with_only_a_local_delete_settles_directory_mtime_but_keeps_the_record(ws):
+    # Nothing to transfer and the kept file record is not itself a structural
+    # change - but the deletion bumped the directory's own mtime, which push
+    # now tracks and refreshes; a second push (nothing left to see) converges.
     ws.write("data/a.txt", "a")
     ws.write("data/b.txt", "b")
     ws.config({"data": {"path": str(ws.root / "data")}})
     ws.run("push", "data", expect_rc=0)
 
     (ws.root / "data" / "b.txt").unlink()
-    res = ws.run("push", "data", expect_rc=0)
+    first = ws.run("push", "data", expect_rc=0)
+    second = ws.run("push", "data", expect_rc=0)
 
-    assert res.out == ""
-    assert "Updating" not in res.err
+    assert first.out == ""
+    assert second.out == ""
+    assert "Updating" in first.err  # the directory's own mtime drifted
+    assert "Updating" not in second.err  # settled: converges
+    assert (
+        b'"path":"./b.txt"'
+        in ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl")["Body"].read()
+    )  # the file record survives (no --delete)
 
 
 def test_push_keeps_records_of_locally_deleted_symlink_and_empty_dir(ws):
@@ -529,6 +722,67 @@ def test_pull_delete_removes_extra_directory_tree(ws):
     assert (dest / "keep.txt").read_text() == "k"
 
 
+def test_pull_delete_removes_extras_in_post_order(ws):
+    # Removal is streamed subtree by subtree in ascending S3-key order, not
+    # one global deepest-first pass: extradir's children are removed before
+    # extradir itself, and the whole extradir subtree finishes streaming
+    # before the later sibling zzz.txt is even looked at.
+    ws.write("data/keep.txt", "k")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    dest = ws.root / "restore"
+    (dest / "extradir" / "sub").mkdir(parents=True)
+    (dest / "extradir" / "sub" / "deep.txt").write_text("d")
+    (dest / "keep.txt").write_text("k")
+    (dest / "zzz.txt").write_text("z")
+
+    res = ws.run("pull", "data", "-o", str(dest), "--delete", "--yes", expect_rc=0)
+
+    deletes = [
+        ln.removeprefix("delete: ") for ln in res.out.splitlines() if ln.startswith("delete: ")
+    ]
+    assert deletes == [
+        str(dest / "extradir" / "sub" / "deep.txt"),
+        str(dest / "extradir" / "sub"),
+        str(dest / "extradir"),
+        str(dest / "zzz.txt"),
+    ]
+
+
+def test_pull_delete_judges_a_leaf_extra_on_arrival_not_at_its_parents_close(ws):
+    # A leaf extra is judged the moment it arrives in the ascending S3-key
+    # stream - only a directory extra waits for its own subtree to finish.
+    # "a/b.txt" sorts ahead of the whole "a/c" subtree, so it must be
+    # reported before "a/c" is even opened; deferring every extra (leaf
+    # included) to its parent directory's close would instead report
+    # "d.txt, c, b.txt, e.txt, a", jumping b.txt behind a subtree it sorts
+    # ahead of.
+    ws.write("data/keep.txt", "k")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    dest = ws.root / "restore"
+    (dest / "a" / "c").mkdir(parents=True)
+    (dest / "a" / "b.txt").write_text("b")
+    (dest / "a" / "c" / "d.txt").write_text("d")
+    (dest / "a" / "e.txt").write_text("e")
+    (dest / "keep.txt").write_text("k")
+
+    res = ws.run("pull", "data", "-o", str(dest), "--delete", "--yes", expect_rc=0)
+
+    deletes = [
+        ln.removeprefix("delete: ") for ln in res.out.splitlines() if ln.startswith("delete: ")
+    ]
+    assert deletes == [
+        str(dest / "a" / "b.txt"),
+        str(dest / "a" / "c" / "d.txt"),
+        str(dest / "a" / "c"),
+        str(dest / "a" / "e.txt"),
+        str(dest / "a"),
+    ]
+
+
 # --- pull --delete (confirmed removals) ----------------------------------------
 
 
@@ -546,22 +800,44 @@ def test_pull_delete_without_tty_keeps_extras_and_succeeds(ws):
 
 
 def test_pull_delete_interactive_keeps_ancestors_of_kept_items(ws, answers):
-    # Deepest-first prompting: the nested file is asked first; keeping it makes
-    # its ancestor extra dir unremovable, so the dir is kept without a prompt.
+    # Post-order prompting follows the ascending S3-key stream: "extra.txt"
+    # sorts before the "extradir/" subtree (`.` < `d`), so it is asked first;
+    # extradir/inner.txt is asked once the stream is inside that subtree, and
+    # keeping it makes the closing extradir frame unremovable, so extradir is
+    # kept without a prompt of its own.
     ws.write("data/keep.txt", "k")
     ws.config({"data": {"path": str(ws.root / "data")}})
     ws.run("push", "data", expect_rc=0)
     ws.write("data/extradir/inner.txt", "i")
     ws.write("data/extra.txt", "e")
 
-    answers.feed("n", "y")  # keep extradir/inner.txt, delete extra.txt
+    answers.feed("y", "n")  # delete extra.txt, keep extradir/inner.txt
     ws.run("pull", "--delete", "data", expect_rc=0)
 
     assert len(answers.prompts) == 2
-    assert "extradir" in answers.prompts[0] and "inner.txt" in answers.prompts[0]
-    assert "extra.txt" in answers.prompts[1]
+    assert "extra.txt" in answers.prompts[0]
+    assert "extradir" in answers.prompts[1] and "inner.txt" in answers.prompts[1]
     assert (ws.root / "data" / "extradir" / "inner.txt").exists()
     assert not (ws.root / "data" / "extra.txt").exists()
+
+
+def test_pull_delete_interactive_rejecting_a_grandchild_keeps_every_open_ancestor(ws, answers):
+    # Denying the deepest item never prompts for either directory still open
+    # above it: keeping a child forces keeping its whole open ancestor chain,
+    # not just its immediate parent.
+    ws.write("data/keep.txt", "k")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.write("data/extradir/child/grandchild.txt", "g")
+
+    answers.feed("n")  # keep the grandchild
+    ws.run("pull", "--delete", "data", expect_rc=0)
+
+    assert len(answers.prompts) == 1
+    assert "grandchild.txt" in answers.prompts[0]
+    assert (ws.root / "data" / "extradir" / "child" / "grandchild.txt").exists()
+    assert (ws.root / "data" / "extradir" / "child").is_dir()
+    assert (ws.root / "data" / "extradir").is_dir()
 
 
 def test_pull_delete_interactive_prompts_for_empty_extra_dir(ws, answers):
@@ -584,13 +860,13 @@ def test_pull_delete_interactive_q_aborts(ws, answers):
     ws.write("data/extra1.txt", "1")
     ws.write("data/extra2.txt", "2")
 
-    answers.feed("y", "q")  # extras prompt deepest-first: extra2 then extra1
+    answers.feed("y", "q")  # ascending order: extra1.txt then extra2.txt
     res = ws.run("pull", "--delete", "data")
 
     assert res.rc == 1
     assert "aborted" in res.err
-    assert not (ws.root / "data" / "extra2.txt").exists()
-    assert (ws.root / "data" / "extra1.txt").exists()
+    assert not (ws.root / "data" / "extra1.txt").exists()
+    assert (ws.root / "data" / "extra2.txt").exists()
 
 
 def test_pull_delete_confirms_on_the_clean_tree_short_circuit_too(ws, answers):
@@ -657,7 +933,7 @@ def test_pull_keeps_conflicting_file_root_when_dir_download_fails(ws, monkeypatc
     monkeypatch.setattr(
         Boto3S3Store,
         "sync_down",
-        lambda self, *a, **k: TransferResult(returncode=1, stderr="injected failure"),
+        lambda self, *a, **k: TransferResult(returncode=1),
     )
     res = ws.run("pull", "data", "-o", str(dest))
     assert res.rc == 1
@@ -771,6 +1047,366 @@ def test_push_delete_refuses_deletions_when_scan_is_incomplete(ws):
     assert "./sub/f.txt" in _manifest_body(ws, "data")
 
 
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs an unreadable directory")
+def test_push_delete_refuses_deletions_when_incomplete_scan_path_looks_like_timestamp_warning(ws):
+    # A path whose name contains the invalid-timestamp warning's text must not
+    # let the "Skipping file .../invalid timestamp/f.txt. File/Directory is not
+    # readable." gap warning be misread as the (harmless) timestamp fallback.
+    # A substring match on the warning body would clear scan_incomplete and
+    # mirror a partial view, deleting a good backup.
+    ws.write("data/a.txt", "a")
+    ws.write("data/invalid timestamp/f.txt", "f")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    sub = ws.root / "data" / "invalid timestamp"
+    os.chmod(sub, 0)
+    try:
+        res = ws.run("push", "--delete", "--yes", "data")
+    finally:
+        os.chmod(sub, 0o755)
+    assert res.rc == 0  # cli.main; cli.run maps the warnings to exit 2
+    assert "kept 1 deletion candidate(s)" in res.err
+    assert "data/invalid timestamp/f.txt" in ws.keys()
+    assert "./invalid timestamp/f.txt" in _manifest_body(ws, "data")
+
+
+def test_pull_errors_on_size_mismatched_object(ws):
+    # An out-of-band overwrite leaves the S3 object a different size than the
+    # manifest records. Pull must not apply metadata and report success on the
+    # wrong bytes - restore fidelity is the point of the backup.
+    ws.write("data", "hello")  # 5 bytes
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data", Body=b"x")  # 1 byte
+    dest = ws.root / "restored"
+    res = ws.run("pull", "data", "-o", str(dest))
+    assert res.rc == 1
+    assert "size does not match" in (res.out + res.err).lower()
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs an unsearchable directory")
+def test_push_delete_refuses_when_sub_ancestor_is_unsearchable(ws):
+    # os.path.lexists reports EACCES (an unsearchable parent) as "absent";
+    # push --delete must not read that as "locally deleted" and drop a backup
+    # for a path it merely could not reach.
+    ws.write("data/locked/file.txt", "secret")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    locked = ws.root / "data" / "locked"
+    os.chmod(locked, 0)
+    try:
+        res = ws.run("push", "--delete", "--yes", "data/locked/file.txt")
+    finally:
+        os.chmod(locked, 0o755)
+    assert res.rc == 1
+    assert "cannot access" in res.err.lower()
+    assert "data/locked/file.txt" in ws.keys()  # the backup is intact
+
+
+def test_subpath_pull_delete_keeps_excluded_local_file(ws):
+    # A sub-path pull --delete's local walk must anchor the entry's excludes at
+    # the ENTRY root; otherwise an excluded local-only file under the sub is
+    # matched against the wrong prefix, seen as an extra, and deleted.
+    ws.write("data/sub/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["sub/private/*"]}})
+    ws.run("push", "data", expect_rc=0)
+
+    secret = ws.write("data/sub/private/secret", "keep me")  # excluded, local-only
+    ws.run("pull", "--delete", "--yes", "data/sub", expect_rc=0)
+    assert secret.exists() and secret.read_text() == "keep me"  # the exclude protected it
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs an unreadable file")
+def test_verify_checksum_warns_on_unreadable_local_file(ws):
+    # A verification tool must say it could not check a file, not silently skip
+    # it as if the content matched.
+    p = ws.write("data", "hello")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    os.chmod(p, 0)
+    try:
+        res = ws.run("verify", "--checksum", "data")
+    finally:
+        os.chmod(p, 0o644)
+    assert "cannot read local file for --checksum" in res.err
+    assert "1 warning(s)" in res.out  # surfaced in the summary, not reported OK
+
+
+def test_pull_meta_only_ignores_size_difference(ws):
+    # --meta-only applies metadata over whatever data is already present; it
+    # never downloads, so it must NOT fail on a size difference from the record
+    # (the presence/size check is for real data pulls only).
+    p = ws.write("data/a.txt", "hello")
+    os.chmod(p, 0o644)
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    p.write_text("a much longer replacement body")  # size now differs from the record
+    os.chmod(p, 0o600)  # and a mode drift for --meta-only to settle
+    res = ws.run("pull", "--meta-only", "data")
+    assert res.rc == 0
+    assert (os.lstat(p).st_mode & 0o777) == 0o644  # metadata applied despite the size
+
+
+def test_pull_data_only_detects_size_mismatched_object(ws):
+    # --data-only skips apply_manifest; the integrity check must still catch an
+    # object whose size no longer matches the record (out-of-band overwrite).
+    ws.write("data/a.txt", "hello")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/a.txt", Body=b"x")  # 1 byte
+    res = ws.run("pull", "--data-only", "data", "-o", str(ws.root / "out"))
+    assert res.rc == 1
+    assert "size does not match" in res.err.lower()
+
+
+def test_pull_data_only_detects_missing_object(ws):
+    ws.write("data/a.txt", "hello")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.s3.delete_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/a.txt")
+    res = ws.run("pull", "--data-only", "data", "-o", str(ws.root / "out"))
+    assert res.rc == 1
+    assert "missing" in res.err.lower()
+
+
+def test_staged_pull_preserves_old_root_when_apply_fails(ws):
+    # A conflicting-type restore root is swapped only after the download; if the
+    # post-swap metadata apply then fails (here a size-mismatched object), the
+    # swapped-out old root must be preserved, not destroyed by the cleanup.
+    ws.write("data/a.txt", "hello")  # 5 bytes
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/a.txt", Body=b"x")  # corrupt: 1 byte
+
+    dest = ws.root / "restore_here"
+    dest.write_text("precious pre-existing data")  # a conflicting type (regular file)
+    res = ws.run("pull", "data", "-o", str(dest))
+    assert res.rc == 1
+    assert "preserved at" in res.err
+    stages = list(ws.root.glob("restore_here.s3bak-stage*"))
+    assert len(stages) == 1
+    assert (stages[0] / "replaced").read_text() == "precious pre-existing data"
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs an unsearchable directory")
+def test_pull_subpath_rejects_unsearchable_ancestor(ws):
+    # A deepest ancestor that lstat's fine (a directory) but is itself
+    # unsearchable (mode 000) must be caught by the guard up front, not surface
+    # as a bare EACCES only when the download tries to write through it.
+    ws.write("data/a/file.txt", "content")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    a = ws.root / "data" / "a"
+    os.chmod(a, 0)
+    try:
+        res = ws.run("pull", "data/a/file.txt")
+    finally:
+        os.chmod(a, 0o755)
+    assert res.rc == 1
+    assert "cannot access" in res.err.lower()
+
+
+def test_staged_pull_preserves_old_root_on_interrupt_right_after_move(ws, monkeypatch):
+    # A SIGINT landing right after the old root is moved into the stage (before
+    # the code could record where it went) must still preserve it, not let the
+    # cleanup delete the only copy.
+    ws.write("data/a.txt", "hello")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    dest = ws.root / "restore_here"
+    dest.write_text("precious pre-existing data")  # a conflicting type -> staged pull
+
+    real_replace = os.replace
+
+    def replace_then_interrupt(src, dst):
+        real_replace(src, dst)  # perform the real move...
+        if os.fspath(dst).endswith(os.sep + "replaced"):
+            raise KeyboardInterrupt  # ...then interrupt, as a signal would mid-swap
+
+    monkeypatch.setattr("s3bak.commands.os.replace", replace_then_interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        ws.run("pull", "data", "-o", str(dest))
+
+    stages = list(ws.root.glob("restore_here.s3bak-stage*"))
+    assert len(stages) == 1
+    assert (stages[0] / "replaced").read_text() == "precious pre-existing data"
+
+
+def test_staged_pull_preserves_old_root_when_delete_step_fails(ws, monkeypatch):
+    # The apply succeeds after the staged swap, but the --delete extras step
+    # fails: the preserve check runs AFTER --delete, so the old root is still kept.
+    ws.write("data/a.txt", "hello")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    # An unrecorded object: the staged download materializes it as a local extra.
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/extra.txt", Body=b"x")
+
+    dest = ws.root / "restore_here"
+    dest.write_text("precious pre-existing data")  # conflicting type -> staged pull
+
+    real_remove = os.remove
+
+    def remove_failing_on_extra(path):
+        if os.fspath(path).endswith("extra.txt"):
+            raise OSError("injected delete failure")
+        return real_remove(path)
+
+    monkeypatch.setattr("s3bak.restore.os.remove", remove_failing_on_extra)
+    res = ws.run("pull", "--delete", "--yes", "data", "-o", str(dest))
+    assert res.rc == 1
+    assert "preserved at" in res.err
+    stages = list(ws.root.glob("restore_here.s3bak-stage*"))
+    assert len(stages) == 1
+    assert (stages[0] / "replaced").read_text() == "precious pre-existing data"
+
+
+def test_subpath_pull_delete_keeps_data_when_whole_sub_excluded(ws):
+    # An exclude that targets the sub itself ("sub/*") excludes the whole sub;
+    # a sub-path pull --delete must not treat the excluded contents as extras.
+    ws.write("data/sub/kept.txt", "kept")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["sub/*"]}})
+    precious = ws.write("data/sub/precious.txt", "keep me")  # excluded, local-only
+    ws.run("pull", "--delete", "--yes", "data/sub", expect_rc=0)
+    assert precious.exists() and precious.read_text() == "keep me"
+
+
+def test_pull_output_trailing_slash_is_exact(ws):
+    # -o is the exact destination: a trailing slash must NOT append the entry
+    # name (that container behavior belongs to the configured path only).
+    ws.write("data/a.txt", "hello")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    dest = ws.root / "exact"
+    ws.run("pull", "data", "-o", str(dest) + os.sep, expect_rc=0)
+    assert (dest / "a.txt").read_text() == "hello"  # restored AT dest...
+    assert not (dest / "data").exists()  # ...not dest/data
+
+
+def test_diff_ignores_conflicting_unrecorded_orphans(ws):
+    # --data-only pushes leave unrecorded objects; two that conflict (a file and
+    # a directory recorded at one path) cannot be materialized together by a bulk
+    # prefix sync. diff must ignore unrecorded objects (download only recorded
+    # files), not fail trying to download them all.
+    (ws.root / "data").mkdir()
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)  # empty dir entry: manifest = root only
+
+    foo = ws.write("data/foo", "i am a file")
+    ws.run("push", "--data-only", "data/foo", expect_rc=0)  # unrecorded object data/foo
+
+    os.remove(foo)
+    (ws.root / "data" / "foo").mkdir()
+    ws.write("data/foo/bar", "i am under a dir")
+    ws.run("push", "--data-only", "data/foo/bar", expect_rc=0)  # unrecorded data/foo/bar
+
+    shutil.rmtree(ws.root / "data" / "foo")  # local foo gone; S3 has conflicting orphans
+    res = ws.run("diff", "data")
+    assert res.rc == 0  # nothing recorded, nothing local: no diff, not a download failure
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs an unreadable directory")
+def test_status_warns_when_unreadable_dir_hides_local_file(ws):
+    # An unreadable directory hides its children from the walk; status must warn
+    # that it could not see the whole tree, not silently report a clean tree
+    # while a local-only file sits behind the unreadable directory.
+    ws.write("data/a.txt", "a")
+    (ws.root / "data" / "locked").mkdir()
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "locked" / "extra.txt").write_text("hidden")  # local-only
+    os.chmod(ws.root / "data" / "locked", 0)
+    try:
+        res = ws.run("status", "data")
+    finally:
+        os.chmod(ws.root / "data" / "locked", 0o755)
+    assert "not readable" in res.err.lower()  # surfaced, not silently clean
+
+
+def test_push_delete_removes_exact_root_object(ws):
+    # An object at a directory entry's OWN key (out-of-band, or a former-file
+    # residue) is invisible to the slash-bounded delete lane; push --delete must
+    # still retire it (verify flags it as a root type conflict otherwise).
+    ws.write("data/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data", Body=b"orphan")
+
+    assert "data" in ws.keys()  # the exact-key orphan exists
+    ws.run("push", "--delete", "--yes", "data", expect_rc=0)
+    assert "data" not in ws.keys()  # retired
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs an unreadable parent")
+def test_status_warns_on_inaccessible_single_file_entry(ws):
+    # A single-file entry whose parent is unsearchable is inaccessible, not
+    # missing: status must warn, not silently report D.
+    (ws.root / "locked").mkdir()
+    solo = ws.root / "locked" / "solo"
+    solo.write_text("hi")
+    ws.config({"solo": {"path": str(solo)}})
+    ws.run("push", "solo", expect_rc=0)
+
+    os.chmod(ws.root / "locked", 0)
+    try:
+        res = ws.run("status", "solo")
+    finally:
+        os.chmod(ws.root / "locked", 0o755)
+    assert "cannot access" in res.err.lower()
+    assert not res.out.strip().startswith("D ")  # not falsely reported missing
+
+
+@pytest.mark.skipif(os.name == "nt", reason="needs os.mkfifo")
+def test_push_refreshes_special_file_mtime(ws):
+    # A special file's own mtime is meaningful: an out-of-window mtime drift
+    # must refresh the manifest, so status settles and pull restores the
+    # current mtime.
+    ws.write("data/a.txt", "a")
+    fifo = ws.root / "data" / "pipe"
+    os.mkfifo(fifo)
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    os.utime(fifo, (2_000_000_000, 2_000_000_000))  # drift far, mode unchanged
+    actual_ns = os.lstat(fifo).st_mtime_ns
+    ws.run("push", "data", expect_rc=0)
+
+    body = (
+        ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl")["Body"]
+        .read()
+        .decode()
+    )
+    record = next(
+        json.loads(line) for line in body.splitlines()[1:] if json.loads(line)["path"] == "./pipe"
+    )
+    assert record["mtime_ns"] == actual_ns  # the drifted mtime is now recorded
+    assert ws.run("status", "data", expect_rc=0).out.strip() == ""  # no perpetual M
+
+
+def test_diff_empty_single_file_detects_missing_local(ws):
+    # A missing local file is a difference even against a 0-byte backup, whose
+    # content diff vs /dev/null shows nothing and used to exit 0.
+    ws.write("solo", "")  # 0-byte single-file entry
+    ws.config({"solo": {"path": str(ws.root / "solo")}})
+    ws.run("push", "solo", expect_rc=0)
+    os.remove(ws.root / "solo")
+
+    res = ws.run("diff", "solo")
+    assert res.rc == 1
+    assert "missing" in res.out.lower()
+
+
 def test_missing_subpath_delete_aborts_on_damaged_manifest_before_deleting(ws):
     # The manifest is downloaded and validated BEFORE the subtree deletion, so
     # a corrupt manifest aborts the push while the backup is still intact.
@@ -813,3 +1449,256 @@ def test_pull_preserves_old_root_when_cutover_and_rollback_both_fail(ws, monkeyp
     stages = list(ws.root.glob("*.s3bak-stage*"))
     assert len(stages) == 1  # preserved, not cleaned up
     assert (stages[0] / "replaced" / "precious.txt").read_text() == "keep me"
+
+
+def test_push_delete_retires_object_shielded_by_a_kind_conflict(ws):
+    # A pushed file replaced locally by a symlink occupies its key, so the S3
+    # object forms an update pair instead of an orphan and the sync's delete
+    # lane never sees it. push --delete offers it out-of-lane: the object
+    # goes, the symlink record (already journaled) stays.
+    ws.write("data/f.txt", "was a file")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "f.txt").unlink()
+    os.symlink("elsewhere", ws.root / "data" / "f.txt")
+    ws.run("push", "data", expect_rc=0)  # records the symlink; the object stays
+    assert "data/f.txt" in ws.keys()
+    assert '"link":"elsewhere"' in _manifest_body(ws, "data")
+
+    ws.run("push", "--delete", "--yes", "data", expect_rc=0)
+    assert "data/f.txt" not in ws.keys()
+    assert '"link":"elsewhere"' in _manifest_body(ws, "data")  # the record survives
+
+
+def test_noop_push_does_not_rewrite_the_manifest(ws):
+    # The rewrite condition is "the journal is non-empty": a push that finds
+    # nothing to do must not re-upload an identical manifest.
+    ws.write("data/a.txt", "alpha")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    key = f"{ws.prefix}/data-manifest.jsonl"
+    first = ws.s3.get_object(Bucket=ws.bucket, Key=key)
+    res = ws.run("push", "data", expect_rc=0)
+    assert res.out.strip() == ""
+    second = ws.s3.get_object(Bucket=ws.bucket, Key=key)
+    assert first["ETag"] == second["ETag"]
+    assert first["LastModified"] == second["LastModified"]  # not re-uploaded
+
+
+def test_noop_subpath_push_does_not_rewrite_the_manifest(ws):
+    # A sub-path push journals like a whole-entry push: an unchanged sub-tree
+    # produces no events, so nothing is rewritten and no hook would fire.
+    ws.write("data/sub/f.txt", "f")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    key = f"{ws.prefix}/data-manifest.jsonl"
+    first = ws.s3.get_object(Bucket=ws.bucket, Key=key)
+    ws.run("push", "data/sub", expect_rc=0)
+    second = ws.s3.get_object(Bucket=ws.bucket, Key=key)
+    assert first["LastModified"] == second["LastModified"]
+
+
+def test_push_delete_of_unrecorded_object_leaves_manifest_untouched(ws):
+    # Deleting an object the manifest never recorded journals nothing: the
+    # object goes, and the manifest is not rewritten (there is no record to
+    # drop).
+    ws.write("data/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/stray.bin", Body=b"x")
+    key = f"{ws.prefix}/data-manifest.jsonl"
+    first = ws.s3.get_object(Bucket=ws.bucket, Key=key)
+
+    ws.run("push", "--delete", "--yes", "data", expect_rc=0)
+    assert "data/stray.bin" not in ws.keys()
+    second = ws.s3.get_object(Bucket=ws.bucket, Key=key)
+    assert first["LastModified"] == second["LastModified"]
+
+
+def test_push_probes_readability_only_on_transfer(ws):
+    # Readability is probed only on files a lane decided to copy: a chmod-0
+    # file whose content is already backed up passes the stat compare, so no
+    # open is attempted - the mode drift refreshes just its record, with no
+    # warning and rc 0 (the old per-file probe warn-skipped it every run).
+    bad = ws.write("data/bad.txt", "secret")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    os.chmod(bad, 0)
+    try:
+        res = ws.run("push", "data", expect_rc=0)
+    finally:
+        os.chmod(bad, 0o644)
+    assert "not readable" not in res.err
+    assert "upload:" not in res.out  # no transfer, record-only refresh
+    assert '"mode":"100000"' in _manifest_body(ws, "data")
+
+
+def test_checksum_push_with_unreadable_file_warns_and_exits_2(ws, monkeypatch):
+    # --checksum reads every paired file; an unreadable one must warn-skip
+    # (exit 2) like the default compare, not abort the sync with AccessDenied.
+    # The probe runs before the content comparison for exactly this reason.
+    import signal
+
+    from s3bak import cli
+
+    ws.write("data/bad.txt", "secret")
+    ws.write("data/good.txt", "good")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    bad = ws.root / "data" / "bad.txt"
+    os.chmod(bad, 0)
+    ws.write("data/good.txt", "good v2")
+    monkeypatch.setattr("sys.argv", ["s3bak", "push", "--checksum", "data"])
+    saved = signal.getsignal(signal.SIGINT)
+    try:
+        rc = cli.run()
+    finally:
+        signal.signal(signal.SIGINT, saved)
+        os.chmod(bad, 0o644)
+
+    assert rc == 2  # warned, not aborted
+    body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/good.txt")["Body"].read()
+    assert body == b"good v2"  # the readable file still synced
+
+
+def test_subpath_delete_keeps_kind_changed_record_at_sub_itself(ws):
+    # entry/a/b was pushed as a file, then became a directory locally. The
+    # sub sync's S3 listing is slash-bounded (a/b/), so the object a/b never
+    # enters any lane - its record is not provably stale and must survive a
+    # sub-path --delete (records travel with their objects). A directory-
+    # level push --delete retires the pair.
+    ws.write("data/a/b", "was a file")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "a" / "b").unlink()
+    ws.write("data/a/b/inner.txt", "now a dir")
+
+    res = ws.run("push", "--delete", "--yes", "data/a/b", expect_rc=0)
+    assert "data/a/b" in ws.keys()  # the out-of-listing object survives
+    body = _manifest_body(ws, "data")
+    assert '{"path":"./a/b","mode":"100644"' in body  # its record too
+    assert "./a/b/inner.txt" in body
+    assert "non-directory ./a/b" in res.err  # the surviving pair is warned
+
+
+def test_push_delete_without_tty_keeps_kind_conflict_object(ws):
+    # A non-TTY --delete without --yes answers no to everything - the
+    # out-of-lane kind-conflict candidates included.
+    ws.write("data/f.txt", "was a file")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "f.txt").unlink()
+    os.symlink("elsewhere", ws.root / "data" / "f.txt")
+    ws.run("push", "--delete", "data", expect_rc=0)
+    assert "data/f.txt" in ws.keys()  # kept: every answer is no
+
+
+def test_push_delete_retires_every_kind_conflict_object_and_counts_them(ws, monkeypatch):
+    # PushJournal spools kind-conflict delete candidates to disk instead of
+    # holding a list (memory independent of tree size); with several
+    # candidates in one run, every one of them must still be offered and
+    # deleted - not just the first - and pending_object_deletes must behave
+    # as a plain counter of what was spooled, not a list length.
+    from s3bak import commands
+
+    names = ("f1.txt", "f2.txt", "f3.txt")
+    for name in names:
+        ws.write(f"data/{name}", "was a file")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    for name in names:
+        (ws.root / "data" / name).unlink()
+        os.symlink("elsewhere", ws.root / "data" / name)
+    ws.run("push", "data", expect_rc=0)  # records the symlinks; the objects stay
+    for name in names:
+        assert f"data/{name}" in ws.keys()
+
+    seen_counts: list[int] = []
+    real = commands._delete_conflict_objects
+
+    def spy(cfg, entry, plan, journal, opts):
+        seen_counts.append(journal.pending_object_deletes)
+        return real(cfg, entry, plan, journal, opts)
+
+    monkeypatch.setattr(commands, "_delete_conflict_objects", spy)
+    ws.run("push", "--delete", "--yes", "data", expect_rc=0)
+
+    assert seen_counts == [3]  # the counter matched all three spooled candidates
+    for name in names:
+        assert f"data/{name}" not in ws.keys()  # every shielded object retired
+    body = _manifest_body(ws, "data")
+    assert body.count('"link":"elsewhere"') == 3  # every symlink record survives
+
+
+def test_pending_object_delete_spool_round_trips_a_newline_in_the_key(tmp_path):
+    # The spool JSON-encodes each candidate rather than using a plain
+    # delimiter, precisely so a key containing a newline round-trips whole
+    # instead of splitting into two spool lines. A local tree with such a
+    # name is fragile to build portably, so this exercises PushJournal's
+    # spool directly - the escape hatch this class of test is meant to use.
+    from s3bak import localwalk
+    from s3bak.syncops import PushJournal
+
+    walker = localwalk.sync_walker([])
+    journal = PushJournal(str(tmp_path / "j.journal"), None, window_ns=0, walker=walker)
+    assert journal.pending_object_deletes == 0  # unset: no spool created yet
+
+    journal._record_pending_object_delete("a\nb.txt", True)
+    journal._record_pending_object_delete("plain.txt", False)
+    assert journal.pending_object_deletes == 2  # a counter, not a list length
+
+    journal.close()
+    assert list(journal.iter_pending_object_deletes()) == [
+        ("a\nb.txt", True),
+        ("plain.txt", False),
+    ]
+    assert list(journal.iter_pending_object_deletes()) == []  # spool closed, forgotten
+
+
+def test_pull_checksum_skips_the_size_mtime_gate(ws, monkeypatch):
+    # --checksum ignores the size+mtime gate, so a real --checksum pull must not
+    # pay for the (potentially millions of lstats) gate walk under it.
+    from s3bak import commands
+
+    ws.write("data/a.txt", "alpha")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    dest = ws.root / "out"
+
+    calls: list[int] = []
+    real = commands._manifest_matches_local
+    monkeypatch.setattr(
+        commands,
+        "_manifest_matches_local",
+        lambda *a, **k: (calls.append(1), real(*a, **k))[1],
+    )
+    ws.run("pull", "data", "--checksum", "-o", str(dest), expect_rc=0)
+    assert calls == []  # gate walk skipped under a real --checksum pull
+
+    calls.clear()
+    ws.run("pull", "data", "-o", str(dest), expect_rc=0)
+    assert calls  # a plain pull still runs the gate
+
+
+def test_subpath_push_records_ancestor_directory_mtime_drift(ws):
+    # A leaf sub-path push must record a drifted ancestor-directory mtime (adding
+    # the child bumps it), not just a mode change - otherwise pull restores the
+    # stale directory mtime (docs/journal.md).
+    ws.write("data/sub/a.txt", "a")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    ws.write("data/sub/b.txt", "b")
+    subdir = ws.root / "data" / "sub"
+    os.utime(subdir, (1_600_000_000, 1_600_000_000))  # a distinct ancestor mtime
+    ws.run("push", "data/sub/b.txt", expect_rc=0)
+
+    dest = ws.root / "out"
+    ws.run("pull", "data", "-o", str(dest), expect_rc=0)
+    assert os.stat(dest / "sub").st_mtime_ns == 1_600_000_000_000_000_000

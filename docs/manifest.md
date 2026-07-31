@@ -97,43 +97,42 @@ memory bounded by one directory level rather than the whole tree:
   files, and unreadable entries before filtering. s3bak customizes only exclude
   subtree pruning; boto3-s3 emits each directory record in-stream just before
   its children. An unreadable directory keeps its own record and loses its
-  children; the manifest-writing walk reports that gap as a warning (exit 2),
-  while the read-only diff walks stay silent (their comparison fails safe).
+  children; every walk reports that gap as a warning (exit 2) — the
+  manifest-writing walk and the read-only status / diff walks alike — so a
+  local-only file hidden behind an unreadable directory is never mistaken for a
+  clean comparison.
 - **The writer** streams walk → temp file → upload; it never buffers the whole
   manifest.
 - **The status / pull `--delete` diff** (`merge_join`) pairs the manifest
   stream against a fresh walk on their shared sort keys with a one-record
-  lookahead per side — both-sides pairs are compared (M), manifest-only
-  records report D, local-only paths report A / become delete candidates — so
-  a manifest far larger than RAM still diffs in one pass.
-- **The manifest rewrite** (`write_merged`, used by every push) is a streaming
-  merge of already-sorted inputs — the old manifest, the newly walked tree (or
-  sub-tree: records outside the replaced range are copied verbatim, preserving
-  any unknown keys), and optionally the kept-keys stream — instead of a
-  read-all-then-sort. A walked path always wins over its old record. Old-only
-  records in the range follow the keep policy: all kept (the default push —
-  deleting is opt-in), all dropped (`--delete --yes`, the mirror), or decided
-  by the kept-keys stream (`KeptKeys`) that the `--delete` confirmation wrote —
-  one JSON-encoded key per line, in ascending key order because the sync's
-  delete lane decides serially in that order, so one line of lookahead decides
-  every record with constant memory. The stream governs regular-file records
-  only: directory, symlink, and special records have no S3 object to confirm,
-  always survive it, and thereby keep every kept file's ancestor chain valid.
-  A kept key with no old record (an
-  [unrecorded object](storage.md#unrecorded-objects)) is skipped — a record
-  cannot be fabricated for it.
-- **The default update strategy** (`ManifestFilter`) reads the manifest once,
+  lookahead per side — a both-sides pair of the same type is compared (M), a
+  both-sides pair whose type changed reports D (it is a replacement, not a
+  metadata edit), a manifest-only record reports D, and a local-only path
+  reports A / becomes a delete candidate — so a manifest far larger than RAM
+  still diffs in one pass.
+- **The push rewrite** (`merge_journal`) applies the push journal to the old
+  manifest: a 2-way streaming merge in which a key with no event copies its
+  old record verbatim (preserving any unknown keys), `+` / `!` copy the event
+  payload byte-for-byte, and `-` drops the old record. The journal's own
+  ordering (strictly ascending, at most one event per key) and its marker
+  consistency against the old manifest are validated fail closed — see
+  [journal.md](journal.md) for the format and the emitter that writes it.
+- **The `--meta-only` rewrite** (`write_merged`) merges a fresh local walk
+  into the old manifest: a walked path always wins over its old record,
+  records outside a sub-path patch's replaced range are copied verbatim, and
+  old-only records are kept (`--meta-only` moves no data, so it must not drop
+  the records of objects still on S3).
+- **Pull's update strategy** (`ManifestFilter`) reads the manifest once,
   front to back, merge-joining its records against `S3.sync`'s ascending
   compare-key pairs (`iter_compare_records` keys a directory as `name/` to match
-  the pair order). It is wired as `S3.sync`'s `update_filter`, so it is handed
-  only the both-sides pairs — new entries (`create_filter`) and orphans
-  (`delete_filter`) are decided by those lanes, not here — and decides each with
-  a one-record lookahead; the whole manifest is never loaded into a map. This is
-  sound because a bare update filter is decided serially, in that same order (the
-  one-record cursor self-heals over any key it is not asked about); only
-  `--checksum`'s `ParallelFilter` content strategy runs in parallel, and it never
-  wraps this filter. Because the filter holds the manifest file open for the
-  whole sync, the caller `close()`s it before unlinking the temp manifest.
+  the pair order). It is wired as `sync_down`'s `update_filter`, so it is handed
+  only the both-sides pairs, and decides each with a one-record lookahead; the
+  whole manifest is never loaded into a map. This is sound because the update
+  filter is decided serially, in that same order (the one-record cursor
+  self-heals over any key it is not asked about). Because the filter holds the
+  manifest file open for the whole sync, the caller `close()`s it before
+  unlinking the temp manifest. (Push's compare is the journal emitter's
+  cursor — the same streaming shape, spanning all three lanes.)
 
 Because the order matches an S3 listing, the compare merge-joins the manifest
 against either side of a sync without materializing it.
@@ -161,10 +160,13 @@ against either side of a sync without materializing it.
 ## Versioning and migration
 
 The version bumps when the format changes incompatibly. There is no in-code
-migration and no multi-version reader: to move to a new format, re-run
-`push --all`, which regenerates every manifest. This is the same migration the
-very first push performs — with no manifest on S3, every pair transfers and a
-fresh manifest is written.
+migration and no multi-version reader: a manifest whose version is not the one
+this s3bak reads is rejected at download, exactly like a damaged one, so it
+blocks a plain `push` as well. To move to a new format, first remove the old
+manifest objects (`aws s3 rm` each `<entry>-manifest.jsonl`, or all at once with
+`aws s3 rm --recursive --exclude '*' --include '*-manifest.jsonl'`), then run
+`push --all`: with no manifest on S3 each entry transfers every pair and writes
+a fresh one, exactly as a first push does.
 
 An old manifest object left behind after a filename change (e.g. a pre-v3
 `<entry>-ls-l.txt`) is removed manually with the aws-cli command `aws s3 rm`;

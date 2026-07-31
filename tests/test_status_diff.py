@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import os
 import re
+import signal
+import subprocess
+
+import pytest
 
 MTIME_DETAIL = re.compile(r"mtime: remote=(.+) [<>] local=(.+) \((.+)\)")
 
@@ -29,7 +33,9 @@ def test_status_clean_then_reports_changes(ws):
 def test_status_reports_m_d_a_interleaved_in_key_order(ws):
     # status is one merge-join over the manifest and a fresh walk, so every
     # line - M, D, and A alike - comes out in S3 key order (A is no longer
-    # batched at the end).
+    # batched at the end). The root's own record sorts first (empty compare
+    # key) and shows M too: the additions and the deletion all bumped the
+    # directory's own mtime.
     ws.write("data/b.txt", "b")
     ws.write("data/d.txt", "d")
     ws.config({"data": {"path": str(ws.root / "data")}})
@@ -42,7 +48,13 @@ def test_status_reports_m_d_a_interleaved_in_key_order(ws):
 
     res = ws.run("status", "data", expect_rc=0)
     marks = [(line.split()[0], os.path.basename(line.split()[1])) for line in res.out.splitlines()]
-    assert marks == [("A", "a.txt"), ("M", "b.txt"), ("D", "d.txt"), ("A", "e.txt")]
+    assert marks == [
+        ("M", "data"),
+        ("A", "a.txt"),
+        ("M", "b.txt"),
+        ("D", "d.txt"),
+        ("A", "e.txt"),
+    ]
 
 
 def test_status_excluded_paths_are_invisible_locally(ws):
@@ -270,6 +282,114 @@ def test_diff_subpath_file(ws):
     assert "+v2" in res.out
 
 
+def test_diff_output_interleaves_record_types_in_manifest_key_order(ws):
+    # diff_backup is one streaming merge-join over the manifest and a fresh
+    # local walk (docs/manifest.md's Ordering invariant), so a regular file,
+    # a symlink, and a local-only addition must come out in S3 key order, not
+    # batched by record type (files, then symlinks, then local-only, as the
+    # old three-dict implementation produced them).
+    ws.write("data/z_file", "v1\n")
+    os.symlink("nowhere1", ws.root / "data" / "a_link")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    os.remove(ws.root / "data" / "a_link")
+    os.symlink("nowhere2", ws.root / "data" / "a_link")  # retarget: symlink diff
+    (ws.root / "data" / "z_file").write_text("v2\n")  # content diff, sorts last
+    (ws.root / "data" / "m_extra").write_text("new\n")  # local-only, sorts between
+
+    res = ws.run("diff", "data")
+    assert res.rc == 1
+
+    pos_link = res.out.index("a_link")
+    pos_extra = res.out.index("m_extra")
+    pos_file = res.out.index("z_file")
+    assert pos_link < pos_extra < pos_file
+
+
+def test_diff_stages_at_most_one_downloaded_object_at_a_time(ws, monkeypatch):
+    # diff_backup downloads recorded regular files one at a time into a fixed
+    # per-run staging name, removing each right after its own compare - so
+    # disk use never grows with the number of changed files. Wrap get_object
+    # to observe the staging directory just before each download starts: any
+    # object left over from a previous record would show up here.
+    from s3bak.store import Boto3S3Store
+
+    ws.write("data/a.txt", "aaa\n")
+    ws.write("data/b.txt", "bbb\n")
+    ws.write("data/c.txt", "ccc\n")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "a.txt").write_text("AAA\n")
+    (ws.root / "data" / "b.txt").write_text("BBB\n")
+    (ws.root / "data" / "c.txt").write_text("CCC\n")
+
+    pre_counts: list[int] = []
+    original_get_object = Boto3S3Store.get_object
+
+    def wrapped_get_object(self, rel_key, dest_path, **kwargs):
+        if os.path.basename(dest_path) == "object":  # diff_backup's staging name
+            pre_counts.append(len(os.listdir(os.path.dirname(dest_path))))
+        return original_get_object(self, rel_key, dest_path, **kwargs)
+
+    monkeypatch.setattr(Boto3S3Store, "get_object", wrapped_get_object)
+
+    res = ws.run("diff", "data")
+    assert res.rc == 1
+    assert len(pre_counts) == 3  # one download per changed regular file
+    assert pre_counts == [0, 0, 0]  # nothing left staged from a prior record
+
+
+def test_diff_regular_file_replaced_by_directory_reports_type_diff(ws):
+    # A manifest file record's sort key ("a.txt") never pairs with a local
+    # directory of the same name (sort key "a.txt/") in the merge-join, so
+    # the walk lane comes back empty for this record - not because the path
+    # is missing, but because its key shape changed. diff_backup must fall
+    # back to a direct lstat and report the type change, not misread the
+    # unpaired record as "locally gone" and dump the whole backup content
+    # against /dev/null.
+    ws.write("data/a.txt", "hello\n")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "a.txt").unlink()
+    (ws.root / "data" / "a.txt").mkdir()
+
+    res = ws.run("diff", "data")
+    assert res.rc == 1
+    assert "-regular file" in res.out
+    assert "+directory" in res.out
+    assert "-hello" not in res.out  # not a devnull content dump
+
+
+def test_diff_compares_excluded_recorded_file_against_real_local_content(ws):
+    # An exclude pattern hides a path from local_keyed's walk, but a manifest
+    # record for it can still exist (recorded before the exclude was added).
+    # "not walked" must not be read as "locally missing" - apply_manifest
+    # already relies on the same direct-lstat fallback for excluded paths it
+    # still has to repair (restore.py's apply_manifest), and diff must follow
+    # the same principle: compare the excluded file's real content, not
+    # report it as removed.
+    ws.write("data/old.log", "same\n")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)  # old.log recorded before any exclude
+
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["*.log"]}})
+
+    # Unchanged content, now excluded: still identical -> clean diff, proving
+    # the real file was compared rather than treated as absent.
+    clean = ws.run("diff", "data", expect_rc=0)
+    assert clean.out == ""
+
+    # Changed content, still excluded: a real content diff, not a "missing".
+    (ws.root / "data" / "old.log").write_text("changed\n")
+    res = ws.run("diff", "data")
+    assert res.rc == 1
+    assert "-same" in res.out
+    assert "+changed" in res.out
+
+
 def test_show_streams_file_to_stdout(ws):
     ws.write("data/a.txt", "hello\n")
     ws.config({"data": {"path": str(ws.root / "data")}})
@@ -367,3 +487,53 @@ def test_diff_of_unpushed_single_file_reports_error(ws):
     res = ws.run("diff", str(ws.root / "data" / "new.txt"))
     assert res.rc == 1
     assert "not found on s3" in res.err.lower()
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs an unsearchable parent")
+def test_status_warns_when_entry_path_is_unreadable(ws):
+    # An unreadable entry path (unsearchable parent) is not "absent": status must
+    # not silently report every record D and exit 0 - it warns that the
+    # comparison could not be made.
+    ws.write("locked/data/a.txt", "alpha")
+    ws.config({"data": {"path": str(ws.root / "locked" / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    locked = ws.root / "locked"
+    os.chmod(locked, 0o000)
+    try:
+        res = ws.run("status", "data")
+        assert "cannot read" in res.err
+    finally:
+        os.chmod(locked, 0o755)
+
+
+def test_run_diff_maps_sigpipe_to_broken_pipe(monkeypatch):
+    # A reader that closes the pipe (`s3bak diff | head`) makes the diff child die
+    # with SIGPIPE; that maps to the documented 141, not a plain 1.
+    from s3bak import commands
+    from s3bak.config import Opts
+
+    monkeypatch.setattr(
+        commands.subprocess,
+        "run",
+        lambda cmd, **kw: subprocess.CompletedProcess(cmd, -signal.SIGPIPE),
+    )
+    with pytest.raises(BrokenPipeError):
+        commands._run_diff("a", "b", "label", Opts())
+
+
+def test_run_diff_on_windows_does_not_touch_sigpipe(monkeypatch):
+    # signal.SIGPIPE does not exist on Windows. Simulate that by both flipping
+    # IS_WINDOWS and removing the attribute, so a fix that merely reorders the
+    # check without actually branching on IS_WINDOWS still raises AttributeError
+    # here and fails the test.
+    from s3bak import commands
+    from s3bak.config import Opts
+
+    monkeypatch.setattr(commands, "IS_WINDOWS", True)
+    monkeypatch.delattr(signal, "SIGPIPE", raising=False)
+    monkeypatch.setattr(
+        commands.subprocess,
+        "run",
+        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0),
+    )
+    assert commands._run_diff("a", "b", "label", Opts()) == 0

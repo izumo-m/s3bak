@@ -1,10 +1,11 @@
 """config.py knobs: concurrency settings and the size+mtime-check window.
 
-``max_concurrency`` tunes the transfer thread pool (cp / sync), ``compare_workers``
-tunes the parallel ETag comparison under --checksum; either may be set without
-the other. s3bak does not read aws-cli's ``[s3]`` config, so these are the only
-way to change them. ``mtime_window`` (seconds, 0 allowed = strict) bounds the
-size+mtime-check tolerance.
+``max_concurrency`` tunes the transfer thread pool (cp / sync) and sizes
+verify's hashing pool; the sync-time compare runs serially (the journal needs
+ordered lane decisions), so there is no compare pool to tune. s3bak does not
+read aws-cli's ``[s3]`` config, so this is the only way to change it.
+``mtime_window`` (seconds, 0 allowed = strict) bounds the size+mtime-check
+tolerance.
 """
 
 from __future__ import annotations
@@ -23,17 +24,17 @@ def _store(ws) -> cli.Boto3S3Store:
     return store
 
 
-def test_defaults_leave_both_unset(ws):
+def test_defaults_leave_concurrency_unset(ws):
     ws.write("data/a.txt", "x")
     ws.config({"data": {"path": str(ws.root / "data")}})
 
     store = _store(ws)
     assert store.max_concurrency is None
-    assert store.compare_workers is None
     assert store._s3._transfer_config is None  # library default (10) applies
-    # content_compare is the bare EtagComparison; the pool is sized at sync time.
+    # content_compare is the bare EtagComparison, run inline on the sync
+    # thread (the journal needs ordered lane decisions).
     assert type(store.content_compare()).__name__ == "EtagComparison"
-    assert store.compare_pool_size() == 10  # both unset -> boto3's default
+    assert store.compare_pool_size() == 10  # unset -> boto3's default
 
 
 def test_client_built_once_and_reused(ws):
@@ -64,45 +65,19 @@ def test_client_built_once_and_reused(ws):
     assert calls["n"] == 0  # no client was constructed after __init__
 
 
-def test_both_set_independently(ws):
-    ws.write("data/a.txt", "x")
-    ws.config(
-        {"data": {"path": str(ws.root / "data")}},
-        max_concurrency=7,
-        compare_workers=3,
-    )
-
-    store = _store(ws)
-    assert store.max_concurrency == 7
-    assert store.compare_workers == 3
-    tc = store._s3._transfer_config
-    assert tc is not None and tc.max_concurrency == 7
-
-    assert type(store.content_compare()).__name__ == "EtagComparison"
-    assert store.compare_pool_size() == 3  # compare_workers wins
-
-
-def test_compare_workers_alone_leaves_transfer_default(ws):
-    ws.write("data/a.txt", "x")
-    ws.config({"data": {"path": str(ws.root / "data")}}, compare_workers=5)
-
-    store = _store(ws)
-    assert store._s3._transfer_config is None  # transfers keep the default
-    assert store.compare_pool_size() == 5
-
-
-def test_max_concurrency_alone_leaves_compare_unset(ws):
+def test_max_concurrency_sizes_transfers_and_verify_pool(ws):
     ws.write("data/a.txt", "x")
     ws.config({"data": {"path": str(ws.root / "data")}}, max_concurrency=6)
 
     store = _store(ws)
+    assert store.max_concurrency == 6
     tc = store._s3._transfer_config
     assert tc is not None and tc.max_concurrency == 6
-    # compare_workers unset -> the compare pool falls back to max_concurrency.
+    # verify's hashing pool follows max_concurrency.
     assert store.compare_pool_size() == 6
 
 
-@pytest.mark.parametrize("name", ["max_concurrency", "compare_workers", "entry_concurrency"])
+@pytest.mark.parametrize("name", ["max_concurrency", "entry_concurrency"])
 @pytest.mark.parametrize("bad", [0, -1, True, "lots", 1.5])
 def test_invalid_value_is_rejected(ws, name, bad):
     ws.write("data/a.txt", "x")
@@ -245,10 +220,10 @@ def test_run_entries_caps_at_entry_concurrency():
     assert peak == 2  # never more than the configured cap, and it reaches it
 
 
-def test_run_entries_unbounded_when_unset():
-    rc, peak = _peak_concurrency(entry_concurrency=None, n_entries=4)
+def test_run_entries_default_cap_is_four():
+    rc, peak = _peak_concurrency(entry_concurrency=None, n_entries=6)
     assert rc == 0
-    assert peak == 4  # one thread per entry by default
+    assert peak == 4  # capped at _DEFAULT_ENTRY_CONCURRENCY, not one thread per entry
 
 
 def test_run_entries_cap_above_count_runs_all():
@@ -276,13 +251,12 @@ def test_run_entries_exit_code_is_deterministic_by_entry_order():
 
 
 def test_push_pull_roundtrip_with_concurrency_settings(ws):
-    # The full sync path must work with non-default workers (TransferConfig and
-    # the per-sync ParallelFilter compare pool actually wired into push and pull).
+    # The full sync path must work with a non-default TransferConfig actually
+    # wired into push and pull.
     ws.write("data/a.txt", "hello")
     ws.config(
         {"data": {"path": str(ws.root / "data")}},
         max_concurrency=4,
-        compare_workers=2,
     )
     ws.run("push", "data", expect_rc=0)
 
@@ -352,6 +326,62 @@ def test_run_entries_gives_concurrent_tasks_distinct_stores():
     assert run_entries(fn, cfg, ["one", "two"], Opts()) == 0
     assert len(seen) == 2 and seen[0] != seen[1]
     assert all(name == "MainThread" for name in FakeStore.built_on)
+
+
+def test_run_entries_default_cap_limits_clones():
+    # entry_concurrency unset: workers must cap at _DEFAULT_ENTRY_CONCURRENCY
+    # (4) regardless of how many entries are given, so a large entry list
+    # does not build one store (and thread) per entry up front.
+    from s3bak.cli import _DEFAULT_ENTRY_CONCURRENCY, run_entries
+    from s3bak.config import Config, Opts
+
+    clones = {"n": 0}
+
+    class FakeStore:
+        def clone(self):
+            clones["n"] += 1
+            return FakeStore()
+
+    cfg = Config(
+        profile="p",
+        prefix="s3://b/x",
+        bucket="b",
+        path_prefix="x",
+        entries={},
+        store=FakeStore(),  # type: ignore[arg-type]
+    )
+    rc = run_entries(lambda cfg_, entry, opts_: 0, cfg, [f"e{i}" for i in range(6)], Opts())
+    assert rc == 0
+    # workers = min(6, 4) = 4 -> 3 clones (one store built up front, the rest cloned).
+    assert clones["n"] == _DEFAULT_ENTRY_CONCURRENCY - 1
+
+
+def test_entry_concurrency_replaces_default_cap():
+    # A configured entry_concurrency REPLACES the built-in default cap, it
+    # does not further narrow it - the same min-with-configured-value
+    # semantics as before this change.
+    from s3bak.cli import run_entries
+    from s3bak.config import Config, Opts
+
+    clones = {"n": 0}
+
+    class FakeStore:
+        def clone(self):
+            clones["n"] += 1
+            return FakeStore()
+
+    cfg = Config(
+        profile="p",
+        prefix="s3://b/x",
+        bucket="b",
+        path_prefix="x",
+        entries={},
+        entry_concurrency=2,
+        store=FakeStore(),  # type: ignore[arg-type]
+    )
+    rc = run_entries(lambda cfg_, entry, opts_: 0, cfg, [f"e{i}" for i in range(6)], Opts())
+    assert rc == 0
+    assert clones["n"] == 1  # workers = min(6, 2) = 2 -> 1 clone
 
 
 def test_run_entries_propagates_broken_pipe():

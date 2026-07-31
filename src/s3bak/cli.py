@@ -51,7 +51,7 @@ from s3bak.commands import (
 )
 from s3bak.compare import _resolve_use_color
 from s3bak.config import Config, Opts, load_config
-from s3bak.confirm import reset_confirmations
+from s3bak.confirm import AnswerMode, is_aborted, reset_confirmations, resolve_answer_mode
 from s3bak.console import (
     die,
     err,
@@ -83,22 +83,49 @@ __all__ = [
 # Parallel runner
 # =============================================================================
 
+# Default cap on how many entries a multi-entry command runs at once, when
+# entry_concurrency is not configured (a configured value replaces this
+# default outright, it does not further narrow it). Each entry worker's own
+# sync/cp already drives s3transfer's own transfer pool (~10 threads by
+# default), so 4 entries at once already means roughly 40 transfers in
+# flight - enough to saturate typical bandwidth well before entry count would
+# need to grow further. The cap also bounds how many clients (store.clone,
+# below) and threads run_entries builds up front, which otherwise scales
+# with entry count alone (one of each per entry, sight unseen).
+_DEFAULT_ENTRY_CONCURRENCY = 4
+
 
 def run_entries(
     fn: Callable[[Config, str, Opts], int],
     cfg: Config,
     entries: list[str],
     opts: Opts,
+    *,
+    serial: bool = False,
 ) -> int:
     if not entries:
         return 0
     if len(entries) == 1:
         return fn(cfg, entries[0], opts)
 
-    # One thread per entry by default; cap at entry_concurrency when configured.
-    workers = len(entries)
-    if cfg.entry_concurrency is not None:
-        workers = min(workers, cfg.entry_concurrency)
+    if serial:
+        # Interactive --delete: the per-item confirmation reads stdin on the
+        # calling thread. Running entries on worker threads would leave a Ctrl-C
+        # during a prompt unable to interrupt the blocking read (SIGINT reaches
+        # only the main thread), hanging executor.shutdown(wait=True). Run the
+        # entries sequentially on this thread so the prompt - and its interrupt -
+        # stays here; a q abort then also stops the entries not yet run.
+        statuses = []
+        for entry in entries:
+            if is_aborted():
+                break
+            statuses.append(fn(cfg, entry, opts))
+        return next((status for status in statuses if status), 0)
+
+    # One thread per entry, capped at _DEFAULT_ENTRY_CONCURRENCY unless
+    # entry_concurrency overrides that default (see the constant above).
+    cap = cfg.entry_concurrency if cfg.entry_concurrency is not None else _DEFAULT_ENTRY_CONCURRENCY
+    workers = min(len(entries), cap)
 
     # boto3-s3's concurrency contract: transfers running on different threads
     # must not share a client, and clients must be built sequentially up
@@ -161,6 +188,8 @@ def _run_resolved_entries(
     cfg: Config,
     resolved: Sequence[tuple[str, str | None]],
     opts: Opts,
+    *,
+    serial: bool = False,
 ) -> int:
     entries = [entry for entry, _sub in resolved]
     sub_by_entry = {entry: sub for entry, sub in resolved}
@@ -168,7 +197,14 @@ def _run_resolved_entries(
     def _run_one(cfg_: Config, entry_: str, opts_: Opts) -> int:
         return fn(cfg_, entry_, opts_, sub_by_entry.get(entry_))
 
-    return run_entries(_run_one, cfg, entries, opts)
+    return run_entries(_run_one, cfg, entries, opts, serial=serial)
+
+
+def _interactive_delete(opts: Opts) -> bool:
+    """A --delete run whose confirmations are answered at an interactive prompt
+    (not --yes, not a non-interactive all-no). Such a run must execute its
+    entries serially on the main thread - see run_entries(serial=...)."""
+    return opts.delete and resolve_answer_mode(yes=opts.yes) is AnswerMode.ASK
 
 
 # =============================================================================
@@ -477,7 +513,16 @@ def _resolve_one_arg(cfg: Config, arg: str) -> tuple[str, str | None]:
             sub = posixpath.normpath(raw_sub)
             if sub == ".":
                 return name, None
-            if sub == ".." or sub.startswith("../") or sub.startswith("/"):
+            # os.path.splitdrive is identity on POSIX (so a filename containing
+            # ':' is fine there) but strips a Windows drive: on Windows a
+            # drive-qualified sub like "C:/escape" makes os.path.join(entry_path,
+            # sub) discard the entry path entirely and escape the entry root.
+            if (
+                sub == ".."
+                or sub.startswith("../")
+                or sub.startswith("/")
+                or os.path.splitdrive(sub)[0]
+            ):
                 die(f"sub path must stay inside entry {name}: {arg}")
             return name, sub
 
@@ -645,6 +690,10 @@ def main(argv: list[str] | None = None) -> int:
                 die(f"--mtime-window requires a non-negative number of seconds (got {val!r})")
             if not math.isfinite(opt_mtime_window) or opt_mtime_window < 0:
                 die(f"--mtime-window must be >= 0 (got {opt_mtime_window})")
+            # Converted to an integer nanosecond count (window_ns_for); reject a
+            # value so large the * 1e9 overflows to inf and would crash round().
+            if not math.isfinite(opt_mtime_window * 1_000_000_000):
+                die(f"--mtime-window is too large to use (got {opt_mtime_window})")
         elif a in ("-o", "--output") or a.startswith("--output="):
             used_options.append("output")
             opt_outpath, i = take_value(a, i)
@@ -745,7 +794,9 @@ def main(argv: list[str] | None = None) -> int:
         else:
             resolved = resolve_entry_files(cfg, positional, "push")
         _validate_distinct_entries(resolved, "push")
-        return _run_resolved_entries(cmd_push, cfg, resolved, opts)
+        return _run_resolved_entries(
+            cmd_push, cfg, resolved, opts, serial=_interactive_delete(opts)
+        )
 
     elif subcmd == "pull":
         if opt_all:
@@ -754,7 +805,9 @@ def main(argv: list[str] | None = None) -> int:
             resolved = resolve_entry_files(cfg, positional, "pull")
         _validate_distinct_entries(resolved, "pull")
         _validate_pull_destinations(cfg, resolved)
-        return _run_resolved_entries(cmd_pull, cfg, resolved, opts)
+        return _run_resolved_entries(
+            cmd_pull, cfg, resolved, opts, serial=_interactive_delete(opts)
+        )
 
     elif subcmd == "status":
         if opt_all:

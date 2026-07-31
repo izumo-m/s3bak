@@ -257,6 +257,57 @@ def test_push_checksum_skips_mtime_only_change(ws):
     assert "upload:" not in res.out
 
 
+def test_push_checksum_refreshes_stale_mtime_record(ws):
+    # docs/sync.md's self-healing: an out-of-window mtime-only drift refreshes
+    # the manifest even under --checksum (no re-transfer, since content is
+    # equal), so status settles and a pull restores the current mtime instead
+    # of a stale one. Without the refresh the file would show M forever.
+    import json
+
+    p = ws.write("data/a.txt", "hello")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    os.utime(p, (2_000_000_000, 2_000_000_000))  # content untouched, mtime far off
+    actual_ns = _mtime_ns(p)
+    res = ws.run("push", "--checksum", "data", expect_rc=0)
+    assert "upload:" not in res.out  # content unchanged: no re-transfer
+
+    body = (
+        ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl")["Body"]
+        .read()
+        .decode()
+    )
+    record = next(
+        json.loads(line) for line in body.splitlines()[1:] if json.loads(line)["path"] == "./a.txt"
+    )
+    assert record["mtime_ns"] == actual_ns  # the drifted mtime is now recorded
+
+    assert ws.run("status", "data", expect_rc=0).out.strip() == ""  # no perpetual M
+
+
+def test_single_file_push_checksum_refreshes_stale_mtime_record(ws):
+    # The single-file counterpart of the self-healing refresh.
+    import json
+
+    p = ws.write("data", "hello")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    os.utime(p, (2_000_000_000, 2_000_000_000))
+    actual_ns = _mtime_ns(p)
+    res = ws.run("push", "--checksum", "data", expect_rc=0)
+    assert "upload:" not in res.out
+
+    body = (
+        ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl")["Body"]
+        .read()
+        .decode()
+    )
+    assert json.loads(body.splitlines()[1])["mtime_ns"] == actual_ns
+    assert ws.run("status", "data", expect_rc=0).out.strip() == ""
+
+
 def test_pull_checksum_repairs_same_size_same_mtime_corruption(ws):
     # The reason --checksum exists on pull: local content drifted while
     # keeping size and mtime, so the stat short-circuit must not swallow it.

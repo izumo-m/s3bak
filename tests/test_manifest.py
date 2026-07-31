@@ -110,6 +110,66 @@ def test_iter_manifest_rejects_damaged_lines(tmp_path):
         list(manifest.iter_manifest(str(p)))
 
 
+def test_iter_manifest_rejects_empty_symlink_target(tmp_path):
+    # os.symlink("", target) fails mid-restore after _place_symlink already
+    # removed the existing file; reject it at download instead.
+    p = tmp_path / "m.jsonl"
+    p.write_text('{"s3bak_manifest":3}\n{"path":"./ln","mode":"120777","mtime_ns":0,"link":""}\n')
+    with pytest.raises(manifest.ManifestError):
+        list(manifest.iter_manifest(str(p)))
+
+
+def test_iter_manifest_rejects_symlink_without_target(tmp_path):
+    p = tmp_path / "m.jsonl"
+    p.write_text('{"s3bak_manifest":3}\n{"path":"./ln","mode":"120777","mtime_ns":0}\n')
+    with pytest.raises(manifest.ManifestError):
+        list(manifest.iter_manifest(str(p)))
+
+
+def test_iter_manifest_rejects_oversized_size(tmp_path):
+    # A size past off_t max is a damaged record and would overflow compare.py's
+    # float size formatting.
+    big = 1 << 63
+    p = tmp_path / "m.jsonl"
+    p.write_text(
+        f'{{"s3bak_manifest":3}}\n{{"path":"./a","mode":"100644","size":{big},"mtime_ns":0}}\n'
+    )
+    with pytest.raises(manifest.ManifestError):
+        list(manifest.iter_manifest(str(p)))
+
+
+def test_iter_manifest_rejects_surrogate_owner(tmp_path):
+    # A lone surrogate in owner/group is not UTF-8-encodable and crashes
+    # ls-remote's stdout write; reject the record at parse time.
+    p = tmp_path / "m.jsonl"
+    p.write_text(
+        '{"s3bak_manifest":3}\n'
+        '{"path":".","mode":"40755","owner":"\\ud800","group":"g","mtime_ns":0}\n'
+    )
+    with pytest.raises(manifest.ManifestError):
+        list(manifest.iter_manifest(str(p)))
+
+
+def test_iter_manifest_rejects_deeply_nested_json(tmp_path):
+    # A deeply-nested value makes json.loads raise RecursionError; it must
+    # become a ManifestError, not an uncaught traceback.
+    deep = "[" * 100000 + "]" * 100000
+    p = tmp_path / "m.jsonl"
+    p.write_text(
+        '{"s3bak_manifest":3}\n'
+        '{"path":"./a","mode":"100644","size":1,"mtime_ns":0,"x":' + deep + "}\n"
+    )
+    with pytest.raises(manifest.ManifestError):
+        list(manifest.iter_manifest(str(p)))
+
+
+def test_iter_manifest_rejects_overlong_version_integer(tmp_path):
+    p = tmp_path / "m.jsonl"
+    p.write_text('{"s3bak_manifest":' + "1" * 5000 + "}\n")
+    with pytest.raises(manifest.ManifestError):
+        list(manifest.iter_manifest(str(p)))
+
+
 def test_validate_manifest_rejects_header_only_file(tmp_path):
     p = tmp_path / "m.jsonl"
     p.write_text('{"s3bak_manifest":3}\n')
@@ -180,6 +240,68 @@ def test_path_match_unterminated_class_is_literal():
 
 def test_path_match_invalid_range_never_raises():
     assert not manifest.path_match("a", "[z-a]")
+
+
+# --- PathMatcher ----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "patterns",
+    [
+        [],
+        ["foo.txt"],
+        ["foo.txt", "bar.txt"],
+        ["*.txt"],
+        ["foo.txt", "*.log"],
+        ["dir/*"],
+        ["[!a]"],
+        ["x["],
+        ["[z-a]"],
+        ["foo.txt", "*.log", "[!a]", "x[", "[z-a]", "dir/*"],
+    ],
+)
+def test_path_matcher_matches_the_any_path_match_loop(patterns):
+    # PathMatcher.match must agree with any(path_match(path, p) for p in
+    # patterns) for every candidate, literal/wildcard mixed and every
+    # malformed-bracket case path_match's own docstring already tolerates.
+    candidates = ["foo.txt", "bar.txt", "x[", "x", "a", "b", "z", "dir/child", "other"]
+    matcher = manifest.PathMatcher(patterns)
+    for path in candidates:
+        expected = any(manifest.path_match(path, p) for p in patterns)
+        assert matcher.match(path) == expected, (path, patterns)
+
+
+def test_path_matcher_star_crosses_slash():
+    # fnmatch's '*' matches '/' too (find -path semantics, not shell
+    # globbing) - PathMatcher must keep that, not gain path-component
+    # awareness by combining patterns into one regex.
+    matcher = manifest.PathMatcher(["a/*"])
+    assert matcher.match("a/b/c")
+    assert manifest.path_match("a/b/c", "a/*")  # same reference behavior
+
+
+def test_path_matcher_empty_pattern_list_matches_nothing():
+    matcher = manifest.PathMatcher([])
+    assert not matcher.match("")
+    assert not matcher.match("anything")
+
+
+def test_path_matcher_construction_never_raises_on_malformed_patterns():
+    # fnmatch.translate must safely fall back for these (no regex compile
+    # failure) - the same guarantee path_match's docstring relies on.
+    # PathMatcher additionally ORs every wildcard pattern into ONE compiled
+    # regex, so this also proves that combination stays compilable.
+    manifest.PathMatcher(["x[", "[z-a]", "[!a]", "**", "?[", "[[[["])
+
+
+def test_split_excludes_returns_path_matchers():
+    prune, skip = manifest.split_excludes(["logs/*", "*.tmp"])
+    assert isinstance(prune, manifest.PathMatcher)
+    assert isinstance(skip, manifest.PathMatcher)
+    assert prune.match("./logs")
+    assert not prune.match("./logs/x")
+    assert skip.match("./a.tmp")
+    assert not skip.match("./a.txt")
 
 
 def test_entry_sort_key():
@@ -336,79 +458,126 @@ def test_write_merged_keep_all_retains_old_only_records_verbatim(tmp_path):
     assert entries[3]["mtime_ns"] != 7  # both sides: the fresh walk record won
 
 
-def test_write_merged_selective_drops_only_unkept_file_records(tmp_path):
-    # Only a regular file's record can be confirmed away (its object is the
-    # delete candidate): a.txt was answered "delete" and its record falls out.
-    # Directory, symlink, and other objectless records were never asked and
-    # survive - which also keeps every kept file's ancestor chain intact.
-    old = tmp_path / "old.jsonl"
-    old.write_text(
-        _manifest_text(
-            [
-                '{"path":".","mode":"40755","mtime_ns":0}',
-                '{"path":"./gone","mode":"40755","mtime_ns":0}',
-                '{"path":"./gone/a.txt","mode":"100644","size":1,"mtime_ns":0}',
-                '{"path":"./gone/link","mode":"120777","mtime_ns":0,"link":"a.txt"}',
-                '{"path":"./gone/sub","mode":"40755","mtime_ns":0}',
-                '{"path":"./gone/sub/x.txt","mode":"100644","size":1,"mtime_ns":0}',
-                '{"path":"./keep.txt","mode":"100644","size":1,"mtime_ns":0}',
-            ]
-        )
-    )
-    kept = tmp_path / "kept.jsonl"
-    kept.write_text(json.dumps("gone/sub/x.txt") + "\n")
-    root = tmp_path / "root"
-    root.mkdir()
-    (root / "keep.txt").write_text("k")
+# --- the push journal ----------------------------------------------------------
 
+
+_OLD_LINES = [
+    '{"path":".","mode":"40755","mtime_ns":0}',
+    '{"path":"./gone.txt","mode":"100644","size":1,"mtime_ns":0}',
+    '{"path":"./keep.txt","mode":"100644","size":1,"mtime_ns":7,"future":"kept"}',
+    '{"path":"./link","mode":"120777","mtime_ns":0,"link":"gone.txt"}',
+]
+
+
+def _write_journal(tmp_path, lines: list[str]) -> str:
+    p = tmp_path / "push.journal"
+    p.write_text("".join(line + "\n" for line in lines))
+    return str(p)
+
+
+def test_merge_journal_applies_events_and_copies_the_rest_verbatim(tmp_path):
+    old = tmp_path / "old.jsonl"
+    old.write_text(_manifest_text(_OLD_LINES))
+    journal = _write_journal(
+        tmp_path,
+        [
+            '+{"path":"./added.txt","mode":"100644","size":2,"mtime_ns":1}',
+            "-" + _OLD_LINES[1],  # gone.txt: a confirmed deletion drops its record
+            " " + _OLD_LINES[2],  # keep.txt: a kept delete candidate is a no-op
+            '!{"path":"./link","mode":"120777","mtime_ns":0,"link":"added.txt"}',
+        ],
+    )
     out_path = tmp_path / "merged.jsonl"
-    kept_keys = manifest.KeptKeys(str(kept))
-    try:
-        with open(out_path, "w", encoding="utf-8") as out:
-            manifest.write_merged(
-                out, str(old), None, localwalk.walk_tree(str(root), []), keep_old=kept_keys
-            )
-    finally:
-        kept_keys.close()
-    rels = [json.loads(ln)["path"] for ln in out_path.read_text().splitlines()[1:]]
-    assert rels == [
-        ".",
-        "./gone",
-        "./gone/link",
-        "./gone/sub",
-        "./gone/sub/x.txt",
-        "./keep.txt",
-    ]
+    with open(out_path, "w", encoding="utf-8") as out:
+        manifest.merge_journal(out, str(old), journal)
+    entries = [json.loads(ln) for ln in out_path.read_text().splitlines()[1:]]
+    assert [e["path"] for e in entries] == [".", "./added.txt", "./keep.txt", "./link"]
+    assert entries[2]["future"] == "kept"  # " " copies the old record verbatim
+    assert entries[3]["link"] == "added.txt"  # ! replaced the record
     assert manifest.validate_manifest(str(out_path)) == "dir"
 
 
-def test_write_merged_selective_skips_kept_keys_without_records(tmp_path):
-    # A kept orphan object with no old record has nothing to keep: the key is
-    # discarded while advancing and later records still match.
+def test_merge_journal_without_old_manifest_is_the_first_push(tmp_path):
+    journal = _write_journal(
+        tmp_path,
+        [
+            '+{"path":".","mode":"40755","mtime_ns":0}',
+            '+{"path":"./a.txt","mode":"100644","size":1,"mtime_ns":0}',
+        ],
+    )
+    out_path = tmp_path / "merged.jsonl"
+    with open(out_path, "w", encoding="utf-8") as out:
+        manifest.merge_journal(out, None, journal)
+    assert manifest.validate_manifest(str(out_path)) == "dir"
+
+
+@pytest.mark.parametrize(
+    ("event", "message"),
+    [
+        ('+{"path":"./keep.txt","mode":"100644","size":1,"mtime_ns":7}', "already-recorded"),
+        ('!{"path":"./zzz.txt","mode":"100644","size":1,"mtime_ns":0}', "unrecorded"),
+        ('-{"path":"./zzz.txt","mode":"100644","size":1,"mtime_ns":0}', "unrecorded"),
+        ('-{"path":"./keep.txt","mode":"100644","size":9,"mtime_ns":7}', "does not match"),
+        (' {"path":"./zzz.txt","mode":"100644","size":1,"mtime_ns":0}', "unrecorded"),
+        (' {"path":"./keep.txt","mode":"100644","size":9,"mtime_ns":7}', "does not match"),
+    ],
+)
+def test_merge_journal_marker_mismatch_fails_closed(tmp_path, event, message):
+    # A + whose key exists, a ! / - / " " whose key does not, or a - / " "
+    # payload that differs from the old record is an emitter bug, never
+    # absorbed.
+    old = tmp_path / "old.jsonl"
+    old.write_text(_manifest_text(_OLD_LINES))
+    journal = _write_journal(tmp_path, [event])
+    with pytest.raises(manifest.ManifestError, match=message):
+        manifest.merge_journal(io.StringIO(), str(old), journal)
+
+
+@pytest.mark.parametrize(
+    ("lines", "message"),
+    [
+        (['*{"path":"./a.txt","mode":"100644","size":1,"mtime_ns":0}'], "invalid journal marker"),
+        (["+not json"], "invalid journal record"),
+        (
+            [
+                '+{"path":"./b.txt","mode":"100644","size":1,"mtime_ns":0}',
+                '+{"path":"./a.txt","mode":"100644","size":1,"mtime_ns":0}',
+            ],
+            "out of order",
+        ),
+        (
+            [
+                '-{"path":"./a.txt","mode":"100644","size":1,"mtime_ns":0}',
+                '+{"path":"./a.txt","mode":"100644","size":2,"mtime_ns":1}',
+            ],
+            "out of order",  # one key, one event: a -/+ pair must have been a !
+        ),
+    ],
+)
+def test_iter_journal_validates_shape(tmp_path, lines, message):
+    journal = _write_journal(tmp_path, lines)
+    with pytest.raises(manifest.ManifestError, match=message):
+        list(manifest.iter_journal(journal))
+
+
+def test_merge_journal_warns_when_records_survive_under_a_file(tmp_path):
+    # A + at the free file key "d" while the old dir record and its children
+    # survive: same restorability warning as write_merged, once per subtree.
     old = tmp_path / "old.jsonl"
     old.write_text(
         _manifest_text(
             [
                 '{"path":".","mode":"40755","mtime_ns":0}',
-                '{"path":"./kept.txt","mode":"100644","size":1,"mtime_ns":0}',
+                '{"path":"./d","mode":"40755","mtime_ns":0}',
+                '{"path":"./d/x.txt","mode":"100644","size":1,"mtime_ns":0}',
             ]
         )
     )
-    kept = tmp_path / "kept.jsonl"
-    kept.write_text(json.dumps("aaa-unrecorded.bin") + "\n" + json.dumps("kept.txt") + "\n")
-    root = tmp_path / "root"
-    root.mkdir()
-
-    out = io.StringIO()
-    kept_keys = manifest.KeptKeys(str(kept))
-    try:
-        manifest.write_merged(
-            out, str(old), None, localwalk.walk_tree(str(root), []), keep_old=kept_keys
-        )
-    finally:
-        kept_keys.close()
-    rels = [json.loads(ln)["path"] for ln in out.getvalue().splitlines()[1:]]
-    assert rels == [".", "./kept.txt"]
+    journal = _write_journal(tmp_path, ['+{"path":"./d","mode":"100644","size":1,"mtime_ns":0}'])
+    warnings: list[str] = []
+    manifest.merge_journal(io.StringIO(), str(old), journal, warn=warnings.append)
+    assert len(warnings) == 1
+    assert "./d" in warnings[0]
 
 
 def test_write_merged_warns_once_when_records_survive_under_a_file(tmp_path):
@@ -447,35 +616,6 @@ def test_write_merged_warns_once_when_records_survive_under_a_file(tmp_path):
     assert rels == [".", "./d", "./d.txt", "./d", "./d/x.txt", "./d/y.txt"]
     assert len(warnings) == 1
     assert "./d" in warnings[0]
-
-
-def test_write_merged_empty_kept_stream_drops_every_unkept_file_record(tmp_path):
-    # KeptKeys(None) is the empty stream: every old-only FILE record falls out
-    # (its object was deleted, or was already gone - the stale-record heal),
-    # while objectless records still survive.
-    old = tmp_path / "old.jsonl"
-    old.write_text(
-        _manifest_text(
-            [
-                '{"path":".","mode":"40755","mtime_ns":0}',
-                '{"path":"./gone.txt","mode":"100644","size":1,"mtime_ns":0}',
-                '{"path":"./link","mode":"120777","mtime_ns":0,"link":"gone.txt"}',
-            ]
-        )
-    )
-    root = tmp_path / "root"
-    root.mkdir()
-
-    out = io.StringIO()
-    kept_keys = manifest.KeptKeys(None)
-    try:
-        manifest.write_merged(
-            out, str(old), None, localwalk.walk_tree(str(root), []), keep_old=kept_keys
-        )
-    finally:
-        kept_keys.close()
-    rels = [json.loads(ln)["path"] for ln in out.getvalue().splitlines()[1:]]
-    assert rels == [".", "./link"]
 
 
 # --- RecordedFiles -------------------------------------------------------------

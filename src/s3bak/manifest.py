@@ -1,5 +1,5 @@
-"""Manifest v3: JSONL read/write, the sorted-stream merge-join, and the
-stat-based sync compare (ManifestFilter).
+"""Manifest v3: JSONL read/write, the sorted-stream merge-join, the push
+journal, and the stat-based pull compare (ManifestFilter).
 
 A manifest is stored as ``<entry>-manifest.jsonl`` next to the entry's data
 (the suffix cannot collide with a single-file entry's own key, unlike a bare
@@ -23,9 +23,16 @@ header version only changes when an existing key's meaning does.
 
 The sorted-order invariant is what keeps everything here streaming: the walk
 (localwalk.py, boto3-s3's engine) emits in S3 key order, the writer streams
-walk -> file, and the sub-path patch, the sync compare (ManifestFilter), and
-the status / pull ``--delete`` diff (merge_join) are all merges of sorted
-streams instead of a read-all + sort.
+walk -> file, and the push-journal merge, the ``--meta-only`` rewrite, the
+pull compare (ManifestFilter), and the status / pull ``--delete`` diff
+(merge_join) are all merges of sorted streams instead of a read-all + sort.
+
+The push journal (docs/journal.md) is the diff a push's single scan emits:
+one line per manifest change, a one-character marker (``+`` add / ``!``
+replace / ``-`` drop / ``" "`` no change) followed by a manifest record line,
+in sort-key order. ``merge_journal`` applies it to the old manifest; the
+emitter (syncops.PushJournal) holds every policy decision, so the merge is a
+pure apply.
 """
 
 from __future__ import annotations
@@ -33,6 +40,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import os
+import re
 import stat as stat_mod
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
@@ -106,6 +114,27 @@ class ManifestEntry:
         return abs(st.st_mtime_ns - self.mtime_ns) <= window_ns
 
 
+def _fsencodable(s: str) -> bool:
+    """Whether ``s`` can round-trip to a filesystem path. A surrogateescape'd
+    undecodable byte (``\\udc80``-``\\udcff``) round-trips (POSIX filenames use
+    those), but a lone surrogate like ``\\ud800`` - which a damaged/hostile
+    manifest can carry - raises UnicodeEncodeError deep in os.symlink/os.stat,
+    uncaught by run(), and only after _place_symlink has already removed the
+    existing file (data loss + traceback). Reject it at parse time instead."""
+    try:
+        os.fsencode(s)
+        return True
+    except (UnicodeEncodeError, ValueError):
+        return False
+
+
+# A recorded size beyond a signed 64-bit off_t is not a real file size; it is a
+# damaged/hostile manifest. Rejecting it here keeps the human-readable size
+# formatting (compare.py divides by a unit threshold) from an OverflowError on a
+# value too large to convert to float.
+_MAX_SIZE = (1 << 63) - 1
+
+
 def parse_entry(line: str) -> ManifestEntry | None:
     """Parse one record, returning ``None`` for invalid input.
 
@@ -129,16 +158,41 @@ def parse_entry(line: str) -> ManifestEntry | None:
             not isinstance(path, str)
             or not path
             or "\x00" in path
+            # The path must round-trip to a filesystem path: a lone surrogate
+            # (unlike a surrogateescape'd byte) is not fsencodable and would
+            # crash os.path.join/os.stat on restore.
+            or not _fsencodable(path)
             or mode < 0
             or mode > 0o177777
             or not (size is None or (isinstance(size, int) and not isinstance(size, bool)))
-            or (isinstance(size, int) and size < 0)
+            # A negative or absurdly-large size is a damaged record; the upper
+            # bound also keeps compare.py's float size formatting from overflowing.
+            or (isinstance(size, int) and not 0 <= size <= _MAX_SIZE)
             or not (
                 mtime_ns is None or (isinstance(mtime_ns, int) and not isinstance(mtime_ns, bool))
             )
-            or not (link is None or isinstance(link, str))
+            # A NUL, empty, or non-fsencodable link target survives every type
+            # check but raises ValueError/UnicodeEncodeError/FileNotFoundError deep
+            # in os.symlink/os.path.isdir on restore, which run() does not catch -
+            # and only AFTER _place_symlink removed the existing file (data loss +
+            # traceback). A symlink record with no target at all is equally
+            # unrestorable. Reject both here so a damaged manifest fails closed.
+            or not (
+                link is None
+                or (
+                    isinstance(link, str)
+                    and link != ""
+                    and "\x00" not in link
+                    and _fsencodable(link)
+                )
+            )
+            or (stat_mod.S_ISLNK(mode) and link is None)
+            # owner/group are display-only, but a lone surrogate here is not
+            # UTF-8-encodable and crashes ls-remote's stdout write; reject it.
             or not isinstance(owner, str)
+            or not _fsencodable(owner)
             or not isinstance(group, str)
+            or not _fsencodable(group)
         ):
             return None
         return ManifestEntry(
@@ -150,14 +204,18 @@ def parse_entry(line: str) -> ManifestEntry | None:
             mtime_ns=mtime_ns,
             sym_target=link,
         )
-    except (json.JSONDecodeError, KeyError, ValueError, TypeError):
+    except (json.JSONDecodeError, KeyError, ValueError, TypeError, RecursionError):
+        # RecursionError: a deeply-nested JSON value in an unknown field.
+        # ValueError also covers an integer literal too long to convert.
         return None
 
 
 def _check_header(line: str) -> None:
     try:
         obj = json.loads(line)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, ValueError, RecursionError):
+        # A malformed header, an over-long integer literal, or a deeply-nested
+        # value: a damaged manifest, not a Python traceback for the CLI user.
         obj = None
     if not isinstance(obj, dict) or _HEADER_KEY not in obj:
         raise ManifestError("not an s3bak v3 manifest (bad or missing header line)")
@@ -220,6 +278,7 @@ def validate_manifest(manifest_path: str) -> str:
                     entry.path.startswith("./")
                     or "/" in entry.path
                     or entry.path in (".", "..")
+                    or (os.name == "nt" and "\\" in entry.path)  # a path separator on Windows
                     or not entry.is_file
                     or entry.sym_target is not None
                 ):
@@ -234,6 +293,28 @@ def validate_manifest(manifest_path: str) -> str:
             parts = entry.path[2:].split("/")
             if any(part in ("", ".", "..") for part in parts):
                 raise ManifestError(f"manifest path escapes restore root: {entry.path!r}")
+            # A POSIX filename may contain a backslash; on Windows it is a path
+            # separator, so a record like "./a\\b" (a single file on POSIX) would
+            # restore as a nested dir a / file b. Fail closed there before any
+            # transfer; on POSIX os.name != "nt", so this is a no-op.
+            if os.name == "nt" and any("\\" in part for part in parts):
+                raise ManifestError(
+                    f"manifest path component contains a backslash,"
+                    f" unrestorable on Windows: {entry.path!r}"
+                )
+            # A component like "C:" is an ordinary POSIX filename but a
+            # Windows drive spec; os.path.join drops every earlier segment
+            # once it reaches one (cli.py's sub-path resolution rejects the
+            # same shape on CLI input, via the same os.path.splitdrive check,
+            # for the same reason), so a restore would discard the restore
+            # root entirely and land at the drive-qualified path instead. Fail
+            # closed there before any transfer; on POSIX os.path.splitdrive is
+            # identity, so this is a no-op, like the backslash check above.
+            if os.name == "nt" and any(os.path.splitdrive(part)[0] for part in parts):
+                raise ManifestError(
+                    f"manifest path component is drive-qualified,"
+                    f" unrestorable on Windows: {entry.path!r}"
+                )
             parent = tuple(parts[:-1])
             while directory_stack and len(directory_stack[-1]) > len(parent):
                 directory_stack.pop()
@@ -264,6 +345,24 @@ def validate_manifest(manifest_path: str) -> str:
         raise ManifestError("manifest contains no records")
     assert kind is not None
     return kind
+
+
+def iter_manifest_raw(manifest_path: str) -> Iterator[tuple[str, str, ManifestEntry, str]]:
+    """Stream ``(sort_key, rel, entry, line)`` for every record, root included
+    (path ``"."`` -> rel ``"."``, sort key ``""``). The raw line (no trailing
+    newline) lets a merge copy an untouched record verbatim, preserving any
+    unknown keys. Fails closed like ``iter_manifest``."""
+    try:
+        with open(manifest_path, encoding="utf-8") as f:
+            _check_header(f.readline())
+            for line_number, line in enumerate(f, start=2):
+                e = parse_entry(line)
+                if e is None:
+                    raise ManifestError(f"invalid manifest record at line {line_number}")
+                rel = "." if e.path == "." else e.path.removeprefix("./")
+                yield entry_sort_key(e.path, e.is_dir), rel, e, line.rstrip("\n")
+    except UnicodeError as e:
+        raise ManifestError(f"manifest is not valid UTF-8: {e}") from e
 
 
 def iter_compare_records(
@@ -350,56 +449,6 @@ def entry_sort_key(path: str, is_dir: bool) -> str:
     return norm + "/" if is_dir else norm
 
 
-class KeptKeys:
-    """Streaming reader of a kept-keys file: the entry-relative keys of the S3
-    objects the user chose NOT to delete, one ``json.dumps(rel)`` per line
-    (JSON-encoded because filenames may contain newlines). The file is written
-    in delete-lane decide order, which the sync guarantees is ascending key
-    order, so a one-line lookahead answers every query - but queries must also
-    arrive in ascending order (they do: old-only records are examined in
-    manifest order). ``path=None`` is the empty stream (nothing was kept)."""
-
-    def __init__(self, path: str | None) -> None:
-        self._f = open(path, encoding="utf-8") if path is not None else None
-        self._head = self._read()
-
-    def _read(self) -> str | None:
-        if self._f is None:
-            return None
-        line = self._f.readline()
-        if not line:
-            return None
-        rel = json.loads(line)
-        if not isinstance(rel, str):
-            raise ManifestError("invalid kept-keys line")
-        return rel
-
-    def consume_file(self, rel: str) -> bool:
-        """True iff ``rel`` was kept. Keys skipped while advancing had no old
-        record (pre-existing orphan objects) and stay unrecorded."""
-        while self._head is not None and self._head < rel:
-            self._head = self._read()
-        if self._head == rel:
-            self._head = self._read()
-            return True
-        return False
-
-    def close(self) -> None:
-        if self._f is not None:
-            self._f.close()
-
-
-# The keep policy for old-only records in write_merged's replaced range.
-# Only a regular file's record can be confirmed away - its S3 object is the
-# delete candidate; directories, symlinks, and specials have no object, hence
-# no question, and their records survive everything short of the mirror. So:
-# True keeps every old-only record (no deletions were made), False drops them
-# all (--yes, the mirror), and a KeptKeys stream drops exactly the FILE
-# records whose key it does not hold (their objects were deleted - or were
-# already gone, which is how stale records self-heal).
-KeepOld = bool | KeptKeys
-
-
 class RecordedFiles:
     """Streaming membership test over a manifest's regular-file records - the
     records that own an S3 object. Queries must arrive in ascending key order
@@ -436,46 +485,30 @@ class RecordedFiles:
         self._head = None
 
 
-def write_merged(
-    out: IO[str],
-    old_manifest: str | None,
-    sub: str | None,
-    new_entries: Iterable[tuple[str, os.stat_result, str | None]],
-    *,
-    keep_old: KeepOld = False,
-    warn: Callable[[str], None] | None = None,
-) -> None:
-    """Write a v3 manifest merging a fresh local walk into the old manifest.
+class _RestorabilityWarner:
+    """Warn once per subtree that a merged manifest leaves unrestorable.
 
-    Old records outside the replaced range (everything when ``sub`` is None,
-    the records at/under ``sub`` otherwise) are copied verbatim (preserving
-    any unknown keys). Inside the range, a walked path always wins over its
-    old record and old-only records survive per ``keep_old`` (see its
-    comment); keeping only file records that were explicitly kept never
-    orphans them, because their ancestor directory records are objectless and
-    always survive. Everything streams in sort-key order: one record of
-    lookahead per input (merge_join) plus one kept-key line.
+    Every emitted record passes through ``emit``, which tracks the most recent
+    non-directory records whose descendant key range is still open
+    ("blockers", a stack because siblings like ``sub.txt`` sort between a file
+    ``sub`` and the ``sub/...`` range). A record landing under a blocker means
+    records survive under a path another record says is not a directory (a
+    local change replaced a directory with a file, or vice versa): they stay
+    backed up but ``pull`` cannot materialize both."""
 
-    ``warn`` is called once per subtree that the merge leaves unrestorable:
-    records surviving under a path that another record says is not a
-    directory (a local change replaced a directory with a file, or vice
-    versa). Such records stay backed up but ``pull`` cannot materialize both.
-    """
-    out.write(_header_line() + "\n")
+    def __init__(self, out: IO[str], warn: Callable[[str], None] | None) -> None:
+        self._out = out
+        self._warn = warn
+        self._blockers: list[tuple[str, bool]] = []  # (rel, warned)
 
-    # Restorability check: every emitted record passes through emit(), which
-    # tracks the most recent non-directory records whose descendant key range
-    # is still open ("blockers", a stack because siblings like `sub.txt` sort
-    # between a file `sub` and the `sub/...` range).
-    blockers: list[tuple[str, bool]] = []  # (rel, warned)
-
-    def emit(rel: str, is_dir: bool, text: str) -> None:
+    def emit(self, rel: str, is_dir: bool, text: str) -> None:
         key = rel + "/" if is_dir else rel
+        blockers = self._blockers
         while blockers:
             top_rel = blockers[-1][0]
             if rel == top_rel or rel.startswith(top_rel + "/"):
-                if not blockers[-1][1] and warn is not None:
-                    warn(
+                if not blockers[-1][1] and self._warn is not None:
+                    self._warn(
                         f"warning: manifest keeps records under non-directory"
                         f" ./{top_rel}; pull cannot restore them"
                         f" (push --delete prunes them)"
@@ -488,18 +521,41 @@ def write_merged(
             break  # a sibling like `{top_rel}.x`: the blocker's range is still ahead
         if not is_dir and rel != ".":
             blockers.append((rel, False))
-        out.write(text)
+        self._out.write(text)
+
+
+def write_merged(
+    out: IO[str],
+    old_manifest: str | None,
+    sub: str | None,
+    new_entries: Iterable[tuple[str, os.stat_result, str | None]],
+    *,
+    keep_old: bool = False,
+    warn: Callable[[str], None] | None = None,
+) -> None:
+    """Write a v3 manifest merging a fresh local walk into the old manifest -
+    the ``--meta-only`` rewrite (an ordinary push merges its journal instead,
+    see ``merge_journal``).
+
+    Old records outside the replaced range (everything when ``sub`` is None,
+    the records at/under ``sub`` otherwise) are copied verbatim (preserving
+    any unknown keys). Inside the range, a walked path always wins over its
+    old record and old-only records survive when ``keep_old`` is True (the
+    ``--meta-only`` keep merge; False drops them - the sub-path removal).
+    Everything streams in sort-key order: one record of lookahead per input
+    (merge_join).
+
+    ``warn`` receives the ``_RestorabilityWarner`` message for records kept
+    under a non-directory path.
+    """
+    out.write(_header_line() + "\n")
+    warner = _RestorabilityWarner(out, warn)
 
     def old_items() -> Iterator[tuple[str, tuple[str, ManifestEntry, str]]]:
         if old_manifest is None:
             return
-        with open(old_manifest, encoding="utf-8") as f:
-            _check_header(f.readline())
-            for line in f:
-                e = parse_entry(line)
-                if e is None:
-                    raise ManifestError("invalid record in manifest being merged")
-                yield entry_sort_key(e.path, e.is_dir), (e.path.removeprefix("./"), e, line)
+        for key, rel, e, line in iter_manifest_raw(old_manifest):
+            yield key, (rel, e, line)
 
     def walk_items() -> Iterator[tuple[str, tuple[str, os.stat_result, str | None]]]:
         for item in new_entries:
@@ -510,16 +566,126 @@ def write_merged(
         if new is not None:  # the fresh walk record wins over any old record
             path, st, sym_target = new
             rel = "." if path == "." else path.removeprefix("./")
-            emit(rel, stat_mod.S_ISDIR(st.st_mode), format_entry(path, st, sym_target) + "\n")
+            line = format_entry(path, st, sym_target) + "\n"
+            warner.emit(rel, stat_mod.S_ISDIR(st.st_mode), line)
             continue
         assert old is not None
         rel, e, line = old
-        if sub is None or rel == sub or rel.startswith(sub + "/"):  # the replaced range
-            if keep_old is False:
-                continue
-            if keep_old is not True and e.is_file and not keep_old.consume_file(rel):
-                continue
-        emit(rel, e.is_dir, line if line.endswith("\n") else line + "\n")
+        in_range = sub is None or rel == sub or rel.startswith(sub + "/")
+        if in_range and not keep_old:
+            continue
+        warner.emit(rel, e.is_dir, line + "\n")
+
+
+# =============================================================================
+# The push journal (docs/journal.md)
+# =============================================================================
+
+JOURNAL_ADD = "+"
+JOURNAL_REPLACE = "!"
+JOURNAL_DROP = "-"
+# No change: the record is kept as-is. The emitter writes it as the reserved
+# line of a directory-record delete candidate - the post-order decision (ask
+# only once everything beneath is gone) arrives after the children's lines,
+# so the candidate's line position is claimed up front and the one-byte
+# marker is flipped in place to JOURNAL_DROP when the drop is confirmed. A
+# kept candidate simply stays a no-op line; the merge needs no cleanup pass.
+JOURNAL_KEEP = " "
+
+
+def iter_journal(journal_path: str) -> Iterator[tuple[str, str, ManifestEntry, str]]:
+    """Stream ``(sort_key, marker, entry, payload_line)`` from a push journal.
+
+    Validates the journal's own shape fail closed: a known marker, a payload
+    that parses as a manifest record, and strictly ascending sort keys (at
+    most one event per key - a ``-`` plus ``+`` pair at one key is an emitter
+    bug that must have been a ``!``). Marker consistency against the old
+    manifest is ``merge_journal``'s job, where the old record is in hand."""
+    previous: str | None = None
+    try:
+        with open(journal_path, encoding="utf-8") as f:
+            for line_number, line in enumerate(f, start=1):
+                marker, payload = line[:1], line[1:]
+                if marker not in (JOURNAL_ADD, JOURNAL_REPLACE, JOURNAL_DROP, JOURNAL_KEEP):
+                    raise ManifestError(f"invalid journal marker at line {line_number}")
+                e = parse_entry(payload)
+                if e is None:
+                    raise ManifestError(f"invalid journal record at line {line_number}")
+                key = entry_sort_key(e.path, e.is_dir)
+                if previous is not None and key <= previous:
+                    raise ManifestError(
+                        f"journal events are duplicated or out of order at {e.path!r}"
+                    )
+                previous = key
+                yield key, marker, e, payload.rstrip("\n")
+    except UnicodeError as exc:
+        raise ManifestError(f"journal is not valid UTF-8: {exc}") from exc
+
+
+def merge_journal(
+    out: IO[str],
+    old_manifest: str | None,
+    journal_path: str,
+    *,
+    warn: Callable[[str], None] | None = None,
+) -> None:
+    """Write a v3 manifest applying a push journal to the old manifest.
+
+    The 2-way streaming merge of the journal design: a key with no event
+    copies its old record verbatim (unknown keys preserved), ``+`` / ``!``
+    copy the event payload byte-for-byte (marker stripped, no
+    re-serialization), ``-`` skips the old record, and ``" "`` (no change, a
+    kept delete candidate) copies the old record verbatim exactly like a key
+    with no event. The merge applies events and knows no policy - every
+    keep/drop decision was the emitter's.
+
+    Markers are cross-checked against the old manifest, fail closed: a ``+``
+    whose key exists, a ``!`` / ``-`` / ``" "`` whose key does not, or a
+    ``-`` / ``" "`` payload that differs from the old record is an emitter
+    bug and raises ``ManifestError`` rather than publishing a manifest built
+    on it. ``warn`` receives the same restorability message as
+    ``write_merged``.
+    """
+    out.write(_header_line() + "\n")
+    warner = _RestorabilityWarner(out, warn)
+
+    def old_items() -> Iterator[tuple[str, tuple[str, ManifestEntry, str]]]:
+        if old_manifest is None:
+            return
+        for key, rel, e, line in iter_manifest_raw(old_manifest):
+            yield key, (rel, e, line)
+
+    def events() -> Iterator[tuple[str, tuple[str, ManifestEntry, str]]]:
+        for key, marker, e, payload in iter_journal(journal_path):
+            yield key, (marker, e, payload)
+
+    for _key, old, event in merge_join(old_items(), events()):
+        if event is None:
+            assert old is not None
+            rel, e, line = old
+            warner.emit(rel, e.is_dir, line + "\n")
+            continue
+        marker, e, payload = event
+        rel = "." if e.path == "." else e.path.removeprefix("./")
+        if marker == JOURNAL_ADD:
+            if old is not None:
+                raise ManifestError(f"journal adds an already-recorded path: {e.path!r}")
+            warner.emit(rel, e.is_dir, payload + "\n")
+        elif marker == JOURNAL_REPLACE:
+            if old is None:
+                raise ManifestError(f"journal replaces an unrecorded path: {e.path!r}")
+            warner.emit(rel, e.is_dir, payload + "\n")
+        elif marker == JOURNAL_KEEP:
+            if old is None:
+                raise ManifestError(f"journal keeps an unrecorded path: {e.path!r}")
+            if payload != old[2]:
+                raise ManifestError(f"journal keep does not match the record at {e.path!r}")
+            warner.emit(rel, e.is_dir, old[2] + "\n")
+        else:  # JOURNAL_DROP
+            if old is None:
+                raise ManifestError(f"journal drops an unrecorded path: {e.path!r}")
+            if payload != old[2]:
+                raise ManifestError(f"journal drop does not match the record at {e.path!r}")
 
 
 # =============================================================================
@@ -531,11 +697,58 @@ def path_match(path: str, pattern: str) -> bool:
     # fnmatchcase is platform-neutral and, because it matches plain strings
     # rather than filesystem components, ``*`` also matches ``/``. Its mature
     # translator handles malformed/range-heavy bracket expressions without the
-    # regex compilation failures a hand-rolled translator can introduce.
+    # regex compilation failures a hand-rolled translator can introduce. This
+    # is also PathMatcher's reference semantics (below) - the two must agree.
     return fnmatch.fnmatchcase(path, pattern)
 
 
-def split_excludes(excludes: list[str]) -> tuple[list[str], list[str]]:
+class PathMatcher:
+    """A precompiled ``any(fnmatch.fnmatchcase(path, p) for p in patterns)``.
+
+    An exclude check runs once per walked path against every configured
+    pattern (localwalk's per-child prune/skip test, restore's sub-ancestor
+    test); scanning the pattern list with ``path_match`` costs one fnmatch
+    call per pattern per path - O(paths x patterns). Splitting the patterns
+    once at construction avoids that:
+
+    - a **literal** pattern (no ``*`` / ``?`` / ``[``) goes into a
+      ``frozenset``, an O(1) membership test;
+    - every **wildcard** pattern is translated with ``fnmatch.translate`` -
+      the same mature translator ``path_match`` relies on, so a malformed or
+      range-heavy bracket expression (an unterminated ``[``, an invalid
+      ``[z-a]`` range) still translates to a safe regex rather than failing
+      to compile - and every translation is OR'd into ONE compiled regex, so
+      matching costs one ``.match()`` call regardless of how many wildcard
+      patterns there are.
+
+    ``match`` is exactly ``any(path_match(path, p) for p in patterns)``: a
+    literal pattern under fnmatchcase is a plain equality test, which the
+    frozenset lookup replicates; each wildcard pattern's own
+    ``fnmatch.translate`` output keeps its trailing ``\\Z`` full-string
+    anchor inside the alternation, so one alternative reaching past the end
+    of ``path`` can never make a different, shorter alternative "match" -
+    the combined regex accepts iff at least one original pattern would have.
+    An empty pattern list matches nothing.
+    """
+
+    def __init__(self, patterns: Iterable[str]) -> None:
+        literals: set[str] = set()
+        translated: list[str] = []
+        for p in patterns:
+            if any(c in p for c in "*?["):
+                translated.append(fnmatch.translate(p))
+            else:
+                literals.add(p)
+        self._literals = frozenset(literals)
+        self._regex = re.compile("|".join(f"(?:{t})" for t in translated)) if translated else None
+
+    def match(self, path: str) -> bool:
+        if path in self._literals:
+            return True
+        return self._regex is not None and self._regex.match(path) is not None
+
+
+def split_excludes(excludes: list[str]) -> tuple[PathMatcher, PathMatcher]:
     prune_patterns: list[str] = []
     skip_patterns: list[str] = []
     for ex in excludes:
@@ -543,7 +756,7 @@ def split_excludes(excludes: list[str]) -> tuple[list[str], list[str]]:
             prune_patterns.append(f"./{ex[:-2]}")
         else:
             skip_patterns.append(f"./{ex}")
-    return prune_patterns, skip_patterns
+    return PathMatcher(prune_patterns), PathMatcher(skip_patterns)
 
 
 # =============================================================================
@@ -584,26 +797,26 @@ def merge_join(
 
 
 # =============================================================================
-# ManifestFilter (the default sync compare)
+# ManifestFilter (the pull compare)
 # =============================================================================
 
 
 class ManifestFilter:
-    """The default update-lane strategy for sync: an rsync-style size+mtime
-    check against the manifest (True = copy). Wired as ``S3.sync``'s
-    ``update_filter``, so it is handed only the both-sides pairs; new entries
-    (``create_filter``) and orphans (``delete_filter``) are decided by those
-    lanes, never here.
+    """Pull's update-lane strategy: an rsync-style size+mtime check against
+    the manifest (True = copy). Wired as ``S3.sync``'s ``update_filter`` on
+    ``sync_down``, so it is handed only the both-sides download pairs; new
+    entries (``create_filter``) and local extras are decided by those lanes,
+    never here. (Push's compare lives in ``syncops.PushJournal``, which folds
+    the same size+mtime judgment into its journal emission.)
 
     Streaming: it reads the manifest once, front to back, merge-joining its
     records against ``S3.sync``'s ascending compare-key pairs - the whole
     manifest is never held in memory. This works because the manifest is
-    written in ``LocalStorage.scan`` order (``entry_sort_key``) and a bare
-    ``update_filter`` is decided serially on one thread in that same order
-    (``--checksum``'s ``ParallelFilter`` content strategy is the only concurrent
-    path, and it never wraps this filter), so a one-record lookahead suffices -
-    the cursor self-heals over any key it is not asked about. A filter is a
-    forward-only cursor: one serves exactly one sync.
+    written in ``LocalStorage.scan`` order (``entry_sort_key``) and the
+    update lane is decided serially on one thread in that same order, so a
+    one-record lookahead suffices - the cursor self-heals over any key it is
+    not asked about. A filter is a forward-only cursor: one serves exactly
+    one sync.
 
     A pair is skipped only when the local side's size and mtime both match the
     manifest record (mtime within ``window_ns``) and the remote side has the
@@ -615,13 +828,10 @@ class ManifestFilter:
     (a content edit with a restored mtime, or an S3-side write that bypassed
     s3bak at the same size) is invisible here; ``--checksum`` covers those.
 
-    A spurious mtime-only difference self-heals on push: the file is
-    re-transferred once, the manifest is refreshed with the new mtime, and
-    later runs pass the size+mtime check again. The converse does not hold for a
-    STALE manifest (``push --data-only``, or out-of-band S3 writes): pull
-    never rewrites the manifest, so affected pairs re-transfer on every pull
-    until a full push refreshes the record. Deliberate: the manifest is the
-    record of the last real push, and only a push may change it.
+    A STALE manifest (``push --data-only``, or out-of-band S3 writes) makes
+    affected pairs re-transfer on every pull until a real push refreshes the
+    record - pull never rewrites the manifest. Deliberate: the manifest is
+    the record of the last real push, and only a push may change it.
     """
 
     def __init__(self, records: Iterator[tuple[str, ManifestEntry]], *, window_ns: int):
@@ -629,11 +839,6 @@ class ManifestFilter:
         self._records = iter(records)
         self.window_ns = window_ns
         self._head: tuple[str, ManifestEntry] | None = next(self._records, None)
-        # Upload pairs copied because the manifest holds no owning file record:
-        # the re-upload face of an unrecorded object (a create-lane upload is
-        # its birth). Read by push --data-only's warning, so the warning
-        # repeats on every push while the object stays unrecorded.
-        self.unknown_uploads = 0
 
     def close(self) -> None:
         """Release the manifest file handle the record stream holds open. The
@@ -659,27 +864,18 @@ class ManifestFilter:
         return None
 
     def __call__(self, pair: SyncPair) -> bool:
-        # As an ``update_filter`` this is only ever handed a both-sides pair
-        # (source and destination both present); the create lane (source-only)
-        # and delete lane (destination-only) never reach here.
-        direction = pair.transfer_type.value
-        if direction == "upload":
-            local, remote = pair.src, pair.dest
-        elif direction == "download":
-            local, remote = pair.dest, pair.src
-        else:
-            raise ValueError(f"ManifestFilter cannot judge a {direction!r} pair: {pair.key!r}")
+        # Only ever handed a both-sides download pair (pull's sync_down).
+        if pair.transfer_type.value != "download":
+            raise ValueError(f"ManifestFilter judges download pairs only: {pair.compare_key!r}")
+        local, remote = pair.dest, pair.src
 
-        m = self._lookup(pair.key)
+        m = self._lookup(pair.compare_key)
         if m is None or not m.is_file:
             # Both sides present, but the manifest is silent or records a
-            # dir/symlink at this key: a push re-uploads it (local is the source
-            # of truth); a pull re-downloads an unknown key but leaves a recorded
-            # non-file to apply_manifest, which recreates it with no data object.
-            if direction == "download":
-                return m is None
-            self.unknown_uploads += 1
-            return True
+            # dir/symlink at this key: re-download an unknown key, but leave a
+            # recorded non-file to apply_manifest, which recreates it with no
+            # data object.
+            return m is None
         if remote.size != m.size:
             return True  # the remote drifted from the record; size is free evidence
         try:

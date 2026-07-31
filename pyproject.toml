@@ -1,6 +1,6 @@
 [project]
 name = "s3bak"
-version = "0.4.0"
+version = "0.5.0"
 description = "Unified S3 backup/restore tool"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -22,7 +22,7 @@ classifiers = [
 # boto3-s3 provides the in-process S3 transfer/listing API; boto3 is used
 # directly for head-object / list-objects-v2.
 dependencies = [
-    "boto3-s3>=0.7,<0.8",
+    "boto3-s3>=0.8,<0.9",
     "boto3>=1.28",
 ]
 

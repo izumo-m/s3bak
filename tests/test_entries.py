@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
@@ -15,6 +16,25 @@ def _marker_hook(ws, marker) -> list[str]:
         "from pathlib import Path\nimport sys\nPath(sys.argv[1]).touch()\n",
     )
     return [sys.executable, str(hook), str(marker)]
+
+
+def _journal_hook(ws, info, copy) -> list[str]:
+    """A post_hook that records what it saw: S3BAK_JOURNAL's value (or the
+    literal "UNSET") into ``info``, and - only when set - a copy of the
+    journal file's content into ``copy``, taken while the file is still
+    guaranteed to exist (s3bak deletes it only after the hook returns)."""
+    hook = ws.write(
+        "record-journal.py",
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        "journal = os.environ.get('S3BAK_JOURNAL')\n"
+        "if journal is None:\n"
+        "    Path(sys.argv[1]).write_text('UNSET')\n"
+        "else:\n"
+        "    Path(sys.argv[1]).write_text(journal)\n"
+        "    Path(sys.argv[2]).write_text(Path(journal).read_text())\n",
+    )
+    return [sys.executable, str(hook), str(info), str(copy)]
 
 
 def test_single_file_entry_roundtrip(ws):
@@ -95,18 +115,22 @@ def test_push_delete_offers_excluded_objects_as_orphans(ws, answers):
     # An exclude added after a push must not strand the pushed objects: the
     # local side no longer lists cache/, so its S3 objects surface as ordinary
     # delete candidates - recorded ones, so no "(not in manifest)" flag - and
-    # the confirmed deletion drops object and record together.
+    # the confirmed deletion drops object and record together. Once everything
+    # beneath it is gone, the excluded directory's own record (invisible to
+    # the walk, so an orphan too) is offered post-order and retired as well.
     _push_then_exclude_cache(ws)
 
-    answers.feed("y")
+    answers.feed("y", "y")
     res = ws.run("push", "--delete", "data", expect_rc=0)
 
-    assert len(answers.prompts) == 1
+    assert len(answers.prompts) == 2
     assert "cache/c.txt" in answers.prompts[0]
     assert "(not in manifest)" not in answers.prompts[0]
+    assert "data/cache/ (directory record)" in answers.prompts[1]
     assert "delete:" in res.out
+    assert "delete record:" in res.out
     assert "data/cache/c.txt" not in ws.keys()
-    assert "./cache/c.txt" not in _manifest_paths(ws)
+    assert _manifest_paths(ws) == [".", "./keep.txt"]
     assert (ws.root / "data" / "cache" / "c.txt").read_text() == "c"  # local untouched
 
 
@@ -122,8 +146,9 @@ def test_push_delete_yes_prunes_excluded_objects_unattended(ws, answers):
 
 def test_push_delete_answer_n_keeps_excluded_object_and_record(ws, answers):
     # n keeps the pair - even through a manifest rewrite forced by another
-    # change, the kept record must survive the KeptKeys merge, so the entry
-    # still verifies clean and a later --delete asks again.
+    # change, the kept record must survive the journal merge (n journals no
+    # drop), so the entry still verifies clean and a later --delete asks
+    # again.
     _push_then_exclude_cache(ws)
     (ws.root / "data" / "keep.txt").write_text("k-v2")  # forces a rewrite
 
@@ -198,16 +223,19 @@ def test_subpath_push_delete_offers_excluded_objects(ws, answers):
     ws.run("push", "data", expect_rc=0)
     ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["sub/cache/*"]}})
 
-    answers.feed("y")
+    answers.feed("y", "y")
     ws.run("push", "--delete", "data/sub", expect_rc=0)
 
-    assert len(answers.prompts) == 1
+    assert len(answers.prompts) == 2
     assert "sub/cache/c.txt" in answers.prompts[0]
+    assert "data/sub/cache/ (directory record)" in answers.prompts[1]
     keys = ws.keys()
     assert "data/sub/cache/c.txt" not in keys
     assert "data/sub/a.txt" in keys
-    assert "./sub/cache/c.txt" not in _manifest_paths(ws)
-    assert "./sub/a.txt" in _manifest_paths(ws)
+    paths = _manifest_paths(ws)
+    assert "./sub/cache/c.txt" not in paths
+    assert "./sub/cache" not in paths
+    assert "./sub/a.txt" in paths
 
 
 def test_subpath_push_of_excluded_subtree_backs_it_up(ws):
@@ -476,6 +504,137 @@ def test_post_hook_runs_on_success(ws):
     )
     ws.run("push", "data", expect_rc=0)
     assert marker.exists()
+
+
+def test_post_hook_receives_the_push_journal(ws):
+    # A directory push that did work is journal-driven: post_hook must see
+    # S3BAK_JOURNAL pointing at a readable journal file, and the file must be
+    # gone once the push (which deletes it right after the hook returns) has
+    # completed.
+    info = ws.root / "journal-path.txt"
+    copy = ws.root / "journal-copy.jsonl"
+    ws.write("data/a.txt", "a")
+    ws.config(
+        {
+            "data": {
+                "path": str(ws.root / "data"),
+                "post_hook": _journal_hook(ws, info, copy),
+            }
+        }
+    )
+    ws.run("push", "data", expect_rc=0)
+
+    journal_path = info.read_text()
+    assert journal_path != "UNSET"
+    assert not os.path.exists(journal_path)  # deleted after the hook returned
+
+    paths = set()
+    for line in copy.read_text().splitlines():
+        assert line[0] in "+!-"
+        paths.add(json.loads(line[1:])["path"])
+    # A first push journals `+` for everything, root included.
+    assert paths == {".", "./a.txt"}
+
+
+def test_subpath_post_hook_receives_the_push_journal(ws):
+    # A sub-path push whose local target still exists is journal-driven too.
+    info = ws.root / "journal-path.txt"
+    copy = ws.root / "journal-copy.jsonl"
+    ws.write("data/sub/a.txt", "a")
+    ws.config(
+        {
+            "data": {
+                "path": str(ws.root / "data"),
+                "post_hook": _journal_hook(ws, info, copy),
+            }
+        }
+    )
+    ws.run("push", "data/sub", expect_rc=0)
+
+    journal_path = info.read_text()
+    assert journal_path != "UNSET"
+    assert not os.path.exists(journal_path)
+    assert copy.read_text().strip() != ""
+
+
+def test_subpath_deletion_post_hook_has_no_journal(ws):
+    # A sub-path push whose local target vanished runs drop_subtree_records,
+    # not a journal-driven compare: post_hook must see no S3BAK_JOURNAL.
+    info = ws.root / "journal-path.txt"
+    copy = ws.root / "journal-copy.jsonl"
+    ws.write("data/sub/a.txt", "a")
+    ws.config(
+        {
+            "data": {
+                "path": str(ws.root / "data"),
+                "post_hook": _journal_hook(ws, info, copy),
+            }
+        }
+    )
+    ws.run("push", "data", expect_rc=0)
+    info.unlink()
+    shutil.rmtree(ws.root / "data" / "sub")
+
+    ws.run("push", "--delete", "--yes", "data/sub", expect_rc=0)
+
+    assert info.read_text() == "UNSET"
+
+
+def test_single_file_post_hook_has_no_journal(ws):
+    info = ws.root / "journal-path.txt"
+    copy = ws.root / "journal-copy.jsonl"
+    target = ws.write("solo.txt", "x")
+    ws.config(
+        {
+            "solo.txt": {
+                "path": str(target),
+                "post_hook": _journal_hook(ws, info, copy),
+            }
+        }
+    )
+    ws.run("push", "solo.txt", expect_rc=0)
+
+    assert info.read_text() == "UNSET"
+
+
+def test_meta_only_post_hook_has_no_journal(ws):
+    info = ws.root / "journal-path.txt"
+    copy = ws.root / "journal-copy.jsonl"
+    ws.write("data/a.txt", "a")
+    ws.config(
+        {
+            "data": {
+                "path": str(ws.root / "data"),
+                "post_hook": _journal_hook(ws, info, copy),
+            }
+        }
+    )
+    ws.run("push", "data", expect_rc=0)  # journal-driven: sets info to a path
+    info.unlink()
+
+    ws.run("push", "--meta-only", "data", expect_rc=0)
+
+    assert info.read_text() == "UNSET"
+
+
+def test_noop_push_does_not_run_post_hook(ws):
+    marker = ws.root / "hook-ran"
+    ws.write("data/a.txt", "a")
+    ws.config(
+        {
+            "data": {
+                "path": str(ws.root / "data"),
+                "post_hook": _marker_hook(ws, marker),
+            }
+        }
+    )
+    ws.run("push", "data", expect_rc=0)
+    assert marker.exists()
+    marker.unlink()
+
+    ws.run("push", "data", expect_rc=0)  # nothing changed: a pure no-op
+
+    assert not marker.exists()
 
 
 def test_hook_arguments_are_passed_without_shell_expansion(ws):
@@ -750,7 +909,7 @@ def test_hook_string_is_rejected(ws):
     res = ws.run("list")
 
     assert res.rc == 1
-    assert "pre_hook must be a non-empty list of strings" in res.err
+    assert "pre_hook must be a non-empty list of" in res.err
 
 
 def test_local_path_resolution_handles_an_entry_at_filesystem_root(tmp_path):

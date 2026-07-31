@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import os
 
+import pytest
+
 
 def _push_tree(ws, entry: str = "data") -> None:
     ws.write(f"{entry}/a.txt", "alpha")
@@ -99,7 +101,7 @@ def test_verify_type_conflict_at_entry_root(ws):
     assert f"{ws.prefix}/data (manifest records a directory" in res.err
 
 
-def test_verify_archived_storage_class_is_an_error(ws):
+def test_verify_archived_storage_class_is_a_warning(ws):
     _push_tree(ws)
     ws.s3.put_object(
         Bucket=ws.bucket,
@@ -107,8 +109,9 @@ def test_verify_archived_storage_class_is_an_error(ws):
         Body=b"alpha",
         StorageClass="GLACIER",
     )
-    res = ws.run("verify", "data", expect_rc=1)
-    assert "storage class GLACIER blocks restore" in res.err and "a.txt" in res.err
+    res = ws.run("verify", "data", expect_rc=0)  # cli.main; cli.run maps warnings to 2
+    assert "archived storage class GLACIER" in res.err and "a.txt" in res.err
+    assert "0 error(s), 1 warning(s)" in res.out
 
 
 def test_verify_checksum_flags_silent_divergence(ws):
@@ -147,6 +150,25 @@ def test_verify_data_without_manifest_is_an_error(ws):
     ws.s3.delete_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl")
     res = ws.run("verify", "data", expect_rc=1)
     assert "no manifest records them" in res.err
+    # The summary's object tally reflects the objects actually found, not 0.
+    assert "2 data object(s)" in res.out
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs an unsearchable parent")
+def test_verify_checksum_warns_when_local_is_unreadable(ws):
+    # verify --checksum must not report OK for a file whose content it could not
+    # read (an unreadable ancestor); it warns instead of silently passing.
+    ws.write("locked/data/a.txt", "alpha")
+    ws.config({"data": {"path": str(ws.root / "locked" / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    locked = ws.root / "locked"
+    os.chmod(locked, 0o000)
+    try:
+        res = ws.run("verify", "data", "--checksum")
+        assert "cannot read local file for --checksum" in res.err
+        assert "OK (" not in res.out  # not a clean pass
+    finally:
+        os.chmod(locked, 0o755)
 
 
 def test_verify_single_file_entry(ws):

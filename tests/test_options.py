@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import os
 import shutil
+from types import SimpleNamespace
 
+import pytest
+
+from s3bak import store
 from s3bak.cli import _resolve_use_color
 
 
@@ -30,16 +34,30 @@ def test_status_all_is_clean_after_push_all(ws):
 
 
 def test_push_meta_only_updates_manifest_not_data(ws):
-    ws.write("data/a.txt", "a")
+    ws.write("data/a.txt", "original-content")
     ws.config({"data": {"path": str(ws.root / "data")}})
     ws.run("push", "data", expect_rc=0)
+    original_body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/a.txt")["Body"].read()
 
+    # Drift the already-pushed file's content (a real content+size change, not
+    # just a new untracked path) and add a brand-new file.
+    ws.write("data/a.txt", "edited-locally-and-never-pushed")
     ws.write("data/new.txt", "new")
     ws.run("push", "--meta-only", "data", expect_rc=0)
 
-    assert "data/new.txt" not in ws.keys()  # data was not uploaded
-    body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl")["Body"].read()
-    assert "new.txt" in body.decode()  # but it is recorded in the manifest
+    assert "data/new.txt" not in ws.keys()  # the new file was not uploaded either
+    body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/a.txt")["Body"].read()
+    assert body == original_body  # the existing object still holds the OLD bytes
+    manifest_body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl")[
+        "Body"
+    ].read()
+    assert "new.txt" in manifest_body.decode()  # but it is recorded in the manifest
+
+    # The refresh is a fresh local walk (docs/sync.md): it now records a.txt's
+    # edited size/mtime too, so --meta-only "asserts S3 matches local without
+    # making it true" - status goes clean even though the object is stale.
+    res = ws.run("status", "data", expect_rc=0)
+    assert res.out.strip() == ""
 
 
 def test_meta_only_records_mode_change_and_clears_status(ws):
@@ -347,19 +365,92 @@ def test_pull_allows_disjoint_destinations_from_trailing_slash(ws):
     assert (restore_root / "b" / "source-b.txt").read_text() == "b"
 
 
-def test_pull_meta_only_restores_mode_without_download(ws):
-    f = ws.write("data/a.txt", "a")
+def test_pull_meta_only_restores_mode_without_download(ws, monkeypatch):
+    import botocore.client
+
+    f = ws.write("data/a.txt", "recorded-content")
     ws.config({"data": {"path": str(ws.root / "data")}})
     os.chmod(f, 0o640)
+    ws.run("push", "data", expect_rc=0)
+    recorded_mtime_ns = os.stat(f).st_mtime_ns
+
+    dest = ws.root / "restore"
+    dest.mkdir()
+    # Content, size, and mtime all disagree with the backup - the exact
+    # condition under which a plain pull is certain to re-download (see
+    # test_pull_without_meta_only_downloads_the_same_drift below). If
+    # --meta-only ever ran the data lane, this local content would be
+    # overwritten with "recorded-content".
+    (dest / "a.txt").write_text("locally-drifted-content-of-a-different-length")
+    os.utime(dest / "a.txt", (1_000_000_000, 1_000_000_000))
+    os.chmod(dest / "a.txt", 0o600)  # the mode is wrong too
+
+    calls: list[tuple[str, dict]] = []
+    original_make_api_call = botocore.client.BaseClient._make_api_call
+
+    def spy(self, operation_name, api_params):
+        calls.append((operation_name, dict(api_params)))
+        return original_make_api_call(self, operation_name, api_params)
+
+    monkeypatch.setattr(botocore.client.BaseClient, "_make_api_call", spy)
+    ws.run("pull", "--meta-only", "data", "-o", str(dest), expect_rc=0)
+
+    # Never downloaded: the local (wrong) content survives untouched.
+    assert (dest / "a.txt").read_text() == "locally-drifted-content-of-a-different-length"
+    # But the recorded metadata IS applied: mode and the file's own mtime.
+    assert (os.stat(dest / "a.txt").st_mode & 0o777) == 0o640
+    assert os.stat(dest / "a.txt").st_mtime_ns == recorded_mtime_ns
+
+    # Direct observation of the data lane, not just its absence of effect:
+    # the data object's key is never fetched. (The manifest key IS fetched
+    # by every pull, --meta-only included - a distinct GetObject this does
+    # not, and must not, assert away.)
+    data_key = f"{ws.prefix}/data/a.txt"
+    assert not any(
+        op in ("GetObject", "HeadObject") and params.get("Key") == data_key for op, params in calls
+    )
+
+
+def test_pull_without_meta_only_downloads_the_same_drift(ws):
+    # Contrast for the test above: the identical local/backup mismatch,
+    # without --meta-only, is certainly re-downloaded - proving that scenario
+    # is not something the size+mtime no-op gate would have skipped anyway.
+    ws.write("data/a.txt", "recorded-content")
+    ws.config({"data": {"path": str(ws.root / "data")}})
     ws.run("push", "data", expect_rc=0)
 
     dest = ws.root / "restore"
     dest.mkdir()
-    (dest / "a.txt").write_text("a")  # content already matches
-    os.chmod(dest / "a.txt", 0o600)  # but the mode is wrong
-    ws.run("pull", "--meta-only", "data", "-o", str(dest), expect_rc=0)
+    (dest / "a.txt").write_text("locally-drifted-content-of-a-different-length")
+    os.utime(dest / "a.txt", (1_000_000_000, 1_000_000_000))
 
-    assert (os.stat(dest / "a.txt").st_mode & 0o777) == 0o640  # mode applied, no download
+    ws.run("pull", "data", "-o", str(dest), expect_rc=0)
+
+    assert (dest / "a.txt").read_text() == "recorded-content"
+
+
+def test_pull_meta_only_repairs_dir_mode_and_symlink_target(ws):
+    # --meta-only's gated apply covers more than a file's mode: a directory's
+    # own mode/mtime and a symlink's target are also repaired - both
+    # objectless records, so there was never data to download for them either
+    # way, but this pins that --meta-only still reaches them.
+    ws.write("data/sub/keep.txt", "keep")
+    os.symlink("keep.txt", ws.root / "data" / "sub" / "link")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    sub = ws.root / "data" / "sub"
+    link = ws.root / "data" / "sub" / "link"
+    recorded_dir_mode = os.stat(sub).st_mode & 0o777
+
+    os.chmod(sub, 0o700 if recorded_dir_mode != 0o700 else 0o750)
+    os.remove(link)
+    os.symlink("nope.txt", link)  # wrong target
+
+    ws.run("pull", "--meta-only", "data", expect_rc=0)
+
+    assert (os.stat(sub).st_mode & 0o777) == recorded_dir_mode
+    assert os.readlink(link) == "keep.txt"
 
 
 def test_pull_data_only_downloads_without_metadata(ws):
@@ -444,6 +535,7 @@ def test_push_delete_yes_mirrors_unattended(ws, answers):
 
     assert answers.prompts == []
     assert "delete:" in res.out
+    assert "delete record:" in res.out  # ./sub's directory record, auto-confirmed
     keys = ws.keys()
     assert "data/sub/x.txt" not in keys
     assert "data/sub/y.txt" not in keys
@@ -492,9 +584,10 @@ def test_push_delete_interactive_a_deletes_the_rest(ws, answers):
 
     assert len(answers.prompts) == 1
     assert ws.keys() == {"data/keep.txt", "data-manifest.jsonl"}
-    # ./sub survives: a directory record has no object, so no confirmation can
-    # drop it - only the --yes mirror prunes objectless records.
-    assert _manifest_paths(ws) == [".", "./keep.txt", "./sub"]
+    # a is sticky across candidate kinds: ./sub's directory record - asked
+    # post-order, once its children resolved deleted - drops without another
+    # question.
+    assert _manifest_paths(ws) == [".", "./keep.txt"]
 
 
 def test_push_delete_interactive_d_keeps_the_rest(ws, answers):
@@ -599,33 +692,303 @@ def test_push_all_delete_yes_mirrors_every_entry(ws):
     assert "d2/b.txt" in keys
 
 
-def test_push_delete_interactive_never_drops_objectless_records(ws, answers):
-    # Symlinks and empty dirs have no S3 object, hence no delete question:
-    # their records must survive an interactive --delete whatever the answers.
+def _objectless_orphans(ws) -> None:
+    """Push a tree, then delete a file, a symlink, and an empty directory
+    locally: the file's object is an ordinary delete candidate, and the two
+    objectless records become record-only candidates (the record IS their
+    backup). Candidate order is ascending by key: emptydir/, gone.txt, link."""
     ws.write("data/keep.txt", "k")
     ws.write("data/gone.txt", "g")
     (ws.root / "data" / "emptydir").mkdir()
     os.symlink("keep.txt", ws.root / "data" / "link")
     ws.config({"data": {"path": str(ws.root / "data")}})
     ws.run("push", "data", expect_rc=0)
-
     (ws.root / "data" / "gone.txt").unlink()
     (ws.root / "data" / "link").unlink()
     (ws.root / "data" / "emptydir").rmdir()
-    answers.feed("n")  # the only question: gone.txt's object
-    ws.run("push", "--delete", "data", expect_rc=0)
 
-    assert len(answers.prompts) == 1
+
+def test_push_delete_interactive_offers_objectless_records(ws, answers):
+    # A vanished symlink or empty directory leaves a record with no object,
+    # so --delete asks about the record itself: the symlink on arrival, the
+    # directory at its pop (vacuously "everything beneath is gone" here).
+    # Each prompt names the record kind; n keeps each record.
+    _objectless_orphans(ws)
+
+    answers.feed("n", "n", "n")
+    res = ws.run("push", "--delete", "data", expect_rc=0)
+
+    assert len(answers.prompts) == 3
+    assert "data/emptydir/ (directory record)" in answers.prompts[0]
+    assert "data/gone.txt" in answers.prompts[1]
+    assert "data/link (symlink record)" in answers.prompts[2]
+    assert "delete record:" not in res.out
     paths = _manifest_paths(ws)
     assert "./gone.txt" in paths
     assert "./link" in paths
     assert "./emptydir" in paths
 
 
+def test_push_delete_interactive_drops_objectless_records_on_y(ws, answers):
+    _objectless_orphans(ws)
+
+    answers.feed("y", "y", "y")
+    res = ws.run("push", "--delete", "data", expect_rc=0)
+
+    assert res.out.count("delete record:") == 2  # emptydir/ and link
+    assert _manifest_paths(ws) == [".", "./keep.txt"]
+    # The retired records stay retired: nothing left to ask, nothing to D.
+    second = ws.run("push", "--delete", "data", expect_rc=0)
+    assert second.out == ""
+    status = ws.run("status", "data", expect_rc=0)
+    assert "D " not in status.out
+
+
+def _nested_orphan_tree(ws) -> None:
+    """Push a nested tree, then delete the whole `skills/` subtree locally.
+    Candidates arrive in ascending key order; directory records resolve
+    post-order, each once the stream has left its subtree."""
+    ws.write("data/keep.txt", "k")
+    ws.write("data/skills/top.txt", "t")
+    ws.write("data/skills/evals/e1.txt", "e")
+    ws.write("data/skills/evals/deep/d1.txt", "d")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    shutil.rmtree(ws.root / "data" / "skills")
+
+
+def test_push_delete_offers_directory_records_post_order(ws, answers):
+    # The order is subtree by subtree - children before their own directory,
+    # in the same ascending key order as everything else (the push twin of
+    # pull --delete's extras removal): d1.txt, deep/, e1.txt, evals/,
+    # top.txt, skills/. All-y empties the backup of the vanished subtree.
+    _nested_orphan_tree(ws)
+
+    answers.feed("y", "y", "y", "y", "y", "y")
+    ws.run("push", "--delete", "data", expect_rc=0)
+
+    probes = [
+        "skills/evals/deep/d1.txt",
+        "data/skills/evals/deep/ (directory record)",
+        "skills/evals/e1.txt",
+        "data/skills/evals/ (directory record)",
+        "skills/top.txt",
+        "data/skills/ (directory record)",
+    ]
+    assert len(answers.prompts) == len(probes)
+    for prompt, probe in zip(answers.prompts, probes, strict=True):
+        assert probe in prompt
+    assert _manifest_paths(ws) == [".", "./keep.txt"]
+    assert ws.keys() == {"data/keep.txt", "data-manifest.jsonl"}
+    status = ws.run("status", "data", expect_rc=0)
+    assert "D " not in status.out
+    # Converged: nothing left to offer, nothing to rewrite.
+    second = ws.run("push", "--delete", "data", expect_rc=0)
+    assert len(answers.prompts) == len(probes)
+    assert second.out == ""
+    assert "Updating" not in second.err
+
+
+def test_push_delete_keeping_a_grandchild_keeps_every_open_ancestor_record(ws, answers):
+    # n on the deepest file pins the whole ancestor chain: every directory
+    # record still open above it is kept silently - no question of its own -
+    # so the published manifest keeps the parent chain the validator demands.
+    _nested_orphan_tree(ws)
+
+    answers.feed("n", "y", "y")
+    ws.run("push", "--delete", "data", expect_rc=0)
+
+    assert len(answers.prompts) == 3  # d1.txt, e1.txt, top.txt - no dir prompts
+    assert "d1.txt" in answers.prompts[0]
+    assert "e1.txt" in answers.prompts[1]
+    assert "top.txt" in answers.prompts[2]
+    assert _manifest_paths(ws) == [
+        ".",
+        "./keep.txt",
+        "./skills",
+        "./skills/evals",
+        "./skills/evals/deep",
+        "./skills/evals/deep/d1.txt",
+    ]
+    assert "data/skills/evals/deep/d1.txt" in ws.keys()
+    res = ws.run("verify", "data", expect_rc=0)
+    assert "data: OK" in res.out
+
+
+def test_push_delete_dry_run_lists_record_candidates(ws):
+    # The dry run reports every candidate the completeness gate admits -
+    # record-only candidates included, one "(dry-run) delete record:" line
+    # each - and changes nothing: the rehearsal merge runs to a temp file.
+    _nested_orphan_tree(ws)
+
+    res = ws.run("push", "--delete", "--dry-run", "data", expect_rc=0)
+
+    assert res.out.count("(dry-run) delete record:") == 3
+    assert "(dry-run) delete record: " + f"s3://{ws.bucket}/{ws.prefix}/data/skills/" in res.out
+    assert "(dry-run) would update manifest" in res.out
+    keys = ws.keys()
+    assert "data/skills/top.txt" in keys  # nothing deleted
+    paths = _manifest_paths(ws)
+    assert "./skills/evals/deep/d1.txt" in paths  # nothing dropped
+
+
+def test_push_delete_all_no_run_skips_the_manifest_rewrite(ws):
+    # A non-TTY --delete answers no to everything: the directory-record
+    # candidates leave only no-change placeholder lines in the journal, and a
+    # journal without one real event must not rewrite (or re-upload) the
+    # manifest - a cron run would otherwise republish it forever.
+    _nested_orphan_tree(ws)
+    ws.run("push", "data", expect_rc=0)  # settle the root-mtime drift first
+
+    res = ws.run("push", "--delete", "data", expect_rc=0)
+
+    assert res.out == ""
+    assert "Updating" not in res.err
+    assert "./skills/evals/deep/d1.txt" in _manifest_paths(ws)
+
+
+def test_push_delete_prunes_records_kept_under_a_file(ws, answers):
+    # dir -> file replacement, records kept (the restorability warning case):
+    # once --delete retires the shadowed objects, the loser directory record
+    # is offered too, and the warning goes with it.
+    ws.write("data/d/x.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    shutil.rmtree(ws.root / "data" / "d")
+    (ws.root / "data" / "d").write_text("now a file")
+    res = ws.run("push", "data", expect_rc=0)
+    assert "non-directory" in res.err
+
+    answers.feed("y", "y")
+    res = ws.run("push", "--delete", "data", expect_rc=0)
+
+    assert "non-directory" not in res.err
+    assert "data/d/ (directory record)" in answers.prompts[1]
+    assert _manifest_paths(ws) == [".", "./d"]
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no mkfifo on this platform")
+def test_push_delete_offers_special_file_record(ws, answers):
+    ws.write("data/keep.txt", "k")
+    os.mkfifo(ws.root / "data" / "fifo")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    (ws.root / "data" / "fifo").unlink()
+
+    answers.feed("y")
+    res = ws.run("push", "--delete", "data", expect_rc=0)
+
+    assert len(answers.prompts) == 1
+    assert "data/fifo (special-file record)" in answers.prompts[0]
+    assert "delete record:" in res.out
+    assert _manifest_paths(ws) == [".", "./keep.txt"]
+
+
+def test_push_delete_dry_run_yes_lists_record_candidates(ws):
+    # --yes and its rehearsal share one path: the real run prints the same
+    # delete record: lines unmarked, the dry run marks them (dry-run) and
+    # deletes nothing.
+    _nested_orphan_tree(ws)
+
+    res = ws.run("push", "--delete", "--yes", "--dry-run", "data", expect_rc=0)
+
+    assert res.out.count("(dry-run) delete record:") == 3
+    assert "data/skills/top.txt" in ws.keys()  # nothing deleted
+
+
+def test_push_delete_failed_sync_asks_nothing_in_the_drain(ws, answers, monkeypatch):
+    # A sync that stops mid-stream (an error, an interrupt) parks the
+    # manifest cursor; the records it never reached are not evidence of
+    # deletion. close()'s drain must keep them all without a question or a
+    # "delete record:" line - the completeness gate, not a judgment call.
+    _nested_orphan_tree(ws)
+
+    def failed_sync(self, *args, **kwargs):
+        return SimpleNamespace(returncode=1, results=0)
+
+    monkeypatch.setattr(store.Boto3S3Store, "sync_up", failed_sync)
+    res = ws.run("push", "--delete", "data", expect_rc=1)
+
+    assert answers.prompts == []
+    assert "delete record:" not in res.out
+    assert "./skills/evals/deep/d1.txt" in _manifest_paths(ws)  # nothing dropped
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs an unreadable directory")
+def test_push_delete_gate_counts_suppressed_record_candidates(ws):
+    # Once the walk warns, a record-only candidate is kept without a
+    # question - and must still count in the kept-candidates warning, which
+    # would otherwise not fire at all on a record-only run.
+    ws.write("data/keep.txt", "k")
+    (ws.root / "data" / "aa").mkdir()  # sorts first: its warning precedes zlink's skip-over
+    os.symlink("keep.txt", ws.root / "data" / "zlink")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "zlink").unlink()
+    os.chmod(ws.root / "data" / "aa", 0)
+    try:
+        res = ws.run("push", "--delete", "--yes", "data")
+    finally:
+        os.chmod(ws.root / "data" / "aa", 0o755)
+
+    assert res.rc == 0  # cli.main; cli.run maps the warnings to exit 2
+    assert "kept 1 deletion candidate(s)" in res.err
+    assert "./zlink" in _manifest_paths(ws)
+
+
+def test_push_delete_yes_keeps_directory_record_pinned_by_a_shadowed_record(ws):
+    # A key can hold a real S3 object AND a non-file record (a pushed file
+    # later replaced by a symlink keeps its object until a --delete). When
+    # the directory then vanishes locally, --yes deletes the object but must
+    # keep the symlink record and its ancestor directory record - dropping
+    # ./d would strand ./d/x.txt and fail the pre-publish validation after
+    # the object was already gone. The next run retires the pair cleanly.
+    ws.write("data/keep.txt", "k")
+    ws.write("data/d/x.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    (ws.root / "data" / "d" / "x.txt").unlink()
+    os.symlink("gone", ws.root / "data" / "d" / "x.txt")
+    ws.run("push", "data", expect_rc=0)  # records the symlink; the object stays
+    shutil.rmtree(ws.root / "data" / "d")
+
+    ws.run("push", "--delete", "--yes", "data", expect_rc=0)
+
+    assert "data/d/x.txt" not in ws.keys()  # the shadowed object went
+    paths = _manifest_paths(ws)
+    assert "./d" in paths
+    assert "./d/x.txt" in paths  # the surviving record pinned its parent
+
+    ws.run("push", "--delete", "--yes", "data", expect_rc=0)
+    assert _manifest_paths(ws) == [".", "./keep.txt"]  # converged
+
+
+def test_push_delete_directory_record_flip_crosses_the_write_buffer(ws, answers):
+    # The placeholder flip seeks back to an offset that has long left the
+    # journal's 8 KiB write buffer: ~120 dropped children put well over
+    # 20 KiB between the directory's line and its flip. The published
+    # manifest proves the one-byte overwrite landed on the marker.
+    ws.write("data/keep.txt", "k")
+    for i in range(120):
+        ws.write(f"data/big/file-{i:04d}-{'x' * 60}.txt", "d")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    shutil.rmtree(ws.root / "data" / "big")
+
+    answers.feed("a")
+    ws.run("push", "--delete", "data", expect_rc=0)
+
+    assert len(answers.prompts) == 1
+    assert _manifest_paths(ws) == [".", "./keep.txt"]
+
+
 def test_push_delete_with_all_answers_no_converges(ws):
-    # A kept record must not read as "structure changed": the same non-TTY
-    # push --delete run twice may not rewrite the manifest or produce output,
-    # or a cron mirror would re-upload and fire post_hook forever.
+    # A kept record must not read as "structure changed" beyond the directory
+    # mtime the deletion itself bumped: the first non-TTY push --delete
+    # settles that drift, and the second run - with nothing left to see -
+    # may not rewrite the manifest or produce output, or a cron mirror would
+    # re-upload and fire post_hook forever.
     ws.write("data/keep.txt", "k")
     ws.write("data/gone.txt", "g")
     ws.config({"data": {"path": str(ws.root / "data")}})
@@ -635,9 +998,10 @@ def test_push_delete_with_all_answers_no_converges(ws):
     first = ws.run("push", "--delete", "data", expect_rc=0)
     second = ws.run("push", "--delete", "data", expect_rc=0)
 
-    for res in (first, second):
-        assert res.out == ""
-        assert "Updating" not in res.err
+    assert first.out == ""
+    assert second.out == ""
+    assert "Updating" in first.err  # the deletion bumped the directory's own mtime
+    assert "Updating" not in second.err  # settled: converges
 
 
 def test_push_delete_heals_stale_record_whose_object_is_gone(ws):
@@ -723,3 +1087,61 @@ def test_file_subpath_push_delete_keeps_former_directory_records(ws, answers):
     paths = _manifest_paths(ws)
     assert "./sub/x.txt" in paths
     assert "data/sub/x.txt" in ws.keys()
+
+
+def test_resolve_pull_destination_treats_native_sep_as_container():
+    # A configured path ending in the native separator is a container: the entry
+    # name is appended. On Windows os.sep is "\\", so checking only "/" would
+    # miss it and restore to the container itself (a --delete data-loss risk).
+    from s3bak import restore
+
+    got = restore.resolve_pull_destination("data", f"/restore{os.sep}", None, None)
+    assert got == os.path.join("/restore", "data")
+    # -o is exact: no append, even with a trailing separator
+    assert restore.resolve_pull_destination("data", None, None, f"/out{os.sep}") == f"/out{os.sep}"
+
+
+def test_post_hook_stdin_is_detached_from_terminal(ws, monkeypatch):
+    # Entries push concurrently and a --delete confirmation may be reading stdin
+    # on another thread; a hook must not steal that answer. _run_hook detaches
+    # the hook's stdin (subprocess.DEVNULL).
+    import subprocess
+
+    from s3bak import commands
+
+    captured: dict = {}
+
+    def spy(cmd, **kwargs):
+        captured["stdin"] = kwargs.get("stdin")
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(commands.subprocess, "run", spy)
+    ws.write("data/a.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data"), "post_hook": ["true"]}})
+    ws.run("push", "data", expect_rc=0)
+    assert captured["stdin"] is subprocess.DEVNULL
+
+
+def test_interactive_q_stops_later_upload_only_entries(ws, answers):
+    # push --all --delete runs interactively and serially: a q at the first
+    # (sorted) entry's deletion prompt aborts the whole command, so a later entry
+    # that would only upload must not run (its new file is never pushed).
+    ws.write("a_del/keep.txt", "k")
+    ws.write("a_del/gone.txt", "g")
+    ws.write("b_new/only.txt", "o")
+    ws.config(
+        {
+            "a_del": {"path": str(ws.root / "a_del")},
+            "b_new": {"path": str(ws.root / "b_new")},
+        }
+    )
+    ws.run("push", "--all", expect_rc=0)
+
+    (ws.root / "a_del" / "gone.txt").unlink()  # a_del now has a deletion to confirm
+    ws.write("b_new/fresh.txt", "new")  # b_new would upload this
+    answers.feed("q")
+    res = ws.run("push", "--all", "--delete")
+
+    assert "aborted" in res.err
+    assert "b_new/only.txt" in ws.keys()  # from the initial push
+    assert "b_new/fresh.txt" not in ws.keys()  # the abort stopped the later entry

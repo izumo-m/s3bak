@@ -11,12 +11,20 @@ from __future__ import annotations
 
 import os
 import shlex
+import stat as stat_mod
 import sys
 import threading
 from typing import NoReturn
 
 PROG = "s3bak"
 IS_WINDOWS = sys.platform == "win32"
+
+# The stat module only defines this name on Windows builds; the numeric value
+# is fixed by the NTFS on-disk format, so it is hardcoded as a fallback here.
+# That lets is_junction be exercised by a Linux unit test that monkeypatches
+# an lstat result's st_reparse_tag, and reads correctly on a real Windows host
+# regardless of which name the platform's stat module happens to expose.
+_IO_REPARSE_TAG_MOUNT_POINT = getattr(stat_mod, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003)
 
 _output_lock = threading.Lock()
 
@@ -27,8 +35,11 @@ _warning_count = 0
 
 
 def err(msg: str) -> None:
-    sys.stderr.write(f"{PROG}: {msg}\n")
-    sys.stderr.flush()
+    # Share the output lock with write_output/write_stderr so a worker thread's
+    # error line cannot interleave with another thread's output under --all.
+    with _output_lock:
+        sys.stderr.write(f"{PROG}: {msg}\n")
+        sys.stderr.flush()
 
 
 def die(msg: str) -> NoReturn:
@@ -108,3 +119,16 @@ def expand_home(path: str) -> str:
 def normalize_local_path(arg: str) -> str:
     expanded = expand_home(arg) if arg.startswith("~") else arg
     return os.path.abspath(expanded)
+
+
+def is_junction(st: os.stat_result) -> bool:
+    """True if ``st`` (an ``os.lstat`` result) is a Windows directory
+    junction (``mklink /J``): a mount-point reparse point. Windows does not
+    model a junction as a symlink - ``os.path.islink()``/``stat.S_ISLNK`` are
+    both False for it - yet it lstats as an ordinary directory, so a plain
+    type check treats it as one and walks through it like any other
+    directory. ``st_reparse_tag`` (Python 3.8+, Windows only) is how it is
+    told apart from a real directory; the attribute is simply absent on
+    every other platform, so ``getattr`` makes the read safe there (always
+    False)."""
+    return getattr(st, "st_reparse_tag", 0) == _IO_REPARSE_TAG_MOUNT_POINT

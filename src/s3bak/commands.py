@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import stat as stat_mod
 import subprocess
 import tempfile
 from collections import deque
+from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from s3bak import localwalk, manifest
@@ -42,6 +44,7 @@ from s3bak.console import (
     IS_WINDOWS,
     echo_command,
     err,
+    is_junction,
     normalize_local_path,
     note_warning,
     write_output,
@@ -50,44 +53,69 @@ from s3bak.console import (
 from s3bak.manifest import ManifestEntry
 from s3bak.restore import (
     apply_manifest,
+    fs_alias_key,
     local_keyed,
     manifest_keyed,
     manifest_target,
     prepare_dir_conflicts,
     remove_extras,
-    resolve_manifest_rel,
     resolve_pull_destination,
     windows_collect_writable_prep,
     windows_restore_modes,
 )
 from s3bak.store import ObjectMeta
 from s3bak.syncops import (
+    PushJournal,
     download_from_s3,
     download_manifest,
+    drop_subtree_records,
     patch_manifest_subtree,
+    publish_journal_manifest,
     sync_compare,
     write_manifest_to_aws,
 )
 
 if TYPE_CHECKING:
-    from boto3_s3 import FileFilter, FileInfo, PairFilter
+    from boto3_s3 import FileFilter, FileInfo
 
 
-def _run_hook(name: str, hook: list[str] | None, opts: Opts) -> int:
+def _run_hook(
+    name: str, hook: list[str] | None, opts: Opts, journal_path: str | None = None
+) -> int:
     """Run one configured hook directly, without a command shell. A failing
     hook's status propagates (the documented 3+ lane), normalized where it
     would collide with s3bak's own exit codes: 2 is reserved for a
     warnings-only run, so it maps to 1, and a signal death (negative
     returncode) becomes the conventional 128+N instead of leaking a negative
-    value into sys.exit."""
+    value into sys.exit.
+
+    ``journal_path`` is the just-produced push journal (see journal.md),
+    passed only by the journal-driven directory and sub-path pushes; every
+    other caller leaves it None. When set, the hook's environment gets
+    ``S3BAK_JOURNAL`` pointing at it - the file is still on disk (the caller
+    unlinks it only after this call returns). Entries push concurrently in a
+    thread pool, so the variable is passed through ``env=`` rather than
+    mutating ``os.environ``; when None, no ``env`` argument is passed at all
+    and the hook simply inherits the process environment unchanged."""
     if not hook:
         return 0
     if opts.dryrun:
-        print(f"(dry-run) would run {name}: {hook!r}")
+        write_output(f"(dry-run) would run {name}: {hook!r}\n")
         return 0
     if opts.verbose:
         write_stderr(f"+ {name}: {hook!r}\n")
-    rc = subprocess.run(hook, shell=False).returncode
+    # Hooks are non-interactive: entries push concurrently and a --delete
+    # confirmation may be reading stdin on another thread, so a hook that also
+    # read stdin would steal the answer. Detach it from the terminal.
+    if journal_path is None:
+        rc = subprocess.run(hook, shell=False, stdin=subprocess.DEVNULL).returncode
+    else:
+        rc = subprocess.run(
+            hook,
+            shell=False,
+            stdin=subprocess.DEVNULL,
+            env={**os.environ, "S3BAK_JOURNAL": journal_path},
+        ).returncode
     if rc == 0:
         return 0
     err(f"{name} failed (exit {rc}): {hook!r}")
@@ -104,13 +132,15 @@ def upload_manifest(
     opts: Opts,
     *,
     old_manifest: str | None = None,
-    keep_old: manifest.KeepOld = False,
+    keep_old: bool = False,
 ) -> int:
-    """Write the manifest to S3, then run the entry's post_hook."""
+    """Write the manifest from a fresh walk (the ``--meta-only`` rewrite, and
+    the single-file entry's one-record write), then run the entry's
+    post_hook. An ordinary directory push publishes its journal instead."""
     post_hook: list[str] | None = cfg.entries[entry].get("post_hook")
 
     if opts.dryrun:
-        print(f"(dry-run) would update manifest: {manifest.manifest_key(entry)}")
+        write_output(f"(dry-run) would update manifest: {manifest.manifest_key(entry)}\n")
         # The walk and merge write only a local temp file: run them so the
         # rehearsal emits the same structural warnings as the real push,
         # skipping only the upload.
@@ -135,16 +165,19 @@ def upload_manifest(
 
 @dataclass
 class _PushDeletePlan:
-    """How this push treats S3 orphans: the sync's delete-lane value, plus what
-    the manifest merge must do about old-only records afterwards."""
+    """How this push treats S3 orphans: the sync's delete-lane value, plus
+    the confirmation for objectless record orphans (``record_delete``, the
+    journal emitter's callback for a vanished directory / symlink / special
+    file whose record is the whole backup). What each answer means for the
+    manifest is the journal emitter's business (a confirmed deletion journals
+    its record's drop at the decision point)."""
 
     lane: bool | FileFilter  # sync_up delete=: False | True | per-orphan callable
     confirmer: DeleteConfirmer | None  # --delete without --yes (asked or auto-n)
-    mirror: bool  # --delete --yes: every record follows its object; pure walk
     walker: localwalk.ManifestWalker | None = None  # the sync's local walker (--delete only)
     old_manifest: str | None = None  # set by the caller once downloaded
     refused: int = 0  # candidates refused because the local scan was incomplete
-    _kept: list[manifest.KeptKeys] = field(default_factory=list)
+    record_delete: Callable[[str, ManifestEntry], bool] | None = None
     _files: manifest.RecordedFiles | None = None
 
     def _scan_incomplete(self) -> bool:
@@ -170,45 +203,51 @@ class _PushDeletePlan:
             self._files = manifest.RecordedFiles(self.old_manifest)
         return self._files.contains(rel)
 
-    def keep_old(self) -> manifest.KeepOld:
-        """A fresh view of the manifest keep policy (KeptKeys streams, so each
-        consumer opens its own). Call after the sync: the kept-keys file is
-        complete only once every orphan was decided. An incomplete scan keeps
-        every old-only record: the refused candidates kept their objects, and
-        records travel with their objects (any record whose object a pre-gap
-        confirmation did delete goes stale and the next ``push --delete``
-        merge drops it - the standard self-healing)."""
-        if self._scan_incomplete():
-            return True
-        if self.mirror:
-            return False
-        if self.confirmer is not None:
-            kept = manifest.KeptKeys(self.confirmer.kept_keys_path())
-            self._kept.append(kept)
-            return kept
-        return True  # no deletions were made: keep every old-only record
-
     def close(self) -> None:
-        for kept in self._kept:
-            kept.close()
-        self._kept.clear()
         if self._files is not None:
             self._files.close()
-        if self.confirmer is not None:
-            self.confirmer.close()
+
+
+def _record_candidate_display(cfg: Config, entry: str, rel: str, e: ManifestEntry) -> str:
+    """How a record-only delete candidate is shown (prompt and delete line):
+    a directory record carries a trailing slash, like the S3 key its children
+    would sort under."""
+    return f"{cfg.prefix}/{entry}/{rel}/" if e.is_dir else f"{cfg.prefix}/{entry}/{rel}"
+
+
+def _record_candidate_kind(e: ManifestEntry) -> str:
+    if e.is_dir:
+        return "directory record"
+    if e.sym_target is not None:
+        return "symlink record"
+    return "special-file record"
 
 
 def _plan_push_deletes(
     cfg: Config, entry: str, sub: str | None, opts: Opts, walker: localwalk.ManifestWalker
 ) -> _PushDeletePlan:
     if not opts.delete:
-        return _PushDeletePlan(lane=False, confirmer=None, mirror=False)
+        return _PushDeletePlan(lane=False, confirmer=None)
     if opts.dryrun or resolve_answer_mode(yes=opts.yes) is AnswerMode.ALL_YES:
         # Report (dry run) or delete (--yes) every candidate the completeness
         # gate admits. The gate callable never prompts, so it is safe under
         # dryrun too (the library invokes a callable there as well).
-        plan = _PushDeletePlan(lane=True, confirmer=None, mirror=opts.yes, walker=walker)
+        plan = _PushDeletePlan(lane=True, confirmer=None, walker=walker)
         plan.lane = lambda info: plan.allow()
+
+        def report_record(rel: str, e: ManifestEntry) -> bool:
+            # --yes auto-confirms, a dry run reports; both drop the candidate
+            # through this one path, so the unattended run and its rehearsal
+            # cannot diverge (there is no separate mirror lane).
+            if not plan.allow():
+                return False
+            marker = "(dry-run) " if opts.dryrun else ""
+            write_output(
+                f"{marker}delete record: {_record_candidate_display(cfg, entry, rel, e)}\n"
+            )
+            return True
+
+        plan.record_delete = report_record
         return plan
     # ASK and ALL_NO both run the lane through a confirmer. ALL_NO never
     # prompts, but its auto-n answers still record every existing orphan -
@@ -220,75 +259,156 @@ def _plan_push_deletes(
         if not plan.allow():
             return False
         # compare_key is relative to the sync's S3 listing prefix, i.e. to the
-        # sub on a sub-path push; the kept key must be entry-rooted to match
-        # the manifest merge.
+        # sub on a sub-path push; the prompt shows the entry-rooted key.
         assert info.compare_key is not None  # the sync stamps every listed entry
         rel = info.compare_key if sub is None else f"{sub}/{info.compare_key}"
         # A candidate the manifest never recorded is outside the backup: n
         # keeps its object for this run only, so the prompt says so.
         note = "" if plan.recorded(rel) else " (not in manifest)"
-        return confirmer.confirm(f"{cfg.prefix}/{entry}/{rel}{note}", kept_key=rel)
+        return confirmer.confirm(f"{cfg.prefix}/{entry}/{rel}{note}")
 
-    plan = _PushDeletePlan(lane=decide, confirmer=confirmer, mirror=False, walker=walker)
+    def confirm_record(rel: str, e: ManifestEntry) -> bool:
+        # A record with no object: the record IS the backup, so the prompt
+        # says what kind it is. Confirmed drops print a delete line (the
+        # store prints one for each deleted object; records have no store
+        # call, so the emitter's confirmation is where it belongs).
+        if not plan.allow():
+            return False
+        display = _record_candidate_display(cfg, entry, rel, e)
+        if not confirmer.confirm(f"{display} ({_record_candidate_kind(e)})"):
+            return False
+        write_output(f"delete record: {display}\n")
+        return True
+
+    plan = _PushDeletePlan(lane=decide, confirmer=confirmer, walker=walker)
+    plan.record_delete = confirm_record
     return plan
 
 
-def _warn_refused_deletes(entry: str, plan: _PushDeletePlan) -> None:
+def _warn_refused_deletes(entry: str, plan: _PushDeletePlan, journal: PushJournal) -> None:
     """After the sync: say why deletion candidates were kept when the local
-    scan was incomplete (see _PushDeletePlan.allow)."""
-    if plan.refused:
+    scan was incomplete (see _PushDeletePlan.allow). The journal counts the
+    record-only candidates its own gate suppressed before they could reach
+    the plan's callback."""
+    refused = plan.refused + journal.refused_records
+    if refused:
         note_warning(
             f"warning: {entry}: the local scan skipped unreadable or vanished paths;"
-            f" kept {plan.refused} deletion candidate(s) and every manifest record"
+            f" kept {refused} deletion candidate(s) and every manifest record"
         )
 
 
-def _plan_data_only_creates(
-    plan: _PushDeletePlan, sub: str | None, opts: Opts
-) -> tuple[bool | FileFilter, list[int]]:
-    """Create-lane hook for --data-only: count uploads of files the manifest
-    does not record - the unrecorded objects this push creates (see
-    storage.md). The count feeds _warn_unrecorded_uploads after the sync.
-    Everything still copies (the hook always returns True), and the tally is
-    taken at decision time: a file that vanishes before its transfer
-    completes still counts (the sync reports that as its own warning). The
-    lane decides under --dry-run too, so a dry run previews the warning the
-    real push would emit. Outside --data-only the lane is the plain default.
-    The manifest lookup reuses plan.recorded(): --delete cannot combine with
-    --data-only, so the delete lane never queries the same stream."""
-    count = [0]
-    if not opts.data_only:
-        return True, count
-
-    def note(info: FileInfo) -> bool:
-        assert info.compare_key is not None  # the sync stamps every listed entry
-        rel = info.compare_key if sub is None else f"{sub}/{info.compare_key}"
-        if not plan.recorded(rel):
-            count[0] += 1
-        return True
-
-    return note, count
-
-
-def _warn_unrecorded_uploads(
-    entry: str, opts: Opts, count: list[int], compare: PairFilter | None
-) -> None:
+def _warn_unrecorded_uploads(entry: str, opts: Opts, journal: PushJournal) -> None:
     """Emit the --data-only unrecorded-upload warning after a successful sync.
-    `count` is the create-lane tally (the run that creates the object); a
-    later --data-only push meets the same object as an update pair instead,
-    which ManifestFilter re-uploads and counts, so the warning repeats on
-    every push while the object stays unrecorded. A dry run makes the same
-    decisions without transferring, so it previews the warning (and its
-    exit 2) with "would upload" wording."""
-    total = count[0]
-    if opts.data_only and isinstance(compare, manifest.ManifestFilter):
-        total += compare.unknown_uploads
-    if total:
+    The journal tallies uploads with no owning file record at decision time
+    (create and update lanes both - the birth and the re-upload faces of an
+    unrecorded object), so the warning repeats on every push while the object
+    stays unrecorded. A dry run makes the same decisions without
+    transferring, so it previews the warning (and its exit 2) with "would
+    upload" wording."""
+    if opts.data_only and journal.unrecorded_uploads:
         verb = "would upload" if opts.dryrun else "uploaded"
         note_warning(
-            f"warning: {entry}: --data-only {verb} {total} object(s) the manifest"
-            f" does not record; run a push without --data-only to record them"
+            f"warning: {entry}: --data-only {verb} {journal.unrecorded_uploads} object(s)"
+            f" the manifest does not record; run a push without --data-only to record them"
         )
+
+
+def _delete_conflict_objects(
+    cfg: Config, entry: str, plan: _PushDeletePlan, journal: PushJournal, opts: Opts
+) -> tuple[int, bool]:
+    """Offer the kind-conflict objects a --delete run collected (see
+    PushJournal.pending_object_deletes): a local symlink or special file
+    occupies a key holding a real S3 object, so the object formed an update
+    pair and the sync's delete lane never saw it. Confirmed like any other
+    candidate - through the same confirmer, so a/d stickiness carries over -
+    and deleted through the store directly. The record at the key describes
+    the local non-file (already journaled) and is untouched: only the object
+    goes. Returns ``(status, deleted_any)``."""
+    doomed: list[str] = []
+    for rel, recorded in journal.iter_pending_object_deletes():
+        if not plan.allow():
+            continue
+        if plan.confirmer is not None:
+            note = "" if recorded else " (not in manifest)"
+            if not plan.confirmer.confirm(f"{cfg.prefix}/{entry}/{rel}{note}"):
+                continue
+        doomed.append(f"{entry}/{rel}")
+    if not doomed:
+        return 0, False
+    assert cfg.store is not None
+    result = cfg.store.delete_objects(doomed, dryrun=opts.dryrun, verbose=opts.verbose)
+    return result.returncode, result.returncode == 0
+
+
+def _delete_exact_root_object(
+    cfg: Config, entry: str, plan: _PushDeletePlan, opts: Opts
+) -> tuple[int, bool]:
+    """A directory push's slash-bounded sync lists ``entry/`` and so never sees
+    an object at the entry's OWN key ``entry`` (the residue of a former file, or
+    an out-of-band write). verify flags it as a root type conflict, but the
+    delete lane can't reach it. Under --delete, probe it and offer it for
+    deletion out-of-lane - through the same confirmer / completeness gate as the
+    kind-conflict objects. Returns ``(status, deleted_any)``."""
+    assert cfg.store is not None
+    if cfg.store.head_object(entry, verbose=opts.verbose) is None:
+        return 0, False
+    if not plan.allow():
+        return 0, False
+    if plan.confirmer is not None and not plan.confirmer.confirm(
+        f"{cfg.prefix}/{entry} (not in manifest)"
+    ):
+        return 0, False
+    result = cfg.store.delete_objects([entry], dryrun=opts.dryrun, verbose=opts.verbose)
+    return result.returncode, result.returncode == 0
+
+
+def _reject_symlinked_sub_ancestors(base: str, sub: str) -> str | None:
+    """Return an error message if ``base`` itself or any ancestor of ``sub`` (the
+    components between ``base`` and the final one) is a symlink, a Windows
+    directory junction, another non-directory, or otherwise inaccessible, else
+    None. ``base`` is checked first, then each ancestor shallowest-first, so
+    the outermost symlink is caught before any lstat resolves through it -
+    including a relocated entry root (``base`` a symlink), through which
+    `pull entry/file` would otherwise write outside the entry.
+
+    A *genuinely missing* component (ENOENT) is not an error (no local state to
+    read, nothing resolves through it; the caller's own existence checks and the
+    --delete manifest path handle it). Any OTHER OS error - EACCES on an
+    unsearchable directory, ELOOP, ENOTDIR - is a hard error: it must never be
+    mistaken for "absent", which on a push --delete would drop a backup the walk
+    simply could not see."""
+    to_check = [base]
+    acc = base
+    for part in sub.split("/")[:-1]:
+        acc = os.path.join(acc, part)
+        to_check.append(acc)
+    for path in to_check:
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            return None
+        except OSError as e:
+            return f"cannot access sub path ancestor {path}: {e}"
+        # A junction lstats as an ordinary directory (Windows does not model
+        # it as a symlink), so it needs its own check alongside S_ISLNK -
+        # otherwise it would sail through as if it were a real directory.
+        if stat_mod.S_ISLNK(st.st_mode) or is_junction(st):
+            return f"sub path crosses a symlink or junction ancestor, not allowed: {path}"
+        if not stat_mod.S_ISDIR(st.st_mode):
+            return f"sub path crosses a non-directory ancestor, not allowed: {path}"
+    # The ancestors are accessible directories; probe the final target too (its
+    # type is unrestricted). This catches a deepest ancestor that lstat'd fine
+    # but is itself unsearchable (mode 000), whose EACCES would otherwise only
+    # surface mid-operation.
+    final = os.path.join(base, *sub.split("/"))
+    try:
+        os.lstat(final)
+    except FileNotFoundError:
+        return None  # absent target: fine (created on restore, or a gone --delete path)
+    except OSError as e:
+        return f"cannot access sub path ancestor {os.path.dirname(final)}: {e}"
+    return None
 
 
 def _push_sub(
@@ -304,6 +424,17 @@ def _push_sub(
     sub_rel = f"{entry}/{sub}"
     s3_sub_path = f"{cfg.prefix}/{sub_rel}"
     assert cfg.store is not None
+
+    # Reject a sub whose ancestor chain crosses a symlink before reading any
+    # local state: os.lstat(target_root/sub) resolves ancestor symlinks, so
+    # e.g. `push entry/link/passwd` with `link -> /etc` would upload /etc/passwd
+    # as entry/link/passwd and then leave it unrecorded (the ancestor records as
+    # a symlink-shaped directory and fails manifest validation). The final
+    # component may itself be a symlink (backed up as one), so it is not checked.
+    ancestor_error = _reject_symlinked_sub_ancestors(target_root, sub)
+    if ancestor_error is not None:
+        err(ancestor_error)
+        return 1
 
     walker = localwalk.sync_walker(excludes, sub=sub)
     plan = _plan_push_deletes(cfg, entry, sub, opts, walker)
@@ -324,7 +455,18 @@ def _push_sub(
         if have_manifest:
             plan.old_manifest = manifest_path
 
-        if not os.path.lexists(local_sub):
+        # os.path.lexists swallows EACCES (an unsearchable parent) as "absent",
+        # which under --delete would delete a live backup for a path we simply
+        # could not reach. Distinguish a genuine ENOENT from any other error.
+        try:
+            os.lstat(local_sub)
+            local_sub_present = True
+        except FileNotFoundError:
+            local_sub_present = False
+        except OSError as e:
+            err(f"cannot access sub path: {local_sub}: {e}")
+            return 1
+        if not local_sub_present:
             if not opts.delete:
                 err(f"local path does not exist (use --delete to remove its backup): {local_sub}")
                 return 1
@@ -337,19 +479,10 @@ def _push_sub(
                 err(f"backup subtree not deleted (answer y, or use --yes): {s3_sub_path}")
                 return 1
             result = cfg.store.delete_subtree(sub_rel, dryrun=opts.dryrun, verbose=opts.verbose)
-            if result.stdout:
-                write_output(f"{result.stdout}\n")
             if result.returncode != 0:
-                if result.stderr:
-                    write_stderr(f"{result.stderr}\n")
                 return result.returncode
-            did_work = bool(result.stdout)
-            did_work = (
-                patch_manifest_subtree(
-                    cfg, entry, target_root, sub, excludes, opts, old_manifest=old_manifest
-                )
-                or did_work
-            )
+            did_work = result.results > 0
+            did_work = drop_subtree_records(cfg, entry, old_manifest, sub, opts) or did_work
             return _run_hook("post_hook", post_hook, opts) if did_work else 0
 
         if opts.meta_only:
@@ -367,83 +500,116 @@ def _push_sub(
             return _run_hook("post_hook", post_hook, opts) if did_work else 0
 
         st = os.lstat(local_sub)
-        did_work = False
-
-        # A non-directory sub-path has no S3 listing, so --delete has no
-        # candidates to confirm there: old records under a same-named former
-        # directory are kept (with the restorability warning); pruning them
-        # takes a directory-level push --delete. The dir branch replaces this
-        # with the plan's policy.
-        patch_keep: manifest.KeepOld = True
-        if stat_mod.S_ISLNK(st.st_mode):
-            # symlink: upload nothing, just update manifest line.
-            pass
-        elif os.path.isdir(local_sub):
-            compare = None
-            try:
-                compare = sync_compare(cfg, opts, entry, old_manifest, sub=sub)
-                create_lane, unrecorded = _plan_data_only_creates(plan, sub, opts)
-                result = cfg.store.sync_up(
-                    local_sub,
-                    sub_rel,
-                    walker=walker,
-                    compare=compare,
-                    create=create_lane,
-                    delete=plan.lane,
-                    dryrun=opts.dryrun,
-                    verbose=opts.verbose,
-                )
-            finally:
-                # The streaming ManifestFilter holds the temp manifest open;
-                # close it early (an open file cannot be removed on Windows).
-                # The temp manifest lives on: the patch reads it as the old side.
-                if isinstance(compare, manifest.ManifestFilter):
-                    compare.close()
-            if result.returncode != 0:
-                write_output(result.stdout)
-                if result.stderr:
-                    write_stderr(result.stderr)
-                return result.returncode
-            if result.stdout:
-                write_output(f"{result.stdout}\n")
-                did_work = True
-            _warn_unrecorded_uploads(entry, opts, unrecorded, compare)
-            _warn_refused_deletes(entry, plan)
-            patch_keep = plan.keep_old()
-        elif stat_mod.S_ISREG(st.st_mode):
-            # Regular file: an explicit sub-path push always uploads.
-            if opts.dryrun:
-                print(f"(dry-run) upload: {local_sub} -> {s3_sub_path}")
-                did_work = True
-            else:
-                result = cfg.store.put_object(sub_rel, local_sub, verbose=opts.verbose)
-                if result.returncode != 0:
-                    write_output(result.stdout)
-                    if result.stderr:
-                        write_stderr(result.stderr)
-                    return result.returncode
-                if result.stdout:
-                    write_output(f"{result.stdout}\n")
-                    did_work = True
-        else:
+        is_link = stat_mod.S_ISLNK(st.st_mode)
+        is_dir_sub = not is_link and os.path.isdir(local_sub)
+        if not (is_link or is_dir_sub or stat_mod.S_ISREG(st.st_mode)):
             err(f"sub path must be a regular file, directory, or symlink: {local_sub}")
             return 1
 
-        if not opts.data_only:
-            did_work = (
-                patch_manifest_subtree(
-                    cfg,
-                    entry,
-                    target_root,
-                    sub,
-                    excludes,
-                    opts,
-                    keep_old=patch_keep,
-                    old_manifest=old_manifest,
-                )
-                or did_work
+        did_work = False
+        conflict_deleted = False
+        journal_fd, journal_path = tempfile.mkstemp(suffix=".journal")
+        os.close(journal_fd)
+        try:
+            # A non-directory sub-path has no S3 listing, so --delete has no
+            # candidates to confirm there: old records under a same-named
+            # former directory are kept (with the restorability warning);
+            # pruning them takes a directory-level push --delete. Hence
+            # delete_mode only for the directory branch.
+            journal = PushJournal(
+                journal_path,
+                old_manifest,
+                window_ns=cfg.window_ns_for(entry),
+                walker=walker,
+                sub=sub,
+                content=cfg.store.content_compare() if opts.checksum else None,
+                delete_mode=opts.delete and is_dir_sub,
+                record_delete=plan.record_delete,
             )
-        return _run_hook("post_hook", post_hook, opts) if did_work else 0
+            # False until the journal's stream truly completed: a sync that
+            # errored or an exception mid-push parks the cursor mid-manifest,
+            # and close()'s drain must not judge (or offer) the unreached
+            # tail. Only the directory branch runs delete_mode, but the flag
+            # is kept honest for every branch.
+            stream_complete = False
+            try:
+                if old_manifest is None:
+                    # First-ever manifest born from a sub-path push: record the
+                    # entry root so the manifest keeps its dir-entry shape and
+                    # the root's metadata restores on pull.
+                    journal.record_root(os.lstat(target_root))
+                # Ancestor records for sub's parents: every record needs a
+                # recorded directory parent (the validator's rule); only a
+                # missing or drifted ancestor journals.
+                acc = target_root
+                rel_acc: str | None = None
+                for part in sub.split("/")[:-1]:
+                    acc = os.path.join(acc, part)
+                    rel_acc = part if rel_acc is None else f"{rel_acc}/{part}"
+                    journal.record_ancestor(rel_acc, os.lstat(acc))
+
+                if is_link:
+                    # symlink: upload nothing; the manifest record IS the backup.
+                    journal.record_target(sub, st, os.readlink(local_sub))
+                    stream_complete = True
+                elif is_dir_sub:
+                    delete_lane: bool | FileFilter = (
+                        journal.observe_delete(plan.lane) if callable(plan.lane) else plan.lane
+                    )
+                    result = cfg.store.sync_up(
+                        local_sub,
+                        sub_rel,
+                        walker=walker,
+                        compare=journal.update_filter,
+                        create=journal.create_filter,
+                        delete=delete_lane,
+                        dryrun=opts.dryrun,
+                        verbose=opts.verbose,
+                    )
+                    stream_complete = result.returncode == 0
+                    if result.returncode != 0:
+                        return result.returncode
+                    if result.results > 0:
+                        did_work = True
+                    _warn_unrecorded_uploads(entry, opts, journal)
+                else:
+                    # Regular file: an explicit sub-path push always uploads,
+                    # and always re-records - naming the path is the
+                    # instruction to back up its current state.
+                    if opts.dryrun:
+                        write_output(f"(dry-run) upload: {local_sub} -> {s3_sub_path}\n")
+                        did_work = True
+                    else:
+                        result = cfg.store.put_object(sub_rel, local_sub, verbose=opts.verbose)
+                        if result.returncode != 0:
+                            return result.returncode
+                        if result.results > 0:
+                            did_work = True
+                    journal.record_target(sub, st, None)
+                    stream_complete = True
+            finally:
+                if not stream_complete:
+                    # Gate close()'s drain: the unreached records are no
+                    # evidence of deletion (see the directory push's twin).
+                    walker.scan_incomplete = True
+                journal.close()
+            if journal.pending_object_deletes > 0:
+                st_del, conflict_deleted = _delete_conflict_objects(cfg, entry, plan, journal, opts)
+                if st_del != 0:
+                    return st_del
+            # After the conflict candidates: their refusals (incomplete scan)
+            # must count in the summary too.
+            _warn_refused_deletes(entry, plan, journal)
+            if journal.has_events and not opts.data_only:
+                publish_journal_manifest(cfg, entry, old_manifest, journal_path, opts)
+                did_work = True
+            if conflict_deleted:
+                did_work = True
+            # The journal must still be on disk for post_hook (S3BAK_JOURNAL);
+            # it is unlinked in the finally below, after the hook returns.
+            return _run_hook("post_hook", post_hook, opts, journal_path) if did_work else 0
+        finally:
+            os.unlink(journal_path)
     finally:
         plan.close()
         os.unlink(manifest_path)
@@ -488,66 +654,21 @@ def _single_file_compare(
     return True, False
 
 
-def _single_file_manifest_matches(manifest_path: str, target: str) -> bool:
+def _single_file_manifest_matches(manifest_path: str, target: str, window_ns: int) -> bool:
     """Whether the already-downloaded manifest describes this single-file
-    entry: the record names the configured basename and its permission bits
-    match the local file."""
+    entry's current state: the record names the configured basename, its
+    permission bits match, AND its size+mtime match (within ``window_ns``).
+
+    The size+mtime part keeps --checksum's manifest self-healing on par with the
+    default push: a content-equal file whose mtime drifted out of the window
+    still refreshes the record, so status settles and pull restores the current
+    mtime, instead of the manifest staying stale forever (--checksum never
+    re-transfers a content-equal file)."""
     record = next(manifest.iter_manifest(manifest_path))
     if record.path != os.path.basename(target):
         return False
-    return not mode_differs(record, os.lstat(target))
-
-
-def _manifest_records_match_local(
-    manifest_path: str, target: str, excludes: list[str], *, keep_old: manifest.KeepOld
-) -> bool:
-    """Whether an existing manifest still describes the local tree: the
-    manifest-visible structure and the recorded permissions.
-
-    Data transfer output normally drives refresh, but structure changes
-    (add/remove/type/target of empty directories and symlinks, which have no
-    S3 object) and permission changes move no data and must still make an
-    ordinary push rewrite the manifest. Mode uses the shared ``mode_differs``
-    predicate and skips symlink records, so the refresh settles exactly the
-    mode differences `status` reports; mtime drift (a rounding tolerance
-    inside the window; outside it the default compare transfers upstream of
-    this check, and --checksum deliberately ignores stats) and
-    owner/group changes stay non-triggers. Manifest-only records are
-    judged by the same ``keep_old`` policy the merge would apply: a record the
-    merge would keep is the expected shape of a kept deletion, not a change;
-    one it would drop (the mirror, or a file record with no delete candidate
-    behind it) demands the rewrite that settles it - anything else would
-    either rewrite an identical manifest forever or never heal a stale
-    record. The merge remains streaming and returns at the first mismatch.
-    """
-    manifest_items = (
-        (manifest.entry_sort_key(entry.path, entry.is_dir), entry)
-        for entry in manifest.iter_manifest(manifest_path)
-    )
-    local_items = (
-        (manifest.entry_sort_key(path, stat_mod.S_ISDIR(st.st_mode)), (st, sym))
-        for path, st, sym in localwalk.walk_tree(target, excludes)
-    )
-    for _key, record, local in manifest.merge_join(manifest_items, local_items):
-        if local is None:
-            assert record is not None
-            if keep_old is True:
-                continue
-            if keep_old is False:
-                return False
-            if record.is_file and not keep_old.consume_file(record.path.removeprefix("./")):
-                return False
-            continue
-        if record is None:
-            return False
-        st, sym = local
-        if stat_mod.S_IFMT(record.mode) != stat_mod.S_IFMT(st.st_mode):
-            return False
-        if record.sym_target != sym:
-            return False
-        if record.sym_target is None and mode_differs(record, st):
-            return False
-    return True
+    st = os.lstat(target)
+    return not mode_differs(record, st) and record.matches_stat(st, window_ns)
 
 
 def _migrate_entry_kind(cfg: Config, entry: str, to_dir: bool, opts: Opts) -> int:
@@ -576,23 +697,20 @@ def _migrate_entry_kind(cfg: Config, entry: str, to_dir: bool, opts: Opts) -> in
         err(f"old backup not deleted (answer y, or use --yes): {display}")
         return 1
     result = cfg.store.delete_subtree(entry, dryrun=opts.dryrun, verbose=opts.verbose)
-    if result.stdout:
-        write_output(f"{result.stdout}\n")
     if result.returncode != 0:
-        if result.stderr:
-            write_stderr(f"{result.stderr}\n")
         return result.returncode
     return 0
 
 
-def _delete_file_entry_strays(cfg: Config, entry: str, opts: Opts) -> tuple[int, str]:
+def _delete_file_entry_strays(cfg: Config, entry: str, opts: Opts) -> tuple[int, int]:
     """``push --delete`` for a single-file entry: offer the objects under
     ``entry/`` for deletion. A file-shaped manifest records only the entry's
     own key, so anything below ``entry/`` is outside the backup - the residue
     of an entry that used to be a directory, or an out-of-band upload - and
     would otherwise be invisible to every command but verify. The same
     per-object confirmation as the directory delete lane; the manifest is not
-    touched (these keys have no records). Returns ``(status, output_lines)``."""
+    touched (these keys have no records). Returns ``(status, results)`` -
+    ``results`` is the number of delete lines printed (0 means nothing done)."""
     assert cfg.store is not None
     candidates = (f"{entry}/{o.key}" for o in cfg.store.iter_objects(entry, verbose=opts.verbose))
     if opts.dryrun or resolve_answer_mode(yes=opts.yes) is AnswerMode.ALL_YES:
@@ -602,21 +720,16 @@ def _delete_file_entry_strays(cfg: Config, entry: str, opts: Opts) -> tuple[int,
         if mode is AnswerMode.ALL_NO:
             # Every answer is no: keep everything (each object returns as a
             # candidate on the next --delete).
-            return 0, ""
+            return 0, 0
         doomed: list[str] = []
         confirmer = DeleteConfirmer(mode, entry)
-        try:
-            for rel in candidates:
-                if confirmer.confirm(f"{cfg.prefix}/{rel} (not in manifest)"):
-                    doomed.append(rel)
-        finally:
-            confirmer.close()
+        for rel in candidates:
+            if confirmer.confirm(f"{cfg.prefix}/{rel} (not in manifest)"):
+                doomed.append(rel)
         if not doomed:
-            return 0, ""
+            return 0, 0
         result = cfg.store.delete_objects(doomed, verbose=opts.verbose)
-    if result.stderr:
-        write_stderr(f"{result.stderr}\n")
-    return result.returncode, result.stdout
+    return result.returncode, result.results
 
 
 def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int:
@@ -671,7 +784,7 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             err(f"{entry}: aborted")
             return 1
 
-    results = ""
+    results = 0  # count of upload/delete lines printed this push
     refresh_manifest = False
     assert cfg.store is not None
 
@@ -726,47 +839,92 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             )
 
         if is_dir_target:
-            compare = None
-            manifest_stale = False
+            journal_fd, journal_path = tempfile.mkstemp(suffix=".journal")
+            os.close(journal_fd)
+            conflict_deleted = False
             try:
-                compare = sync_compare(cfg, opts, entry, manifest_path if have_manifest else None)
-                create_lane, unrecorded = _plan_data_only_creates(plan, None, opts)
-                result = cfg.store.sync_up(
-                    target,
-                    entry,
+                journal = PushJournal(
+                    journal_path,
+                    manifest_path if have_manifest else None,
+                    window_ns=cfg.window_ns_for(entry),
                     walker=walker,
-                    compare=compare,
-                    create=create_lane,
-                    delete=plan.lane,
-                    dryrun=opts.dryrun,
-                    verbose=opts.verbose,
+                    content=cfg.store.content_compare() if opts.checksum else None,
+                    delete_mode=opts.delete,
+                    record_delete=plan.record_delete,
                 )
-                if (
-                    result.returncode == 0
-                    and not result.stdout
-                    and not opts.data_only
-                    and have_manifest
-                ):
-                    manifest_stale = not _manifest_records_match_local(
-                        manifest_path, target, excludes, keep_old=plan.keep_old()
+                sync_ok = False
+                try:
+                    delete_lane: bool | FileFilter = (
+                        journal.observe_delete(plan.lane) if callable(plan.lane) else plan.lane
                     )
+                    result = cfg.store.sync_up(
+                        target,
+                        entry,
+                        walker=walker,
+                        compare=journal.update_filter,
+                        create=journal.create_filter,
+                        delete=delete_lane,
+                        dryrun=opts.dryrun,
+                        verbose=opts.verbose,
+                    )
+                    sync_ok = result.returncode == 0
+                finally:
+                    if not sync_ok:
+                        # The sync stopped mid-stream (an error or an
+                        # interrupt, not a walk warning), so the cursor's
+                        # unreached tail is no evidence of deletion. Gate
+                        # close()'s drain like any other partial view: it
+                        # must keep - and ask about - nothing.
+                        walker.scan_incomplete = True
+                    # Flush the journal (and release the old-manifest handle the
+                    # cursor holds open - an open file cannot be removed on
+                    # Windows) whether or not the sync succeeded.
+                    journal.close()
+                if result.returncode != 0:
+                    return result.returncode
+                results = result.results
+                _warn_unrecorded_uploads(entry, opts, journal)
+                if journal.pending_object_deletes > 0:
+                    st_del, conflict_deleted = _delete_conflict_objects(
+                        cfg, entry, plan, journal, opts
+                    )
+                    if st_del != 0:
+                        return st_del
+                if opts.delete:
+                    # The object at the entry's own key is invisible to the
+                    # slash-bounded delete lane; retire it here (verify flags it).
+                    st_root, root_deleted = _delete_exact_root_object(cfg, entry, plan, opts)
+                    if st_root != 0:
+                        return st_root
+                    conflict_deleted = conflict_deleted or root_deleted
+                # After the conflict candidates: their refusals (incomplete
+                # scan) must count in the summary too.
+                _warn_refused_deletes(entry, plan, journal)
+                # The rewrite condition: at least one real event (+/!/-). A
+                # first push journals everything (the root included); a pure
+                # no-op push journals nothing; a --delete run whose record
+                # candidates were all kept leaves only no-change lines, which
+                # must not republish an identical manifest.
+                if journal.has_events and not opts.data_only:
+                    publish_journal_manifest(
+                        cfg,
+                        entry,
+                        manifest_path if have_manifest else None,
+                        journal_path,
+                        opts,
+                    )
+                    refresh_manifest = True
+                else:
+                    refresh_manifest = False
+                if results or refresh_manifest or conflict_deleted:
+                    post_hook: list[str] | None = entry_cfg.get("post_hook")
+                    # The journal must still be on disk for post_hook
+                    # (S3BAK_JOURNAL); it is unlinked in the finally below,
+                    # after the hook returns.
+                    return _run_hook("post_hook", post_hook, opts, journal_path)
+                return 0
             finally:
-                # The streaming ManifestFilter holds the temp manifest open; close
-                # it early (an open file cannot be removed on Windows). The temp
-                # manifest itself lives on: the merge reads it as the old side.
-                if isinstance(compare, manifest.ManifestFilter):
-                    compare.close()
-            if result.returncode != 0:
-                write_output(result.stdout)
-                if result.stderr:
-                    write_stderr(result.stderr)
-                return result.returncode
-            _warn_unrecorded_uploads(entry, opts, unrecorded, compare)
-            _warn_refused_deletes(entry, plan)
-            results = result.stdout
-            refresh_manifest = bool(results)
-            if not refresh_manifest and not opts.data_only:
-                refresh_manifest = not have_manifest or manifest_stale
+                os.unlink(journal_path)
         else:
             needs_upload, mode_drifted = _single_file_compare(
                 cfg, entry, target, opts, manifest_path if have_manifest else None
@@ -776,35 +934,29 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 # manifest (or the --checksum ETag comparison), or was never
                 # pushed: upload it.
                 if opts.dryrun:
-                    # Set results only; the shared writer below emits it (and the
-                    # truthy results drives the dryrun manifest line). Printing
-                    # here too would double the line.
-                    results = f"(dry-run) upload: {target} -> {cfg.prefix}/{entry}"
+                    write_output(f"(dry-run) upload: {target} -> {cfg.prefix}/{entry}\n")
+                    results = 1
                 else:
                     result = cfg.store.put_object(entry, target, verbose=opts.verbose)
                     if result.returncode != 0:
-                        write_output(result.stdout)
-                        if result.stderr:
-                            write_stderr(result.stderr)
                         return result.returncode
-                    results = result.stdout
-                refresh_manifest = bool(results)
+                    results = result.results
+                refresh_manifest = results > 0
             elif not opts.data_only:
                 if opts.checksum:
                     # ETag equality can skip an already-present data object even
                     # when its manifest was deleted, still names an older
-                    # configured basename, or records a stale mode.
+                    # configured basename, or records a stale mode / mtime.
                     refresh_manifest = not have_manifest or not _single_file_manifest_matches(
-                        manifest_path, target
+                        manifest_path, target, cfg.window_ns_for(entry)
                     )
                 else:
                     refresh_manifest = mode_drifted
             if opts.delete:
                 # A single-file entry has no sync listing, so its --delete lane
                 # is this explicit sweep of entry/ (see _delete_file_entry_strays).
-                st, stray_lines = _delete_file_entry_strays(cfg, entry, opts)
-                if stray_lines:
-                    write_output(f"{stray_lines}\n")
+                st, stray_count = _delete_file_entry_strays(cfg, entry, opts)
+                if stray_count:
                     # Deletions are work: refresh the manifest (a no-op rewrite
                     # of the single record) so post_hook fires, as a directory
                     # delete-only push would.
@@ -812,34 +964,19 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 if st != 0:
                     return st
 
-        if results:
-            write_output(f"{results}\n")
-
-        # Refresh after a data transfer or deletion, an objectless structural
-        # or permission change, or the first push even when an empty tree
-        # produced no transfer lines. An mtime drift inside the window does not
-        # refresh an existing manifest (the window is a rounding tolerance);
-        # owner/group are informational, not comparison inputs, and update
-        # whenever the manifest is rewritten. Note --meta-only asserts "S3
-        # matches local" without making it true: any never-pushed local edit
-        # becomes invisible to the size+mtime check afterwards, so it is a
-        # metadata refresh, never a substitute for a real push.
+        # Single-file refresh: after an upload, a mode drift, or a stray
+        # deletion (a no-op rewrite of the one record, so post_hook fires as
+        # a directory delete-only push would). An mtime drift inside the
+        # window does not refresh an existing manifest (the window is a
+        # rounding tolerance).
         if refresh_manifest and not opts.data_only:
-            st = upload_manifest(
-                cfg,
-                entry,
-                target,
-                excludes,
-                opts,
-                old_manifest=manifest_path if have_manifest else None,
-                keep_old=plan.keep_old(),
-            )
+            st = upload_manifest(cfg, entry, target, excludes, opts)
             if st != 0:
                 return st
 
         if results and opts.data_only:
-            post_hook: list[str] | None = entry_cfg.get("post_hook")
-            return _run_hook("post_hook", post_hook, opts)
+            post_hook_file: list[str] | None = entry_cfg.get("post_hook")
+            return _run_hook("post_hook", post_hook_file, opts)
 
         return 0
     except DeletionAbortedError:
@@ -903,6 +1040,75 @@ def _manifest_matches_local(
     return True
 
 
+def _verify_restored_sizes(manifest_path: str, outpath: str, is_dir: bool, sub: str | None) -> int:
+    """After a --data-only sync, verify every recorded regular file was placed
+    with its recorded size. --data-only skips apply_manifest (and the
+    presence/size check it carries), so without this a missing or size-drifted
+    object would let the pull report success on incomplete/wrong data. Read-only
+    (never writes); returns 1 if any record failed, else 0."""
+    errors = 0
+    for entry in manifest.iter_manifest(manifest_path):
+        if not entry.is_file or entry.sym_target is not None or entry.size is None:
+            continue  # only regular files own an object with a size to check
+        res = manifest_target(entry, outpath, is_dir, sub)
+        if res is None:
+            continue
+        target, _rel = res
+        try:
+            st = os.lstat(target)
+        except OSError:
+            err(f"expected file missing (sync did not place it): {target}")
+            errors += 1
+            continue
+        if not stat_mod.S_ISREG(st.st_mode):
+            err(f"expected {entry.path} to be a regular file: {target}")
+            errors += 1
+        elif st.st_size != entry.size:
+            err(
+                f"restored size does not match manifest ({st.st_size} != {entry.size}),"
+                f" the stored object does not match the record: {target}"
+            )
+            errors += 1
+    return 1 if errors else 0
+
+
+def _manifest_restore_conflict(manifest_path: str, sub: str | None) -> str | None:
+    """Return the entry-relative path of the first non-directory record (a file
+    or symlink) in the pulled range that another record contradicts by treating
+    it as a directory or filling it with descendants, else None.
+
+    Such a manifest cannot be materialized: pulling it restores some records and
+    then the deferred symlink/directory replacement rmtree's (or removes) the
+    just-restored subtree - taking unrecorded local data with it - before failing.
+    pull and verify therefore fail closed on it (push --delete prunes the stale
+    records). Streams the manifest in sort order with a stack of "blockers" (the
+    non-directory records whose descendant key range is still open), the shape
+    write_merged's restorability warning uses. Works in ENTRY-RELATIVE space
+    (not sub-rebased): a conflict AT the sub root itself - a symlink ``./d`` and a
+    directory ``./d`` both recorded when pulling ``entry/d`` - would be invisible
+    if both collapsed to ``.``; the ``sub`` filter only restricts the range to the
+    records the pull would touch."""
+    blockers: list[str] = []  # rels of non-directory records with an open descendant range
+    for entry in manifest.iter_manifest(manifest_path):
+        if entry.path == ".":
+            continue
+        rel = entry.path.removeprefix("./")  # entry-relative
+        if sub is not None and rel != sub and not rel.startswith(sub + "/"):
+            continue  # outside the pulled range
+        key = rel + "/" if entry.is_dir else rel
+        while blockers:
+            top = blockers[-1]
+            if rel == top or rel.startswith(top + "/"):
+                return top  # this record contradicts the non-directory record at `top`
+            if key > top + "/":
+                blockers.pop()  # past the blocker's descendant range (a sorted sibling)
+                continue
+            break
+        if not entry.is_dir:
+            blockers.append(rel)
+    return None
+
+
 def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int:
     entry_cfg = cfg.entries.get(entry)
     configured_path: str | None = entry_cfg["path"] if entry_cfg else None
@@ -911,6 +1117,19 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         err(f"no such entry in config: {entry}")
         err("use -o <path> to specify the output path")
         return 1
+
+    # A sub-path restore to the configured location writes at
+    # configured_path/sub; if an ancestor of sub is a symlink (or otherwise
+    # inaccessible), the download would land outside the entry root - e.g.
+    # `pull entry/dir/file` with a local `dir -> /outside` writes /outside/file.
+    # (An -o destination is the user's own explicit path, so it is exempt; a
+    # full-tree pull's root and recorded dirs are handled by the staging swap
+    # and prepare_dir_conflicts.)
+    if sub is not None and opts.outpath is None and configured_path is not None:
+        ancestor_error = _reject_symlinked_sub_ancestors(configured_path, sub)
+        if ancestor_error is not None:
+            err(ancestor_error)
+            return 1
 
     fd, manifest_path = tempfile.mkstemp(suffix=".jsonl")
     os.close(fd)
@@ -940,6 +1159,22 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             is_dir = entry_is_dir
             has_data = True
 
+        # A manifest that records a non-directory (file/symlink) and a directory
+        # or descendants at one logical path cannot be materialized: pulling it
+        # restores some records and then the deferred symlink/dir replacement
+        # rmtree's the subtree, destroying local data (incl. unrecorded files) on
+        # a pull that then fails. Fail closed BEFORE any mutation; push --delete
+        # prunes the stale records. (Only a directory range can hold the conflict.)
+        if is_dir:
+            conflict = _manifest_restore_conflict(manifest_path, sub)
+            if conflict is not None:
+                err(
+                    f"{entry}: unrestorable manifest - a non-directory and a directory"
+                    f" (or files under it) are both recorded at ./{conflict};"
+                    f" run push --delete to prune the stale records"
+                )
+                return 1
+
         # 2. If everything in the manifest already matches local, both
         #    the s3 sync/cp and apply_manifest are no-ops. Skip them. Not
         #    under --checksum: this gate is the same size+mtime check whose
@@ -947,7 +1182,14 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         #    between the user and the content comparison.
         window_ns = cfg.window_ns_for(entry)
         excludes: list[str] = entry_cfg.get("excludes", []) if entry_cfg else []
-        manifest_matches = _manifest_matches_local(manifest_path, outpath, is_dir, sub, window_ns)
+        # --checksum ignores this gate (see below), so on a real --checksum pull
+        # skip the whole size+mtime walk under it - on a large tree that is
+        # millions of wasted lstats before the content compare even starts. A
+        # --checksum --dry-run still computes it: it is a preview (not the hot
+        # path) and the dry-run metadata stand-in line below reads manifest_matches.
+        manifest_matches = (opts.dryrun or not opts.checksum) and _manifest_matches_local(
+            manifest_path, outpath, is_dir, sub, window_ns
+        )
         if manifest_matches and not opts.checksum:
             if not opts.meta_only and opts.delete and is_dir:
                 return _mirror_extras(
@@ -974,7 +1216,14 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         # transfer report may differ from what the real pull does.
         stage_dir: str | None = None
         stage_holds_old_root = False
+        swap_done = False  # the old root was moved aside AND the new root swapped in
+        replaced_root: str | None = None  # where the swapped-out old root now lives
         prep: list[tuple[str, int]] = []
+        # True once something has already re-applied the recorded mode over
+        # every prepped path (a clean apply_manifest does this itself, as an
+        # ordinary part of the repair) - so the outer finally's restore below
+        # is skipped there and only fires on a path that never got that far.
+        prep_repaired = False
         if has_data and not opts.meta_only and os.path.lexists(outpath):
             if is_dir:
                 conflict = os.path.islink(outpath) or not os.path.isdir(outpath)
@@ -1041,8 +1290,8 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                     if isinstance(compare, manifest.ManifestFilter):
                         compare.close()
                 if rc != 0:
-                    if IS_WINDOWS:
-                        windows_restore_modes(prep)
+                    # The Windows writable prep is restored by the outer
+                    # finally below, whichever way this function now returns.
                     return rc
                 if stage_dir is not None:
                     # The download is complete: swap in two atomic renames with
@@ -1050,17 +1299,23 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                     # in the finally below then retires it (or, on a failed
                     # swap, the partial download).
                     replaced = os.path.join(stage_dir, "replaced")
+                    # Record the destination BEFORE the rename: a SIGINT landing
+                    # between the move and this assignment must still let the
+                    # cleanup preserve the swapped-out old root, not delete it.
+                    replaced_root = replaced
                     os.replace(outpath, replaced)
                     try:
                         os.replace(dest, outpath)
+                        swap_done = True
                     except BaseException:
                         try:
                             os.replace(replaced, outpath)  # put the old root back
+                            replaced_root = None  # old root restored: nothing to preserve
                         except OSError:
-                            # The rollback itself failed: the cleanup below
-                            # must not delete the only remaining copy.
-                            stage_holds_old_root = True
-                            err(f"could not restore {outpath}; it is preserved at {replaced}")
+                            # The rollback itself failed: the old root stays at
+                            # `replaced` (replaced_root still set), so the handler
+                            # and finally below preserve it and report where.
+                            pass
                         raise
 
             # 4. Apply manifest metadata (mode, mtime, symlinks): objectless or
@@ -1071,12 +1326,17 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             #    time onto it, the file lane leaves the write time) and gets its
             #    recorded mtime back; a stamp landing inside the mtime window is a
             #    match and stays, like any other within-window drift. The gate also
-            #    re-applies the recorded modes over the writable prep - no separate
-            #    restore needed. Skipped with --data-only.
+            #    re-applies the recorded modes over the writable prep on success -
+            #    the outer finally below covers every other case. Skipped with
+            #    --data-only, which never touches the prep itself either way.
             if opts.data_only:
-                if IS_WINDOWS and not opts.meta_only:
-                    windows_restore_modes(prep)
-                st = 0
+                # --data-only skips apply_manifest, so run its presence+size
+                # integrity check directly - but only after a real download (a
+                # dry run placed nothing; a symlink/special sub has no data).
+                if opts.dryrun or not has_data:
+                    st = 0
+                else:
+                    st = _verify_restored_sizes(manifest_path, outpath, is_dir, sub)
             elif opts.dryrun:
                 # One stand-in line for the metadata apply (mode / mtime /
                 # symlinks), printed only when the real apply could repair
@@ -1085,9 +1345,27 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                     write_output(f"(dry-run) would apply manifest metadata: {outpath}\n")
                 st = 0
             else:
+                # enforce_size only when the data sync ran: --meta-only applies
+                # metadata over the existing data and must not fail on a size it
+                # was never asked to download.
                 st = apply_manifest(
-                    outpath, is_dir, manifest_path, sub=sub, window_ns=window_ns, excludes=excludes
+                    outpath,
+                    is_dir,
+                    manifest_path,
+                    sub=sub,
+                    window_ns=window_ns,
+                    excludes=excludes,
+                    enforce_size=not opts.meta_only,
                 )
+                if st == 0:
+                    # A clean apply already re-chmod'd every prepped path to its
+                    # recorded mode (the write bit prep added made it mismatch
+                    # its record, so apply_manifest corrected it) - nothing left
+                    # for the outer finally to do. A failure can leave one
+                    # unrepaired (its own record's apply bailed out before
+                    # reaching the chmod, e.g. a missing file or a failed
+                    # symlink placement), so only then does it still apply.
+                    prep_repaired = True
 
             if not opts.meta_only and opts.delete and is_dir:
                 if st != 0:
@@ -1105,20 +1383,54 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                         window_ns=window_ns,
                     )
 
+            # Any non-zero exit after a staged swap - the metadata apply OR the
+            # --delete re-settle - means the pull did not fully succeed. Keep the
+            # swapped-out old root instead of letting the cleanup destroy it: the
+            # staging's promise that a failed pull does not cost the local state
+            # it was replacing, held past the swap, not only across a failed
+            # download. Checked after the --delete step so its failure counts too.
+            if swap_done and st != 0 and replaced_root is not None:
+                stage_holds_old_root = True
+                err(
+                    f"{entry}: pull failed after replacing {outpath};"
+                    f" the previous {outpath} is preserved at {replaced_root}"
+                )
+
             return st
         except BaseException:
             # An exception (S3 error, local I/O, SIGINT) skips the normal
-            # mode-restoring exits; put the Windows writable prep back before
-            # it propagates.
-            if IS_WINDOWS:
-                windows_restore_modes(prep)
+            # return paths; the outer finally below still restores the Windows
+            # writable prep, and runs before this propagates. If the old root
+            # was moved into the stage (even mid-swap, before the assignment
+            # completed), keep it - the finally's stage cleanup only removes a
+            # stage that is NOT holding the stranded old root.
+            if replaced_root is not None:
+                stage_holds_old_root = True
+                if os.path.lexists(replaced_root):
+                    err(
+                        f"{entry}: pull failed after replacing {outpath};"
+                        f" the previous {outpath} is preserved at {replaced_root}"
+                    )
             raise
         finally:
-            if stage_dir is not None and not stage_holds_old_root:
-                # Retires the swapped-out old root on success, the partial
-                # download on failure - never anything this pull did not make,
-                # and never a stranded old root the rollback could not put back.
-                shutil.rmtree(stage_dir, ignore_errors=True)
+            # Put every prepped path back to its original mode on every exit
+            # this function did not already resolve on its own (download
+            # failure, --data-only, a failed apply_manifest, an early
+            # conflict-clearing return, or an exception) - never after a clean
+            # apply, which already re-chmod'd them itself (prep_repaired,
+            # above). This is the one place that restores the prep, so it can
+            # never double up with another restore.
+            if IS_WINDOWS and not prep_repaired:
+                windows_restore_modes(prep)
+            if stage_dir is not None:
+                # Preserve the stage ONLY while it actually holds the stranded old
+                # root (the swap did not cleanly retire or roll it back); on
+                # success, rollback, or an interrupt before the old root moved in,
+                # the stage holds nothing irreplaceable, so retire it.
+                if not (
+                    stage_holds_old_root and os.path.lexists(os.path.join(stage_dir, "replaced"))
+                ):
+                    shutil.rmtree(stage_dir, ignore_errors=True)
     except DeletionAbortedError:
         err(f"{entry}: aborted")
         return 1
@@ -1140,6 +1452,56 @@ def _single_file_size(manifest_path: str) -> int | None:
 # metadata apply consumes.
 
 
+def _collect_extra_aliases(
+    manifest_path: str, outpath: str, sub: str | None, excludes: list[str]
+) -> set[tuple[str, str]]:
+    """The alias set ``remove_extras`` checks a candidate against: one
+    ``(parent_rel, fs_alias_key(basename))`` pair per manifest-only record
+    whose recorded spelling a name-folding filesystem (case, NFC/NFD, a
+    Win32-trimmed trailing dot/space) could fold onto some local path - the
+    W-F3 defense (pushing from POSIX and pulling on Windows or macOS splits
+    one file into a manifest-only record plus a local-only extra with a
+    different byte spelling; without this, the extras pass would delete the
+    file the same pull just restored).
+
+    Runs the SAME merge-join ``_delete_extras`` runs, a second time,
+    read-only, purely to collect this set BEFORE the removal stream starts.
+    This cannot be folded into ``apply_manifest``'s own merge-join instead:
+    ``_mirror_extras`` (the caller two levels up) is invoked from two call
+    sites in ``cmd_pull`` - one of them a no-op short-circuit where
+    ``apply_manifest`` never runs at all (the "manifest already matches
+    local" fast path) - and ``--data-only`` skips ``apply_manifest`` too; all
+    three of those paths must get alias protection uniformly, so collecting
+    it has to be self-contained here, independent of whether or how apply
+    ran.
+
+    A manifest-only record only becomes an alias candidate when
+    ``os.path.lexists`` finds something at its OWN recorded spelling - which
+    a plain byte-different local walk would never do, but a name-folding
+    filesystem's own path resolution does (case-insensitive lookup, NFC/NFD
+    equivalence, or the Win32 trailing dot/space trim), the same fold that
+    produced the manifest-only/local-only split in the first place. So the
+    set stays empty on an ordinary tree, and its size is bounded by the
+    number of records the filesystem actually folded - the same "bounded by
+    actual conflicts" allowance ``apply_manifest``'s deferred-symlink list
+    gets (see docs/overview.md). Cost is one extra lstat per manifest-only
+    record, on top of the merge-join this already re-runs."""
+    aliases: set[tuple[str, str]] = set()
+    for _key, m, loc in manifest.merge_join(
+        manifest_keyed(manifest_path, sub), local_keyed(outpath, excludes, sub)
+    ):
+        if m is None or loc is not None:
+            continue
+        rel, _m_entry = m
+        if rel == ".":
+            continue
+        if os.path.lexists(os.path.join(outpath, rel)):
+            parent = "." if "/" not in rel else rel.rsplit("/", 1)[0]
+            name = rel.rsplit("/", 1)[-1]
+            aliases.add((parent, fs_alias_key(name)))
+    return aliases
+
+
 def _delete_extras(
     manifest_path: str,
     outpath: str,
@@ -1154,9 +1516,13 @@ def _delete_extras(
     non-interactive run without --yes answers no, i.e. removes nothing).
     Returns ``(status, removals)``.
 
-    The local-only lane of the merge-join; only the extras themselves are
-    collected (never the whole key set) so the deepest-first removal order
-    costs memory proportional to what is actually deleted."""
+    The local-only lane of the merge-join streams straight into
+    ``remove_extras`` (never materialized as a list), which settles the
+    post-order removal itself with an ancestor stack - memory bounded by the
+    depth of directories currently open, not by how many extras exist.
+    ``_collect_extra_aliases`` runs first (its own, separate pass over the
+    same merge-join) so the W-F3 alias set is complete before any candidate
+    is judged."""
     confirmer: DeleteConfirmer | None = None
     if not opts.dryrun:
         mode = resolve_answer_mode(yes=opts.yes)
@@ -1164,20 +1530,22 @@ def _delete_extras(
             return 0, 0  # every answer is no: keep every extra, successfully
         if mode is AnswerMode.ASK:
             confirmer = DeleteConfirmer(mode, entry)
-    extras: list[tuple[str, bool]] = []
-    for _key, m, loc in manifest.merge_join(
-        manifest_keyed(manifest_path, sub), local_keyed(outpath, excludes)
-    ):
-        if m is None and loc is not None:
-            rel, st, _sym = loc
-            if rel != ".":
-                extras.append((os.path.join(outpath, rel), stat_mod.S_ISDIR(st.st_mode)))
-    try:
-        errors, removed = remove_extras(extras, dryrun=opts.dryrun, confirm=confirmer)
-        return (1 if errors else 0), removed
-    finally:
-        if confirmer is not None:
-            confirmer.close()
+
+    aliases = _collect_extra_aliases(manifest_path, outpath, sub, excludes)
+
+    def extras() -> Iterator[tuple[str, str, bool]]:
+        for _key, m, loc in manifest.merge_join(
+            manifest_keyed(manifest_path, sub), local_keyed(outpath, excludes, sub)
+        ):
+            if m is None and loc is not None:
+                rel, st, _sym = loc
+                if rel != ".":
+                    yield rel, os.path.join(outpath, rel), stat_mod.S_ISDIR(st.st_mode)
+
+    errors, removed = remove_extras(
+        extras(), aliases=aliases, dryrun=opts.dryrun, confirm=confirmer
+    )
+    return (1 if errors else 0), removed
 
 
 def _mirror_extras(
@@ -1252,22 +1620,52 @@ def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
         window_ns = cfg.window_ns_for(entry)
 
         if not is_dir:
-            # Single-file entry (or a file/symlink sub): one direct compare.
+            # Single-file entry (or a file/symlink sub): one direct compare. A
+            # leaf sub reached through a local symlinked ancestor is not cleanly
+            # present at its recorded path - a full-entry status, walking
+            # no-follow, would show it D - so report D rather than compare a file
+            # the record does not describe (reached through the symlink).
+            through_symlink = sub is not None and _symlinked_ancestor(base_path, sub)
             for entry_obj in manifest.iter_manifest(manifest_path):
                 res = manifest_target(entry_obj, outpath, is_dir, sub)
                 if res is None:
                     continue
                 target, _rel = res
+                if through_symlink:
+                    write_output(f"D {target}\n")
+                    continue
+                # An inaccessible file (EACCES on an unsearchable parent) is not
+                # missing: compare_to_local turns every OSError into st=None and
+                # would silently report D. Distinguish it and warn instead.
+                try:
+                    os.lstat(target)
+                except FileNotFoundError:
+                    pass  # genuinely absent: check_metadata reports it D
+                except OSError as e:
+                    note_warning(f"warning: cannot access {target}: {e}")
+                    continue
                 block = check_metadata(
                     target,
                     entry_obj,
                     opts.verbose,
                     window_ns,
                     use_color=use_color,
-                    ignore_dir_mtime=True,
                 )
                 if block:
                     write_output(block)
+            return 0
+
+        # A directory sub whose local root sits behind a symlinked ancestor
+        # would make the walk compare an entry-outside tree; report every record
+        # D (not cleanly present at its recorded path) and warn, like the leaf
+        # sub and the full-entry no-follow walk do.
+        if sub is not None and _symlinked_ancestor(base_path, sub):
+            note_warning(
+                f"warning: {entry}/{sub}: reached through a symlinked parent; not compared"
+            )
+            for _key, (rel, _entry_obj) in manifest_keyed(manifest_path, sub):
+                if rel != ".":
+                    write_output(f"D {os.path.join(outpath, rel)}\n")
             return 0
 
         # Directory tree: one streaming merge-join of the manifest against a
@@ -1276,7 +1674,8 @@ def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
         # current pair in memory. The walk's lstat/readlink feed the compare,
         # so no path is stat'd twice.
         for _key, m, loc in manifest.merge_join(
-            manifest_keyed(manifest_path, sub), local_keyed(outpath, excludes)
+            manifest_keyed(manifest_path, sub),
+            local_keyed(outpath, excludes, sub, warn=note_warning),
         ):
             if m is not None:
                 rel, entry_obj = m
@@ -1291,7 +1690,6 @@ def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
                     sym,
                     window_ns=window_ns,
                     use_color=use_color,
-                    ignore_dir_mtime=True,
                 )
                 block = format_diff_block(diff, target, opts.verbose)
                 if block:
@@ -1324,7 +1722,14 @@ def _run_diff(left: str, right: str, label: str, opts: Opts) -> int:
         ]
     )
     echo_command(opts.verbose, cmd)
-    return subprocess.run(cmd).returncode
+    rc = subprocess.run(cmd).returncode
+    # signal.SIGPIPE does not exist on Windows, and this check is evaluated
+    # unconditionally regardless of rc, so guard on platform before touching it.
+    if not IS_WINDOWS and rc == -signal.SIGPIPE:
+        # The reader closed the pipe (e.g. `s3bak diff | head`): let run() map
+        # this to the documented 141 instead of collapsing it to a plain 1.
+        raise BrokenPipeError
+    return rc
 
 
 def _write_leaf_type_diff(label: str, backup: str, local: str) -> None:
@@ -1360,7 +1765,14 @@ def diff_single_file(
         try:
             local_mode = os.lstat(localfile).st_mode
         except FileNotFoundError:
-            return 0 if _run_diff(tmppath, os.devnull, label, opts) == 0 else 1
+            # The local file is missing: always a difference (exit 1), even
+            # against a 0-byte backup - whose content diff vs /dev/null would
+            # show nothing and (before this) exit 0, hiding the missing file.
+            if os.path.getsize(tmppath) == 0:
+                _write_leaf_type_diff(label, "regular file", "missing")
+            else:
+                _run_diff(tmppath, os.devnull, label, opts)
+            return 1
         if not stat_mod.S_ISREG(local_mode):
             # Never let content diff follow a symlink that replaced a recorded
             # regular file: it could disclose an unrelated target's contents.
@@ -1375,6 +1787,50 @@ def diff_single_file(
         os.unlink(tmppath)
 
 
+def _ancestor_block_reason(root: str, rel: str) -> str | None:
+    """Why ``root/rel``'s parent chain (``root`` itself plus every ancestor up to
+    but excluding the final component) cannot be safely read through, or ``None``
+    if it can:
+
+    - ``"structural"`` - a symlink, a Windows directory junction, or another
+      non-directory ancestor would redirect the read to a file the record does
+      not describe (an entry-outside target in the worst case). This is a
+      local type change, not a backup defect.
+    - ``"inaccessible"`` - an ancestor could not be stat'd (EACCES/ELOOP), so
+      reachability is undeterminable and the content simply cannot be read.
+
+    A missing ancestor is not blocking (``None``): the caller reports the leaf as
+    absent, not as unreachable. Read-only lstat probe."""
+    acc = root
+    to_check = [root]
+    for part in rel.split("/")[:-1]:
+        acc = os.path.join(acc, part)
+        to_check.append(acc)
+    for path in to_check:
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return "inaccessible"
+        # A junction lstats as an ordinary directory (Windows does not model
+        # it as a symlink); without this check it would pass the S_ISDIR test
+        # below as if it were a real directory.
+        if not stat_mod.S_ISDIR(st.st_mode) or is_junction(st):
+            return "structural"
+    return None
+
+
+def _symlinked_ancestor(root: str, rel: str) -> bool:
+    """True if ``root/rel``'s parent chain cannot be safely read through - a
+    symlink, a non-directory, or an inaccessible ancestor. Reading local content
+    through such a path - verify --checksum's hash, diff's content compare, a
+    single-file status/diff/verify stat - would touch a file the record does not
+    describe. Callers that must tell an access error apart from a structural
+    change (to warn rather than silently skip) use _ancestor_block_reason."""
+    return _ancestor_block_reason(root, rel) is not None
+
+
 def diff_backup(
     cfg: Config,
     rel_prefix: str,
@@ -1387,122 +1843,179 @@ def diff_backup(
 ) -> int:
     excludes: list[str] = cfg.entries[entry].get("excludes", [])
     tmpdir = tempfile.mkdtemp()
+    obj_path = os.path.join(tmpdir, "object")
     has_diff = 0
 
     try:
         assert cfg.store is not None
-        result = cfg.store.sync_down(rel_prefix, tmpdir, verbose=opts.verbose)
-        if result.returncode != 0:
-            if result.stderr:
-                write_stderr(result.stderr)
-            return result.returncode
 
-        # The manifest, not every object that happens to remain under the S3
-        # prefix, defines the backup. Orphan objects can still exist (e.g. a
-        # --meta-only push after a local delete, or an exclude added later);
-        # diff must ignore them just as pull/status do.
-        backup_files: set[str] = set()
-        backup_symlinks: dict[str, str] = {}
-        backup_special: dict[str, int] = {}
-        for record in manifest.iter_manifest(manifest_path):
-            rel = resolve_manifest_rel(record.path, sub)
-            if rel is None or rel == ".":
-                continue
-            if record.is_file and record.sym_target is None:
-                backup_files.add(rel)
-            elif record.sym_target is not None:
-                backup_symlinks[rel] = record.sym_target
-            elif not record.is_dir:
-                backup_special[rel] = record.mode
-
-        for rel in sorted(backup_files):
-            full = os.path.join(tmpdir, rel)
-            if not os.path.isfile(full):
-                err(f"expected backup object missing: {rel_prefix}/{rel}")
-                has_diff = 1
-                continue
-            local = os.path.join(outpath, rel)
-            try:
-                local_mode = os.lstat(local).st_mode
-            except FileNotFoundError:
-                _run_diff(full, os.devnull, rel, opts)
-                has_diff = 1
-                continue
-            if not stat_mod.S_ISREG(local_mode):
-                _write_leaf_type_diff(
-                    rel,
-                    "regular file",
-                    _local_leaf_description(local, local_mode),
-                )
-                has_diff = 1
-                continue
-            if _run_diff(full, local, rel, opts) != 0:
-                has_diff = 1
-
-        for rel, backup_target in sorted(backup_symlinks.items()):
-            local = os.path.join(outpath, rel)
-            try:
-                local_mode = os.lstat(local).st_mode
-            except FileNotFoundError:
-                local_value = "missing"
-            else:
-                local_value = _local_leaf_description(local, local_mode)
-                if stat_mod.S_ISLNK(local_mode) and os.readlink(local) == backup_target:
+        # One streaming merge-join of the manifest against a fresh local walk -
+        # the same shape cmd_status uses - so memory stays bounded by one
+        # record on each side, not the whole manifest. The manifest, not every
+        # object under the prefix, defines the backup: only its recorded
+        # regular files are ever downloaded, one at a time (see below), so
+        # orphan objects (from --data-only / interrupted pushes) are ignored,
+        # as pull/status do - and, crucially, conflicting orphans (a file and
+        # a directory recorded at one path by out-of-band pushes) that a bulk
+        # prefix sync could not even materialize onto one filesystem never
+        # break the diff.
+        #
+        # warn=note_warning surfaces walk gaps (an unreadable directory hides
+        # its children), so an otherwise-clean diff still warns (exit 2)
+        # rather than hiding a local-only file that may sit unseen behind one.
+        # The isdir/not-islink gate matches the old local-only walk: a
+        # missing, non-directory, or symlinked outpath yields no local items
+        # at all (a symlinked outpath is still caught per-record below, via
+        # _symlinked_ancestor - which checks the root itself too).
+        for _key, m, loc in manifest.merge_join(
+            manifest_keyed(manifest_path, sub),
+            local_keyed(outpath, excludes, sub, warn=note_warning)
+            if os.path.isdir(outpath) and not os.path.islink(outpath)
+            else (),
+        ):
+            if m is not None:
+                rel, record = m
+                if rel == "." or record.is_dir:
                     continue
-            _write_leaf_type_diff(rel, f"symlink -> {backup_target!r}", local_value)
-            has_diff = 1
+                local = os.path.join(outpath, rel)
 
-        for rel, backup_mode in sorted(backup_special.items()):
-            local = os.path.join(outpath, rel)
-            try:
-                local_mode = os.lstat(local).st_mode
-            except FileNotFoundError:
-                local_value = "missing"
-            else:
-                if stat_mod.S_IFMT(local_mode) == stat_mod.S_IFMT(backup_mode):
+                if record.is_file and record.sym_target is None:
+                    if _symlinked_ancestor(outpath, rel):
+                        # Never diff a file reached through a symlinked parent:
+                        # it would disclose an entry-outside target's contents
+                        # (the final-component guard below does the same for a
+                        # leaf symlink).
+                        _write_leaf_type_diff(
+                            rel, "regular file", "unreachable (through a symlinked parent)"
+                        )
+                        has_diff = 1
+                        continue
+                    # A fixed destination name, removed in the finally right
+                    # after this record's compare: at most one backup object
+                    # sits on disk at a time, however many the manifest records.
+                    try:
+                        if not cfg.store.get_object(
+                            f"{rel_prefix}/{rel}",
+                            obj_path,
+                            size=record.size,
+                            verbose=opts.verbose,
+                        ):
+                            err(f"expected backup object missing: {rel_prefix}/{rel}")
+                            has_diff = 1
+                            continue
+                        local_mode: int | None
+                        if loc is not None:
+                            _lrel, st, _sym = loc
+                            local_mode = st.st_mode
+                        else:
+                            # The walk prunes excludes, and cannot pair a
+                            # manifest file record (sort key "x") with a
+                            # same-named local directory (sort key "x/") - a
+                            # type change, not a hidden path, but the same
+                            # unpaired shape. Either way "not walked" may mean
+                            # hidden rather than missing: judge from a direct
+                            # lstat, like apply_manifest's own fallback.
+                            try:
+                                local_mode = os.lstat(local).st_mode
+                            except FileNotFoundError:
+                                local_mode = None
+                        if local_mode is None:
+                            _run_diff(obj_path, os.devnull, rel, opts)
+                            has_diff = 1
+                        elif not stat_mod.S_ISREG(local_mode):
+                            _write_leaf_type_diff(
+                                rel,
+                                "regular file",
+                                _local_leaf_description(local, local_mode),
+                            )
+                            has_diff = 1
+                        elif _run_diff(obj_path, local, rel, opts) != 0:
+                            has_diff = 1
+                    finally:
+                        try:
+                            os.unlink(obj_path)
+                        except FileNotFoundError:
+                            pass
+
+                elif record.sym_target is not None:
+                    if _symlinked_ancestor(outpath, rel):
+                        _write_leaf_type_diff(
+                            rel,
+                            f"symlink -> {record.sym_target!r}",
+                            "unreachable (through a symlinked parent)",
+                        )
+                        has_diff = 1
+                        continue
+                    if loc is not None:
+                        _lrel, st, sym = loc
+                        local_value = _local_leaf_description(local, st.st_mode)
+                        if stat_mod.S_ISLNK(st.st_mode) and sym == record.sym_target:
+                            continue
+                    else:
+                        # The walk prunes excludes, and cannot pair a manifest
+                        # symlink record (sort key "x") with a same-named local
+                        # directory (sort key "x/") - a type change, not a
+                        # hidden path, but the same unpaired shape. Either way
+                        # "not walked" may mean hidden rather than missing:
+                        # judge from a direct lstat, like apply_manifest's own
+                        # fallback.
+                        try:
+                            local_mode = os.lstat(local).st_mode
+                        except FileNotFoundError:
+                            local_value = "missing"
+                        else:
+                            local_value = _local_leaf_description(local, local_mode)
+                            if (
+                                stat_mod.S_ISLNK(local_mode)
+                                and os.readlink(local) == record.sym_target
+                            ):
+                                continue
+                    _write_leaf_type_diff(rel, f"symlink -> {record.sym_target!r}", local_value)
+                    has_diff = 1
+
+                else:  # special file (neither directory, regular file, nor symlink)
+                    if _symlinked_ancestor(outpath, rel):
+                        _write_leaf_type_diff(
+                            rel, "special file", "unreachable (through a symlinked parent)"
+                        )
+                        has_diff = 1
+                        continue
+                    if loc is not None:
+                        _lrel, st, _sym = loc
+                        if stat_mod.S_IFMT(st.st_mode) == stat_mod.S_IFMT(record.mode):
+                            continue
+                        local_value = _local_leaf_description(local, st.st_mode)
+                    else:
+                        # The walk prunes excludes, and cannot pair a manifest
+                        # special-file record (sort key "x") with a same-named
+                        # local directory (sort key "x/") - a type change, not
+                        # a hidden path, but the same unpaired shape. Either
+                        # way "not walked" may mean hidden rather than
+                        # missing: judge from a direct lstat, like
+                        # apply_manifest's own fallback.
+                        try:
+                            local_mode = os.lstat(local).st_mode
+                        except FileNotFoundError:
+                            local_value = "missing"
+                        else:
+                            if stat_mod.S_IFMT(local_mode) == stat_mod.S_IFMT(record.mode):
+                                continue
+                            local_value = _local_leaf_description(local, local_mode)
+                    _write_leaf_type_diff(rel, "special file", local_value)
+                    has_diff = 1
+
+            elif loc is not None:
+                rel, st, _sym = loc
+                if rel == "." or stat_mod.S_ISDIR(st.st_mode):
                     continue
-                local_value = _local_leaf_description(local, local_mode)
-            _write_leaf_type_diff(rel, "special file", local_value)
-            has_diff = 1
-
-        if sub is None:
-            local_items = (
-                localwalk.walk_tree(outpath, excludes)
-                if os.path.isdir(outpath) and not os.path.islink(outpath)
-                else ()
-            )
-            root_rel = "."
-            rel_prefix_local = "./"
-        else:
-            root_rel = f"./{sub}"
-            rel_prefix_local = f"./{sub}/"
-            local_items = (
-                localwalk.walk_tree(
-                    outpath,
-                    excludes,
-                    root_rel=root_rel,
-                    rel_prefix=rel_prefix_local,
-                )
-                if os.path.isdir(outpath) and not os.path.islink(outpath)
-                else ()
-            )
-
-        for walk_rel, walk_st, _sym in local_items:
-            if walk_rel == root_rel or stat_mod.S_ISDIR(walk_st.st_mode):
-                continue
-            rel = walk_rel.removeprefix(rel_prefix_local)
-            local = os.path.join(outpath, rel)
-            if rel in backup_files or rel in backup_symlinks or rel in backup_special:
-                continue
-            if stat_mod.S_ISREG(walk_st.st_mode):
-                _run_diff(os.devnull, local, rel, opts)
-            else:
-                _write_leaf_type_diff(
-                    rel,
-                    "missing",
-                    _local_leaf_description(local, walk_st.st_mode),
-                )
-            has_diff = 1
+                local = os.path.join(outpath, rel)
+                if stat_mod.S_ISREG(st.st_mode):
+                    _run_diff(os.devnull, local, rel, opts)
+                else:
+                    _write_leaf_type_diff(
+                        rel, "missing", _local_leaf_description(local, st.st_mode)
+                    )
+                has_diff = 1
 
         return has_diff
     finally:
@@ -1534,6 +2047,19 @@ def cmd_diff(cfg: Config, entry: str, opts: Opts, file: str | None = None) -> in
                 err(f"not found on S3: {entry}/{file}")
                 return 1
             local = os.path.join(outpath, *file.split("/"))
+            if _symlinked_ancestor(outpath, file):
+                # A sub reached through a local symlinked ancestor - including one
+                # ABOVE a directory sub's own root - must never read/compare the
+                # entry-outside target (content, link, or type), whatever the
+                # recorded kind. Report it unreachable. (diff_backup's own guards
+                # only cover ancestors at/under the sub root, not above it.)
+                backup_desc = {"dir": "directory", "symlink": "symlink", "special": "special file"}
+                _write_leaf_type_diff(
+                    f"{entry}/{file}",
+                    backup_desc.get(kind, "regular file"),
+                    "unreachable (through a symlinked parent)",
+                )
+                return 1
             if kind == "dir":
                 return diff_backup(
                     cfg,
@@ -1666,8 +2192,9 @@ class _ContentChecker:
     """The verify ``--checksum`` lane: compare local file content against the
     S3 ETag the listing (or head) already delivered - zero extra S3 calls.
 
-    Hashing runs on a pool sized by the same ``compare_workers`` knob as the
-    push --checksum comparison, with at most two hashes per worker in flight,
+    Hashing runs on a pool sized by ``max_concurrency`` (the sync compare
+    itself is serial, but verify has no ordering constraint), with at most
+    two hashes per worker in flight,
     and findings emitted in submission (key) order. A mismatch splits on the
     manifest stat: size+mtime still matching means the default push will never
     upload the edit (the size+mtime blind spot - an error), a drifted stat is
@@ -1675,7 +2202,15 @@ class _ContentChecker:
 
     def __init__(self, cfg: Config, entry: str, report: _VerifyReport):
         assert cfg.store is not None
+        from boto3_s3 import Boto3S3Error
+
         self._differs = cfg.store.etag_checker()
+        # Hashing the local file reads it: a vanished file raises OSError, an
+        # unreadable one AccessDeniedError (a Boto3S3Error) from the reconstruct
+        # open. Both mean "could not check", not "matches" - and must not crash
+        # the whole verify. (The comparison is UPLOAD-shaped and reads only the
+        # local side, so a Boto3S3Error here is always a local-read failure.)
+        self._read_errors: tuple[type[BaseException], ...] = (OSError, Boto3S3Error)
         self._window_ns = cfg.window_ns_for(entry)
         self._report = report
         self._size = cfg.store.compare_pool_size()
@@ -1685,16 +2220,21 @@ class _ContentChecker:
     def check(self, rel_key: str, local_path: str, record: ManifestEntry, obj: ObjectMeta) -> None:
         try:
             st = os.lstat(local_path)
-        except OSError:
+        except FileNotFoundError:
             return  # a kept deletion has no local counterpart: nothing to compare
+        except OSError as e:
+            # An unsearchable parent etc. is not "nothing to compare": a
+            # verification tool must say it could not check, not report OK.
+            self._report.warn(f"cannot read local file for --checksum: {local_path} ({e})")
+            return
         if not stat_mod.S_ISREG(st.st_mode):
             return  # a local type change is a status finding, not a backup defect
 
         def hash_one() -> bool | None:
             try:
                 return self._differs(rel_key, local_path, obj.size, obj.etag)
-            except OSError:
-                return None  # vanished or unreadable mid-check: skip, not crash
+            except self._read_errors:
+                return None  # unreadable/vanished mid-check: reported as a warning below
 
         if self._pool is None:
             self._pool = ThreadPoolExecutor(
@@ -1706,8 +2246,14 @@ class _ContentChecker:
     def _drain(self, limit: int) -> None:
         while len(self._queue) > limit:
             future, record, st, local_path = self._queue.popleft()
-            if not future.result():
+            differs = future.result()
+            if differs is None:
+                # Could not read the file to hash it: warn rather than let a
+                # silently-skipped file read as a passing content check.
+                self._report.warn(f"cannot read local file for --checksum: {local_path}")
                 continue
+            if not differs:
+                continue  # content matches the stored object
             if record.matches_stat(st, self._window_ns):
                 self._report.error(
                     f"content differs but size+mtime match: {local_path}"
@@ -1735,16 +2281,28 @@ def _report_folder_object(report: _VerifyReport, url: str, obj: ObjectMeta) -> N
         )
 
 
-def _check_archived(report: _VerifyReport, url: str, obj: ObjectMeta) -> bool:
-    """Flag an object pull cannot download. Applies to every listed object -
-    pull's listing-driven sync fetches unrecorded objects too."""
+def _check_archived(report: _VerifyReport, url: str, obj: ObjectMeta) -> None:
+    """Advise that an object sits in an archive storage tier - not a defect in
+    the backup, just a fact about where it currently lives. Applies to every
+    listed object - pull's listing-driven sync fetches unrecorded objects
+    too."""
     if obj.storage_class in _ARCHIVED_CLASSES:
-        report.error(
-            f"storage class {obj.storage_class} blocks restore: {url}"
-            f" (get_object fails until the object is restored from the archive)"
+        report.warn(
+            f"archived storage class {obj.storage_class}: {url}"
+            f" (a pull cannot fetch it until RestoreObject completes)"
         )
-        return True
-    return False
+
+
+def _report_restore_conflict(report: _VerifyReport, manifest_path: str, sub: str | None) -> None:
+    """Flag a manifest that records a non-directory and a directory/descendants
+    at one logical path - unrestorable (pull fails closed on it, see
+    _manifest_restore_conflict)."""
+    conflict = _manifest_restore_conflict(manifest_path, sub)
+    if conflict is not None:
+        report.error(
+            f"unrestorable: a non-directory and a directory (or files under it) are both"
+            f" recorded at ./{conflict} (pull cannot restore it; push --delete prunes it)"
+        )
 
 
 def _verify_dir(
@@ -1755,11 +2313,17 @@ def _verify_dir(
     sub: str | None,
     opts: Opts,
     local_base: str,
+    content_reachable: bool = True,
 ) -> None:
     """Merge-join the manifest records against the S3 listing - both ascend in
     key byte order, so one streaming pass checks the whole correspondence:
     every file record has its object (size intact, class restorable), every
-    non-file record has none, and every object is accounted for."""
+    non-file record has none, and every object is accounted for.
+
+    ``content_reachable`` False (a directory sub whose local root sits behind a
+    symlinked ancestor) skips the --checksum content hash, which would otherwise
+    read entry-outside files. The S3<->manifest checks still run (no local
+    access needed)."""
     assert cfg.store is not None
     rel_base = f"{entry}/{sub}" if sub else entry
 
@@ -1774,7 +2338,7 @@ def _verify_dir(
             f" (manifest records a directory, but a data object exists at its key)"
         )
 
-    checker = _ContentChecker(cfg, entry, report) if opts.checksum else None
+    checker = _ContentChecker(cfg, entry, report) if opts.checksum and content_reachable else None
     # An unmatched object waits here while a directory record at key + "/"
     # can still arrive (siblings such as "key.txt" sort between the two, since
     # "." < "/"); once the join passes that key it settles as unrecorded.
@@ -1805,10 +2369,9 @@ def _verify_dir(
                     else:
                         settle(w, conflict=key == w.key + "/" and record is not None)
                 waiting = still
-            archived = False
             if obj is not None:
                 report.objects += 1
-                archived = _check_archived(report, f"{cfg.prefix}/{rel_base}/{obj.key}", obj)
+                _check_archived(report, f"{cfg.prefix}/{rel_base}/{obj.key}", obj)
             if record is not None and obj is not None:
                 if key.endswith("/"):
                     # Only a directory record carries the trailing slash, and
@@ -1821,9 +2384,21 @@ def _verify_dir(
                             f"size mismatch: {cfg.prefix}/{rel_base}/{obj.key}"
                             f" (manifest {record.size}, S3 {obj.size})"
                         )
-                    elif checker is not None and not archived:
-                        local_path = os.path.join(local_base, *key.split("/"))
-                        checker.check(f"{rel_base}/{key}", local_path, record, obj)
+                    elif checker is not None:
+                        reason = _ancestor_block_reason(local_base, key)
+                        if reason == "inaccessible":
+                            # An unreadable ancestor: the content cannot be hashed,
+                            # so warn (rc 2) rather than silently pass as OK.
+                            report.warn(
+                                "cannot read local file for --checksum: "
+                                f"{os.path.join(local_base, *key.split('/'))}"
+                            )
+                        elif reason is None:
+                            local_path = os.path.join(local_base, *key.split("/"))
+                            checker.check(f"{rel_base}/{key}", local_path, record, obj)
+                        # reason == "structural": a symlinked/non-directory ancestor
+                        # redirects to a file the record does not describe (a local
+                        # type change, not a backup defect): skip, like a type change.
                 else:
                     kind = "symlink" if record.sym_target is not None else "special file"
                     report.error(
@@ -1862,10 +2437,13 @@ def _verify_file_record(
     rel_key: str,
     local_path: str,
     opts: Opts,
+    content_reachable: bool = True,
 ) -> None:
     """Verify one recorded regular file (a single-file entry, or a file
     sub-path) against its exact object - a head probe, since a lone file has
-    no listing to stream."""
+    no listing to stream. ``content_reachable`` False (a file sub-path reached
+    through a local symlinked ancestor) skips the --checksum content hash, which
+    would otherwise read a file the record does not describe."""
     assert cfg.store is not None
     report.file_records += 1
     head = cfg.store.head_object(rel_key, verbose=opts.verbose)
@@ -1873,14 +2451,13 @@ def _verify_file_record(
         report.error(f"missing data object: {cfg.prefix}/{rel_key} (pull cannot restore it)")
         return
     report.objects += 1
-    if _check_archived(report, f"{cfg.prefix}/{rel_key}", head):
-        return
+    _check_archived(report, f"{cfg.prefix}/{rel_key}", head)
     if record.size != head.size:
         report.error(
             f"size mismatch: {cfg.prefix}/{rel_key} (manifest {record.size}, S3 {head.size})"
         )
         return
-    if opts.checksum:
+    if opts.checksum and content_reachable:
         checker = _ContentChecker(cfg, entry, report)
         try:
             checker.check(rel_key, local_path, record, head)
@@ -1917,10 +2494,11 @@ def cmd_verify(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
         if not download_manifest(cfg, entry, manifest_path, opts.verbose):
             # No manifest: an unrecorded backup (interrupted push, --data-only)
             # and no backup at all are different emergencies - tell them apart.
-            has_data = cfg.store.head_object(entry, verbose=opts.verbose) is not None or (
-                next(iter(cfg.store.iter_objects(entry, verbose=opts.verbose)), None) is not None
-            )
-            if has_data:
+            # Count the stray objects (streaming) so the summary's object tally
+            # reflects what was actually found instead of a misleading 0.
+            report.objects = 1 if cfg.store.head_object(entry, verbose=opts.verbose) else 0
+            report.objects += sum(1 for _ in cfg.store.iter_objects(entry, verbose=opts.verbose))
+            if report.objects:
                 report.error(
                     "data objects exist but no manifest records them"
                     " (interrupted push? a push records them)"
@@ -1940,19 +2518,47 @@ def cmd_verify(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
                 return 1
             rel_key = f"{entry}/{sub}"
             local_path = os.path.join(base_path, *sub.split("/"))
+            # An unreadable ancestor of the sub root means --checksum cannot read
+            # any local content: warn (rc 2) rather than silently report OK. A
+            # structural (symlinked/non-dir) ancestor is a local type change and
+            # is skipped silently. Either way the content compare is off.
+            sub_reason = _ancestor_block_reason(base_path, sub)
+            if opts.checksum and sub_reason == "inaccessible":
+                report.warn(f"cannot read local files for --checksum through: {local_path}")
+            content_reachable = sub_reason is None
             if kind == "dir":
-                _verify_dir(cfg, entry, report, manifest_path, sub, opts, local_path)
+                _report_restore_conflict(report, manifest_path, sub)
+                _verify_dir(
+                    cfg,
+                    entry,
+                    report,
+                    manifest_path,
+                    sub,
+                    opts,
+                    local_path,
+                    content_reachable=content_reachable,
+                )
             elif kind == "file":
                 record = next(
                     r
                     for r in manifest.iter_manifest(manifest_path)
                     if r.path.removeprefix("./") == sub
                 )
-                _verify_file_record(cfg, entry, report, record, rel_key, local_path, opts)
+                _verify_file_record(
+                    cfg,
+                    entry,
+                    report,
+                    record,
+                    rel_key,
+                    local_path,
+                    opts,
+                    content_reachable=content_reachable,
+                )
             else:
                 kind_name = "symlink" if kind == "symlink" else "special file"
                 _verify_objectless_record(cfg, report, rel_key, kind_name, opts)
         elif entry_is_dir:
+            _report_restore_conflict(report, manifest_path, None)
             _verify_dir(cfg, entry, report, manifest_path, None, opts, base_path)
         else:
             # A validated file-shaped manifest holds exactly one regular-file

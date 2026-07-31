@@ -14,19 +14,15 @@ d = keep this and everything after, q = abort the whole command. Full words
 (yes/no/all/quit) are accepted; "delete" deliberately is not, because d means
 keep. ``?`` - or any answer not understood, a bare Enter included - prints the
 legend and re-asks, and a one-line summary of the answers precedes the first
-question of a run. Kept keys are appended (in arrival order, which the sync
-guarantees is ascending key order) to a temp file the manifest merge later
-streams (manifest.KeptKeys).
+question of a run. What each answer means for the manifest is the journal
+emitter's business (a confirmed deletion journals its record's drop at the
+decision point - see syncops.PushJournal); the confirmer only answers.
 """
 
 from __future__ import annotations
 
-import json
-import os
-import tempfile
 import threading
 from enum import Enum, auto
-from typing import IO
 
 from s3bak.console import prompt_is_interactive, read_prompt_answer, write_stderr
 
@@ -84,36 +80,30 @@ def reset_confirmations() -> None:
     _summary_shown = False
 
 
+def is_aborted() -> bool:
+    """Whether a q answer has aborted the whole command. The serial interactive
+    runner checks this between entries so a q stops the entries that have not run
+    yet, not only the ones that reach a further confirmation."""
+    return _abort.is_set()
+
+
 class DeleteConfirmer:
     """Per-entry y/n/a/d/q decider carrying the a/d sticky state.
 
-    ``confirm`` returns True to delete. Every kept item's ``kept_key`` (when
-    given) is appended to a lazily-created temp file, one ``json.dumps(rel)``
-    per line - JSON because filenames may contain newlines. EOF on stdin is
-    treated as q: a deletion flow that lost its answer channel must stop, not
-    guess."""
+    ``confirm`` returns True to delete. EOF on stdin is treated as q: a
+    deletion flow that lost its answer channel must stop, not guess."""
 
     def __init__(self, mode: AnswerMode, entry: str) -> None:
         self._mode = mode
         self._entry = entry
-        self._kept_path: str | None = None
-        self._kept_file: IO[str] | None = None
 
-    def _note_kept(self, kept_key: str | None) -> bool:
-        if kept_key is not None:
-            if self._kept_file is None:
-                fd, self._kept_path = tempfile.mkstemp(suffix=".kept")
-                self._kept_file = os.fdopen(fd, "w", encoding="utf-8")
-            self._kept_file.write(json.dumps(kept_key, ensure_ascii=True) + "\n")
-        return False
-
-    def confirm(self, display: str, kept_key: str | None = None) -> bool:
+    def confirm(self, display: str) -> bool:
         if _abort.is_set():
             raise DeletionAbortedError()
         if self._mode is AnswerMode.ALL_YES:
             return True
         if self._mode is AnswerMode.ALL_NO:
-            return self._note_kept(kept_key)
+            return False
         with _prompt_lock:
             if _abort.is_set():  # another entry aborted while we waited
                 raise DeletionAbortedError()
@@ -131,34 +121,19 @@ class DeleteConfirmer:
                 if answer in ("y", "yes"):
                     return True
                 if answer in ("n", "no"):
-                    return self._note_kept(kept_key)
+                    return False
                 if answer in ("a", "all"):
                     self._mode = AnswerMode.ALL_YES
                     return True
                 if answer == "d":
                     self._mode = AnswerMode.ALL_NO
-                    return self._note_kept(kept_key)
+                    return False
                 if answer in ("q", "quit"):
                     _abort.set()
                     raise DeletionAbortedError()
                 # ? or anything unrecognized - "delete" (which d does NOT
                 # mean) and a bare Enter included - explains and re-asks.
                 write_stderr(_ANSWER_LEGEND)
-
-    def kept_keys_path(self) -> str | None:
-        """Path of the kept-keys file, flushed for reading; None if every
-        answer was a deletion."""
-        if self._kept_file is not None:
-            self._kept_file.flush()
-        return self._kept_path
-
-    def close(self) -> None:
-        if self._kept_file is not None:
-            self._kept_file.close()
-            self._kept_file = None
-        if self._kept_path is not None:
-            os.unlink(self._kept_path)
-            self._kept_path = None
 
 
 def confirm_subtree_delete(mode: AnswerMode, entry: str, display: str) -> bool:
@@ -172,6 +147,8 @@ def confirm_subtree_delete(mode: AnswerMode, entry: str, display: str) -> bool:
     if mode is AnswerMode.ALL_NO:
         return False
     with _prompt_lock:
+        if _abort.is_set():  # another entry answered q while we waited for the lock
+            raise DeletionAbortedError()
         while True:
             answer = read_prompt_answer(
                 f"s3bak: {entry}: delete the backup subtree {display}? [y/n] "

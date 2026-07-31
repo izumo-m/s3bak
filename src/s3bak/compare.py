@@ -24,6 +24,14 @@ from s3bak.manifest import ManifestEntry
 _ANSI_GREEN = "\033[1;32m"
 _ANSI_RESET = "\033[0m"
 
+# Whether the platform's os.utime can set a symlink's own mtime without
+# following it (POSIX; not Windows). Gates every place a symlink's mtime is
+# compared or restored - compare_to_stat's symlink branch, PushJournal's
+# symlink journaling, and restore's _place_symlink - so an unsupported
+# platform degrades all three to target-only handling instead of churning the
+# manifest with a creation-time mtime on every pull-then-push cycle.
+SYMLINK_MTIME_SUPPORTED = os.utime in os.supports_follow_symlinks
+
 
 def _resolve_use_color(mode: str) -> bool:
     if mode == "always":
@@ -111,6 +119,36 @@ def _fmt_mtime(mtime_ns: int, *, subsecond: bool = False) -> str:
     return text
 
 
+def _mtime_mismatch(entry_mtime_ns: int, loc_mtime_ns: int, use_color: bool) -> tuple[str, str]:
+    """Build the ("mtime", detail-line) pair for a manifest/local mtime
+    mismatch, shared by the regular-file and symlink mtime checks so both
+    render identically."""
+    diff_ns = loc_mtime_ns - entry_mtime_ns
+    # A sub-second drift (e.g. WSL2 drvfs truncates a restored mtime to whole
+    # seconds) renders as two identical second-precision timestamps, so show
+    # the fractional digits that actually differ.
+    subsecond = abs(diff_ns) < 1_000_000_000
+    fmt_local = _fmt_mtime(loc_mtime_ns, subsecond=subsecond)
+    fmt_remote = _fmt_mtime(entry_mtime_ns, subsecond=subsecond)
+    if entry_mtime_ns < loc_mtime_ns:
+        cmp = "<"
+        remote_disp = fmt_remote
+        local_disp = _color_wrap(fmt_local, use_color)
+    else:
+        cmp = ">"
+        remote_disp = _color_wrap(fmt_remote, use_color)
+        local_disp = fmt_local
+    if subsecond:
+        diff_str = f"{diff_ns / 1_000_000_000:+.9f}".rstrip("0") + "s"
+    else:
+        # Difference of the displayed whole seconds, so the number always
+        # agrees with the two rendered timestamps.
+        diff_str = _humanize_duration(
+            loc_mtime_ns // 1_000_000_000 - entry_mtime_ns // 1_000_000_000
+        )
+    return "mtime", f"mtime: remote={remote_disp} {cmp} local={local_disp} ({diff_str})"
+
+
 def mode_differs(entry: ManifestEntry, st: os.stat_result) -> bool:
     """Whether the record's permission bits differ from the local stat's.
 
@@ -145,7 +183,6 @@ def compare_to_local(
     *,
     window_ns: int,
     use_color: bool = False,
-    ignore_dir_mtime: bool = False,
 ) -> EntryDiff:
     """Manifest record vs local filesystem state, stat'd here.
 
@@ -170,7 +207,6 @@ def compare_to_local(
         local_sym,
         window_ns=window_ns,
         use_color=use_color,
-        ignore_dir_mtime=ignore_dir_mtime,
     )
 
 
@@ -181,7 +217,6 @@ def compare_to_stat(
     *,
     window_ns: int,
     use_color: bool = False,
-    ignore_dir_mtime: bool = False,
 ) -> EntryDiff:
     """Manifest record vs the local side's already-taken ``lstat``.
 
@@ -192,7 +227,10 @@ def compare_to_stat(
     applies (mtime within ``window_ns``), so `status` and push/pull agree on
     what counts as changed; mode is additionally compared here for the
     metadata report (a mode change never re-transfers data - push refreshes
-    the manifest instead, through the same ``mode_differs`` predicate).
+    the manifest instead, through the same ``mode_differs`` predicate). A
+    directory's own mtime is compared the same as any other record's: push
+    tracks its drift and refreshes the record, so status reports it and pull
+    restores it, the same as any other tracked mtime.
     """
     diff = EntryDiff(status=None, tags=[], details=[])
 
@@ -205,6 +243,15 @@ def compare_to_stat(
             diff.status = "M"
             diff.tags.append("link")
             diff.details.append(f"link: remote={entry.sym_target} local={loc_link}")
+        if (
+            SYMLINK_MTIME_SUPPORTED
+            and entry.mtime_ns is not None
+            and abs(st.st_mtime_ns - entry.mtime_ns) > window_ns
+        ):
+            diff.status = "M"
+            tag, detail = _mtime_mismatch(entry.mtime_ns, st.st_mtime_ns, use_color)
+            diff.tags.append(tag)
+            diff.details.append(detail)
         return diff
 
     if st is None:
@@ -241,42 +288,11 @@ def compare_to_stat(
         diff.tags.append("mode")
         diff.details.append(f"mode: remote={entry.perm_str} local={loc_mode}")
 
-    # A directory's mtime changes whenever its children are added/removed, so
-    # it is noise in `status` and is suppressed there (ignore_dir_mtime=True).
-    # The restore paths (_manifest_matches_local and apply_manifest's gate)
-    # keep the default and still detect dir mtime drift so the apply can
-    # restore it.
-    if ignore_dir_mtime and is_dir_local:
-        return diff
-
     if entry.mtime_ns is not None and abs(st.st_mtime_ns - entry.mtime_ns) > window_ns:
-        loc_mtime_ns = st.st_mtime_ns
-        diff_ns = loc_mtime_ns - entry.mtime_ns
-        # A sub-second drift (e.g. WSL2 drvfs truncates a restored mtime to
-        # whole seconds) renders as two identical second-precision timestamps,
-        # so show the fractional digits that actually differ.
-        subsecond = abs(diff_ns) < 1_000_000_000
-        fmt_local = _fmt_mtime(loc_mtime_ns, subsecond=subsecond)
-        fmt_remote = _fmt_mtime(entry.mtime_ns, subsecond=subsecond)
         diff.status = "M"
-        diff.tags.append("mtime")
-        if entry.mtime_ns < loc_mtime_ns:
-            cmp = "<"
-            remote_disp = fmt_remote
-            local_disp = _color_wrap(fmt_local, use_color)
-        else:
-            cmp = ">"
-            remote_disp = _color_wrap(fmt_remote, use_color)
-            local_disp = fmt_local
-        if subsecond:
-            diff_str = f"{diff_ns / 1_000_000_000:+.9f}".rstrip("0") + "s"
-        else:
-            # Difference of the displayed whole seconds, so the number always
-            # agrees with the two rendered timestamps.
-            diff_str = _humanize_duration(
-                loc_mtime_ns // 1_000_000_000 - entry.mtime_ns // 1_000_000_000
-            )
-        diff.details.append(f"mtime: remote={remote_disp} {cmp} local={local_disp} ({diff_str})")
+        tag, detail = _mtime_mismatch(entry.mtime_ns, st.st_mtime_ns, use_color)
+        diff.tags.append(tag)
+        diff.details.append(detail)
 
     return diff
 
@@ -300,9 +316,6 @@ def check_metadata(
     verbose: bool,
     window_ns: int,
     use_color: bool = False,
-    ignore_dir_mtime: bool = False,
 ) -> str | None:
-    diff = compare_to_local(
-        entry, target, window_ns=window_ns, use_color=use_color, ignore_dir_mtime=ignore_dir_mtime
-    )
+    diff = compare_to_local(entry, target, window_ns=window_ns, use_color=use_color)
     return format_diff_block(diff, target, verbose)

@@ -34,8 +34,24 @@ evaluated separately.
 
 ### Performance and scalability
 
-I/O, memory use, S3 access, and concurrency should continue to improve so
-s3bak remains practical as backup sets grow, without compromising correctness.
+Everything that processes a tree streams. The manifest, the local walk, and
+the S3 listing all ascend in S3 key byte order, so every multi-record
+operation is a merge-join with a bounded lookahead — memory stays independent
+of file count. The invariant is precise about its allowances:
+
+- an **ancestor stack** bounded by directory depth, for the operations that
+  are inherently post-order (settling a directory's metadata after its
+  children; removing children before their directory);
+- a **per-directory sort** bounded by one directory's direct entries (key
+  order has to be produced from an unsorted readdir);
+- **deferred work** bounded by the number of actual type conflicts, never by
+  tree size.
+
+Disk use follows the same rule: content is staged at most one object at a
+time, and intermediate state that could grow with the tree spools to
+temporary files. I/O, S3 access, and concurrency should continue to improve
+within this invariant, without compromising correctness. See
+[manifest.md](manifest.md) for the ordering contract the merge-joins rely on.
 
 ### Maintainable evolution
 
@@ -43,6 +59,45 @@ Responsibilities and dependency directions should remain explicit, and
 behaviour should be verified with automated tests. Superseded implementations
 are removed, and a clear current design is preferred over backward-
 compatibility layers.
+
+## Scope
+
+s3bak is designed for personal use by a single, attentive operator. Problems
+that the operator can avoid simply by taking care are out of scope for the
+tool itself, for example:
+
+- Running multiple s3bak invocations against the same configuration at the
+  same time.
+- Backing up a directory while it is being modified.
+
+s3bak does not detect or guard against these conditions; avoiding them is
+the operator's responsibility.
+
+### Trust boundary
+
+s3bak trusts its own bucket and its own local filesystem. Neither is treated
+as attacker-controlled input, and s3bak does not try to defend against one
+that is — because at that point there is nothing left to defend:
+
+- **An attacker who can write the bucket already owns the backup.** They can
+  rewrite any recorded object and the manifest itself, and a pull faithfully
+  restores what the backup says. Elaborate paths such as escaping the restore
+  root through a symlink gain them nothing they could not get by editing the
+  target file's own object. This is solved one layer down, with AWS-side
+  access control — a bucket policy, source-IP restriction, SSO-issued
+  short-lived credentials — not inside s3bak.
+- **An attacker who can write the local tree does not need s3bak at all.**
+  Racing a check against its use, to make s3bak write a file on their behalf,
+  is a detour around simply writing that file.
+
+So a guard is only worth having here when it holds with **no attacker at
+all**. Confinement to the restore destination is one of those: a pull that
+writes outside the tree the operator named is a blast-radius bug in ordinary
+single-operator use, reachable through nothing more hostile than a symlink,
+an interrupted push's unrecorded object, or a filesystem that spells a name
+differently than the manifest does. Those are treated as correctness bugs,
+on the same footing as any other, and cross-platform restore fidelity is
+their most common source (see [storage.md](storage.md)).
 
 ## Design documents
 
@@ -52,8 +107,14 @@ compatibility layers.
   ordering, and streaming invariants.
 - **[Sync model](sync.md)** — comparison and transfer strategies, concurrency,
   and the push and pull pipelines.
+- **[Push journal](journal.md)** — the single-scan push: the journal of
+  manifest changes the compare emits, its format, and the streaming manifest
+  rewrite it drives.
 - **[Verification model](verify.md)** — the read-only manifest ↔ S3 integrity
   check, its finding severities, and the suggested verification routine.
+- **[Interruption and recovery](recovery.md)** — what an unfinished command
+  leaves behind, which run converges it, and the residues a hard kill needs
+  resolved by hand.
 - **[CLI contract](cli.md)** — argument resolution, explicit option handling,
   concurrent result aggregation, and exit codes.
 - **[Internal architecture](architecture.md)** — module responsibilities,

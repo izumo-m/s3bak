@@ -229,6 +229,28 @@ def test_pull_rejects_destinations_that_differ_only_by_case(ws):
     assert "inner" in res.err
 
 
+def test_pull_rejects_destinations_differing_only_by_trailing_dot(ws):
+    # Win32 drops a trailing dot (or space) from a path's final component, so
+    # ".../data" and ".../data." can land on the SAME directory there even
+    # though they are two different paths on POSIX (W-F4). The
+    # destination-overlap check folds it out on every platform (see
+    # restore.fs_alias_key), so this is caught here - not discovered as a
+    # live overlap the first time both entries run --delete.
+    ws.config(
+        {
+            "outer": {"path": str(ws.root / "data")},
+            "inner": {"path": str(ws.root / "data." / "sub")},
+        }
+    )
+
+    res = ws.run("pull", "outer", "inner")
+
+    assert res.rc == 1
+    assert "restore destinations overlap" in res.err.lower()
+    assert "outer" in res.err
+    assert "inner" in res.err
+
+
 def test_ls_remote_rejects_data_only(cfg_ws):
     res = cfg_ws.run("ls-remote", "--data-only")
     assert res.rc == 1
@@ -278,6 +300,62 @@ def test_mtime_window_flag_rejects_non_finite_values(cfg_ws, value):
     res = cfg_ws.run("push", "--mtime-window", value, "data")
     assert res.rc == 1
     assert "mtime-window" in res.err.lower()
+
+
+def test_mtime_window_flag_rejects_huge_finite_value(cfg_ws):
+    # Finite but so large that seconds * 1e9 overflows to inf; window_ns_for's
+    # round() would raise an uncaught OverflowError. Reject cleanly instead.
+    res = cfg_ws.run("push", "--mtime-window", "1e308", "data")
+    assert res.rc == 1
+    assert "mtime-window" in res.err.lower()
+
+
+def test_config_mtime_window_rejects_huge_finite_value(ws):
+    ws.write("data/a.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}}, mtime_window=1e308)
+    res = ws.run("list")
+    assert res.rc == 1
+    assert "mtime_window" in res.err
+
+
+def test_config_mtime_window_rejects_huge_integer(ws):
+    # A huge Python int overflows the int->float conversion math.isfinite does;
+    # it must die with a message, not an uncaught OverflowError traceback.
+    ws.write("data/a.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}}, mtime_window=10**1000)
+    res = ws.run("list")
+    assert res.rc == 1
+    assert "mtime_window" in res.err
+
+
+@pytest.mark.parametrize("field", ["path", "pre_hook"])
+def test_config_rejects_nul_byte(ws, field):
+    # A NUL survives every isinstance/normpath check but raises ValueError deep
+    # in the first filesystem/subprocess call, which run() does not catch. It
+    # must die at config load with a message, not a traceback.
+    entry = {"path": str(ws.root / "data")}
+    if field == "path":
+        entry["path"] = str(ws.root / "data") + "\x00bad"
+    else:
+        entry["pre_hook"] = ["echo", "\x00"]
+    ws.write("data/a.txt", "x")
+    ws.config({"data": entry})
+    res = ws.run("list")
+    assert res.rc == 1
+    assert field.split("_")[0] in res.err.lower() or "nul" in res.err.lower()
+
+
+def test_push_subpath_allows_colon_in_posix_filename(cfg_ws):
+    # The Windows drive-letter guard (os.path.splitdrive) must be a no-op on
+    # POSIX: a filename containing ':' is legal there and must still push.
+    if os.name == "nt":
+        import pytest as _pytest
+
+        _pytest.skip("':' is not a legal filename component on Windows")
+    cfg_ws.write("data/a:b.txt", "colon")
+    res = cfg_ws.run("push", "data/a:b.txt")
+    assert res.rc == 0
+    assert any(k.endswith("a:b.txt") and not k.endswith("manifest.jsonl") for k in cfg_ws.keys())
 
 
 def test_unknown_command_is_reported_before_loading_config(monkeypatch, capfd):
