@@ -24,10 +24,14 @@ That shapes what converges an interrupted run:
 
 - **additions and updates** converge with a plain `push` — the next scan sees
   the local files whose objects or records are missing and redoes them;
-- **anything that requires dropping a record** — a deletion that completed on
-  S3, a record whose object is already gone — needs the same `push --delete`
-  that was interrupted. A plain push keeps records by default, so it cannot
-  finish the job on its own.
+- **records whose object already went** — a deletion that completed on S3
+  before the interruption — converge with a plain `push` as well: the record
+  describes a backup that no longer exists, so any push retires it
+  ([sync.md](sync.md#deleting-backups---delete---yes));
+- **deletions that had not run yet, and record-only backups** — a vanished
+  symlink, special file, or directory, whose record IS the backup — still
+  need the `push --delete` that was interrupted. Those are real backups, and
+  only a confirmed deletion may drop them.
 
 `verify` is the read-only way to see where an interrupted run left the backup:
 it reports missing data objects, unrecorded objects, and type conflicts
@@ -37,10 +41,10 @@ without changing anything (see [verify.md](verify.md)).
 
 | Interrupted during | Surviving S3 state | Converged by |
 | --- | --- | --- |
-| the sync (uploads and deletions interleave) | any mix of completed uploads and deletions; the old manifest | plain `push` for the uploads, `push --delete` for the deletions and now-stale records |
-| between 1,000-key delete batches | earlier batches deleted, later ones intact; every record still in the old manifest | `push --delete` — it re-lists, drops the records whose objects are gone, and retries the rest |
+| the sync (uploads and deletions interleave) | any mix of completed uploads and deletions; the old manifest | plain `push` for the uploads and the now-stale records; `push --delete` for the deletions not yet run |
+| between 1,000-key delete batches | earlier batches deleted, later ones intact; every record still in the old manifest | plain `push` drops the records whose objects are gone; `push --delete` also re-offers the rest |
 | the out-of-lane deletions (kind conflicts, the entry's own key) | the ordinary sync finished; some out-of-lane objects deleted; the old manifest | `push --delete` |
-| the journal merge or its validation | data objects in their new state; the old manifest | `push --delete` (records still need dropping) |
+| the journal merge or its validation | data objects in their new state; the old manifest | plain `push` re-derives the merge; `push --delete` if deletions were part of it |
 | the manifest upload | either the old manifest or the complete new one — never a partial one | nothing, if the new one landed; otherwise as above |
 | `post_hook` | the backup is fully consistent; only the hook's own effects are incomplete | **not automatic** — see below |
 

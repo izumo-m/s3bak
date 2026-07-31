@@ -8,11 +8,12 @@ instead of being scrolled away by a transfer worker's result line - see
 `Console.prompt`. Transfer warnings are counted here too, so run() can turn a
 warning-only run into exit code 2.
 
-Two writers stay outside the console on purpose: `Boto3S3Store.cat` streams
-bytes straight to `sys.stdout.buffer` (a single-item, non-line-oriented
-passthrough), and cli's usage/version text prints before any concurrency
-starts. `sys.stdout` itself is never wrapped or replaced - `compare.isatty`
-reads it, and `diff` inherits it as a file descriptor.
+Two writers stay outside the console on purpose:
+`Boto3S3Store.stream_object_to_stdout` writes bytes straight to
+`sys.stdout.buffer` (a single-item, non-line-oriented passthrough), and cli's
+usage/version text prints before any concurrency starts. `sys.stdout` itself
+is never wrapped or replaced - `compare.isatty` reads it, and `diff` inherits
+it as a file descriptor.
 """
 
 from __future__ import annotations
@@ -153,6 +154,10 @@ class Console:
         assert threading.current_thread() is threading.main_thread(), (
             "a prompt session may only be opened on the main thread"
         )
+        # Sessions do not nest: the lock is not reentrant, so a second one on
+        # this thread would wait on itself forever. Fail instead of hanging -
+        # at a prompt, a hang is indistinguishable from waiting for the human.
+        assert self._owner != threading.get_ident(), "prompt sessions do not nest"
         with self._lock:
             self._owner = threading.get_ident()
             try:

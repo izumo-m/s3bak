@@ -59,8 +59,9 @@ Retiring an object is a deletion, so it waits for `--delete` — this is the one
 seam in the correspondence. When a regular file is replaced by a symlink or a
 special file, a plain push records the new (objectless) kind but keeps the old
 data object, which is now unreferenced: `verify` flags it as a type conflict,
-and the next `push --delete` retires it. A record whose object is already gone
-(an interrupted deletion) is likewise settled by the next `push --delete` merge.
+and the next `push --delete` retires it. The mirror image needs no `--delete`:
+a file record whose object is already gone (an interrupted deletion) backs
+nothing up, so any push retires the record — repair, not deletion.
 Directory, symlink, and special-file records stand alone by design, as described
 above.
 

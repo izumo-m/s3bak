@@ -27,7 +27,9 @@ storage class, so none of these checks costs an extra S3 call:
 
 - **Missing data object** — a regular-file record with no object behind it. A
   pull of that file fails. Detects S3-side deletions, an interrupted
-  `push --delete`, and lifecycle misconfiguration.
+  `push --delete`, and lifecycle misconfiguration. A push settles it either
+  way: it re-uploads the file if it is still there locally, and retires the
+  record if it is not.
 - **Size mismatch** — the object's size differs from the record. Restoring it
   would produce a file the push never saw: the residue of an out-of-band
   overwrite or a torn upload.

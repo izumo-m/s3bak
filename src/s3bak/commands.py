@@ -232,7 +232,13 @@ def _journal_delete_lane(journal: PushJournal, plan: _PushDeletePlan) -> FileFil
     there must reach the journal rather than be skipped over. Without
     ``--delete`` the wrapped decision is a flat no, so the lane observes and
     deletes nothing."""
-    return journal.observe_delete(plan.lane if callable(plan.lane) else _keep_orphan)
+    lane = _keep_orphan if plan.lane is False else plan.lane
+    # A --delete plan always resolves its lane to a callable (_plan_push_deletes
+    # replaces the placeholder True before returning). Assert rather than fall
+    # back: silently reading a True lane as "keep" would turn an unattended
+    # --yes run into a no-op instead of failing.
+    assert not isinstance(lane, bool), "a --delete lane must be a callable decision"
+    return journal.observe_delete(lane)
 
 
 def _plan_push_deletes(

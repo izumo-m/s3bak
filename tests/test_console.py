@@ -47,14 +47,26 @@ def test_prompt_owner_writes_through_the_ordinary_api(capfd):
         console.err("owner stderr")
         console.warn("warning: owner warning")
     assert console._owner is None
+    warnings = console.warning_count()
+    console.reset_warnings()  # module-level singleton: leave the counter clean
 
     captured = capfd.readouterr()
     assert captured.out == "owner stdout\n"
     assert "legend\n" in captured.err
     assert "s3bak: owner stderr\n" in captured.err
     assert "warning: owner warning\n" in captured.err
-    assert console.warning_count() > 0
-    console.reset_warnings()
+    assert warnings == 1
+
+
+def test_prompt_sessions_do_not_nest():
+    # A second session on the same thread would wait on a lock it already
+    # holds. The assert turns that into a failure rather than a hang at a
+    # prompt, where a hang looks exactly like waiting for the operator.
+    with console.prompt():
+        with pytest.raises(AssertionError, match="do not nest"):
+            with console.prompt():
+                pass
+    assert console._owner is None
 
 
 def test_prompt_session_releases_the_terminal_on_an_exception():

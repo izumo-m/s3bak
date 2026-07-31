@@ -133,7 +133,8 @@ s3bak ls-remote               # list entries stored on S3
 
 The `status` letters are push-oriented (what a push would change on the backup):
 `M` modified, `A` only local (push would add), `D` only in backup
-(`push --delete` would remove; a plain push keeps it).
+(`push --delete` would remove; a plain push keeps it, unless its stored object
+is already gone — a record backing nothing is retired by any push).
 
 ## Design
 
