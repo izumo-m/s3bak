@@ -3,9 +3,11 @@
 What survives a command that did not finish, and what brings the backup back
 into a consistent state. Two cases behave very differently:
 
-- an **ordinary interruption** — an S3 error, a local I/O error, `Ctrl-C` —
-  unwinds through the normal paths, and the design answers it by falling back
-  to the old state;
+- an **ordinary interruption** — an S3 error, a local I/O error, `Ctrl-C`, or
+  a `q` answer to a `--delete` confirmation — unwinds through the normal
+  paths, and the design answers it by falling back to the old state. `q` is
+  deliberately not a special case: one unwind, one resulting state, whichever
+  way a run stops ([sync.md](sync.md#deleting-backups---delete---yes));
 - a **hard kill** — `kill -9`, a power loss — runs no handler and no
   `finally`. The backup itself stays consistent, but a few residues are left
   for the operator to resolve; they are listed at the end.

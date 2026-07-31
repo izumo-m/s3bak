@@ -33,7 +33,13 @@ from s3bak.console import console, prompt_is_interactive
 
 class DeletionAbortedError(Exception):
     """The user answered q: abort the whole command, delete and record nothing
-    further (push skips the manifest update and post_hook)."""
+    further (push skips the manifest update and post_hook).
+
+    It unwinds like any other failure - no separate stopping path, and nothing
+    published to describe the partial run. What it cannot undo is work already
+    dispatched: a request in flight completes, and a deletion already batched
+    to S3 stays deleted. The next push settles both; docs/sync.md's q entry is
+    the specification."""
 
 
 class AnswerMode(Enum):

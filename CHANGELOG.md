@@ -15,7 +15,6 @@ a fix only (Fixed).
   not only by `push --delete`: it describes a backup that no longer exists,
   so dropping it is repair rather than deletion and is done silently. A
   record whose object is still on S3 is untouched, as before.
-
 - Answering `q` to a `--delete` confirmation now reports what the abort left
   behind and how to settle it — for a push, that the manifest was not
   rewritten and may no longer match S3; for a pull, that the local tree was

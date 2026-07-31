@@ -383,17 +383,27 @@ Deleting is opt-in and confirmed:
 - **`--yes`** answers yes to every confirmation: the unattended mirror for
   cron. Without a TTY (stdin/stderr), `--delete` without `--yes` answers no
   to everything — nothing is deleted and the run still succeeds (rc 0).
-- **`q` (abort)** exits 1 without rewriting the manifest or running
-  `post_hook`, and says what that leaves behind: the manifest may no longer
-  match S3, so the entry should be pushed again — plainly, without
-  `--delete`. Both drifts settle there. Uploads the run completed are
-  recorded by the next push, and deletions already confirmed may have run;
-  their records linger only until that push — any push, `--delete` or not —
-  journals the drop of a stale old-only file record with no object behind
-  it. The same self-healing covers a push interrupted mid-deletion. Under
-  `--all`, q stops the command, so the entries it never reached are named
-  too. `pull --delete` aborts the same way: it reports that the local tree
-  was updated only as far as the answers went.
+- **`q` (abort)** stops the command the way any other failure does — the same
+  "fail old" unwind as an S3 error or `Ctrl-C` ([recovery.md](recovery.md)):
+  the transfers not yet started are cancelled, the deletions not yet sent are
+  abandoned, the manifest is not rewritten, `post_hook` does not run, and the
+  exit is 1. It is an abort, not a stopping point — nothing is published to
+  describe the partial run, because the journal records each decision before
+  its transfer completes, and a run that stopped cannot vouch for what it had
+  already written. Two limits follow from stopping rather than finishing, and
+  the next push settles both. **A request already in flight completes**:
+  s3bak cancels what has not started, but never tears down a transfer
+  mid-request, which would strand an abandoned multipart upload — so an
+  upload or two can land after the q, unrecorded. **A confirmed deletion may
+  or may not have run**: deletions batch (up to 1,000 keys per request), so
+  an object answered y before the q is gone if its batch had already been
+  sent and untouched if it had not; flushing per answer would cost one
+  request per object. Both drifts converge on the next push of the entry —
+  plainly, without `--delete`: it records the uploads and retires the records
+  whose objects are gone. The abort message says so. Under `--all`, q stops
+  the command, so the entries it never reached are named too. `pull --delete`
+  aborts the same way, reporting that the local tree was updated only as far
+  as the answers went.
 - **`--meta-only` / `--data-only` cannot combine with `--delete`**: a deletion
   drops the object and its record atomically, which a one-sided push cannot.
 
