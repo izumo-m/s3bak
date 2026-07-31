@@ -14,7 +14,7 @@ import tokenize
 from dataclasses import dataclass
 from typing import Any
 
-from s3bak.console import die, expand_home
+from s3bak.console import console, expand_home
 from s3bak.manifest import MANIFEST_SUFFIX
 from s3bak.store import Boto3S3Store
 
@@ -92,7 +92,7 @@ def _config_int(
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
         kind = "a positive integer" if minimum > 0 else "a non-negative integer"
         where = f"{label}.{name}" if label else name
-        die(f"{where} must be {kind} in {config_path} (got {value!r})")
+        console.die(f"{where} must be {kind} in {config_path} (got {value!r})")
     return value
 
 
@@ -102,13 +102,15 @@ def _config_seconds(value: Any, config_path: str, *, label: str) -> float | None
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        die(f"{label} must be a non-negative number of seconds in {config_path} (got {value!r})")
+        console.die(
+            f"{label} must be a non-negative number of seconds in {config_path} (got {value!r})"
+        )
     try:
         # A huge Python int (e.g. 10**1000) overflows in the int->float
         # conversion math.isfinite would do, so convert here under guard first.
         seconds = float(value)
     except (OverflowError, ValueError):
-        die(f"{label} is too large to use in {config_path} (got {value!r})")
+        console.die(f"{label} is too large to use in {config_path} (got {value!r})")
     if (
         not math.isfinite(seconds)
         or seconds < 0
@@ -116,19 +118,25 @@ def _config_seconds(value: Any, config_path: str, *, label: str) -> float | None
         # a value so large the * 1e9 overflows to inf would crash that round().
         or not math.isfinite(seconds * 1_000_000_000)
     ):
-        die(f"{label} must be a non-negative number of seconds in {config_path} (got {value!r})")
+        console.die(
+            f"{label} must be a non-negative number of seconds in {config_path} (got {value!r})"
+        )
     return seconds
 
 
 def _validate_entry_name(name: Any, config_path: str) -> str:
     if not isinstance(name, str) or not name:
-        die(f"entry names must be non-empty strings in {config_path} (got {name!r})")
+        console.die(f"entry names must be non-empty strings in {config_path} (got {name!r})")
     if name in (".", "..") or "/" in name or "\\" in name:
-        die(f"entry name must be one path component in {config_path} (got {name!r})")
+        console.die(f"entry name must be one path component in {config_path} (got {name!r})")
     if name.endswith(MANIFEST_SUFFIX):
-        die(f"entry name must not end with {MANIFEST_SUFFIX!r} in {config_path} (got {name!r})")
+        console.die(
+            f"entry name must not end with {MANIFEST_SUFFIX!r} in {config_path} (got {name!r})"
+        )
     if any(ord(char) < 32 or ord(char) == 127 for char in name):
-        die(f"entry name must not contain control characters in {config_path} (got {name!r})")
+        console.die(
+            f"entry name must not contain control characters in {config_path} (got {name!r})"
+        )
     return name
 
 
@@ -140,11 +148,11 @@ def load_config(*, create_store: bool = True) -> Config:
     if not os.path.isfile(config_path):
         config_sh = expand_home("~/.config/s3bak/config.sh")
         if os.path.isfile(config_sh):
-            die(
+            console.die(
                 f"found {config_sh} but s3bak now requires config.py\n"
                 f"  Please create: {config_path}"
             )
-        die(
+        console.die(
             f"config file not found: {config_path}\n\n"
             f"Create it with contents like:\n\n"
             f'  profile = "default"\n'
@@ -162,25 +170,25 @@ def load_config(*, create_store: bool = True) -> Config:
     except Exception as e:
         # Include the exception type: a bare KeyError renders as just "'HOME'",
         # which reads as a typo rather than a missing environment variable.
-        die(f"error loading {config_path}: {type(e).__name__}: {e}")
+        console.die(f"error loading {config_path}: {type(e).__name__}: {e}")
 
     profile = ns.get("profile")
     prefix = ns.get("prefix")
     entries = ns.get("entries")
 
     if not isinstance(profile, str) or not profile or not isinstance(prefix, str) or not prefix:
-        die(f"profile and prefix must be set in {config_path}")
+        console.die(f"profile and prefix must be set in {config_path}")
     if not isinstance(entries, dict) or not entries:
-        die(f"no entries defined in {config_path}")
+        console.die(f"no entries defined in {config_path}")
     if not prefix.startswith("s3://"):
-        die(f"prefix must start with s3:// (got '{prefix}')")
+        console.die(f"prefix must start with s3:// (got '{prefix}')")
 
     rest = prefix[5:]
     bucket = rest.split("/", 1)[0]
     path_prefix = rest.split("/", 1)[1].strip("/") if "/" in rest else ""
 
     if not bucket:
-        die(f"could not parse bucket from prefix='{prefix}'")
+        console.die(f"could not parse bucket from prefix='{prefix}'")
     # Keep direct boto3 keys and boto3-s3 URLs on the same canonical prefix.
     # A user-friendly trailing slash must not become a doubled slash in transfer
     # URLs while direct GetObject/PutObject use the stripped path_prefix.
@@ -202,27 +210,27 @@ def load_config(*, create_store: bool = True) -> Config:
     for raw_name, entry_cfg in entries.items():
         name = _validate_entry_name(raw_name, config_path)
         if not isinstance(entry_cfg, dict):
-            die(f"entries[{name!r}] must be a dict in {config_path} (got {entry_cfg!r})")
+            console.die(f"entries[{name!r}] must be a dict in {config_path} (got {entry_cfg!r})")
         path = entry_cfg.get("path")
         if not isinstance(path, str) or not path:
-            die(f"entries[{name!r}].path must be a non-empty string in {config_path}")
+            console.die(f"entries[{name!r}].path must be a non-empty string in {config_path}")
         # A NUL survives every string check but raises ValueError deep inside the
         # first filesystem call (os.lstat/lexists), which run() does not catch;
         # reject it here so a malformed config dies with a message, not a
         # traceback. Same for exclude patterns and hook arguments below.
         if "\x00" in path:
-            die(f"entries[{name!r}].path must not contain NUL in {config_path}")
+            console.die(f"entries[{name!r}].path must not contain NUL in {config_path}")
         # A relative path silently depends on the working directory, and a
         # filesystem root as an entry is almost certainly a broken f-string
         # (e.g. an empty HOME); both would aim push/pull at the wrong tree.
         if not os.path.isabs(path):
-            die(
+            console.die(
                 f"entries[{name!r}].path must be an absolute path in {config_path} "
                 f'(got {path!r}; "~" is not expanded - build paths from HOME)'
             )
         norm = os.path.normpath(path)
         if os.path.dirname(norm) == norm:
-            die(
+            console.die(
                 f"entries[{name!r}].path must not be a filesystem root in {config_path} "
                 f"(got {path!r})"
             )
@@ -231,7 +239,9 @@ def load_config(*, create_store: bool = True) -> Config:
             not isinstance(excludes, list)
             or not all(isinstance(x, str) and "\x00" not in x for x in excludes)
         ):
-            die(f"entries[{name!r}].excludes must be a list of NUL-free strings in {config_path}")
+            console.die(
+                f"entries[{name!r}].excludes must be a list of NUL-free strings in {config_path}"
+            )
         for hook in ("pre_hook", "post_hook"):
             hook_value = entry_cfg.get(hook)
             if hook_value is not None and (
@@ -240,7 +250,7 @@ def load_config(*, create_store: bool = True) -> Config:
                 or not all(isinstance(arg, str) and "\x00" not in arg for arg in hook_value)
                 or not hook_value[0]
             ):
-                die(
+                console.die(
                     f"entries[{name!r}].{hook} must be a non-empty list of NUL-free strings "
                     f"with a non-empty executable in {config_path}"
                 )

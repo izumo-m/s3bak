@@ -508,7 +508,7 @@ def test_push_broken_pipe_from_transfer_output_maps_to_141(ws, monkeypatch):
     # s3transfer's own futures.py wraps that callback in a bare `except
     # Exception` that only logs - it never re-raises. Without _transfer's own
     # catch/reraise, a closed stdout during a transfer (`s3bak push data |
-    # head -n 0`) would make write_output's BrokenPipeError vanish inside
+    # head -n 0`) would make the result line's BrokenPipeError vanish inside
     # s3transfer instead of surfacing: the run would look like a clean
     # success (exit 0) instead of the documented exit 141, like the
     # sigpipe-mapping tests below (test_run_diff_maps_sigpipe_to_broken_pipe
@@ -516,16 +516,16 @@ def test_push_broken_pipe_from_transfer_output_maps_to_141(ws, monkeypatch):
     import signal
 
     from s3bak import cli
-    from s3bak import store as store_mod
+    from s3bak.console import console
 
     ws.write("data/a.txt", "alpha")
     ws.write("data/b.txt", "beta")
     ws.config({"data": {"path": str(ws.root / "data")}})
 
-    def broken_write_output(text: str) -> None:
+    def broken_out(text: str) -> None:
         raise BrokenPipeError
 
-    monkeypatch.setattr(store_mod, "write_output", broken_write_output)
+    monkeypatch.setattr(console, "out", broken_out)
     monkeypatch.setattr("sys.argv", ["s3bak", "push", "data"])
     saved = signal.getsignal(signal.SIGINT)
     try:

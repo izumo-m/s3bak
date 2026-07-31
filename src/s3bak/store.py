@@ -21,7 +21,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from s3bak.console import note_warning, write_output, write_stderr
+from s3bak.console import console
 
 if TYPE_CHECKING:
     from boto3_s3 import (
@@ -212,16 +212,18 @@ class Boto3S3Store:
         SUCCEEDED/DRYRUN items print immediately as 'upload:'/'download:'/
         'delete:' stdout lines, failures print immediately to stderr, and any
         boto3-s3 error also prints to stderr and sets returncode 1.
-        `write_output`/`write_stderr` serialize by line (console._output_lock),
-        so printing straight from on_result - which runs on s3transfer worker
-        threads - is safe; `results` (the SUCCEEDED/DRYRUN count) still needs
-        its own lock since the increment itself is not.
+        The console serializes its writes by line, so printing straight from
+        on_result - which runs on s3transfer worker threads - is safe; a line
+        arriving while an interactive --delete question is on screen simply
+        waits until the answer is in (`console.Console.prompt`). `results`
+        (the SUCCEEDED/DRYRUN count) still needs its own lock since the
+        increment itself is not.
 
         s3transfer calls on_result as a transfer's "done" callback and, in its
         own futures.py (`_run_callback`), catches any exception the callback
         raises and only logs it at debug level - it never propagates past
         s3transfer. A closed stdout (``s3bak push data | head``) makes
-        write_output raise BrokenPipeError, which would otherwise vanish
+        console.out raise BrokenPipeError, which would otherwise vanish
         right there: the documented exit 141 would silently become 0, and
         the transfer would look complete (post_hook would even run) though
         nothing after the closed pipe was ever reported. So on_result catches
@@ -234,7 +236,7 @@ class Boto3S3Store:
         from boto3_s3 import Boto3S3Error, OpOutcome, TransferType
 
         if verbose:
-            write_stderr(f"+ (boto3-s3) {label}\n")
+            console.diag(f"+ (boto3-s3) {label}\n")
         results = 0
         broken_pipe = False
         lock = threading.Lock()
@@ -257,16 +259,16 @@ class Boto3S3Store:
                     # discovers the broken pipe.
                     with lock:
                         results += 1
-                    write_output(f"{line}\n")
+                    console.out(f"{line}\n")
                 elif r.outcome is OpOutcome.FAILED:
-                    write_stderr(f"{r.compare_key}: {r.error}\n")
+                    console.diag(f"{r.compare_key}: {r.error}\n")
                 elif r.outcome is OpOutcome.WARNED:
-                    note_warning(
+                    console.warn(
                         f"warning: {r.error}" if r.error else f"warning: skipped {r.compare_key}"
                     )
                 elif r.outcome is OpOutcome.NOTICE:
                     if r.error:
-                        write_stderr(f"{r.error}\n")
+                        console.diag(f"{r.error}\n")
                 # CANCELLED (a fatal elsewhere revoked the item) is dropped,
                 # like aws-cli, which omits cancelled items from its output;
                 # the fatal itself surfaces through the Boto3S3Error the
@@ -279,7 +281,7 @@ class Boto3S3Store:
             rc = 0
         except Boto3S3Error as e:
             rc = 1
-            write_stderr(f"{e}\n")
+            console.diag(f"{e}\n")
         if broken_pipe:
             raise BrokenPipeError
         return TransferResult(returncode=rc, results=results)
@@ -290,7 +292,7 @@ class Boto3S3Store:
 
         key = self._api_key(rel_key)
         if verbose:
-            write_stderr(f"+ (boto3) head_object s3://{self.bucket}/{key}\n")
+            console.diag(f"+ (boto3) head_object s3://{self.bucket}/{key}\n")
         try:
             data = self._client.head_object(Bucket=self.bucket, Key=key)
         except ClientError as e:
@@ -365,7 +367,7 @@ class Boto3S3Store:
         api_base = self._api_key(rel_prefix)
         prefix = api_base + "/"
         if verbose:
-            write_stderr(f"+ (boto3) list objects s3://{self.bucket}/{prefix}\n")
+            console.diag(f"+ (boto3) list objects s3://{self.bucket}/{prefix}\n")
         paginator = self._client.get_paginator("list_objects_v2")
         prev_key: str | None = None
         for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
@@ -398,7 +400,7 @@ class Boto3S3Store:
         from boto3_s3 import FileKind
 
         if verbose:
-            write_stderr(f"+ (boto3-s3) ls {self.prefix}/\n")
+            console.diag(f"+ (boto3-s3) ls {self.prefix}/\n")
         objects: list[str] = []
         prefixes: list[str] = []
 
@@ -433,7 +435,7 @@ class Boto3S3Store:
             from boto3_s3 import NotFoundError
 
             if verbose:
-                write_stderr(f"+ (boto3-s3) cp {self._s3_url(rel_key)} {dest_path}\n")
+                console.diag(f"+ (boto3-s3) cp {self._s3_url(rel_key)} {dest_path}\n")
             try:
                 # force_glacier_transfer: without it cp WARN-skips a GLACIER /
                 # DEEP_ARCHIVE source and returns as if it succeeded, so pull would
@@ -449,7 +451,7 @@ class Boto3S3Store:
         from botocore.exceptions import ClientError
 
         if verbose:
-            write_stderr(f"+ (boto3) get_object s3://{self.bucket}/{self._api_key(rel_key)}\n")
+            console.diag(f"+ (boto3) get_object s3://{self.bucket}/{self._api_key(rel_key)}\n")
         try:
             resp = self._client.get_object(Bucket=self.bucket, Key=self._api_key(rel_key))
         except ClientError as e:
@@ -514,12 +516,12 @@ class Boto3S3Store:
                 return
             if dryrun:
                 for rel in batch:
-                    write_output(f"(dry-run) delete: {self._s3_url(rel)}\n")
+                    console.out(f"(dry-run) delete: {self._s3_url(rel)}\n")
                     results += 1
                 batch.clear()
                 return
             if verbose:
-                write_stderr(
+                console.diag(
                     f"+ (boto3) delete_objects s3://{self.bucket}/ ({len(batch)} key(s))\n"
                 )
             response = self._client.delete_objects(
@@ -545,7 +547,7 @@ class Boto3S3Store:
                     for item in unattributable
                 )
                 for rel in batch:
-                    write_stderr(f"{self._s3_url(rel)}: delete failed ({detail})\n")
+                    console.diag(f"{self._s3_url(rel)}: delete failed ({detail})\n")
                 had_error = True
                 batch.clear()
                 return
@@ -558,10 +560,10 @@ class Boto3S3Store:
             for rel in batch:
                 code = failed.get(self._api_key(rel))
                 if code is None:
-                    write_output(f"delete: {self._s3_url(rel)}\n")
+                    console.out(f"delete: {self._s3_url(rel)}\n")
                     results += 1
                 else:
-                    write_stderr(f"{self._s3_url(rel)}: {code}\n")
+                    console.diag(f"{self._s3_url(rel)}: {code}\n")
                     had_error = True
             batch.clear()
 
@@ -584,7 +586,7 @@ class Boto3S3Store:
         ``docs.txt``.
         """
         if verbose:
-            write_stderr(f"+ (boto3) delete subtree s3://{self.bucket}/{self._api_key(rel_key)}\n")
+            console.diag(f"+ (boto3) delete subtree s3://{self.bucket}/{self._api_key(rel_key)}\n")
 
         def doomed_keys() -> Iterator[str]:
             if self.head_object(rel_key, verbose=verbose) is not None:
@@ -598,11 +600,11 @@ class Boto3S3Store:
         from botocore.exceptions import ClientError
 
         if verbose:
-            write_stderr(f"+ (boto3) get_object s3://{self.bucket}/{self._api_key(rel_key)}\n")
+            console.diag(f"+ (boto3) get_object s3://{self.bucket}/{self._api_key(rel_key)}\n")
         try:
             resp = self._client.get_object(Bucket=self.bucket, Key=self._api_key(rel_key))
         except ClientError as e:
-            write_stderr(f"{e}\n")
+            console.diag(f"{e}\n")
             return 1
         with closing(resp["Body"]) as body:
             shutil.copyfileobj(body, sys.stdout.buffer)
@@ -652,11 +654,11 @@ class Boto3S3Store:
         Errors (ClientError / Boto3S3Error) surface to run()."""
         if os.path.getsize(src_path) >= self._small_limit:
             if verbose:
-                write_stderr(f"+ (boto3-s3) cp {src_path} {self._s3_url(rel_key)}\n")
+                console.diag(f"+ (boto3-s3) cp {src_path} {self._s3_url(rel_key)}\n")
             self._s3.cp(src_path, self._s3_loc(rel_key))
             return
         if verbose:
-            write_stderr(f"+ (boto3) put_object s3://{self.bucket}/{self._api_key(rel_key)}\n")
+            console.diag(f"+ (boto3) put_object s3://{self.bucket}/{self._api_key(rel_key)}\n")
         with open(src_path, "rb") as f:
             self._client.put_object(Bucket=self.bucket, Key=self._api_key(rel_key), Body=f)
 
@@ -674,14 +676,14 @@ class Boto3S3Store:
         from botocore.exceptions import ClientError
 
         if verbose:
-            write_stderr(f"+ (boto3) put_object s3://{self.bucket}/{self._api_key(rel_key)}\n")
+            console.diag(f"+ (boto3) put_object s3://{self.bucket}/{self._api_key(rel_key)}\n")
         try:
             with open(src_path, "rb") as f:
                 self._client.put_object(Bucket=self.bucket, Key=self._api_key(rel_key), Body=f)
         except ClientError as e:
-            write_stderr(f"{e}\n")
+            console.diag(f"{e}\n")
             return TransferResult(returncode=1, results=0)
-        write_output(f"upload: {src_path} to {dst}\n")
+        console.out(f"upload: {src_path} to {dst}\n")
         return TransferResult(returncode=0, results=1)
 
     def sync_up(

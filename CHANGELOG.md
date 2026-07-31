@@ -9,6 +9,12 @@ a fix only (Fixed).
 
 ## [Unreleased]
 
+### Fixed
+
+- A `--delete` confirmation is no longer scrolled away by the transfer result
+  lines of the same run: the question holds the terminal until it is
+  answered, and the output that arrives meanwhile prints afterwards.
+
 ## [0.5.0] - 2026-07-31
 
 ### Added

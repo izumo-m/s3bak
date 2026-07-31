@@ -40,16 +40,7 @@ from s3bak.confirm import (
     confirm_subtree_delete,
     resolve_answer_mode,
 )
-from s3bak.console import (
-    IS_WINDOWS,
-    echo_command,
-    err,
-    is_junction,
-    normalize_local_path,
-    note_warning,
-    write_output,
-    write_stderr,
-)
+from s3bak.console import IS_WINDOWS, console, is_junction, normalize_local_path
 from s3bak.manifest import ManifestEntry
 from s3bak.restore import (
     apply_manifest,
@@ -100,10 +91,10 @@ def _run_hook(
     if not hook:
         return 0
     if opts.dryrun:
-        write_output(f"(dry-run) would run {name}: {hook!r}\n")
+        console.out(f"(dry-run) would run {name}: {hook!r}\n")
         return 0
     if opts.verbose:
-        write_stderr(f"+ {name}: {hook!r}\n")
+        console.diag(f"+ {name}: {hook!r}\n")
     # Hooks are non-interactive: entries push concurrently and a --delete
     # confirmation may be reading stdin on another thread, so a hook that also
     # read stdin would steal the answer. Detach it from the terminal.
@@ -118,7 +109,7 @@ def _run_hook(
         ).returncode
     if rc == 0:
         return 0
-    err(f"{name} failed (exit {rc}): {hook!r}")
+    console.err(f"{name} failed (exit {rc}): {hook!r}")
     if rc < 0:
         return 128 - rc  # killed by signal N -> 128+N
     return 1 if rc == 2 else rc
@@ -140,7 +131,7 @@ def upload_manifest(
     post_hook: list[str] | None = cfg.entries[entry].get("post_hook")
 
     if opts.dryrun:
-        write_output(f"(dry-run) would update manifest: {manifest.manifest_key(entry)}\n")
+        console.out(f"(dry-run) would update manifest: {manifest.manifest_key(entry)}\n")
         # The walk and merge write only a local temp file: run them so the
         # rehearsal emits the same structural warnings as the real push,
         # skipping only the upload.
@@ -242,9 +233,7 @@ def _plan_push_deletes(
             if not plan.allow():
                 return False
             marker = "(dry-run) " if opts.dryrun else ""
-            write_output(
-                f"{marker}delete record: {_record_candidate_display(cfg, entry, rel, e)}\n"
-            )
+            console.out(f"{marker}delete record: {_record_candidate_display(cfg, entry, rel, e)}\n")
             return True
 
         plan.record_delete = report_record
@@ -277,7 +266,7 @@ def _plan_push_deletes(
         display = _record_candidate_display(cfg, entry, rel, e)
         if not confirmer.confirm(f"{display} ({_record_candidate_kind(e)})"):
             return False
-        write_output(f"delete record: {display}\n")
+        console.out(f"delete record: {display}\n")
         return True
 
     plan = _PushDeletePlan(lane=decide, confirmer=confirmer, walker=walker)
@@ -292,7 +281,7 @@ def _warn_refused_deletes(entry: str, plan: _PushDeletePlan, journal: PushJourna
     the plan's callback."""
     refused = plan.refused + journal.refused_records
     if refused:
-        note_warning(
+        console.warn(
             f"warning: {entry}: the local scan skipped unreadable or vanished paths;"
             f" kept {refused} deletion candidate(s) and every manifest record"
         )
@@ -308,7 +297,7 @@ def _warn_unrecorded_uploads(entry: str, opts: Opts, journal: PushJournal) -> No
     upload" wording."""
     if opts.data_only and journal.unrecorded_uploads:
         verb = "would upload" if opts.dryrun else "uploaded"
-        note_warning(
+        console.warn(
             f"warning: {entry}: --data-only {verb} {journal.unrecorded_uploads} object(s)"
             f" the manifest does not record; run a push without --data-only to record them"
         )
@@ -433,7 +422,7 @@ def _push_sub(
     # component may itself be a symlink (backed up as one), so it is not checked.
     ancestor_error = _reject_symlinked_sub_ancestors(target_root, sub)
     if ancestor_error is not None:
-        err(ancestor_error)
+        console.err(ancestor_error)
         return 1
 
     walker = localwalk.sync_walker(excludes, sub=sub)
@@ -450,7 +439,7 @@ def _push_sub(
         if have_manifest and _entry_kind_from_manifest(manifest_path) == "file":
             # Patching a sub-path into a file-shaped manifest would corrupt it;
             # push the entry itself to migrate the kind first.
-            err(f"sub path not allowed for single-file entry: {entry}")
+            console.err(f"sub path not allowed for single-file entry: {entry}")
             return 1
         if have_manifest:
             plan.old_manifest = manifest_path
@@ -464,11 +453,13 @@ def _push_sub(
         except FileNotFoundError:
             local_sub_present = False
         except OSError as e:
-            err(f"cannot access sub path: {local_sub}: {e}")
+            console.err(f"cannot access sub path: {local_sub}: {e}")
             return 1
         if not local_sub_present:
             if not opts.delete:
-                err(f"local path does not exist (use --delete to remove its backup): {local_sub}")
+                console.err(
+                    f"local path does not exist (use --delete to remove its backup): {local_sub}"
+                )
                 return 1
             # --delete cannot combine with --meta-only/--data-only (rejected at
             # the CLI), so this is always the full deletion: one confirmation
@@ -476,7 +467,7 @@ def _push_sub(
             if not opts.dryrun and not confirm_subtree_delete(
                 resolve_answer_mode(yes=opts.yes), entry, s3_sub_path
             ):
-                err(f"backup subtree not deleted (answer y, or use --yes): {s3_sub_path}")
+                console.err(f"backup subtree not deleted (answer y, or use --yes): {s3_sub_path}")
                 return 1
             result = cfg.store.delete_subtree(sub_rel, dryrun=opts.dryrun, verbose=opts.verbose)
             if result.returncode != 0:
@@ -503,7 +494,7 @@ def _push_sub(
         is_link = stat_mod.S_ISLNK(st.st_mode)
         is_dir_sub = not is_link and os.path.isdir(local_sub)
         if not (is_link or is_dir_sub or stat_mod.S_ISREG(st.st_mode)):
-            err(f"sub path must be a regular file, directory, or symlink: {local_sub}")
+            console.err(f"sub path must be a regular file, directory, or symlink: {local_sub}")
             return 1
 
         did_work = False
@@ -577,7 +568,7 @@ def _push_sub(
                     # and always re-records - naming the path is the
                     # instruction to back up its current state.
                     if opts.dryrun:
-                        write_output(f"(dry-run) upload: {local_sub} -> {s3_sub_path}\n")
+                        console.out(f"(dry-run) upload: {local_sub} -> {s3_sub_path}\n")
                         did_work = True
                     else:
                         result = cfg.store.put_object(sub_rel, local_sub, verbose=opts.verbose)
@@ -685,7 +676,7 @@ def _migrate_entry_kind(cfg: Config, entry: str, to_dir: bool, opts: Opts) -> in
     assert cfg.store is not None
     old_kind, new_kind = ("file", "directory") if to_dir else ("directory", "file")
     if not opts.delete:
-        err(
+        console.err(
             f"{entry}: the backup records a {old_kind} but the local path is now a"
             f" {new_kind}; push --delete replaces the old backup"
         )
@@ -694,7 +685,7 @@ def _migrate_entry_kind(cfg: Config, entry: str, to_dir: bool, opts: Opts) -> in
     if not opts.dryrun and not confirm_subtree_delete(
         resolve_answer_mode(yes=opts.yes), entry, display
     ):
-        err(f"old backup not deleted (answer y, or use --yes): {display}")
+        console.err(f"old backup not deleted (answer y, or use --yes): {display}")
         return 1
     result = cfg.store.delete_subtree(entry, dryrun=opts.dryrun, verbose=opts.verbose)
     if result.returncode != 0:
@@ -735,7 +726,7 @@ def _delete_file_entry_strays(cfg: Config, entry: str, opts: Opts) -> tuple[int,
 def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int:
     entry_cfg = cfg.entries.get(entry)
     if not entry_cfg:
-        err(f"no such entry: {entry}")
+        console.err(f"no such entry: {entry}")
         return 1
     target: str = entry_cfg["path"]
     target_root = normalize_local_path(target)
@@ -762,26 +753,26 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
     # local data source when an existing manifest can be patched.
     if not os.path.lexists(target_root):
         if sub is None or not opts.delete:
-            err(f"target does not exist: {target}")
+            console.err(f"target does not exist: {target}")
             return 1
     else:
         mode = os.lstat(target_root).st_mode
         if stat_mod.S_ISLNK(mode):
-            err(f"entry path is a symlink, which is not allowed as an entry: {target}")
+            console.err(f"entry path is a symlink, which is not allowed as an entry: {target}")
             return 1
         if not (stat_mod.S_ISREG(mode) or stat_mod.S_ISDIR(mode)):
-            err(f"entry path must be a regular file or directory: {target}")
+            console.err(f"entry path must be a regular file or directory: {target}")
             return 1
 
     if sub is not None:
         if os.path.lexists(target_root) and not os.path.isdir(target_root):
-            err(f"sub path not allowed for single-file entry: {entry}")
+            console.err(f"sub path not allowed for single-file entry: {entry}")
             return 1
         post_hook_sub: list[str] | None = entry_cfg.get("post_hook")
         try:
             return _push_sub(cfg, entry, post_hook_sub, target_root, sub, excludes, opts)
         except DeletionAbortedError:
-            err(f"{entry}: aborted")
+            console.err(f"{entry}: aborted")
             return 1
 
     results = 0  # count of upload/delete lines printed this push
@@ -807,7 +798,7 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 # --meta-only moves no data, so it cannot migrate a kind
                 # change; recording the new kind anyway would silently orphan
                 # the old tree or corrupt the manifest.
-                err(
+                console.err(
                     f"{entry}: the backup and the local path disagree on kind"
                     f" (file vs directory); push --delete migrates it"
                 )
@@ -934,7 +925,7 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 # manifest (or the --checksum ETag comparison), or was never
                 # pushed: upload it.
                 if opts.dryrun:
-                    write_output(f"(dry-run) upload: {target} -> {cfg.prefix}/{entry}\n")
+                    console.out(f"(dry-run) upload: {target} -> {cfg.prefix}/{entry}\n")
                     results = 1
                 else:
                     result = cfg.store.put_object(entry, target, verbose=opts.verbose)
@@ -983,7 +974,7 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         # q mid-confirmation: already-confirmed deletions may have run, but the
         # manifest was not rewritten and no hook fires. The next push --delete
         # settles any records those deletions left behind.
-        err(f"{entry}: aborted")
+        console.err(f"{entry}: aborted")
         return 1
     finally:
         plan.close()
@@ -1057,14 +1048,14 @@ def _verify_restored_sizes(manifest_path: str, outpath: str, is_dir: bool, sub: 
         try:
             st = os.lstat(target)
         except OSError:
-            err(f"expected file missing (sync did not place it): {target}")
+            console.err(f"expected file missing (sync did not place it): {target}")
             errors += 1
             continue
         if not stat_mod.S_ISREG(st.st_mode):
-            err(f"expected {entry.path} to be a regular file: {target}")
+            console.err(f"expected {entry.path} to be a regular file: {target}")
             errors += 1
         elif st.st_size != entry.size:
-            err(
+            console.err(
                 f"restored size does not match manifest ({st.st_size} != {entry.size}),"
                 f" the stored object does not match the record: {target}"
             )
@@ -1114,8 +1105,8 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
     configured_path: str | None = entry_cfg["path"] if entry_cfg else None
     outpath = resolve_pull_destination(entry, configured_path, sub, opts.outpath)
     if outpath is None:
-        err(f"no such entry in config: {entry}")
-        err("use -o <path> to specify the output path")
+        console.err(f"no such entry in config: {entry}")
+        console.err("use -o <path> to specify the output path")
         return 1
 
     # A sub-path restore to the configured location writes at
@@ -1128,7 +1119,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
     if sub is not None and opts.outpath is None and configured_path is not None:
         ancestor_error = _reject_symlinked_sub_ancestors(configured_path, sub)
         if ancestor_error is not None:
-            err(ancestor_error)
+            console.err(ancestor_error)
             return 1
 
     fd, manifest_path = tempfile.mkstemp(suffix=".jsonl")
@@ -1138,20 +1129,20 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         #    without any extra head-object calls.
         if not download_manifest(cfg, entry, manifest_path, opts.verbose):
             if sub is not None:
-                err(f"not found on S3: {entry}/{sub}")
+                console.err(f"not found on S3: {entry}/{sub}")
             else:
-                err(f"entry not found on S3: {entry}")
+                console.err(f"entry not found on S3: {entry}")
             return 1
 
         entry_is_dir = _entry_kind_from_manifest(manifest_path) == "dir"
 
         if sub is not None:
             if not entry_is_dir:
-                err(f"sub path not allowed for single-file entry: {entry}")
+                console.err(f"sub path not allowed for single-file entry: {entry}")
                 return 1
             kind = _sub_kind_from_manifest(manifest_path, sub)
             if kind == "missing":
-                err(f"not found on S3: {entry}/{sub}")
+                console.err(f"not found on S3: {entry}/{sub}")
                 return 1
             is_dir = kind == "dir"
             has_data = kind in ("file", "dir")
@@ -1168,7 +1159,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         if is_dir:
             conflict = _manifest_restore_conflict(manifest_path, sub)
             if conflict is not None:
-                err(
+                console.err(
                     f"{entry}: unrestorable manifest - a non-directory and a directory"
                     f" (or files under it) are both recorded at ./{conflict};"
                     f" run push --delete to prune the stale records"
@@ -1231,7 +1222,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 conflict = not stat_mod.S_ISREG(os.lstat(outpath).st_mode)
             if conflict:
                 if opts.dryrun:
-                    write_output(f"(dry-run) would replace {outpath} (conflicting type)\n")
+                    console.out(f"(dry-run) would replace {outpath} (conflicting type)\n")
                 else:
                     parent = os.path.dirname(os.path.abspath(outpath))
                     stage_dir = tempfile.mkdtemp(
@@ -1342,7 +1333,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 # symlinks), printed only when the real apply could repair
                 # something: a stat-gate difference, or a planned transfer.
                 if not manifest_matches or changed:
-                    write_output(f"(dry-run) would apply manifest metadata: {outpath}\n")
+                    console.out(f"(dry-run) would apply manifest metadata: {outpath}\n")
                 st = 0
             else:
                 # enforce_size only when the data sync ran: --meta-only applies
@@ -1371,7 +1362,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 if st != 0:
                     # The local tree is not in the recorded state; extras built
                     # on that view are not trustworthy deletion candidates.
-                    err(f"{entry}: skipping --delete (the metadata apply failed)")
+                    console.err(f"{entry}: skipping --delete (the metadata apply failed)")
                 else:
                     st = _mirror_extras(
                         manifest_path,
@@ -1391,7 +1382,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             # download. Checked after the --delete step so its failure counts too.
             if swap_done and st != 0 and replaced_root is not None:
                 stage_holds_old_root = True
-                err(
+                console.err(
                     f"{entry}: pull failed after replacing {outpath};"
                     f" the previous {outpath} is preserved at {replaced_root}"
                 )
@@ -1407,7 +1398,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             if replaced_root is not None:
                 stage_holds_old_root = True
                 if os.path.lexists(replaced_root):
-                    err(
+                    console.err(
                         f"{entry}: pull failed after replacing {outpath};"
                         f" the previous {outpath} is preserved at {replaced_root}"
                     )
@@ -1432,7 +1423,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 ):
                     shutil.rmtree(stage_dir, ignore_errors=True)
     except DeletionAbortedError:
-        err(f"{entry}: aborted")
+        console.err(f"{entry}: aborted")
         return 1
     finally:
         os.unlink(manifest_path)
@@ -1574,7 +1565,7 @@ def _mirror_extras(
 
 def cmd_show(cfg: Config, entry: str, opts: Opts, file: str | None = None) -> int:
     if entry not in cfg.entries:
-        err(f"no such entry: {entry}")
+        console.err(f"no such entry: {entry}")
         return 1
 
     if file:
@@ -1592,7 +1583,7 @@ def cmd_show(cfg: Config, entry: str, opts: Opts, file: str | None = None) -> in
 def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int:
     entry_cfg = cfg.entries.get(entry)
     if not entry_cfg:
-        err(f"no such entry: {entry}")
+        console.err(f"no such entry: {entry}")
         return 1
     base_path: str = entry_cfg["path"]
     outpath = os.path.join(base_path, sub) if sub else base_path
@@ -1601,7 +1592,7 @@ def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
     os.close(fd)
     try:
         if not download_manifest(cfg, entry, manifest_path, opts.verbose):
-            err(f"entry not found on S3: {entry}")
+            console.err(f"entry not found on S3: {entry}")
             return 1
         # Classify from the manifest (the record of the last push), not the
         # local filesystem: a directory entry whose local tree was deleted must
@@ -1610,7 +1601,7 @@ def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
         if sub is not None:
             sub_kind = _sub_kind_from_manifest(manifest_path, sub)
             if sub_kind == "missing":
-                err(f"not found on S3: {entry}/{sub}")
+                console.err(f"not found on S3: {entry}/{sub}")
                 return 1
             is_dir = sub_kind == "dir"
         else:
@@ -1632,7 +1623,7 @@ def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
                     continue
                 target, _rel = res
                 if through_symlink:
-                    write_output(f"D {target}\n")
+                    console.out(f"D {target}\n")
                     continue
                 # An inaccessible file (EACCES on an unsearchable parent) is not
                 # missing: compare_to_local turns every OSError into st=None and
@@ -1642,7 +1633,7 @@ def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
                 except FileNotFoundError:
                     pass  # genuinely absent: check_metadata reports it D
                 except OSError as e:
-                    note_warning(f"warning: cannot access {target}: {e}")
+                    console.warn(f"warning: cannot access {target}: {e}")
                     continue
                 block = check_metadata(
                     target,
@@ -1652,7 +1643,7 @@ def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
                     use_color=use_color,
                 )
                 if block:
-                    write_output(block)
+                    console.out(block)
             return 0
 
         # A directory sub whose local root sits behind a symlinked ancestor
@@ -1660,12 +1651,12 @@ def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
         # D (not cleanly present at its recorded path) and warn, like the leaf
         # sub and the full-entry no-follow walk do.
         if sub is not None and _symlinked_ancestor(base_path, sub):
-            note_warning(
+            console.warn(
                 f"warning: {entry}/{sub}: reached through a symlinked parent; not compared"
             )
             for _key, (rel, _entry_obj) in manifest_keyed(manifest_path, sub):
                 if rel != ".":
-                    write_output(f"D {os.path.join(outpath, rel)}\n")
+                    console.out(f"D {os.path.join(outpath, rel)}\n")
             return 0
 
         # Directory tree: one streaming merge-join of the manifest against a
@@ -1675,13 +1666,13 @@ def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
         # so no path is stat'd twice.
         for _key, m, loc in manifest.merge_join(
             manifest_keyed(manifest_path, sub),
-            local_keyed(outpath, excludes, sub, warn=note_warning),
+            local_keyed(outpath, excludes, sub, warn=console.warn),
         ):
             if m is not None:
                 rel, entry_obj = m
                 target = outpath if rel == "." else os.path.join(outpath, rel)
                 if loc is None:
-                    write_output(f"D {target}\n")
+                    console.out(f"D {target}\n")
                     continue
                 _rel, st, sym = loc
                 diff = compare_to_stat(
@@ -1693,11 +1684,11 @@ def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
                 )
                 block = format_diff_block(diff, target, opts.verbose)
                 if block:
-                    write_output(block)
+                    console.out(block)
             elif loc is not None:
                 rel, _st, _sym = loc
                 if rel != ".":
-                    write_output(f"A {os.path.join(outpath, rel)}\n")
+                    console.out(f"A {os.path.join(outpath, rel)}\n")
 
         return 0
     finally:
@@ -1721,7 +1712,7 @@ def _run_diff(left: str, right: str, label: str, opts: Opts) -> int:
             right,
         ]
     )
-    echo_command(opts.verbose, cmd)
+    console.echo_command(opts.verbose, cmd)
     rc = subprocess.run(cmd).returncode
     # signal.SIGPIPE does not exist on Windows, and this check is evaluated
     # unconditionally regardless of rc, so guard on platform before touching it.
@@ -1733,7 +1724,7 @@ def _run_diff(left: str, right: str, label: str, opts: Opts) -> int:
 
 
 def _write_leaf_type_diff(label: str, backup: str, local: str) -> None:
-    write_output(f"--- a/{label}\n+++ b/{label}\n-{backup}\n+{local}\n")
+    console.out(f"--- a/{label}\n+++ b/{label}\n-{backup}\n+{local}\n")
 
 
 def _local_leaf_description(path: str, mode: int) -> str:
@@ -1760,7 +1751,7 @@ def diff_single_file(
     try:
         assert cfg.store is not None
         if not cfg.store.get_object(rel_key, tmppath, size=size, verbose=opts.verbose):
-            err(f"not found on S3: {rel_key}")
+            console.err(f"not found on S3: {rel_key}")
             return 1
         try:
             local_mode = os.lstat(localfile).st_mode
@@ -1860,7 +1851,7 @@ def diff_backup(
         # prefix sync could not even materialize onto one filesystem never
         # break the diff.
         #
-        # warn=note_warning surfaces walk gaps (an unreadable directory hides
+        # warn=console.warn surfaces walk gaps (an unreadable directory hides
         # its children), so an otherwise-clean diff still warns (exit 2)
         # rather than hiding a local-only file that may sit unseen behind one.
         # The isdir/not-islink gate matches the old local-only walk: a
@@ -1869,7 +1860,7 @@ def diff_backup(
         # _symlinked_ancestor - which checks the root itself too).
         for _key, m, loc in manifest.merge_join(
             manifest_keyed(manifest_path, sub),
-            local_keyed(outpath, excludes, sub, warn=note_warning)
+            local_keyed(outpath, excludes, sub, warn=console.warn)
             if os.path.isdir(outpath) and not os.path.islink(outpath)
             else (),
         ):
@@ -1900,7 +1891,7 @@ def diff_backup(
                             size=record.size,
                             verbose=opts.verbose,
                         ):
-                            err(f"expected backup object missing: {rel_prefix}/{rel}")
+                            console.err(f"expected backup object missing: {rel_prefix}/{rel}")
                             has_diff = 1
                             continue
                         local_mode: int | None
@@ -2025,7 +2016,7 @@ def diff_backup(
 def cmd_diff(cfg: Config, entry: str, opts: Opts, file: str | None = None) -> int:
     entry_cfg = cfg.entries.get(entry)
     if not entry_cfg:
-        err(f"no such entry: {entry}")
+        console.err(f"no such entry: {entry}")
         return 1
     outpath: str = entry_cfg["path"]
 
@@ -2033,18 +2024,18 @@ def cmd_diff(cfg: Config, entry: str, opts: Opts, file: str | None = None) -> in
     os.close(fd)
     try:
         if not download_manifest(cfg, entry, manifest_path, opts.verbose):
-            err(f"entry not found on S3: {entry}")
+            console.err(f"entry not found on S3: {entry}")
             return 1
         entry_is_dir = _entry_kind_from_manifest(manifest_path) == "dir"
 
         if file:
             if not entry_is_dir:
-                err(f"sub path not allowed for single-file entry: {entry}")
+                console.err(f"sub path not allowed for single-file entry: {entry}")
                 return 1
             file = file.removeprefix("./")
             kind = _sub_kind_from_manifest(manifest_path, file)
             if kind == "missing":
-                err(f"not found on S3: {entry}/{file}")
+                console.err(f"not found on S3: {entry}/{file}")
                 return 1
             local = os.path.join(outpath, *file.split("/"))
             if _symlinked_ancestor(outpath, file):
@@ -2162,15 +2153,15 @@ class _VerifyReport:
     pendings: int = 0
 
     def error(self, msg: str) -> None:
-        err(f"{self.entry}: {msg}")
+        console.err(f"{self.entry}: {msg}")
         self.errors += 1
 
     def warn(self, msg: str) -> None:
-        note_warning(f"warning: {self.entry}: {msg}")
+        console.warn(f"warning: {self.entry}: {msg}")
         self.warnings += 1
 
     def pending(self, msg: str) -> None:
-        write_output(f"{self.entry}: pending change: {msg}\n")
+        console.out(f"{self.entry}: pending change: {msg}\n")
         self.pendings += 1
 
     def finish(self) -> int:
@@ -2180,11 +2171,11 @@ class _VerifyReport:
         if self.pendings:
             counts += f", {self.pendings} pending change(s)"
         if self.errors or self.warnings:
-            write_output(
+            console.out(
                 f"{self.entry}: {self.errors} error(s), {self.warnings} warning(s) ({counts})\n"
             )
         else:
-            write_output(f"{self.entry}: OK ({counts})\n")
+            console.out(f"{self.entry}: OK ({counts})\n")
         return 1 if self.errors else 0
 
 
@@ -2482,7 +2473,7 @@ def _verify_objectless_record(
 def cmd_verify(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int:
     entry_cfg = cfg.entries.get(entry)
     if not entry_cfg:
-        err(f"no such entry: {entry}")
+        console.err(f"no such entry: {entry}")
         return 1
     base_path: str = entry_cfg["path"]
     report = _VerifyReport(entry)
@@ -2510,11 +2501,11 @@ def cmd_verify(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
         entry_is_dir = _entry_kind_from_manifest(manifest_path) == "dir"
         if sub is not None:
             if not entry_is_dir:
-                err(f"sub path not allowed for single-file entry: {entry}")
+                console.err(f"sub path not allowed for single-file entry: {entry}")
                 return 1
             kind = _sub_kind_from_manifest(manifest_path, sub)
             if kind == "missing":
-                err(f"not found on S3: {entry}/{sub}")
+                console.err(f"not found on S3: {entry}/{sub}")
                 return 1
             rel_key = f"{entry}/{sub}"
             local_path = os.path.join(base_path, *sub.split("/"))
@@ -2595,7 +2586,7 @@ def verify_top_level(cfg: Config, opts: Opts) -> None:
         if name.endswith(manifest.MANIFEST_SUFFIX)
     }
     for name in sorted(manifests - cfg.entries.keys()):
-        note_warning(
+        console.warn(
             f"warning: stale manifest (no configured entry):"
             f" {cfg.prefix}/{manifest.manifest_key(name)}"
         )
@@ -2604,11 +2595,11 @@ def verify_top_level(cfg: Config, opts: Opts) -> None:
         # per-entry verify; unconfigured, by the stale-manifest warning above.
         if name.endswith(manifest.MANIFEST_SUFFIX) or name in cfg.entries or name in manifests:
             continue
-        note_warning(f"warning: top-level object outside any configured entry: {cfg.prefix}/{name}")
+        console.warn(f"warning: top-level object outside any configured entry: {cfg.prefix}/{name}")
     for name in sorted(set(prefixes)):
         if name in cfg.entries or name in manifests:
             continue
-        note_warning(
+        console.warn(
             f"warning: data tree without a manifest or configured entry: {cfg.prefix}/{name}/"
         )
 
@@ -2616,7 +2607,7 @@ def verify_top_level(cfg: Config, opts: Opts) -> None:
 def cmd_list(cfg: Config, opts: Opts) -> int:
     for key in sorted(cfg.entries.keys()):
         path = cfg.entries[key]["path"]
-        write_output(f"{key:<20s} {path}\n")
+        console.out(f"{key:<20s} {path}\n")
     return 0
 
 
@@ -2631,7 +2622,7 @@ def show_entry_files(manifest_path: str, sub: str | None = None) -> None:
             display = f"{entry.path} -> {entry.sym_target}"
         when = "" if entry.mtime_ns is None else _fmt_mtime(entry.mtime_ns)
         size = "" if entry.size is None else str(entry.size)
-        write_output(
+        console.out(
             f"{format(entry.mode, 'o'):<6s} {entry.owner:<8s} {entry.group:<8s} "
             f"{size:>8s}  {when}  {display}\n"
         )
@@ -2643,21 +2634,21 @@ def cmd_ls_remote(cfg: Config, opts: Opts, entry: str | None = None, sub: str | 
         names, _prefixes = cfg.store.list_top_level(verbose=opts.verbose)
         for name in names:
             if name.endswith(manifest.MANIFEST_SUFFIX):
-                write_output(f"{name.removesuffix(manifest.MANIFEST_SUFFIX)}\n")
+                console.out(f"{name.removesuffix(manifest.MANIFEST_SUFFIX)}\n")
         return 0
 
     if entry not in cfg.entries:
-        err(f"no such entry: {entry}")
+        console.err(f"no such entry: {entry}")
         return 1
 
     fd, manifest_path = tempfile.mkstemp(suffix=".jsonl")
     os.close(fd)
     try:
         if not download_manifest(cfg, entry, manifest_path, opts.verbose):
-            err(f"entry not found on S3: {entry}")
+            console.err(f"entry not found on S3: {entry}")
             return 1
         if sub is not None and _sub_kind_from_manifest(manifest_path, sub) == "missing":
-            err(f"not found on S3: {entry}/{sub}")
+            console.err(f"not found on S3: {entry}/{sub}")
             return 1
         show_entry_files(manifest_path, sub=sub)
         return 0

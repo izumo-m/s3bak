@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from s3bak import localwalk, manifest
 from s3bak.compare import SYMLINK_MTIME_SUPPORTED, compare_to_stat
 from s3bak.confirm import DeleteConfirmer
-from s3bak.console import IS_WINDOWS, err, is_junction, note_warning, write_output
+from s3bak.console import IS_WINDOWS, console, is_junction
 from s3bak.manifest import ManifestEntry
 
 # =============================================================================
@@ -182,7 +182,7 @@ def prepare_dir_conflicts(outpath: str, manifest_path: str, sub: str | None) -> 
         if not is_symlink and not is_junction(st):
             continue
         if not within_root(root_real, target):
-            err(f"manifest path escapes restore root, skipped: {entry.path}")
+            console.err(f"manifest path escapes restore root, skipped: {entry.path}")
             errors += 1
             continue
         try:
@@ -192,7 +192,9 @@ def prepare_dir_conflicts(outpath: str, manifest_path: str, sub: str | None) -> 
                 os.rmdir(target)  # a junction is removed like an (empty) directory
             os.makedirs(target, exist_ok=True)
         except OSError as e:
-            err(f"cannot replace symlink or junction with recorded directory: {target}: {e}")
+            console.err(
+                f"cannot replace symlink or junction with recorded directory: {target}: {e}"
+            )
             errors += 1
     return errors
 
@@ -262,12 +264,12 @@ def _apply_meta(target: str, mode: int, mtime_ns: int | None) -> bool:
         # which run() would let escape as a traceback. Treat it as an ordinary
         # metadata-apply failure (exit 1) like any other utime error.
         except (OSError, OverflowError, ValueError) as e:
-            err(f"utime failed: {target}: {e}")
+            console.err(f"utime failed: {target}: {e}")
             ok = False
     try:
         os.chmod(target, mode)
     except OSError as e:
-        err(f"chmod failed: {target}: {e}")
+        console.err(f"chmod failed: {target}: {e}")
         ok = False
     return ok
 
@@ -432,7 +434,7 @@ def _place_symlink(
             except OSError:
                 pass
             raise
-    write_output(f"{target} -> {sym_target}\n")
+    console.out(f"{target} -> {sym_target}\n")
     if not SYMLINK_MTIME_SUPPORTED or mtime_ns is None:
         return True
     try:
@@ -442,7 +444,7 @@ def _place_symlink(
     # which run() would let escape as a traceback. Treat it as an ordinary
     # metadata-apply failure (exit 1) like any other utime error.
     except (OSError, OverflowError, ValueError) as e:
-        err(f"utime failed: {target}: {e}")
+        console.err(f"utime failed: {target}: {e}")
         return False
     return True
 
@@ -500,11 +502,11 @@ def _settle_dir(target: str, m_entry: ManifestEntry, window_ns: int) -> int:
     always re-lstats rather than trusting an earlier one."""
     st, _sym = _lstat_readlink(target)
     if st is None or not stat_mod.S_ISDIR(st.st_mode):
-        err(f"expected {m_entry.path} to be a directory: {target}")
+        console.err(f"expected {m_entry.path} to be a directory: {target}")
         return 1
     if compare_to_stat(m_entry, st, None, window_ns=window_ns).is_match:
         return 0
-    write_output(f"{m_entry.perm_str} {target}\n")
+    console.out(f"{m_entry.perm_str} {target}\n")
     return 0 if _apply_meta(target, m_entry.perm_bits, m_entry.mtime_ns) else 1
 
 
@@ -611,13 +613,13 @@ def _apply_record(
     if compare_to_stat(m_entry, st, local_sym, window_ns=window_ns).is_match:
         return _ApplyOutcome(0)
     if st is None:
-        err(f"expected file missing (sync did not place it): {target}")
+        console.err(f"expected file missing (sync did not place it): {target}")
         return _ApplyOutcome(1)
     if stat_mod.S_IFMT(st.st_mode) != stat_mod.S_IFMT(m_entry.mode):
         # In particular, never chmod/utime through a local symlink where a
         # regular file is recorded: --meta-only must not mutate the link's
         # target outside the restore tree.
-        err(f"expected {m_entry.path} to have its recorded file type: {target}")
+        console.err(f"expected {m_entry.path} to have its recorded file type: {target}")
         return _ApplyOutcome(1)
     if enforce_size and m_entry.is_file and m_entry.size is not None and st.st_size != m_entry.size:
         # After the data sync a regular file must have its recorded size: the
@@ -629,12 +631,12 @@ def _apply_record(
         # point of the backup. Only checked when the data sync ran: --meta-only
         # applies metadata over whatever data is already there and must not fail
         # on a size difference it was never asked to reconcile.
-        err(
+        console.err(
             f"restored size does not match manifest ({st.st_size} != {m_entry.size}),"
             f" the stored object does not match the record: {target}"
         )
         return _ApplyOutcome(1)
-    write_output(f"{m_entry.perm_str} {target}\n")
+    console.out(f"{m_entry.perm_str} {target}\n")
     return _ApplyOutcome(0 if _apply_meta(target, m_entry.perm_bits, m_entry.mtime_ns) else 1)
 
 
@@ -731,7 +733,7 @@ def apply_manifest(
                 # The walk prunes excludes, so "not walked" may mean hidden
                 # rather than missing: judge from a direct lstat.
                 if rel != "." and not within_root(root_real, target):
-                    err(f"manifest path escapes restore root, skipped: {m_entry.path}")
+                    console.err(f"manifest path escapes restore root, skipped: {m_entry.path}")
                     errors += 1
                     continue
                 st, local_sym = _lstat_readlink(target)
@@ -852,7 +854,7 @@ def remove_extras(
     at its own pop) both look themselves up in it the instant they are
     judged - no deferral needed. A hit is NOT removed (it may be the very
     file ``pull`` just restored under its recorded spelling), a warning is
-    printed (exit 2 via ``note_warning``), and no confirmation is asked for
+    printed (exit 2 via ``console.warn``), and no confirmation is asked for
     it. This is a choice, not a failure - like a kept item, it silently
     keeps every extra directory still open above it too (their ``rmdir``
     could only fail on a directory that still holds it).
@@ -881,9 +883,9 @@ def remove_extras(
             else:
                 os.remove(path)
             removed += 1
-            write_output(f"delete: {path}\n")
+            console.out(f"delete: {path}\n")
         except OSError as e:
-            err(f"delete failed: {path}: {e}")
+            console.err(f"delete failed: {path}: {e}")
             errors += 1
 
     def keep_open_ancestors() -> None:
@@ -904,14 +906,14 @@ def remove_extras(
         # removal decision (judged at its pop, below) - both look up their
         # OWN (parent, basename) in the pre-collected alias set the same way.
         if (parent_of(rel), fs_alias_key(basename_of(rel))) in aliases:
-            note_warning(
+            console.warn(
                 f"warning: not removed (a local name the filesystem may fold onto"
                 f" a recorded path): {path}"
             )
             keep_open_ancestors()
             return
         if dryrun:
-            write_output(f"(dry-run) delete: {path}\n")
+            console.out(f"(dry-run) delete: {path}\n")
             return
         if confirm is not None and not confirm.confirm(path):
             keep_open_ancestors()

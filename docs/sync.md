@@ -306,8 +306,10 @@ Deleting is opt-in and confirmed:
   key order (the sync decides the delete lane serially). An object answered n
   keeps its manifest record too — the record and the object always travel
   together — and shows up as `D` in `status` until a later `--delete` removes
-  it. Prompts of parallel `--all` entries are serialized and carry the entry
-  name.
+  it. A question owns the terminal until it is answered: the transfer result
+  lines that would otherwise scroll it away wait, and print once the answer
+  is in. Prompts of parallel `--all` entries are serialized and carry the
+  entry name.
 - **A record with no object is offered as the record itself.** A locally
   vanished regular file is offered through its S3 object (above); a locally
   vanished symlink, special file, or directory left only its manifest

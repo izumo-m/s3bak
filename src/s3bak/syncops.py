@@ -24,7 +24,7 @@ from boto3_s3 import LocalFileInfo
 from s3bak import localwalk, manifest
 from s3bak.compare import SYMLINK_MTIME_SUPPORTED, mode_differs
 from s3bak.config import Config, Opts
-from s3bak.console import err, note_warning, write_output, write_stderr
+from s3bak.console import console
 from s3bak.manifest import ManifestEntry
 
 if TYPE_CHECKING:
@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 def _walk_warning(body: str) -> None:
     """The manifest walk's warn hook: boto3-s3 message bodies -> one warning
     line each (exit 2), aws-cli's own prefix included."""
-    note_warning(f"warning: {body}")
+    console.warn(f"warning: {body}")
 
 
 def write_manifest_to_aws(
@@ -61,7 +61,7 @@ def write_manifest_to_aws(
     a real push - and only the S3 write is skipped."""
     key = manifest.manifest_key(entry)
     if upload:
-        write_stderr(f"Updating {cfg.prefix}/{key}\n")
+        console.diag(f"Updating {cfg.prefix}/{key}\n")
 
     fd, tmp = tempfile.mkstemp(suffix=".jsonl")
     try:
@@ -73,7 +73,7 @@ def write_manifest_to_aws(
                     None,
                     localwalk.walk_tree(target, excludes, warn=_walk_warning),
                     keep_old=keep_old,
-                    warn=note_warning,
+                    warn=console.warn,
                 )
             else:
                 st = os.lstat(target)
@@ -166,13 +166,13 @@ def patch_manifest_subtree(
                 sub,
                 new_entries,
                 keep_old=keep_old,
-                warn=note_warning,
+                warn=console.warn,
             )
         _validate_before_publish(entry, new_path)
         if opts.dryrun:
-            write_output(f"(dry-run) would patch manifest: {key} (sub={sub})\n")
+            console.out(f"(dry-run) would patch manifest: {key} (sub={sub})\n")
         else:
-            write_stderr(f"Updating {cfg.prefix}/{key}\n")
+            console.diag(f"Updating {cfg.prefix}/{key}\n")
             assert cfg.store is not None
             cfg.store.put_file(key, new_path, verbose=opts.verbose)
         return True
@@ -761,12 +761,12 @@ def publish_journal_manifest(
     fd, tmp = tempfile.mkstemp(suffix=".jsonl")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            manifest.merge_journal(f, old_manifest, journal_path, warn=note_warning)
+            manifest.merge_journal(f, old_manifest, journal_path, warn=console.warn)
         _validate_before_publish(entry, tmp)
         if opts.dryrun:
-            write_output(f"(dry-run) would update manifest: {key}\n")
+            console.out(f"(dry-run) would update manifest: {key}\n")
         else:
-            write_stderr(f"Updating {cfg.prefix}/{key}\n")
+            console.diag(f"Updating {cfg.prefix}/{key}\n")
             assert cfg.store is not None
             cfg.store.put_file(key, tmp, verbose=opts.verbose)
     finally:
@@ -851,9 +851,9 @@ def download_from_s3(
         # skipped. No substitute probe either: a HeadObject can succeed or
         # fail under different IAM permissions than the real GetObject, and a
         # dry run must only make the calls the real run would make.
-        write_output(f"(dry-run) download: {cfg.prefix}/{rel} -> {outpath}\n")
+        console.out(f"(dry-run) download: {cfg.prefix}/{rel} -> {outpath}\n")
         return 0, True
     if not cfg.store.get_object(rel, outpath, size=size, verbose=verbose):
-        err(f"object missing on S3: {cfg.prefix}/{rel}")
+        console.err(f"object missing on S3: {cfg.prefix}/{rel}")
         return 1, False
     return 0, True

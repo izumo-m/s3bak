@@ -52,14 +52,7 @@ from s3bak.commands import (
 from s3bak.compare import _resolve_use_color
 from s3bak.config import Config, Opts, load_config
 from s3bak.confirm import AnswerMode, is_aborted, reset_confirmations, resolve_answer_mode
-from s3bak.console import (
-    die,
-    err,
-    expand_home,
-    normalize_local_path,
-    reset_warnings,
-    warning_count,
-)
+from s3bak.console import console, expand_home, normalize_local_path
 from s3bak.restore import canonical_restore_comparison_path, resolve_pull_destination
 from s3bak.store import Boto3S3Store
 from s3bak.syncops import download_from_s3
@@ -157,7 +150,7 @@ def run_entries(
                 # handler map it to the documented 141 instead of a worker 1.
                 raise
             except Exception as exc:
-                err(f"{entries[index]}: {exc}")
+                console.err(f"{entries[index]}: {exc}")
                 statuses[index] = 1
     finally:
         # SIGINT lands in this (main) thread as SystemExit: cancel the entries
@@ -176,7 +169,7 @@ def _validate_distinct_entries(resolved: Sequence[tuple[str, str | None]], comma
     seen: set[str] = set()
     for entry, _sub in resolved:
         if entry in seen:
-            die(
+            console.die(
                 f"duplicate entry in {command}: {entry} "
                 f"(parallel {command} of the same entry is not supported)"
             )
@@ -501,7 +494,7 @@ def _resolve_one_arg(cfg: Config, arg: str) -> tuple[str, str | None]:
     if not (any(s in arg for s in seps) or os.path.isabs(arg)):
         if arg in cfg.entries:
             return arg, None
-        die(f"no such entry: {arg}")
+        console.die(f"no such entry: {arg}")
 
     if not os.path.isabs(arg):
         entry_form = arg
@@ -523,7 +516,7 @@ def _resolve_one_arg(cfg: Config, arg: str) -> tuple[str, str | None]:
                 or sub.startswith("/")
                 or os.path.splitdrive(sub)[0]
             ):
-                die(f"sub path must stay inside entry {name}: {arg}")
+                console.die(f"sub path must stay inside entry {name}: {arg}")
             return name, sub
 
     local = normalize_local_path(arg)
@@ -541,18 +534,18 @@ def _resolve_one_arg(cfg: Config, arg: str) -> tuple[str, str | None]:
         matches.append((len(entry_path), name, candidate_file))
 
     if not matches:
-        die(f"no such entry for path: {arg}")
+        console.die(f"no such entry for path: {arg}")
     longest = max(length for length, _name, _sub in matches)
     best = [(name, sub) for length, name, sub in matches if length == longest]
     if len(best) > 1:
         names = ", ".join(sorted(name for name, _sub in best))
-        die(f"path is ambiguous between entries {names}: {arg}")
+        console.die(f"path is ambiguous between entries {names}: {arg}")
     return best[0]
 
 
 def resolve_entry_file(cfg: Config, positional: list[str], cmd: str) -> tuple[str, str | None]:
     if len(positional) != 1:
-        die(f"{cmd} takes <entry> or <path>")
+        console.die(f"{cmd} takes <entry> or <path>")
     return _resolve_one_arg(cfg, positional[0])
 
 
@@ -560,7 +553,7 @@ def resolve_entry_files(
     cfg: Config, positional: list[str], cmd: str
 ) -> list[tuple[str, str | None]]:
     if not positional:
-        die(f"{cmd} requires at least one entry or path")
+        console.die(f"{cmd} requires at least one entry or path")
     return [_resolve_one_arg(cfg, arg) for arg in positional]
 
 
@@ -581,7 +574,7 @@ def _validate_pull_destinations(cfg: Config, resolved: Sequence[tuple[str, str |
             except ValueError:  # different Windows drives
                 continue
             if common in (left_cmp, right_cmp):
-                die(
+                console.die(
                     "pull restore destinations overlap: "
                     f"{left_entry} ({left_path}) and {right_entry} ({right_path})"
                 )
@@ -604,7 +597,7 @@ def _validate_command_options(command: str, used_options: Sequence[str]) -> None
             name for name, spec in _COMMAND_SPECS.items() if option in spec.options
         ]
         label = _OPTION_SPECS[option].error_label
-        die(f"{label} only applies to {_join_command_names(applicable_commands)}")
+        console.die(f"{label} only applies to {_join_command_names(applicable_commands)}")
 
 
 # =============================================================================
@@ -628,7 +621,7 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write(f"s3bak {version('s3bak')}\n")
         return 0
     if subcmd not in _COMMAND_SPECS:
-        err(f"unknown command: {subcmd}")
+        console.err(f"unknown command: {subcmd}")
         print_usage()
 
     opt_all = False
@@ -651,7 +644,7 @@ def main(argv: list[str] | None = None) -> int:
         if "=" in flag:
             return flag.split("=", 1)[1], idx
         if idx + 1 >= len(args):
-            die(f"{flag} requires a value")
+            console.die(f"{flag} requires a value")
         return args[idx + 1], idx + 1
 
     i = 1
@@ -687,18 +680,22 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 opt_mtime_window = float(val)
             except ValueError:
-                die(f"--mtime-window requires a non-negative number of seconds (got {val!r})")
+                console.die(
+                    f"--mtime-window requires a non-negative number of seconds (got {val!r})"
+                )
             if not math.isfinite(opt_mtime_window) or opt_mtime_window < 0:
-                die(f"--mtime-window must be >= 0 (got {opt_mtime_window})")
+                console.die(f"--mtime-window must be >= 0 (got {opt_mtime_window})")
             # Converted to an integer nanosecond count (window_ns_for); reject a
             # value so large the * 1e9 overflows to inf and would crash round().
             if not math.isfinite(opt_mtime_window * 1_000_000_000):
-                die(f"--mtime-window is too large to use (got {opt_mtime_window})")
+                console.die(f"--mtime-window is too large to use (got {opt_mtime_window})")
         elif a in ("-o", "--output") or a.startswith("--output="):
             used_options.append("output")
             opt_outpath, i = take_value(a, i)
             if "=" not in a and opt_outpath.startswith("-"):
-                die(f"{a} requires a path value (use --output=<path> for a path starting with '-')")
+                console.die(
+                    f"{a} requires a path value (use --output=<path> for a path starting with '-')"
+                )
         elif a == "--color":
             opt_color = "always"
             used_options.append("color")
@@ -706,7 +703,7 @@ def main(argv: list[str] | None = None) -> int:
             used_options.append("color")
             val = a.split("=", 1)[1]
             if val not in ("auto", "always", "never"):
-                die(f"invalid --color value: {val} (use auto|always|never)")
+                console.die(f"invalid --color value: {val} (use auto|always|never)")
             opt_color = val
         elif a == "--no-color":
             opt_color = "never"
@@ -718,7 +715,7 @@ def main(argv: list[str] | None = None) -> int:
             positional.extend(args[i + 1 :])
             break
         elif a.startswith("-"):
-            die(f"unknown option: {a}")
+            console.die(f"unknown option: {a}")
         else:
             positional.append(a)
         i += 1
@@ -742,37 +739,45 @@ def main(argv: list[str] | None = None) -> int:
     # that ignored it would perform the REAL operation the user believed was
     # a preview.
     if opt_all and positional:
-        die("--all cannot be combined with explicit entries")
+        console.die("--all cannot be combined with explicit entries")
     if opt_meta_only and opt_data_only:
-        die("--meta-only and --data-only are mutually exclusive")
+        console.die("--meta-only and --data-only are mutually exclusive")
 
     if opt_yes and not opt_delete:
-        die("--yes requires --delete (it answers deletion confirmations)")
+        console.die("--yes requires --delete (it answers deletion confirmations)")
     if subcmd == "push" and opt_delete and opt_meta_only:
-        die("push --delete cannot be combined with --meta-only (a deletion drops the object too)")
+        console.die(
+            "push --delete cannot be combined with --meta-only (a deletion drops the object too)"
+        )
     if subcmd == "push" and opt_delete and opt_data_only:
-        die("push --delete cannot be combined with --data-only (a deletion drops the record too)")
+        console.die(
+            "push --delete cannot be combined with --data-only (a deletion drops the record too)"
+        )
 
     if opt_checksum and opt_meta_only:
-        die("--checksum cannot be combined with --meta-only (no file data is compared)")
+        console.die("--checksum cannot be combined with --meta-only (no file data is compared)")
     # push/pull --checksum replaces the size+mtime check entirely, so a window is
     # meaningless there. verify --checksum is the opposite: the window feeds the
     # stat classification of content mismatches, and is useless without it.
     if subcmd == "verify":
         if opt_mtime_window is not None and not opt_checksum:
-            die("--mtime-window requires --checksum with verify (it classifies content mismatches)")
+            console.die(
+                "--mtime-window requires --checksum with verify (it classifies content mismatches)"
+            )
     elif opt_checksum and opt_mtime_window is not None:
-        die("--mtime-window cannot be combined with --checksum (content comparison ignores it)")
+        console.die(
+            "--mtime-window cannot be combined with --checksum (content comparison ignores it)"
+        )
     if subcmd == "pull" and opt_delete and opt_meta_only:
-        die("pull --delete cannot be combined with --meta-only")
+        console.die("pull --delete cannot be combined with --meta-only")
 
     if opt_outpath == "":
-        die("-o/--output requires a non-empty path")
+        console.die("-o/--output requires a non-empty path")
     if subcmd == "pull" and opt_outpath is not None:
         if opt_all:
-            die("--all cannot be combined with -o/--output")
+            console.die("--all cannot be combined with -o/--output")
         if len(positional) > 1:
-            die("-o/--output cannot be combined with multiple pull targets")
+            console.die("-o/--output cannot be combined with multiple pull targets")
 
     if help_requested:
         print_command_help(subcmd)
@@ -819,7 +824,7 @@ def main(argv: list[str] | None = None) -> int:
             status_sub_by_entry = {}
             for e, s in resolved:
                 if e in status_sub_by_entry and status_sub_by_entry[e] != s:
-                    die(f"conflicting sub paths for entry {e}")
+                    console.die(f"conflicting sub paths for entry {e}")
                 status_sub_by_entry[e] = s
             entries = list(status_sub_by_entry)
 
@@ -837,7 +842,7 @@ def main(argv: list[str] | None = None) -> int:
             verify_sub_by_entry = {}
             for e, s in resolved:
                 if e in verify_sub_by_entry and verify_sub_by_entry[e] != s:
-                    die(f"conflicting sub paths for entry {e}")
+                    console.die(f"conflicting sub paths for entry {e}")
                 verify_sub_by_entry[e] = s
             entries = list(verify_sub_by_entry)
 
@@ -861,12 +866,12 @@ def main(argv: list[str] | None = None) -> int:
 
     elif subcmd == "list":
         if positional:
-            die("list takes no arguments (use 'ls-remote <entry>' for manifest contents)")
+            console.die("list takes no arguments (use 'ls-remote <entry>' for manifest contents)")
         return cmd_list(cfg, opts)
 
     elif subcmd == "ls-remote":
         if len(positional) > 1:
-            die("ls-remote takes at most one entry or path")
+            console.die("ls-remote takes at most one entry or path")
         if not positional:
             return cmd_ls_remote(cfg, opts, None, None)
         entry, sub = _resolve_one_arg(cfg, positional[0])
@@ -892,35 +897,35 @@ def _sdk_errors() -> tuple[type[BaseException], ...]:
 def run() -> int:
     """Console entry point: install signal handling and translate exceptions
     into exit codes. This is what the ``s3bak`` command invokes."""
-    reset_warnings()
+    console.reset_warnings()
     signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
     try:
         rc = main() or 0
     except subprocess.CalledProcessError as e:
         cmd_str = shlex.join(e.cmd) if isinstance(e.cmd, list) else str(e.cmd)
-        err(f"command failed: {cmd_str}")
+        console.err(f"command failed: {cmd_str}")
         return e.returncode or 1
     except BrokenPipeError:
         return 141
     except FileNotFoundError as e:
         # An external command is not on PATH (the `diff` binary), or a required
         # file vanished mid-run: report cleanly instead of a raw traceback.
-        err(str(e))
+        console.err(str(e))
         return 1
     except OSError as e:
         # Permission errors, disk-full failures, and local I/O races are normal
         # operational failures for a backup tool, not reasons to expose a Python
         # traceback to the CLI user.
-        err(str(e))
+        console.err(str(e))
         return 1
     except manifest.ManifestError as e:
-        err(str(e))
+        console.err(str(e))
         return 1
     except _sdk_errors() as e:
-        err(str(e))
+        console.err(str(e))
         return 1
     # A run that only warned (skipped files etc.) but hit no hard error exits 2
     # (aws-style). Successful work is retained, but callers must inspect it.
-    if rc == 0 and warning_count() > 0:
+    if rc == 0 and console.warning_count() > 0:
         return 2
     return rc

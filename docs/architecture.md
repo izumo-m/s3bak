@@ -23,8 +23,11 @@ are foundational modules used from several layers.
 
 ## Module responsibilities
 
-- **console** owns terminal output, warning accounting, and small path helpers.
-  It imports no other s3bak module.
+- **console** owns terminal I/O, warning accounting, and small path helpers. A
+  single `Console` holds both streams: writes are serialized by line, and a
+  prompt session (`Console.prompt`) holds the terminal from the question to
+  the answer, so a transfer's result line can never land between them. It
+  imports no other s3bak module.
 - **manifest** owns the JSONL format, validation, the push-journal format and
   its streaming merge, sorted-stream joins, and the stat-based manifest
   comparison pull uses.
@@ -34,8 +37,9 @@ are foundational modules used from several layers.
 - **store** is the S3 boundary. `Boto3S3Store` wraps transfers, listing, and
   object inspection.
 - **confirm** owns the deletion confirmations: answer modes, the per-item
-  prompt (serialized across parallel entries), and the one-question subtree
-  confirmation. It depends only on `console`.
+  prompt, and the one-question subtree confirmation. Every question runs
+  inside a console prompt session, which is what serializes them. It depends
+  only on `console`.
 - **config** loads and validates executable `config.py`, constructs the store
   when a command needs S3, and defines the `Config` and `Opts` values passed
   through the command layers.

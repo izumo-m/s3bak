@@ -17,6 +17,10 @@ legend and re-asks, and a one-line summary of the answers precedes the first
 question of a run. What each answer means for the manifest is the journal
 emitter's business (a confirmed deletion journals its record's drop at the
 decision point - see syncops.PushJournal); the confirmer only answers.
+
+Every question is asked inside a `console.prompt` session, which owns the
+terminal from the question to the answer: one question at a time, and no
+transfer's result line between a question and the answer it is waiting for.
 """
 
 from __future__ import annotations
@@ -24,7 +28,7 @@ from __future__ import annotations
 import threading
 from enum import Enum, auto
 
-from s3bak.console import prompt_is_interactive, read_prompt_answer, write_stderr
+from s3bak.console import console, prompt_is_interactive
 
 
 class DeletionAbortedError(Exception):
@@ -47,10 +51,6 @@ def resolve_answer_mode(*, yes: bool) -> AnswerMode:
         return AnswerMode.ASK
     return AnswerMode.ALL_NO
 
-
-# One question at a time across the parallel --all entry threads; the prompt
-# text carries the entry name so interleaved entries stay attributable.
-_prompt_lock = threading.Lock()
 
 # q aborts the whole command, not just one entry: once set, every later
 # confirm() raises immediately without prompting, so sibling --all entries
@@ -104,17 +104,15 @@ class DeleteConfirmer:
             return True
         if self._mode is AnswerMode.ALL_NO:
             return False
-        with _prompt_lock:
+        with console.prompt() as session:
             if _abort.is_set():  # another entry aborted while we waited
                 raise DeletionAbortedError()
             global _summary_shown
             if not _summary_shown:
                 _summary_shown = True
-                write_stderr(_ANSWER_SUMMARY)
+                session.say(_ANSWER_SUMMARY)
             while True:
-                answer = read_prompt_answer(
-                    f"s3bak: {self._entry}: delete {display}? [y/n/a/d/q/?] "
-                )
+                answer = session.ask(f"s3bak: {self._entry}: delete {display}? [y/n/a/d/q/?] ")
                 if answer is None:  # EOF
                     _abort.set()
                     raise DeletionAbortedError()
@@ -133,7 +131,7 @@ class DeleteConfirmer:
                     raise DeletionAbortedError()
                 # ? or anything unrecognized - "delete" (which d does NOT
                 # mean) and a bare Enter included - explains and re-asks.
-                write_stderr(_ANSWER_LEGEND)
+                session.say(_ANSWER_LEGEND)
 
 
 def confirm_subtree_delete(mode: AnswerMode, entry: str, display: str) -> bool:
@@ -146,15 +144,13 @@ def confirm_subtree_delete(mode: AnswerMode, entry: str, display: str) -> bool:
         return True
     if mode is AnswerMode.ALL_NO:
         return False
-    with _prompt_lock:
-        if _abort.is_set():  # another entry answered q while we waited for the lock
+    with console.prompt() as session:
+        if _abort.is_set():  # another entry answered q while we waited for the terminal
             raise DeletionAbortedError()
         while True:
-            answer = read_prompt_answer(
-                f"s3bak: {entry}: delete the backup subtree {display}? [y/n] "
-            )
+            answer = session.ask(f"s3bak: {entry}: delete the backup subtree {display}? [y/n] ")
             if answer in ("y", "yes"):
                 return True
             if answer in ("n", "no") or answer is None:  # None = EOF
                 return False
-            write_stderr("y, yes - delete the subtree\nn, no  - keep it\n")
+            session.say("y, yes - delete the subtree\nn, no  - keep it\n")

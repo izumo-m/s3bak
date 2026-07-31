@@ -246,10 +246,10 @@ def test_transfer_lines_print_as_each_item_completes(ws, monkeypatch):
     # F1: a sync's result lines print from on_result as each item finishes,
     # not accumulated and flushed once as a single write after the whole sync
     # completes - the old shape, which held O(transfer count) lines in memory
-    # and stayed silent until the very end. Wrapping write_output itself (not
-    # just counting output lines) proves the store issues one print call per
-    # transferred file, rather than one big join.
-    from s3bak import store as store_mod
+    # and stayed silent until the very end. Wrapping the console write itself
+    # (not just counting output lines) proves the store issues one print call
+    # per transferred file, rather than one big join.
+    from s3bak.console import console
 
     for i in range(5):
         ws.write(f"data/f{i}.txt", f"payload-{i}")
@@ -257,10 +257,8 @@ def test_transfer_lines_print_as_each_item_completes(ws, monkeypatch):
     store = _store(ws)
 
     calls: list[str] = []
-    real_write_output = store_mod.write_output
-    monkeypatch.setattr(
-        store_mod, "write_output", lambda text: (calls.append(text), real_write_output(text))[0]
-    )
+    real_out = console.out
+    monkeypatch.setattr(console, "out", lambda text: (calls.append(text), real_out(text))[0])
 
     # sync_up's create lane defaults to "copy every new local entry" - directories
     # included (LocalStorage enumerates the complete tree, docs/journal.md); a
@@ -274,7 +272,7 @@ def test_transfer_lines_print_as_each_item_completes(ws, monkeypatch):
     assert result.returncode == 0
     assert result.results == 5
     upload_calls = [c for c in calls if c.startswith("upload:")]
-    # One write_output call per uploaded file, each carrying exactly its own
+    # One console.out call per uploaded file, each carrying exactly its own
     # line - never one call joining every line after the sync finished.
     assert len(upload_calls) == 5
     assert all(c.count("\n") == 1 for c in upload_calls)
