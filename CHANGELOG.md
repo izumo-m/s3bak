@@ -9,6 +9,13 @@ a fix only (Fixed).
 
 ## [Unreleased]
 
+### Changed
+
+- A manifest file record whose S3 object is gone is now retired by any push,
+  not only by `push --delete`: it describes a backup that no longer exists,
+  so dropping it is repair rather than deletion and is done silently. A
+  record whose object is still on S3 is untouched, as before.
+
 ### Fixed
 
 - A `--delete` confirmation is no longer scrolled away by the transfer result

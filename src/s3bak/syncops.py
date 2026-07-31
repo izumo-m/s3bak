@@ -271,6 +271,7 @@ class PushJournal:
         walker: localwalk.ManifestWalker,
         sub: str | None = None,
         content: PairFilter | None = None,
+        dest_listed: bool = False,
         delete_mode: bool = False,
         record_delete: Callable[[str, ManifestEntry], bool] | None = None,
     ) -> None:
@@ -293,6 +294,12 @@ class PushJournal:
         self._walker = walker
         self._sub = sub
         self._content = content
+        # Whether this run's pair stream covers every S3 object in the
+        # journal's range - true when the push runs a directory sync, false
+        # for a single-file or symlink sub-path push, which lists nothing.
+        # Only then does "the stream never keyed this record" prove that the
+        # record's object is gone (see _skip_over).
+        self._dest_listed = dest_listed
         self._delete_mode = delete_mode
         self._record_delete = record_delete
         # Open directory-record delete candidates, innermost last - the same
@@ -365,11 +372,23 @@ class PushJournal:
     def _skip_over(self, record: tuple[str, str, ManifestEntry, str]) -> None:
         """A record the pair stream never keyed: nothing exists at its key on
         either side (an S3 object would have formed a delete-lane pair, a
-        local item an update/create pair). Keep-by-default keeps it. A
-        ``--delete`` run retires it by kind: a stale file record drops
-        silently (its object is already gone, the interrupted-deletion
-        self-heal); a directory record opens a frame whose drop is decided
-        post-order (see ``_resolve_frame``); a symlink or special-file
+        local item an update/create pair).
+
+        A **file** record here has no object left, so it restores nothing:
+        every push drops it, ``--delete`` or not, and without a question.
+        Retiring it is repair, not deletion - there is no backup at the key
+        to protect - and it is the self-heal for a push interrupted (or
+        aborted by q) after some of its deletions had already run. This is
+        why the delete lane is observed even without ``--delete``
+        (commands._journal_delete_lane): a record whose object is still there
+        must reach the journal through that lane instead of arriving here.
+        Where the run lists no objects at all (``dest_listed`` false - a
+        single-file or symlink sub-path push), nothing is provably stale and
+        the record is kept.
+
+        Every other kind IS the backup at its key, so only a ``--delete`` run
+        retires it: a directory record opens a frame whose drop is decided
+        post-order (see ``_resolve_frame``), and a symlink or special-file
         record is confirmed on arrival through ``record_delete``. ``--yes``
         is not a separate lane: it auto-confirms the same candidates through
         the same paths without prompting. All of it only while the scan is
@@ -383,12 +402,10 @@ class PushJournal:
         with its object. The surviving pair reads as the restorability
         warning until a directory-level ``push --delete`` retires it."""
         key, rel, e, line = record
-        if not self._delete_mode:
-            return
         if self._sub is not None and not rel.startswith(self._sub + "/"):
             return
         if self._walker.scan_incomplete:
-            if not e.is_file:
+            if self._delete_mode and not e.is_file:
                 # A record-only candidate kept without a question: count it,
                 # or a record-only run would keep silently with no warning
                 # at all. (A gated stale file record is not a candidate -
@@ -397,7 +414,13 @@ class PushJournal:
             self._mark_record_kept()
             return
         if e.is_file:
-            self._emit(manifest.JOURNAL_DROP, line)
+            if self._dest_listed:
+                self._emit(manifest.JOURNAL_DROP, line)
+            else:
+                self._mark_record_kept()
+            return
+        if not self._delete_mode:
+            self._mark_record_kept()
             return
         if e.is_dir:
             # Claim the drop's line position now (the journal is strictly

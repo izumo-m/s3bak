@@ -310,6 +310,14 @@ Deleting is opt-in and confirmed:
   lines that would otherwise scroll it away wait, and print once the answer
   is in. Prompts of parallel `--all` entries are serialized and carry the
   entry name.
+- **A file record whose object is already gone needs no `--delete`.** It
+  describes a backup that no longer exists — a pull could restore nothing
+  from it — so retiring it is repair, not deletion: any push drops it
+  silently, without a question. Deciding that requires seeing the S3 side,
+  which is why the delete lane is observed on every directory push even
+  without `--delete` (it deletes nothing then); a sub-path push of a file or
+  symlink lists no objects, so it keeps every record below it. This is the
+  self-heal after an interrupted or `q`-aborted `push --delete`.
 - **A record with no object is offered as the record itself.** A locally
   vanished regular file is offered through its S3 object (above); a locally
   vanished symlink, special file, or directory left only its manifest
@@ -377,9 +385,9 @@ Deleting is opt-in and confirmed:
   to everything — nothing is deleted and the run still succeeds (rc 0).
 - **`q` (abort)** exits 1 without rewriting the manifest or running
   `post_hook`. Deletions already confirmed may have run; their records then
-  linger until the next `push --delete`, which journals the drop of any
-  stale old-only file record with no object behind it. The same self-healing
-  covers a push interrupted mid-deletion.
+  linger until the next push — any push, `--delete` or not — journals the
+  drop of any stale old-only file record with no object behind it. The same
+  self-healing covers a push interrupted mid-deletion.
 - **`--meta-only` / `--data-only` cannot combine with `--delete`**: a deletion
   drops the object and its record atomically, which a one-sided push cannot.
 

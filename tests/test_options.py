@@ -1004,10 +1004,11 @@ def test_push_delete_with_all_answers_no_converges(ws):
     assert "Updating" not in second.err  # settled: converges
 
 
-def test_push_delete_heals_stale_record_whose_object_is_gone(ws):
-    # A record whose object vanished (interrupted deletion, q after y, ...)
-    # is not a delete candidate, so no answer covers it: any --delete push -
-    # including the unattended all-no run - drops it from the manifest.
+@pytest.mark.parametrize("delete_flag", [[], ["--delete"]])
+def test_push_heals_stale_record_whose_object_is_gone(ws, delete_flag):
+    # A record whose object vanished (an interrupted deletion, a q after a y,
+    # ...) restores nothing, so retiring it is repair rather than deletion:
+    # ANY push drops it - --delete or not - and without a question.
     ws.write("data/keep.txt", "k")
     ws.write("data/stale.txt", "s")
     ws.config({"data": {"path": str(ws.root / "data")}})
@@ -1015,7 +1016,7 @@ def test_push_delete_heals_stale_record_whose_object_is_gone(ws):
     (ws.root / "data" / "stale.txt").unlink()
     ws.s3.delete_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/stale.txt")
 
-    res = ws.run("push", "--delete", "data", expect_rc=0)
+    res = ws.run("push", *delete_flag, "data", expect_rc=0)
 
     assert "Updating" in res.err
     assert "./stale.txt" not in _manifest_paths(ws)
@@ -1023,6 +1024,44 @@ def test_push_delete_heals_stale_record_whose_object_is_gone(ws):
     dest = ws.root / "restore"
     ws.run("pull", "data", "-o", str(dest), expect_rc=0)
     assert (dest / "keep.txt").read_text() == "k"
+
+
+def test_push_without_delete_keeps_the_record_of_a_backed_up_vanished_file(ws):
+    # The counterpart of the heal above, and the reason the delete lane is
+    # observed even without --delete: here the local file is gone but its
+    # object is still on S3, so the backup stands. Seeing the object through
+    # the lane is what tells this record from a stale one - skip it, and the
+    # record would look objectless and be dropped, orphaning the object.
+    ws.write("data/keep.txt", "k")
+    ws.write("data/gone.txt", "g")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    (ws.root / "data" / "gone.txt").unlink()
+
+    ws.run("push", "data", expect_rc=0)
+
+    assert "data/gone.txt" in ws.keys()
+    assert "./gone.txt" in _manifest_paths(ws)
+    # Still offered - and still deletable - by a later --delete run.
+    ws.run("push", "--delete", "--yes", "data", expect_rc=0)
+    assert "data/gone.txt" not in ws.keys()
+    assert "./gone.txt" not in _manifest_paths(ws)
+
+
+def test_file_subpath_push_keeps_records_it_cannot_prove_stale(ws):
+    # A single-file sub-path push lists no objects at all, so a record below
+    # the sub path is not provably objectless: it must survive, object and
+    # record together, until a directory-level push can see the S3 side.
+    ws.write("data/a/inner.txt", "i")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    shutil.rmtree(ws.root / "data" / "a")
+    ws.write("data/a", "now a file")
+
+    ws.run("push", "data/a")
+
+    assert "data/a/inner.txt" in ws.keys()
+    assert "./a/inner.txt" in _manifest_paths(ws)
 
 
 def test_push_delete_flags_candidates_missing_from_the_manifest(ws, answers):

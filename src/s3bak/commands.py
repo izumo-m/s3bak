@@ -163,7 +163,7 @@ class _PushDeletePlan:
     manifest is the journal emitter's business (a confirmed deletion journals
     its record's drop at the decision point)."""
 
-    lane: bool | FileFilter  # sync_up delete=: False | True | per-orphan callable
+    lane: bool | FileFilter  # the per-orphan decision, or False for "no --delete"
     confirmer: DeleteConfirmer | None  # --delete without --yes (asked or auto-n)
     walker: localwalk.ManifestWalker | None = None  # the sync's local walker (--delete only)
     old_manifest: str | None = None  # set by the caller once downloaded
@@ -212,6 +212,27 @@ def _record_candidate_kind(e: ManifestEntry) -> str:
     if e.sym_target is not None:
         return "symlink record"
     return "special-file record"
+
+
+def _keep_orphan(_info: FileInfo) -> bool:
+    """The delete lane's decision without ``--delete``: keep every S3 orphan.
+
+    Passed to the sync as a filter rather than as a flat False so the journal
+    still observes the key (see ``_journal_delete_lane``)."""
+    return False
+
+
+def _journal_delete_lane(journal: PushJournal, plan: _PushDeletePlan) -> FileFilter:
+    """The delete lane the sync runs, wrapped so the journal sees every S3-only
+    key - with or without ``--delete``.
+
+    The journal has to tell "no object at this key" from "an object the run
+    was not allowed to touch": a record the pair stream never keys is stale
+    and any push retires it (PushJournal._skip_over), so an object that IS
+    there must reach the journal rather than be skipped over. Without
+    ``--delete`` the wrapped decision is a flat no, so the lane observes and
+    deletes nothing."""
+    return journal.observe_delete(plan.lane if callable(plan.lane) else _keep_orphan)
 
 
 def _plan_push_deletes(
@@ -514,6 +535,7 @@ def _push_sub(
                 walker=walker,
                 sub=sub,
                 content=cfg.store.content_compare() if opts.checksum else None,
+                dest_listed=is_dir_sub,
                 delete_mode=opts.delete and is_dir_sub,
                 record_delete=plan.record_delete,
             )
@@ -544,16 +566,13 @@ def _push_sub(
                     journal.record_target(sub, st, os.readlink(local_sub))
                     stream_complete = True
                 elif is_dir_sub:
-                    delete_lane: bool | FileFilter = (
-                        journal.observe_delete(plan.lane) if callable(plan.lane) else plan.lane
-                    )
                     result = cfg.store.sync_up(
                         local_sub,
                         sub_rel,
                         walker=walker,
                         compare=journal.update_filter,
                         create=journal.create_filter,
-                        delete=delete_lane,
+                        delete=_journal_delete_lane(journal, plan),
                         dryrun=opts.dryrun,
                         verbose=opts.verbose,
                     )
@@ -840,21 +859,19 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                     window_ns=cfg.window_ns_for(entry),
                     walker=walker,
                     content=cfg.store.content_compare() if opts.checksum else None,
+                    dest_listed=True,
                     delete_mode=opts.delete,
                     record_delete=plan.record_delete,
                 )
                 sync_ok = False
                 try:
-                    delete_lane: bool | FileFilter = (
-                        journal.observe_delete(plan.lane) if callable(plan.lane) else plan.lane
-                    )
                     result = cfg.store.sync_up(
                         target,
                         entry,
                         walker=walker,
                         compare=journal.update_filter,
                         create=journal.create_filter,
-                        delete=delete_lane,
+                        delete=_journal_delete_lane(journal, plan),
                         dryrun=opts.dryrun,
                         verbose=opts.verbose,
                     )

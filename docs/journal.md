@@ -129,9 +129,15 @@ immediately, on a push where no hook fires).
   directory or special-file own-mtime drift; objectless additions (empty
   directory, symlink, special file); the root record when its metadata
   drifted.
-- **`-`**: only on `--delete` runs — a confirmed object deletion (the object
-  and its record travel together), a stale old-only file record with no
-  object behind it (dropped silently: the record restores nothing), and a
+- **`-`**: a stale old-only file record with no object behind it, dropped
+  silently by **any** push — the record restores nothing, so retiring it is
+  repair rather than deletion and needs neither `--delete` nor a question
+  (this is why the delete lane is observed even without `--delete`: an
+  object that is still there has to reach the emitter through that lane
+  instead of arriving as a skip-over, and a run that lists no objects at all
+  — a single-file or symlink sub-path push — proves nothing and keeps every
+  record). The rest are `--delete` runs only: a confirmed object deletion
+  (the object and its record travel together), and a
   confirmed record-only drop (a vanished symlink or special-file record,
   asked as its skip-over arrives; a vanished directory record, decided
   post-order through its ` ` line — next bullet). `--yes` is not a separate
@@ -194,10 +200,12 @@ keep-everything merge of a fresh walk.)
   verbatim. An explicitly named file or symlink sub-path always re-records
   (naming the path is the instruction to back up its current state); a
   removed sub-path confirmed under `--delete` journals `-` for every record
-  in the range. Skip-over drops apply only strictly *below* `sub`: an object
-  at exactly the `sub` key (a kind-changed former file) sits outside the
-  slash-bounded sub listing, so its record is not provably stale and
-  survives until a directory-level `push --delete` retires the pair.
+  in the range. Skip-over drops apply only strictly *below* `sub`, and only
+  when the sub-path push runs a sync at all: an object at exactly the `sub`
+  key (a kind-changed former file) sits outside the slash-bounded sub
+  listing, so its record is not provably stale and survives until a
+  directory-level `push --delete` retires the pair — and a file or symlink
+  sub-path, which lists nothing, proves nothing about any record below it.
 - **A single-file entry** has no tree walk and no journal: its one-record
   manifest is rewritten from a fresh lstat.
 - **`--meta-only`** runs no sync, so it keeps the full-walk manifest rebuild —
