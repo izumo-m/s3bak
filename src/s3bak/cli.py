@@ -109,8 +109,12 @@ def run_entries(
         # entries sequentially on this thread so the prompt - and its interrupt -
         # stays here; a q abort then also stops the entries not yet run.
         statuses = []
-        for entry in entries:
+        for index, entry in enumerate(entries):
             if is_aborted():
+                # q aborts the command, not just the entry that was asked, so
+                # say which entries it stopped before - silently doing nothing
+                # for them would read like they had run clean.
+                console.err(f"aborted, so these entries were not run: {', '.join(entries[index:])}")
                 break
             statuses.append(fn(cfg, entry, opts))
         return next((status for status in statuses if status), 0)

@@ -384,10 +384,16 @@ Deleting is opt-in and confirmed:
   cron. Without a TTY (stdin/stderr), `--delete` without `--yes` answers no
   to everything — nothing is deleted and the run still succeeds (rc 0).
 - **`q` (abort)** exits 1 without rewriting the manifest or running
-  `post_hook`. Deletions already confirmed may have run; their records then
-  linger until the next push — any push, `--delete` or not — journals the
-  drop of any stale old-only file record with no object behind it. The same
-  self-healing covers a push interrupted mid-deletion.
+  `post_hook`, and says what that leaves behind: the manifest may no longer
+  match S3, so the entry should be pushed again — plainly, without
+  `--delete`. Both drifts settle there. Uploads the run completed are
+  recorded by the next push, and deletions already confirmed may have run;
+  their records linger only until that push — any push, `--delete` or not —
+  journals the drop of a stale old-only file record with no object behind
+  it. The same self-healing covers a push interrupted mid-deletion. Under
+  `--all`, q stops the command, so the entries it never reached are named
+  too. `pull --delete` aborts the same way: it reports that the local tree
+  was updated only as far as the answers went.
 - **`--meta-only` / `--data-only` cannot combine with `--delete`**: a deletion
   drops the object and its record atomically, which a one-sided push cannot.
 

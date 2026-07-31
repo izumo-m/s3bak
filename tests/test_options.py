@@ -626,7 +626,9 @@ def test_push_delete_interactive_q_aborts_without_manifest_update(ws, answers):
     res = ws.run("push", "--delete", "data")
 
     assert res.rc == 1
-    assert "aborted" in res.err
+    # The abort says what it left behind, and how to converge: the manifest
+    # was not rewritten, so it may no longer match S3.
+    assert "aborted" in res.err and "push this entry again" in res.err
     assert _manifest_paths(ws) == before
     assert not hook_sentinel.exists()
     assert "data/sub/y.txt" in ws.keys()  # never asked, never deleted
@@ -1182,5 +1184,6 @@ def test_interactive_q_stops_later_upload_only_entries(ws, answers):
     res = ws.run("push", "--all", "--delete")
 
     assert "aborted" in res.err
+    assert "were not run: b_new" in res.err  # q stops the command, and says so
     assert "b_new/only.txt" in ws.keys()  # from the initial push
     assert "b_new/fresh.txt" not in ws.keys()  # the abort stopped the later entry

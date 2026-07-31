@@ -864,7 +864,7 @@ def test_pull_delete_interactive_q_aborts(ws, answers):
     res = ws.run("pull", "--delete", "data")
 
     assert res.rc == 1
-    assert "aborted" in res.err
+    assert "aborted" in res.err and "pull again to finish" in res.err
     assert not (ws.root / "data" / "extra1.txt").exists()
     assert (ws.root / "data" / "extra2.txt").exists()
 

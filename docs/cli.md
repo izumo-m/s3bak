@@ -111,6 +111,7 @@ maps to `141`.
 A `--delete` confirmation answered no — including the automatic no of a
 non-interactive run without `--yes` — is a successful outcome (status 0), not
 a warning: keeping a backup is a valid answer. Answering q aborts the command
-with status 1. The exception is the explicit backup-subtree deletion
+with status 1, reporting on stderr what the abort left unsettled and which
+entries it never reached (see [sync.md](sync.md#deleting-backups---delete---yes)). The exception is the explicit backup-subtree deletion
 (`push --delete entry/gone-sub`): declining its one confirmation exits 1,
 because the deletion was the command's entire purpose.

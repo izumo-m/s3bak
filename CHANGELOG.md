@@ -16,6 +16,12 @@ a fix only (Fixed).
   so dropping it is repair rather than deletion and is done silently. A
   record whose object is still on S3 is untouched, as before.
 
+- Answering `q` to a `--delete` confirmation now reports what the abort left
+  behind and how to settle it — for a push, that the manifest was not
+  rewritten and may no longer match S3; for a pull, that the local tree was
+  updated only as far as the answers went. Under `--all` the entries the
+  abort stopped before are named instead of being skipped silently.
+
 ### Fixed
 
 - A `--delete` confirmation is no longer scrolled away by the transfer result

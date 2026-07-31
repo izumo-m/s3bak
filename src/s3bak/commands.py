@@ -308,6 +308,18 @@ def _warn_refused_deletes(entry: str, plan: _PushDeletePlan, journal: PushJourna
         )
 
 
+def _warn_aborted_push(entry: str) -> None:
+    """Report a q answer, and what it leaves behind: the manifest is not
+    rewritten, so whatever the run had already done to S3 - objects uploaded,
+    confirmed deletions already executed - is not reflected in it. Both
+    directions settle on the next push of the entry, without --delete: it
+    records the uploads and retires the records whose objects are gone."""
+    console.err(
+        f"{entry}: aborted; the manifest was not rewritten, so it may no longer match S3"
+        " - push this entry again to settle it"
+    )
+
+
 def _warn_unrecorded_uploads(entry: str, opts: Opts, journal: PushJournal) -> None:
     """Emit the --data-only unrecorded-upload warning after a successful sync.
     The journal tallies uploads with no owning file record at decision time
@@ -791,7 +803,7 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         try:
             return _push_sub(cfg, entry, post_hook_sub, target_root, sub, excludes, opts)
         except DeletionAbortedError:
-            console.err(f"{entry}: aborted")
+            _warn_aborted_push(entry)
             return 1
 
     results = 0  # count of upload/delete lines printed this push
@@ -988,10 +1000,7 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
 
         return 0
     except DeletionAbortedError:
-        # q mid-confirmation: already-confirmed deletions may have run, but the
-        # manifest was not rewritten and no hook fires. The next push --delete
-        # settles any records those deletions left behind.
-        console.err(f"{entry}: aborted")
+        _warn_aborted_push(entry)
         return 1
     finally:
         plan.close()
@@ -1440,7 +1449,10 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 ):
                     shutil.rmtree(stage_dir, ignore_errors=True)
     except DeletionAbortedError:
-        console.err(f"{entry}: aborted")
+        console.err(
+            f"{entry}: aborted; the local tree was updated only as far as the answers went"
+            " - pull again to finish it"
+        )
         return 1
     finally:
         os.unlink(manifest_path)
