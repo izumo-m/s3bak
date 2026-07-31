@@ -39,8 +39,26 @@ uv run s3bak --help
 uv run pytest        # hermetic test suite (uses moto; no AWS/Docker needed)
 ```
 
+To install the `s3bak` command from this working tree instead of GitHub (e.g.
+to try out local changes without a venv):
+
+```sh
+uv tool install .
+```
+
 To poke at s3bak against a real S3-compatible endpoint, `scripts/` brings up a
 local MinIO stack: `scripts/compose-up.sh && source scripts/minio-env.sh`.
+
+## Update
+
+```sh
+uv tool upgrade s3bak --reinstall    # installed from GitHub
+uv tool install . --reinstall        # installed from this working tree
+```
+
+The GitHub install tracks the default branch, not a pinned commit, so
+`--reinstall` is required — otherwise `uv` may treat the cached clone as
+already up to date and skip fetching new commits.
 
 ## Configuration
 
