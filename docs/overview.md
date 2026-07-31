@@ -99,7 +99,37 @@ differently than the manifest does. Those are treated as correctness bugs,
 on the same footing as any other, and cross-platform restore fidelity is
 their most common source (see [storage.md](storage.md)).
 
-## Design documents
+## Versioning
+
+s3bak follows [Semantic Versioning](https://semver.org/). While the version
+is below 1.0.0, MAJOR stays at 0: a release containing a spec change bumps
+MINOR, and a fixes-only release bumps PATCH.
+
+Notable changes are tracked in [CHANGELOG.md](../CHANGELOG.md), in
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. The commit
+that makes a notable change also adds it to the `[Unreleased]` section.
+Internal-only changes (refactor, performance, tests, documentation) add no
+entry and do not by themselves warrant a release.
+
+Whether a release bumps MINOR or PATCH is decided at release time from the
+content of `[Unreleased]`: Added / Changed / Removed entries mark a spec
+change (MINOR); Fixed-only content — restoring documented behavior — marks a
+PATCH. A release is cut with a `chore(release): bump version to X.Y.Z`
+commit on `develop` that turns `[Unreleased]` into the new version heading
+and raises `version` in `pyproject.toml`, followed by a merge to `main` and
+an annotated tag `vX.Y.Z`.
+
+## Documentation
+
+The user manual in [manual/](manual/README.md) is the authoritative
+specification of s3bak's observable behavior; the design documents below and
+the implementation are judged against it. What the manual does not describe
+— internal rationale and invariants, such as the streaming invariant above
+and the manifest ordering contract — is owned by the design documents. When
+the manual and the implementation disagree, neither side wins by default:
+which one is wrong is decided case by case, and that side is fixed.
+
+### Design documents
 
 - **[Storage model](storage.md)** — how local trees, data objects, and manifests
   are represented under the configured S3 prefix.
