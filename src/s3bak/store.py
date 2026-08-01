@@ -105,21 +105,23 @@ class Boto3S3Store:
         # must not be shared across concurrently transferring threads, so one
         # store serves one entry at a time (s3transfer's own worker threads
         # under a single transfer are the library's business).
-        from boto3_s3 import S3, session
+        from boto3_s3 import S3, TransferConfig, session
 
-        transfer_config = None
-        if max_concurrency is not None:
-            from boto3_s3 import TransferConfig
-
-            transfer_config = TransferConfig(max_concurrency=max_concurrency)
-        # A configured max_concurrency becomes the default TransferConfig for
-        # every cp / sync (the library otherwise uses boto3's default of 10 and
-        # never reads ~/.aws/config for it). boto3_s3.session is a boto3.Session
-        # whose clients parse response timestamps at C speed - the listings that
-        # drive sync and verify are severalfold faster on large trees.
+        # One TransferConfig always, set max_concurrency or not: it is the
+        # default for every cp / sync, and _resolve_small_limit reads
+        # multipart_threshold back off it. A None argument is dropped rather
+        # than forwarded, so an unset max_concurrency still lands on the
+        # library's own default (boto3's 10 - ~/.aws/config is never read for
+        # it). Handing S3 a None instead would take its separate no-config
+        # branch, which need not resolve to these same values on every library
+        # version this package accepts.
+        self._transfer_config = TransferConfig(max_concurrency=max_concurrency)
+        # boto3_s3.session is a boto3.Session whose clients parse response
+        # timestamps at C speed - the listings that drive sync and verify are
+        # severalfold faster on large trees.
         self._s3 = S3(
             session=session(profile_name=profile),
-            transfer_config=transfer_config,
+            transfer_config=self._transfer_config,
         )
         self._client = self._s3.client()
         self._small_limit = self._resolve_small_limit()
@@ -149,10 +151,8 @@ class Boto3S3Store:
         Below the min, both agree the ETag is a plain MD5, so a direct
         PutObject/GetObject cannot diverge from what S3.cp would store.
         """
-        threshold = getattr(self._s3._transfer_config, "multipart_threshold", None)
-        threshold = threshold if threshold else _DEFAULT_MULTIPART
         part_size = self._s3.aws_config().get_size("s3.multipart_chunksize", _DEFAULT_MULTIPART)
-        return min(threshold, part_size or _DEFAULT_MULTIPART)
+        return min(self._transfer_config.multipart_threshold, part_size or _DEFAULT_MULTIPART)
 
     # --- internal ----------------------------------------------------------
     def _s3_loc(self, rel_key: str = "", *, is_dir: bool = False) -> S3Storage:
