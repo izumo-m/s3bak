@@ -20,6 +20,9 @@ a fix only (Fixed).
   rewritten and may no longer match S3; for a pull, that the local tree was
   updated only as far as the answers went. Under `--all` the entries the
   abort stopped before are named instead of being skipped silently.
+- The boto3-s3 requirement is now `>=0.8,<0.10`, so a fresh install resolves
+  to 0.9 while a project already holding 0.8 can still take s3bak alongside
+  it.
 
 ### Fixed
 

@@ -30,7 +30,7 @@ wheels = [
 
 [[package]]
 name = "boto3-s3"
-version = "0.8.0"
+version = "0.9.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "boto3" },
@@ -38,9 +38,9 @@ dependencies = [
     { name = "s3transfer" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c7/80/5cdf11535dab6fe9c03f07507f48f69c3589c7bf976711786d4660142be2/boto3_s3-0.8.0.tar.gz", hash = "sha256:cfd41ed2017a8abd3042b118b2acc555719c3c1f372561b09a1cb9c2b2a39e0d", size = 217810, upload-time = "2026-07-22T23:29:12.582Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/7b/0f/0b2ffb4e0c33c551d23b47d72896334d09afd2d7aea80e74aa5ee335f87a/boto3_s3-0.9.0.tar.gz", hash = "sha256:51d799cf43f1b7275408777bef8e8a7bed14c860ebe6229694a033fbb7ac8332", size = 214683, upload-time = "2026-07-31T23:15:43.908Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1f/46/5176bd5e84208bfb38ed9508e0a2132270af9b72bdaf860c9676f1546cf8/boto3_s3-0.8.0-py3-none-any.whl", hash = "sha256:ca46444534d145aee90b5e845c4056b4fe43a69697e20dea0a420588b6982daf", size = 227595, upload-time = "2026-07-22T23:29:11.275Z" },
+    { url = "https://files.pythonhosted.org/packages/54/5f/8055ab21d532983b6311963c6163d8e2ddc5854e9b34c64ab9b47a989003/boto3_s3-0.9.0-py3-none-any.whl", hash = "sha256:02d7759a76199a05edd63cb0bbc6498e24fca5a923c9c617d7408b0b81fb7733", size = 231464, upload-time = "2026-07-31T23:15:42.795Z" },
 ]
 
 [[package]]
@@ -741,7 +741,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "boto3", specifier = ">=1.28" },
-    { name = "boto3-s3", specifier = ">=0.8,<0.9" },
+    { name = "boto3-s3", specifier = ">=0.8,<0.10" },
 ]
 
 [package.metadata.requires-dev]
