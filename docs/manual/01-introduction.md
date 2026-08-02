@@ -139,5 +139,6 @@ reach it are what keep a backed-up `~/.ssh` private (see
 ## Next
 
 [Getting started](02-getting-started.md) walks through installing s3bak,
-preparing a bucket, writing a minimal `config.py`, and running the first push,
-status, and pull.
+writing a minimal `config.py`, and running the first push, status, and pull.
+If you do not have a bucket and a profile yet,
+[Appendix A](appendix-a-aws-setup.md) prepares them first.
