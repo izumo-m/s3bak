@@ -7,7 +7,7 @@ real bucket, and every output shown is what the command actually prints.
 
 ## Before you start
 
-You need three things:
+You need:
 
 - **Python 3.10 or later.**
 - **An S3 bucket, and an AWS profile that can read and write it.** If you do
@@ -65,7 +65,7 @@ local path it backs up. The name is what you type on the command line and
 where the backup lives under the prefix, so it must be a single path
 component: `bin`, not `home/bin`.
 
-Two rules about `path` are worth knowing before your first run, because both
+Some rules about `path` are worth knowing before your first run, because they
 are easy to trip over:
 
 - It must be **absolute**. A relative path would silently depend on the

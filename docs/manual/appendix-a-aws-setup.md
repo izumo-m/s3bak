@@ -21,7 +21,7 @@ ever goes wrong: which credentials am I actually using, and can they reach the
 bucket at all. s3bak can only report what S3 told it; the AWS CLI can ask on
 its own.
 
-Throughout, substitute your own names for these three:
+Throughout, substitute your own names for these:
 
 - `my-bucket` — your bucket's name.
 - `backup` — the path inside it that s3bak stores everything under.
@@ -29,7 +29,7 @@ Throughout, substitute your own names for these three:
 
 ## What you are creating
 
-Four things, in this order:
+In this order:
 
 1. **a bucket** — where the backup lives;
 2. **a policy** — what may be done to it;
@@ -44,7 +44,7 @@ bucket. The policy in step 2 is what makes it so.
 
 ## 1. Create the bucket
 
-In S3, create a bucket. Two of its settings matter to you later:
+In S3, create a bucket. These settings matter to you later:
 
 - **Name.** It must be unique across all of AWS, not just your account, so
   personal names like `taro-backup-2026` are the norm. It becomes part of the
@@ -52,8 +52,8 @@ In S3, create a bucket. Two of its settings matter to you later:
 - **Region.** Pick one near you. Note which one you picked; you write it into
   the profile in step 4.
 
-Everything else can stay at its default. Two defaults are worth knowing you
-are keeping:
+Everything else can stay at its default. Some of those defaults are worth
+knowing you are keeping:
 
 - **Block Public Access** stays on. Nothing in s3bak needs the bucket to be
   reachable without credentials.
@@ -107,7 +107,7 @@ In IAM, create a customer managed policy from JSON. Paste this, replacing
 }
 ```
 
-The two statements differ in what they point at, which is why there are two.
+The statements differ in what they point at, which is why they are separate.
 Listing is something you do to a *bucket*, so the first names the bucket
 itself and then restricts the answer to the backup path. Reading and writing
 are things you do to *objects*, so the second names the objects under that
@@ -154,10 +154,9 @@ key. **The secret is shown once**, so store it before leaving the page:
 aws configure --profile s3bak
 ```
 
-It asks four things. The first two are the key you were just shown. The third
-is a default region, which should be the one you created the bucket in. The
-fourth is a default output format, which is the AWS CLI's own affair and never
-reaches s3bak; `json` is fine.
+It asks for the key you were just shown, then for a default region, which
+should be the one you created the bucket in, then for a default output format,
+which is the AWS CLI's own affair and never reaches s3bak; `json` is fine.
 
 The name after `--profile` is what the `profile` line in your s3bak
 configuration file must match.
@@ -190,7 +189,7 @@ worth having written it narrowly.
 
 ## 5. Check that it works
 
-Three commands, each answering a different question. Run them in this order,
+Each of these commands answers a different question. Run them in this order,
 so that a failure has as little as possible left to hide behind.
 
 **Which credentials are in effect?**
@@ -228,7 +227,7 @@ answer you want: the request was allowed. Keep the path on the end. Listing
 the bucket root, `s3://my-bucket/`, is refused by the policy from step 2, and
 that refusal is the policy doing its job rather than a fault to correct.
 
-Once all three pass, the AWS side is done. Go back to
+Once they all pass, the AWS side is done. Go back to
 [Getting started](02-getting-started.md) and write the configuration file.
 
 ## When something is refused

@@ -11,9 +11,9 @@ description of s3bak's observable behavior (see
    minimal `config.py`, and the first push, status, and pull.
 3. [Configuration](03-configuration.md) — the config file: every key,
    environment variables, and pitfalls.
-4. [How s3bak detects changes](04-change-detection.md) — the manifest and
-   the three views, size+mtime comparison and `mtime_window`, the blind spot
-   and `--checksum`, excludes.
+4. [How s3bak detects changes](04-change-detection.md) — the manifest and the
+   views it is compared against, size+mtime comparison and `mtime_window`, the
+   blind spot and `--checksum`, excludes.
 5. [Command reference](05-command-reference.md) — every command and option,
    entry and path resolution, output format, exit codes.
 6. [Deleting safely](06-deleting-safely.md) — `push --delete` and
