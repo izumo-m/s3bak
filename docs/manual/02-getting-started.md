@@ -17,8 +17,11 @@ You need three things:
 - **A `diff` executable.** Only the `s3bak diff` command uses it, so nothing
   in this chapter needs it, but installing it now saves a surprise later.
 
-You do not need the AWS CLI. s3bak talks to S3 from inside its own process and
-installs everything it needs for that.
+s3bak does not need the AWS CLI: it talks to S3 from inside its own process
+and installs everything it needs for that. Have it installed anyway. When
+something goes wrong with credentials, s3bak can only repeat what S3 told it,
+whereas the AWS CLI can ask on its own behalf which credentials are in effect
+and whether they reach the bucket. Appendix A uses it for both.
 
 ## Install s3bak
 

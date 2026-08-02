@@ -34,6 +34,11 @@ What you need to use it:
   [Platform notes](09-platform-notes.md).
 - A `diff` executable, used by the `s3bak diff` command only.
 
+The AWS CLI is not one of them, since s3bak talks to S3 itself. Keep it
+installed and able to reach the bucket all the same: when credentials or
+permissions are the problem, s3bak can only repeat the refusal, while the AWS
+CLI can find out why.
+
 ## What a backup preserves
 
 A push records, and a pull restores:
