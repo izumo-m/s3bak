@@ -104,7 +104,7 @@ def test_root_entry_path_is_rejected(ws):
     ws.config({"data": {"path": root}})
     res = ws.run("list")
     assert res.rc == 1
-    assert "filesystem root" in res.err
+    assert "path root" in res.err
 
 
 def test_entry_with_non_list_excludes_dies_cleanly(ws):

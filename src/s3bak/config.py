@@ -220,9 +220,11 @@ def load_config(*, create_store: bool = True) -> Config:
         # traceback. Same for exclude patterns and hook arguments below.
         if "\x00" in path:
             console.die(f"entries[{name!r}].path must not contain NUL in {config_path}")
-        # A relative path silently depends on the working directory, and a
-        # filesystem root as an entry is almost certainly a broken f-string
-        # (e.g. an empty HOME); both would aim push/pull at the wrong tree.
+        # A relative path silently depends on the working directory, and a path
+        # root as an entry is almost certainly a broken f-string (e.g. an empty
+        # HOME); both would aim push/pull at the wrong tree. "Path root" is
+        # meant literally - a path with no parent, "/" or "C:\" - not the root
+        # of a mounted filesystem, which is an ordinary directory here.
         if not os.path.isabs(path):
             console.die(
                 f"entries[{name!r}].path must be an absolute path in {config_path} "
@@ -231,8 +233,7 @@ def load_config(*, create_store: bool = True) -> Config:
         norm = os.path.normpath(path)
         if os.path.dirname(norm) == norm:
             console.die(
-                f"entries[{name!r}].path must not be a filesystem root in {config_path} "
-                f"(got {path!r})"
+                f"entries[{name!r}].path must not be a path root in {config_path} (got {path!r})"
             )
         excludes = entry_cfg.get("excludes")
         if excludes is not None and (
