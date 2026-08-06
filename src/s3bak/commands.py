@@ -2373,6 +2373,7 @@ def _verify_dir(
     local_base: str,
     content_reachable: bool = True,
     excludes: Excludes | None = None,
+    sub_record: ManifestEntry | None = None,
 ) -> None:
     """Merge-join the manifest records against the S3 listing - both ascend in
     key byte order, so one streaming pass checks the whole correspondence:
@@ -2392,6 +2393,18 @@ def _verify_dir(
     assert cfg.store is not None
     rel_base = f"{entry}/{sub}" if sub else entry
     residue = 0
+    # The sub's OWN record never enters the sub-scoped record stream (like
+    # the entry root, it is the range's anchor, not a member), so its
+    # residue judgment is seeded here - `verify entry/cache` with `cache/`
+    # excluded must not read as a false OK while `verify entry` warns.
+    if (
+        sub is not None
+        and sub_record is not None
+        and excludes is not None
+        and not excludes.empty
+        and excludes.excluded(f"{sub}/", os.path.abspath(local_base).replace(os.sep, "/") + "/")
+    ):
+        residue += 1
 
     def excluded_residue(record: ManifestEntry, compare_key: str) -> bool:
         # record.path is entry-rooted, exactly the space the patterns are
@@ -2452,7 +2465,8 @@ def _verify_dir(
             if obj is not None:
                 report.objects += 1
                 _check_archived(report, f"{cfg.prefix}/{rel_base}/{obj.key}", obj)
-            if record is not None and excluded_residue(record, key):
+            is_residue = record is not None and excluded_residue(record, key)
+            if is_residue:
                 residue += 1
             if record is not None and obj is not None:
                 if key.endswith("/"):
@@ -2466,7 +2480,13 @@ def _verify_dir(
                             f"size mismatch: {cfg.prefix}/{rel_base}/{obj.key}"
                             f" (manifest {record.size}, S3 {obj.size})"
                         )
-                    elif checker is not None:
+                    elif checker is not None and not is_residue:
+                        # A residue record is skipped by the content check: a
+                        # local copy the config excludes is outside the
+                        # backup's purview, and the check's remedies (push
+                        # --checksum, "a push will upload it") are impossible
+                        # for an excluded path - the residue warning already
+                        # points at the pair.
                         reason = _ancestor_block_reason(local_base, key)
                         if reason == "inaccessible":
                             # An unreadable ancestor: the content cannot be hashed,
@@ -2616,6 +2636,14 @@ def cmd_verify(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
             content_reachable = sub_reason is None
             if kind == "dir":
                 _report_restore_conflict(report, manifest_path, sub)
+                sub_record = next(
+                    (
+                        r
+                        for r in manifest.iter_manifest(manifest_path)
+                        if r.path.removeprefix("./") == sub
+                    ),
+                    None,
+                )
                 _verify_dir(
                     cfg,
                     entry,
@@ -2626,6 +2654,7 @@ def cmd_verify(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
                     local_path,
                     content_reachable=content_reachable,
                     excludes=verify_excludes,
+                    sub_record=sub_record,
                 )
             elif kind == "file":
                 record = next(

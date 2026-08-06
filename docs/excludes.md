@@ -103,12 +103,14 @@ above decide.
   `status --delete`, the preview of `push --delete`, shares its exemption:
   residue under excluded paths prints as `D`. Passive discovery stays
   `verify`'s job.
-- **verify** — the reporting exemption. The integrity checks stay
+- **verify** — the reporting exemption. The listing checks stay
   exclude-blind — residue pairs are internally consistent and pass them —
   and verify additionally warns (exit 2) when records remain under the
   entry's current excludes, one count per entry, naming `push --delete` as
   the remedy ([verify.md](verify.md)). An unrecorded object under an
-  excluded path is reported like any other.
+  excluded path is reported like any other. The opt-in `--checksum` content
+  comparison skips residue records: its remedies cannot touch an excluded
+  path, and the residue warning already points at the pair.
 
 ## Manifest consequences
 

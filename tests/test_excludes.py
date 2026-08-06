@@ -474,3 +474,71 @@ def test_verify_unrecorded_object_under_excludes_is_not_double_counted(ws):
     assert "unrecorded object" in res.err
     assert "under excludes" not in res.err
     assert "1 warning(s)" in res.out
+
+
+def test_verify_dir_sub_counts_its_own_excluded_record(ws):
+    # The sub's own record never enters the sub-scoped record stream, so its
+    # residue judgment is seeded separately - `verify entry/cache` must not
+    # read as a false OK while `verify entry` warns about the same record.
+    ws.write("data/cache/c.txt", "c")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["cache/"]}})
+
+    res = ws.run("verify", "data/cache", expect_rc=0)
+
+    assert "1 recorded path(s) under excludes remain in the backup" in res.err
+
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["cache/*"]}})
+    res = ws.run("verify", "data/cache", expect_rc=0)
+    # The dir's own record plus c.txt, both inside the narrowed range.
+    assert "2 recorded path(s) under excludes remain in the backup" in res.err
+
+
+def test_verify_named_excluded_file_sub_counts_one(ws):
+    ws.write("data/uv/uv-receipt.json", "r")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["uv/uv-receipt.json"]}})
+
+    res = ws.run("verify", "data/uv/uv-receipt.json", expect_rc=0)
+
+    assert "1 recorded path(s) under excludes remain in the backup" in res.err
+
+
+def test_verify_counts_residue_next_to_an_unrecorded_object(ws):
+    # A residue record and an unrecorded object under the same exclude:
+    # each keeps its own warning, and the residue count covers records only.
+    ws.write("data/keep.txt", "k")
+    ws.write("data/cache/c.txt", "c")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["cache/*"]}})
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/cache/stray.bin", Body=b"x")
+
+    res = ws.run("verify", "data", expect_rc=0)
+
+    assert "unrecorded object" in res.err
+    assert "2 recorded path(s) under excludes remain in the backup" in res.err
+    assert "2 warning(s)" in res.out
+
+
+def test_verify_checksum_skips_residue_content(ws):
+    # A residue file whose local copy diverged at the same size: the content
+    # check must not turn it into an unfixable error - push --checksum
+    # cannot upload an excluded path. The residue warning stands alone.
+    c = ws.write("data/cache/c.txt", "abc")
+    ws.write("data/keep.txt", "k")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["cache/*"]}})
+    recorded = os.lstat(c)
+    c.write_text("xyz")  # same size, different content
+    os.utime(c, ns=(recorded.st_mtime_ns, recorded.st_mtime_ns))
+
+    res = ws.run("verify", "--checksum", "data", expect_rc=0)
+
+    assert "content differs" not in res.err
+    assert "0 error(s)" in res.out
+    assert "under excludes remain in the backup" in res.err

@@ -97,7 +97,10 @@ mismatch is split by the manifest stat, and the split is the point:
 
 A recorded file with no local counterpart (a kept deletion) or whose local
 path changed type is skipped — the former is a normal backup state, the latter
-is `status`'s finding. ETags that are not content MD5s (SSE-KMS) fail the
+is `status`'s finding. A record under the entry's current excludes is skipped
+too: a local copy the config excludes is outside the backup's purview, and
+the check's remedies (`push --checksum`, a plain push) cannot touch an
+excluded path — the excluded-residue warning already points at the pair. ETags that are not content MD5s (SSE-KMS) fail the
 comparison loudly; the constraint is inherited from `--checksum` push.
 `--mtime-window` tunes the classification stat and therefore requires
 `--checksum` on this command.
