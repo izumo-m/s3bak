@@ -617,9 +617,13 @@ class Boto3S3Store:
         dest_dir: str,
         *,
         compare: PairFilter | None = None,
+        create: bool | FileFilter = True,
         dryrun: bool = False,
         verbose: bool = False,
     ) -> TransferResult:
+        """``create`` is the create-lane value: True downloads every S3-only
+        key (the default); a callable vetoes per key - pull's exclusion, which
+        must not download an excluded path (docs/excludes.md)."""
         from boto3_s3 import LocalStorage
 
         src = self._s3_loc(rel_prefix, is_dir=True)
@@ -633,6 +637,7 @@ class Boto3S3Store:
             lambda cb: self._s3.sync(
                 src,
                 dest,
+                create_filter=create,
                 dryrun=dryrun,
                 update_filter=compare,
                 on_result=cb,

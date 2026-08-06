@@ -41,6 +41,7 @@ from s3bak.confirm import (
     resolve_answer_mode,
 )
 from s3bak.console import IS_WINDOWS, console, is_junction, normalize_local_path
+from s3bak.excludes import Excludes
 from s3bak.manifest import ManifestEntry
 from s3bak.restore import (
     apply_manifest,
@@ -66,7 +67,7 @@ from s3bak.syncops import (
 )
 
 if TYPE_CHECKING:
-    from boto3_s3 import FileFilter, FileInfo
+    from boto3_s3 import FileFilter, FileInfo, PairFilter, SyncPair
 
 
 def _run_hook(
@@ -470,16 +471,43 @@ def _push_sub(
         # os.path.lexists swallows EACCES (an unsearchable parent) as "absent",
         # which under --delete would delete a live backup for a path we simply
         # could not reach. Distinguish a genuine ENOENT from any other error.
+        sub_st: os.stat_result | None
         try:
-            os.lstat(local_sub)
-            local_sub_present = True
+            sub_st = os.lstat(local_sub)
         except FileNotFoundError:
-            local_sub_present = False
+            sub_st = None
         except OSError as e:
             console.err(f"cannot access sub path: {local_sub}: {e}")
             return 1
-        if not local_sub_present:
+
+        # The named target under the entry's excludes (docs/excludes.md):
+        # naming an excluded path does not override the exclude. A present
+        # target is judged by its actual kind - a directory counts as
+        # invisible only when the filtered walk yields NOTHING (its own
+        # record included), so a partially excluded directory still pushes
+        # normally below. An absent target has no kind to consult, so either
+        # spelling matching means the operator's config excludes the name,
+        # and exclusion wins over "missing".
+        ex = Excludes(excludes)
+        sub_anchor = os.path.abspath(local_sub).replace(os.sep, "/")
+        if sub_st is not None and stat_mod.S_ISDIR(sub_st.st_mode):
+            walk = localwalk.walk_tree(
+                local_sub, excludes, root_rel=f"./{sub}", rel_prefix=f"./{sub}/"
+            )
+            nothing_visible = next(iter(walk), None) is None
+        elif sub_st is not None:
+            nothing_visible = ex.excluded(sub, sub_anchor)
+        else:
+            nothing_visible = ex.excluded(sub, sub_anchor) or ex.excluded(
+                f"{sub}/", sub_anchor + "/"
+            )
+
+        if sub_st is None or nothing_visible:
             if not opts.delete:
+                if nothing_visible:
+                    # Ignoring an excluded path is the rule, not an error
+                    # (the same silence as an entry push that skips it).
+                    return 0
                 console.err(
                     f"local path does not exist (use --delete to remove its backup): {local_sub}"
                 )
@@ -498,7 +526,7 @@ def _push_sub(
             did_work = drop_subtree_records(cfg, entry, old_manifest, sub, opts) or did_work
             return _run_hook("post_hook", post_hook, opts) if did_work else 0
 
-        st = os.lstat(local_sub)
+        st = sub_st
         is_link = stat_mod.S_ISLNK(st.st_mode)
         is_dir_sub = not is_link and os.path.isdir(local_sub)
         if not (is_link or is_dir_sub or stat_mod.S_ISREG(st.st_mode)):
@@ -540,12 +568,15 @@ def _push_sub(
                     journal.record_root(os.lstat(target_root))
                 # Ancestor records for sub's parents, so their metadata
                 # restores on pull; only a missing or drifted ancestor
-                # journals.
+                # journals. An excluded ancestor stays unrecorded (a parent
+                # record is optional, docs/excludes.md).
                 acc = target_root
                 rel_acc: str | None = None
                 for part in sub.split("/")[:-1]:
                     acc = os.path.join(acc, part)
                     rel_acc = part if rel_acc is None else f"{rel_acc}/{part}"
+                    if ex.excluded(f"{rel_acc}/", os.path.abspath(acc).replace(os.sep, "/") + "/"):
+                        continue
                     journal.record_ancestor(rel_acc, os.lstat(acc))
 
                 if is_link:
@@ -978,9 +1009,11 @@ def _sub_kind_from_manifest(manifest_path: str, sub: str) -> str:
 
 
 def _manifest_matches_local(
-    manifest_path: str, outpath: str, is_dir: bool, sub: str | None, window_ns: int
+    manifest_path: str, outpath: str, is_dir: bool, sub: str | None, window_ns: int, ex: Excludes
 ) -> bool:
-    """True iff every manifest record matches the local filesystem.
+    """True iff every manifest record the pull would touch matches the local
+    filesystem. Excluded records are outside the comparison - the pull skips
+    them in full (docs/excludes.md) - so they cannot hold the gate open.
 
     Returning True means 'boto3-s3 sync' would copy nothing AND apply_manifest
     would change nothing - so both can be skipped.
@@ -989,10 +1022,53 @@ def _manifest_matches_local(
         res = manifest_target(entry, outpath, is_dir, sub)
         if res is None:
             continue
-        target, _rel = res
+        target, rel = res
+        # The entry root ("." at entry scope, or a single-file entry's one
+        # record) is never excluded; a SUB's own record is judged.
+        base = "" if sub is None and (rel == "." or not is_dir) else rel
+        if sub is not None:
+            base = sub if rel == "." else f"{sub}/{rel}"
+        if base:
+            key = base + "/" if entry.is_dir else base
+            anchor = os.path.abspath(target).replace(os.sep, "/") + ("/" if entry.is_dir else "")
+            if ex.excluded(key, anchor):
+                continue
         if not compare_to_local(entry, target, window_ns=window_ns).is_match:
             return False
     return True
+
+
+def _pull_exclude_lanes(
+    ex: Excludes, sub: str | None, outpath: str, compare: PairFilter | None
+) -> tuple[FileFilter, PairFilter | None]:
+    """Veto excluded keys in pull's download lanes (docs/excludes.md): a
+    create-lane key under an excluded path is never downloaded, and an
+    excluded both-sides pair is left untouched without consulting the
+    stat/content compare (whose streaming cursor self-heals over keys it is
+    not asked about). Keys are re-anchored at the entry root, where the
+    patterns are defined; anchored (absolute) patterns match the restore
+    destination's absolute path - aws-cli's join-onto-root semantics."""
+
+    def excluded_key(compare_key: str) -> bool:
+        key = f"{sub}/{compare_key}" if sub else compare_key
+        anchor = os.path.abspath(os.path.join(outpath, compare_key.replace("/", os.sep)))
+        return ex.excluded(key, anchor.replace(os.sep, "/"))
+
+    def create(info: FileInfo) -> bool:
+        assert info.compare_key is not None  # the sync stamps every listed entry
+        return not excluded_key(info.compare_key)
+
+    if compare is None:
+        return create, None
+
+    inner = compare
+
+    def update(pair: SyncPair) -> bool:
+        if excluded_key(pair.compare_key):
+            return False
+        return inner(pair)
+
+    return create, update
 
 
 def _manifest_restore_conflict(manifest_path: str, sub: str | None) -> str | None:
@@ -1105,13 +1181,23 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         #    between the user and the content comparison.
         window_ns = cfg.window_ns_for(entry)
         excludes: list[str] = entry_cfg.get("excludes", []) if entry_cfg else []
+        ex = Excludes(excludes)
+        # A named non-directory sub whose key is excluded is ignored in FULL
+        # (docs/excludes.md): no download, no metadata, exit 0 - naming an
+        # excluded path does not override the exclude. A directory sub is
+        # not short-circuited: only its own record may be excluded while its
+        # children restore normally (the lanes and the apply judge each key
+        # alone).
+        if sub is not None and not is_dir:
+            if ex.excluded(sub, os.path.abspath(outpath).replace(os.sep, "/")):
+                return 0
         # --checksum ignores this gate (see below), so on a real --checksum pull
         # skip the whole size+mtime walk under it - on a large tree that is
         # millions of wasted lstats before the content compare even starts. A
         # --checksum --dry-run still computes it: it is a preview (not the hot
         # path) and the dry-run metadata stand-in line below reads manifest_matches.
         manifest_matches = (opts.dryrun or not opts.checksum) and _manifest_matches_local(
-            manifest_path, outpath, is_dir, sub, window_ns
+            manifest_path, outpath, is_dir, sub, window_ns, ex
         )
         if manifest_matches and not opts.checksum:
             if opts.delete and is_dir:
@@ -1192,6 +1278,9 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 # size (from the manifest) routes a large file through multipart.
                 dest = os.path.join(stage_dir, "new") if stage_dir is not None else outpath
                 compare = sync_compare(cfg, opts, entry, manifest_path, sub=sub) if is_dir else None
+                create: bool | FileFilter = True
+                if is_dir and excludes:
+                    create, compare = _pull_exclude_lanes(ex, sub, dest, compare)
                 file_size = None if is_dir else _single_file_size(manifest_path)
                 try:
                     rc, changed = download_from_s3(
@@ -1202,6 +1291,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                         opts.verbose,
                         sub=sub,
                         compare=compare,
+                        create=create,
                         size=file_size,
                         dryrun=opts.dryrun,
                     )

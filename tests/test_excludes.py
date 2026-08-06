@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 
 import pytest
 
@@ -193,3 +194,132 @@ def test_push_absolute_pattern_excludes_by_local_path(ws):
     keys = ws.keys()
     assert "data/skip.txt" not in keys
     assert "data/keep.txt" in keys
+
+
+# --- the ignore rule (push sub-paths and pull) -------------------------------
+
+
+def test_subpath_push_of_excluded_file_is_ignored(ws):
+    # The original bug: naming an excluded file used to upload it
+    # unconditionally. Naming does not override the exclude - the push does
+    # nothing and exits 0.
+    ws.write("data/keep.txt", "k")
+    ws.write("data/uv/uv-receipt.json", "r")
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["uv/uv-receipt.json"]}})
+    ws.run("push", "data", expect_rc=0)
+    assert "data/uv/uv-receipt.json" not in ws.keys()
+
+    res = ws.run("push", str(ws.root / "data" / "uv" / "uv-receipt.json"), expect_rc=0)
+
+    assert res.out.strip() == ""
+    assert "data/uv/uv-receipt.json" not in ws.keys()
+
+
+def test_subpath_push_delete_of_excluded_file_removes_its_backup(ws, answers):
+    # The bug report's scenario end to end: pushed before the exclude was
+    # added, then named with --delete - the backup (object and record) goes,
+    # behind the one-question subtree confirmation.
+    ws.write("data/keep.txt", "k")
+    ws.write("data/uv/uv-receipt.json", "r")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["uv/uv-receipt.json"]}})
+
+    answers.feed("y")
+    ws.run("push", str(ws.root / "data" / "uv" / "uv-receipt.json"), "--delete", expect_rc=0)
+
+    assert len(answers.prompts) == 1
+    assert "delete the backup subtree" in answers.prompts[0]
+    assert "data/uv/uv-receipt.json" not in ws.keys()
+    assert "./uv/uv-receipt.json" not in _manifest_paths(ws)
+    assert (ws.root / "data" / "uv" / "uv-receipt.json").read_text() == "r"  # local untouched
+
+
+def test_subpath_push_of_excluded_missing_path_is_ignored(ws):
+    # Excluded AND locally missing: exclusion wins - silent exit 0 instead
+    # of the missing-path error.
+    ws.write("data/keep.txt", "k")
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["tmp/*"]}})
+    ws.run("push", "data", expect_rc=0)
+
+    res = ws.run("push", "data/tmp", expect_rc=0)
+
+    assert res.out.strip() == "" and res.err.strip() == ""
+
+
+def test_subpath_push_skips_an_excluded_ancestor_record(ws):
+    # Pushing a visible path under an excluded directory records the path
+    # and its visible ancestors, but not the excluded level (a parent record
+    # is optional).
+    ws.write("data/cache/sub/keep.txt", "k")
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["cache/"]}})
+
+    ws.run("push", "data/cache/sub", expect_rc=0)
+
+    paths = _manifest_paths(ws)
+    assert "./cache/sub/keep.txt" in paths
+    assert "./cache/sub" in paths
+    assert "./cache" not in paths
+
+
+def test_pull_does_not_restore_an_excluded_path(ws):
+    # Deleted locally and excluded: the pull leaves it deleted - the backup
+    # still holds it, but the exclude makes it invisible to restore too.
+    ws.write("data/keep.txt", "k")
+    ws.write("data/cache/c.txt", "c")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["cache/*"]}})
+    shutil.rmtree(ws.root / "data" / "cache")
+    (ws.root / "data" / "keep.txt").unlink()
+
+    res = ws.run("pull", "data", expect_rc=0)
+
+    assert (ws.root / "data" / "keep.txt").read_text() == "k"  # the rest restored
+    assert not (ws.root / "data" / "cache").exists()
+    assert "cache" not in res.out
+
+
+def test_pull_does_not_overwrite_an_excluded_local_file(ws):
+    ws.write("data/cache/c.txt", "recorded")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["cache/*"]}})
+    c = ws.root / "data" / "cache" / "c.txt"
+    c.write_text("locally newer and longer")
+
+    ws.run("pull", "data", expect_rc=0)
+
+    assert c.read_text() == "locally newer and longer"
+
+
+def test_pull_delete_keeps_an_excluded_local_extra(ws):
+    # A never-pushed local file matching an exclude is invisible to the
+    # extras diff: the mirror never offers it.
+    ws.write("data/keep.txt", "k")
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["*.log"]}})
+    ws.run("push", "data", expect_rc=0)
+    out = ws.root / "out"
+    ws.run("pull", "data", "-o", str(out), expect_rc=0)
+    extra = ws.write("out/x.log", "local only")
+
+    ws.run("pull", "--delete", "--yes", "data", "-o", str(out), expect_rc=0)
+
+    assert extra.read_text() == "local only"
+
+
+def test_pull_of_named_excluded_file_is_ignored(ws):
+    # Naming an excluded path on pull is the same silence as push: no
+    # download, nothing created, exit 0.
+    ws.write("data/uv/uv-receipt.json", "r")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["uv/uv-receipt.json"]}})
+
+    dest = ws.root / "restored.json"
+    res = ws.run("pull", "data/uv/uv-receipt.json", "-o", str(dest), expect_rc=0)
+
+    assert res.out.strip() == ""
+    assert not dest.exists()

@@ -34,6 +34,15 @@ a fix only (Fixed).
 
 ### Changed
 
+- Without `--delete`, an excluded path is now ignored in full, on both
+  sides: push neither uploads nor deletes it and records nothing about it,
+  and pull neither restores, overwrites, nor touches its metadata — a path
+  excluded after it was backed up stays deleted when deleted locally, and
+  stays as it is when present. Naming an excluded path no longer overrides
+  the exclude: a sub-path push or pull of a path the filter leaves nothing
+  visible at does nothing and exits 0, and `push --delete` of such a path
+  removes its backup behind the one-question subtree confirmation — the
+  supported way to retire it by name.
 - `excludes` now match exactly like `aws s3 sync --exclude` — the engine is
   boto3-s3's own, so the two cannot drift. Every path is judged alone
   against its whole entry-rooted key, with a directory carrying a trailing

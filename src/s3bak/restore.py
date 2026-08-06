@@ -23,6 +23,7 @@ from s3bak import localwalk, manifest
 from s3bak.compare import SYMLINK_MTIME_SUPPORTED, compare_to_stat
 from s3bak.confirm import DeleteConfirmer
 from s3bak.console import IS_WINDOWS, console, is_junction
+from s3bak.excludes import Excludes
 from s3bak.manifest import ManifestEntry
 
 # =============================================================================
@@ -719,6 +720,23 @@ def apply_manifest(
     # bless the outside target and make later children look spuriously outside
     # the newly created root.
     root_real = canonical_restore_path(outpath)
+    ex = Excludes(excludes or [])
+
+    def excluded_record(rel: str, is_dir_rec: bool, target: str) -> bool:
+        # rel is sub-relative ("." = the walked root); re-anchor at the
+        # entry root, where the patterns are defined. The entry root itself
+        # is never matched; a SUB pull's own root is an ordinary judged
+        # path. Anchored patterns match the restore destination's absolute
+        # path (aws-cli's join-onto-root semantics).
+        if sub is None:
+            base = "" if rel == "." else rel
+        else:
+            base = sub if rel == "." else f"{sub}/{rel}"
+        if not base:
+            return False
+        key = base + "/" if is_dir_rec else base
+        anchor = os.path.abspath(target).replace(os.sep, "/") + ("/" if is_dir_rec else "")
+        return ex.excluded(key, anchor)
 
     if is_dir:
         for _key, m, loc in manifest.merge_join(
@@ -742,6 +760,8 @@ def apply_manifest(
                 continue  # local-only: pull --delete's lane, not apply's
             rel, m_entry = m
             target = outpath if rel == "." else os.path.join(outpath, rel)
+            if excluded_record(rel, m_entry.is_dir, target):
+                continue  # pull never touches an excluded path
             if loc is not None:
                 _lrel, st, local_sym = loc
             else:
@@ -779,7 +799,11 @@ def apply_manifest(
             res = manifest_target(m_entry, outpath, is_dir, sub)
             if res is None:
                 continue
-            target, _rel = res
+            target, rel = res
+            # A single-file entry's one record IS the entry root (sub None):
+            # excludes never apply to it. A file/symlink SUB is judged.
+            if sub is not None and excluded_record(rel, m_entry.is_dir, target):
+                continue  # pull never touches an excluded path
             st, local_sym = _lstat_readlink(target)
             outcome = _apply_record(
                 m_entry,

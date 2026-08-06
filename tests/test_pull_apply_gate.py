@@ -93,23 +93,23 @@ def test_pull_repairs_mode_only_change_without_download(ws):
     assert "a.txt" in res.out
 
 
-def test_pull_applies_metadata_under_excluded_path(ws):
-    # The apply walk prunes excludes, but a record it therefore never paired
-    # up is judged from a direct lstat - so a record left from a push before
-    # the exclude was added is still repaired, matching pull's exclude-blind
-    # data sync.
+def test_pull_leaves_an_excluded_path_untouched(ws):
+    # The ignore rule (docs/excludes.md): a record under a path the config
+    # now excludes is skipped in full - no download, no metadata repair -
+    # whatever its local state.
     c = ws.write("data/cache/c.txt", "cached")
     ws.write("data/a.txt", "alpha")
     ws.config({"data": {"path": str(ws.root / "data")}})
     ws.run("push", "data", expect_rc=0)  # cache/ recorded: no excludes yet
     recorded_mode = _mode(c)
+    drifted = 0o600 if recorded_mode != 0o600 else 0o640
 
     ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["cache/*"]}})
-    os.chmod(c, 0o600 if recorded_mode != 0o600 else 0o640)
+    os.chmod(c, drifted)
 
     res = ws.run("pull", "data", expect_rc=0)
     assert "download:" not in res.out
-    assert _mode(c) == recorded_mode
+    assert _mode(c) == drifted  # untouched: pull never repairs an excluded path
 
 
 def test_pull_checksum_dryrun_clean_tree_prints_nothing(ws):

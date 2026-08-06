@@ -722,6 +722,7 @@ def download_from_s3(
     verbose: bool,
     sub: str | None = None,
     compare: PairFilter | None = None,
+    create: bool | FileFilter = True,
     size: int | None = None,
     dryrun: bool = False,
 ) -> tuple[int, bool]:
@@ -744,7 +745,7 @@ def download_from_s3(
                 probe = parent
         try:
             result = cfg.store.sync_down(
-                rel, outpath, compare=compare, dryrun=dryrun, verbose=verbose
+                rel, outpath, compare=compare, create=create, dryrun=dryrun, verbose=verbose
             )
         finally:
             for path in created:  # leaf-first, so each rmdir empties its parent
