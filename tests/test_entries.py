@@ -158,8 +158,11 @@ def test_push_delete_answer_n_keeps_excluded_object_and_record(ws, answers):
     assert len(answers.prompts) == 1
     assert "data/cache/c.txt" in ws.keys()
     assert "./cache/c.txt" in _manifest_paths(ws)
+    # The kept pair is intact residue: no integrity error, and verify's
+    # excluded-residue warning keeps pointing at it until a --delete retires it.
     res = ws.run("verify", "data", expect_rc=0)
-    assert "data: OK" in res.out
+    assert "0 error(s)" in res.out
+    assert "under excludes remain in the backup" in res.err
 
 
 def test_push_delete_dry_run_lists_excluded_orphans_without_prompting(ws, answers):
@@ -186,8 +189,11 @@ def test_plain_push_neither_uploads_nor_deletes_excluded_paths(ws):
     assert "upload:" not in res.out
     assert "delete:" not in res.out
     assert "data/cache/c.txt" in ws.keys()
+    # Record and object still correspond (no integrity error); the residue
+    # itself is what verify warns about.
     res = ws.run("verify", "data", expect_rc=0)
-    assert "data: OK" in res.out
+    assert "0 error(s)" in res.out
+    assert "under excludes remain in the backup" in res.err
 
 
 def test_push_delete_retires_unrecorded_excluded_object(ws, answers):
