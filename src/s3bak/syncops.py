@@ -119,9 +119,9 @@ class _DirFrame:
     Its no-change placeholder line is already in the journal at ``offset``;
     the pop - once the ascending stream has left the subtree - decides
     whether to flip that line's marker to a drop. ``kept`` is set the moment
-    anything beneath survives, because dropping the directory record while a
-    descendant record remains would publish a manifest the validator rejects
-    (every record needs a recorded directory parent)."""
+    anything beneath survives: the directory record carries the metadata the
+    surviving records' restore settles into, so it travels with them rather
+    than being asked about on its own."""
 
     prefix: str  # the dir record's sort key ("sub/"): prefixes every descendant key
     rel: str  # entry-rooted display path ("sub")
@@ -333,11 +333,12 @@ class PushJournal:
 
     # --- directory-record frames ---------------------------------------------
     def _mark_record_kept(self) -> None:
-        """A record survives beneath the innermost open directory frame: the
-        directory record can no longer be dropped (every record needs its
-        recorded directory parent), so the frame resolves silently kept -
-        matching pull --delete, where keeping an item keeps every extra
-        directory still open above it without a question of its own."""
+        """A record survives beneath the innermost open directory frame:
+        the directory record travels with it (it carries the metadata the
+        surviving record's restore settles into), so the frame resolves
+        silently kept - matching pull --delete, where keeping an item keeps
+        every extra directory still open above it without a question of its
+        own."""
         if self._frames:
             self._frames[-1].kept = True
 

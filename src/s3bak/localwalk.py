@@ -32,6 +32,7 @@ pull ``--delete`` diff) or an S3 listing (``ManifestFilter``) in one pass.
 from __future__ import annotations
 
 import os
+import stat as stat_mod
 from typing import TYPE_CHECKING
 
 from boto3_s3 import LocalFileGenerator, LocalStorage, WalkChild
@@ -205,7 +206,16 @@ def walk_tree(
     ex = Excludes(excludes)
     key_prefix = "" if rel_prefix == "./" else rel_prefix.removeprefix("./")
     st = os.lstat(root)
-    if not key_prefix or not ex.excluded(key_prefix, os.path.abspath(root).replace(os.sep, "/")):
+    # A SUB walk's own root is an ordinary judged path. Judge it exactly as
+    # the walker would judge the same path as a child: a directory key keeps
+    # the trailing "/" (key_prefix carries it) and its absolute anchor gets
+    # the trailing separator boto3-s3 stamps on directory keys; a non-dir
+    # root (the manifest said directory, the local path is now a file or
+    # symlink) is judged by the slash-less forms.
+    is_dir_root = stat_mod.S_ISDIR(st.st_mode)
+    root_key = key_prefix if is_dir_root else key_prefix.rstrip("/")
+    root_anchor = os.path.abspath(root).replace(os.sep, "/") + ("/" if is_dir_root else "")
+    if not key_prefix or not ex.excluded(root_key, root_anchor):
         yield root_rel, st, None
 
     storage = LocalStorage(

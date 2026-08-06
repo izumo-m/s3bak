@@ -169,6 +169,19 @@ def test_push_symlink_is_not_covered_by_dir_patterns(ws):
     assert "./cache" in _manifest_paths(ws)
 
 
+def test_pull_restores_children_of_an_excluded_directory(ws):
+    # No ./cache record (the directory is excluded): the pull creates the
+    # missing level as a plain directory and restores the child.
+    ws.write("data/cache/c.txt", "c")
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["cache/"]}})
+    ws.run("push", "data", expect_rc=0)
+
+    out = ws.root / "out"
+    ws.run("pull", "data", "-o", str(out), expect_rc=0)
+
+    assert (out / "cache" / "c.txt").read_text() == "c"
+
+
 def test_push_absolute_pattern_excludes_by_local_path(ws):
     ws.write("data/keep.txt", "k")
     ws.write("data/skip.txt", "s")

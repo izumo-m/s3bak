@@ -549,6 +549,29 @@ def test_pull_replaces_symlink_directory_root_without_writing_through_it(ws):
     assert not (victim / "a.txt").exists()
 
 
+def test_pull_replaces_symlink_at_an_unrecorded_ancestor(ws):
+    # excludes ["cache/"]: the manifest records ./cache/c.txt but no ./cache
+    # (a parent record is optional). The pre-sync guard must vet the
+    # unrecorded level from its child records and replace a local symlink
+    # sitting there - otherwise the sync would write through it, outside the
+    # restore tree.
+    ws.write("data/cache/c.txt", "content")
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["cache/"]}})
+    ws.run("push", "data", expect_rc=0)
+
+    outside = ws.root / "outside"
+    outside.mkdir()
+    dest = ws.root / "out"
+    dest.mkdir()
+    os.symlink(outside, dest / "cache")
+
+    ws.run("pull", "data", "-o", str(dest), expect_rc=0)
+
+    assert not (dest / "cache").is_symlink()
+    assert (dest / "cache" / "c.txt").read_text() == "content"
+    assert not (outside / "c.txt").exists()
+
+
 def test_pull_replaces_empty_directory_root_symlink_safely(ws):
     (ws.root / "empty").mkdir()
     ws.config({"empty": {"path": str(ws.root / "empty")}})

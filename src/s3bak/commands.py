@@ -538,9 +538,9 @@ def _push_sub(
                     # entry root so the manifest keeps its dir-entry shape and
                     # the root's metadata restores on pull.
                     journal.record_root(os.lstat(target_root))
-                # Ancestor records for sub's parents: every record needs a
-                # recorded directory parent (the validator's rule); only a
-                # missing or drifted ancestor journals.
+                # Ancestor records for sub's parents, so their metadata
+                # restores on pull; only a missing or drifted ancestor
+                # journals.
                 acc = target_root
                 rel_acc: str | None = None
                 for part in sub.split("/")[:-1]:
@@ -1843,7 +1843,7 @@ def diff_backup(
                             _lrel, st, _sym = loc
                             local_mode = st.st_mode
                         else:
-                            # The walk prunes excludes, and cannot pair a
+                            # The walk filters excludes, and cannot pair a
                             # manifest file record (sort key "x") with a
                             # same-named local directory (sort key "x/") - a
                             # type change, not a hidden path, but the same
@@ -1887,7 +1887,7 @@ def diff_backup(
                         if stat_mod.S_ISLNK(st.st_mode) and sym == record.sym_target:
                             continue
                     else:
-                        # The walk prunes excludes, and cannot pair a manifest
+                        # The walk filters excludes, and cannot pair a manifest
                         # symlink record (sort key "x") with a same-named local
                         # directory (sort key "x/") - a type change, not a
                         # hidden path, but the same unpaired shape. Either way
@@ -1921,7 +1921,7 @@ def diff_backup(
                             continue
                         local_value = _local_leaf_description(local, st.st_mode)
                     else:
-                        # The walk prunes excludes, and cannot pair a manifest
+                        # The walk filters excludes, and cannot pair a manifest
                         # special-file record (sort key "x") with a same-named
                         # local directory (sort key "x/") - a type change, not
                         # a hidden path, but the same unpaired shape. Either

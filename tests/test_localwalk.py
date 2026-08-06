@@ -97,6 +97,96 @@ def test_walk_tree_applies_excludes(tmp_path):
     assert rels == [".", "./keep.txt"]
 
 
+def test_walk_tree_judges_a_sub_roots_own_key(tmp_path):
+    # A SUB walk's own root is an ordinary judged path (the entry root never
+    # is): dir/* covers it and everything beneath; "cache/" omits only the
+    # root itself while the children still walk.
+    (tmp_path / "cache").mkdir()
+    (tmp_path / "cache" / "c.txt").write_text("c")
+
+    covered = list(
+        localwalk.walk_tree(
+            str(tmp_path / "cache"), ["cache/*"], root_rel="./cache", rel_prefix="./cache/"
+        )
+    )
+    assert covered == []
+
+    rels = [
+        rel
+        for rel, _st, _sym in localwalk.walk_tree(
+            str(tmp_path / "cache"), ["cache/"], root_rel="./cache", rel_prefix="./cache/"
+        )
+    ]
+    assert rels == ["./cache/c.txt"]
+
+
+def test_walk_tree_judges_a_file_shaped_sub_root_by_its_file_key(tmp_path):
+    # The manifest may say directory while the local sub is now a file: the
+    # root is judged by its actual kind - the slash-less key - so a bare
+    # name matches it and a directory pattern does not.
+    (tmp_path / "notes.txt").write_text("n")
+
+    gone = list(
+        localwalk.walk_tree(
+            str(tmp_path / "notes.txt"),
+            ["notes.txt"],
+            root_rel="./notes.txt",
+            rel_prefix="./notes.txt/",
+        )
+    )
+    assert gone == []
+
+    rels = [
+        rel
+        for rel, _st, _sym in localwalk.walk_tree(
+            str(tmp_path / "notes.txt"),
+            ["notes.txt/"],
+            root_rel="./notes.txt",
+            rel_prefix="./notes.txt/",
+        )
+    ]
+    assert rels == ["./notes.txt"]
+
+
+def test_walk_tree_anchored_pattern_judges_root_and_child_alike(tmp_path):
+    # The same directory must be judged identically whether it is reached as
+    # a child of a full walk or is itself the walked sub root - the anchored
+    # form gets the same trailing separator either way.
+    (tmp_path / "cache").mkdir()
+    (tmp_path / "cache" / "c.txt").write_text("c")
+    anchor = str(tmp_path / "cache").replace(os.sep, "/") + "/"
+
+    full = [rel for rel, _st, _sym in localwalk.walk_tree(str(tmp_path), [anchor])]
+    assert full == [".", "./cache/c.txt"]
+
+    sub = [
+        rel
+        for rel, _st, _sym in localwalk.walk_tree(
+            str(tmp_path / "cache"), [anchor], root_rel="./cache", rel_prefix="./cache/"
+        )
+    ]
+    assert sub == ["./cache/c.txt"]
+
+
+def test_prune_never_changes_what_the_filter_decides(tmp_path, monkeypatch):
+    # The dir/* descent skip is an optimization only: with it disabled, the
+    # walk must yield exactly the same rels.
+    from s3bak.excludes import Excludes
+
+    (tmp_path / "keep.txt").write_text("k")
+    (tmp_path / "cache" / "sub").mkdir(parents=True)
+    (tmp_path / "cache" / "c.txt").write_text("c")
+    (tmp_path / "cache" / "sub" / "d.log").write_text("d")
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "x.log").write_text("x")
+    patterns = ["cache/*", "*.log", "logs/"]
+
+    pruned = [rel for rel, _st, _sym in localwalk.walk_tree(str(tmp_path), patterns)]
+    monkeypatch.setattr(Excludes, "prunes_subtree", lambda self, key: False)
+    unpruned = [rel for rel, _st, _sym in localwalk.walk_tree(str(tmp_path), patterns)]
+    assert pruned == unpruned == [".", "./keep.txt"]
+
+
 def test_walk_tree_keeps_symlink_at_a_dir_patterns_name(tmp_path):
     # aws-cli semantics: every path is judged alone by its own key. A
     # symlink named "pruned" has the key "pruned" (no trailing slash), which

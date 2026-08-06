@@ -149,11 +149,16 @@ def within_root(root_real: str, target: str) -> bool:
 
 
 def prepare_dir_conflicts(outpath: str, manifest_path: str, sub: str | None) -> int:
-    """Replace a local symlink or Windows directory junction sitting where the
-    manifest records a directory, BEFORE the data sync runs: the sync opens
-    ``dir/file`` paths through whatever is at ``dir``, so a pre-existing
-    symlink or junction there would route the downloads outside the restore
-    tree. The metadata apply would repair the type anyway - this makes the
+    """Replace a local symlink or Windows directory junction sitting at any
+    directory position the restore will write through, BEFORE the data sync
+    runs: the sync opens ``dir/file`` paths through whatever is at ``dir``,
+    so a pre-existing symlink or junction there would route the downloads
+    outside the restore tree. The positions are every recorded directory AND
+    every record's ancestor directories - a parent directory record is
+    optional (an excluded directory is unrecorded while its children are,
+    docs/excludes.md), so the unrecorded levels must be vetted from the
+    child records' paths, not only from directory records. The metadata
+    apply would repair a recorded directory's type anyway - this makes the
     repair happen before any bytes move. Other conflicting types stay
     untouched here: a write through a regular file fails loudly instead of
     escaping, and apply_manifest settles it after the download. A symlink is
@@ -162,29 +167,27 @@ def prepare_dir_conflicts(outpath: str, manifest_path: str, sub: str | None) -> 
     the number of conflicts that could not be cleared (each reported)."""
     errors = 0
     root_real = canonical_restore_path(outpath)
-    for entry in manifest.iter_manifest(manifest_path):
-        if not entry.is_dir:
-            continue
-        rel = resolve_manifest_rel(entry.path, sub)
-        if rel is None or rel == ".":
-            continue  # the pull corrects the restore root itself
+    # The ancestor chain already vetted, innermost last - records arrive in
+    # sorted order, so the chain changes incrementally and memory stays
+    # bounded by directory depth, never tree size.
+    vetted: list[str] = []
+
+    def vet(rel: str, recorded_path: str) -> None:
+        nonlocal errors
         target = os.path.join(outpath, rel)
-        # Records arrive parents-first, so by the time a child is checked its
-        # ancestors are real directories and one lstat per record is enough (a
-        # link or junction behind a fixed parent cannot survive to this point).
         try:
             st = os.lstat(target)
         except OSError:
-            continue
+            return
         is_symlink = stat_mod.S_ISLNK(st.st_mode)
         # A junction lstats as an ordinary directory (Windows does not model
         # it as a symlink), so it needs its own check alongside S_ISLNK.
         if not is_symlink and not is_junction(st):
-            continue
+            return
         if not within_root(root_real, target):
-            console.err(f"manifest path escapes restore root, skipped: {entry.path}")
+            console.err(f"manifest path escapes restore root, skipped: {recorded_path}")
             errors += 1
-            continue
+            return
         try:
             if is_symlink:
                 os.remove(target)
@@ -196,6 +199,22 @@ def prepare_dir_conflicts(outpath: str, manifest_path: str, sub: str | None) -> 
                 f"cannot replace symlink or junction with recorded directory: {target}: {e}"
             )
             errors += 1
+
+    for entry in manifest.iter_manifest(manifest_path):
+        rel = resolve_manifest_rel(entry.path, sub)
+        if rel is None or rel == ".":
+            continue  # the pull corrects the restore root itself
+        # Vet the ancestor directories this record restores through, then -
+        # for a directory record - the recorded position itself.
+        parts = rel.split("/")
+        chain = ["/".join(parts[: depth + 1]) for depth in range(len(parts) - 1)]
+        if entry.is_dir:
+            chain.append(rel)
+        while vetted and (len(vetted) > len(chain) or vetted[-1] != chain[len(vetted) - 1]):
+            vetted.pop()
+        for ancestor in chain[len(vetted) :]:
+            vet(ancestor, entry.path)
+            vetted.append(ancestor)
     return errors
 
 
@@ -726,8 +745,8 @@ def apply_manifest(
             if loc is not None:
                 _lrel, st, local_sym = loc
             else:
-                # The walk prunes excludes, so "not walked" may mean hidden
-                # rather than missing: judge from a direct lstat.
+                # The walk filters excludes, so "not walked" may mean
+                # hidden rather than missing: judge from a direct lstat.
                 if rel != "." and not within_root(root_real, target):
                     console.err(f"manifest path escapes restore root, skipped: {m_entry.path}")
                     errors += 1
