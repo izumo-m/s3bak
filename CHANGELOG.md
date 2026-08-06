@@ -9,6 +9,17 @@ a fix only (Fixed).
 
 ## [Unreleased]
 
+### Added
+
+- `s3bak hook pre <entry>` / `s3bak hook post <entry>`: run one configured
+  hook on demand, outside any push — re-running an off-site copy after the
+  far side changed, or testing a dump script. The hook executes under the
+  same contract as a push-run hook (argument vector, no shell, stdin
+  detached, the same exit-status normalization), with `S3BAK_JOURNAL`
+  unset. An entry without the named hook fails (exit 1); `--dry-run`
+  prints the command line without running it; like `list`, the command
+  needs no S3 client.
+
 ### Removed
 
 - `--meta-only` and `--data-only`, on push and pull both. A one-sided push

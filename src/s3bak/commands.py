@@ -114,6 +114,28 @@ def _run_hook(
     return 1 if rc == 2 else rc
 
 
+def cmd_hook(cfg: Config, entry: str, opts: Opts, *, which: str) -> int:
+    """Run one configured hook on demand (``s3bak hook pre|post <entry>``),
+    outside any push - re-running an off-site copy after the far side
+    changed, or testing a dump script. The hook executes under the same
+    contract as a push-run hook (``_run_hook``: argument vector, no shell,
+    stdin detached, the same exit normalization), with ``S3BAK_JOURNAL``
+    unset - there is no push, hence no journal, which the hook contract
+    reads as "no per-file detail; assume anything may have changed". An
+    entry without the named hook fails: naming the hook is an instruction,
+    and silence would read as success."""
+    entry_cfg = cfg.entries.get(entry)
+    if not entry_cfg:
+        console.err(f"no such entry: {entry}")
+        return 1
+    name = f"{which}_hook"
+    hook: list[str] | None = entry_cfg.get(name)
+    if not hook:
+        console.err(f"{entry}: no {name} configured")
+        return 1
+    return _run_hook(name, hook, opts)
+
+
 def upload_manifest(cfg: Config, entry: str, target: str, opts: Opts) -> int:
     """Write the single-file entry's one-record manifest from a fresh lstat,
     then run the entry's post_hook. An ordinary directory push publishes its

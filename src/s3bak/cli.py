@@ -40,6 +40,7 @@ from typing import NoReturn
 from s3bak import manifest
 from s3bak.commands import (
     cmd_diff,
+    cmd_hook,
     cmd_list,
     cmd_ls_remote,
     cmd_pull,
@@ -383,6 +384,35 @@ _COMMAND_SPECS = {
             "s3bak verify --all --checksum",
         ),
     ),
+    "hook": _CommandSpec(
+        overview="Run an entry's pre_hook or post_hook on demand",
+        summary="Run one configured hook for entries, outside any push.",
+        usage=(
+            "s3bak hook <pre|post> [options] <entry>...",
+            "s3bak hook <pre|post> [options] --all",
+        ),
+        arguments=(
+            ("<pre|post>", "Which hook to run"),
+            ("<entry>...", "Entries whose hook to run"),
+        ),
+        options=("all", "dry_run", "verbose", "help"),
+        sections=(
+            (
+                "Contract",
+                (
+                    "The hook runs exactly as a push would run it: an argument vector,",
+                    "no shell, stdin detached, the same exit-status normalization.",
+                    "S3BAK_JOURNAL is unset (no push, hence no journal), which a hook",
+                    'reads as "no per-file detail; assume anything may have changed".',
+                    "An entry without the named hook fails (exit 1).",
+                ),
+            ),
+        ),
+        examples=(
+            "s3bak hook post vault",
+            "s3bak hook pre keepass --dry-run",
+        ),
+    ),
     "diff": _CommandSpec(
         overview="Show content differences",
         summary="Show content differences between the backup and local files.",
@@ -710,6 +740,16 @@ def main(argv: list[str] | None = None) -> int:
 
     _validate_command_options(subcmd, used_options)
 
+    # The hook selector is a positional subargument, consumed here so the
+    # generic --all/positional compatibility check below sees only entries.
+    hook_kind: str | None = None
+    if subcmd == "hook":
+        if not positional:
+            console.die("hook requires 'pre' or 'post' as its first argument")
+        hook_kind = positional.pop(0)
+        if hook_kind not in ("pre", "post"):
+            console.die(f"hook requires 'pre' or 'post' as its first argument, got {hook_kind!r}")
+
     opts = Opts(
         dryrun=opt_dryrun,
         delete=opt_delete,
@@ -755,8 +795,9 @@ def main(argv: list[str] | None = None) -> int:
 
     # Parsing and option validation deliberately precede config/S3 setup, so a
     # typo reports the typo even when the user's AWS profile is unavailable.
-    # `list` needs config entries only and therefore does not construct a client.
-    cfg = load_config(create_store=subcmd != "list")
+    # `list` and `hook` need config entries only (a hook run touches no S3
+    # state) and therefore do not construct a client.
+    cfg = load_config(create_store=subcmd not in ("list", "hook"))
 
     # A CLI --mtime-window overrides both the top-level and per-entry config
     # windows for this run (0 = exact). Affects the size+mtime check shared
@@ -826,6 +867,26 @@ def main(argv: list[str] | None = None) -> int:
             # per-entry exit status stands and run() maps them to exit 2.
             verify_top_level(cfg, opts)
         return rc
+
+    elif subcmd == "hook":
+        assert hook_kind is not None
+        if opt_all:
+            hook_entries = sorted(cfg.entries.keys())
+        else:
+            resolved = resolve_entry_files(cfg, positional, "hook")
+            for hook_entry, hook_sub in resolved:
+                if hook_sub is not None:
+                    console.die(
+                        f"hook runs per entry; a sub path is not allowed: {hook_entry}/{hook_sub}"
+                    )
+            _validate_distinct_entries(resolved, "hook")
+            hook_entries = [e for e, _ in resolved]
+
+        def _hook_one(cfg_: Config, entry_: str, opts_: Opts) -> int:
+            assert hook_kind is not None
+            return cmd_hook(cfg_, entry_, opts_, which=hook_kind)
+
+        return run_entries(_hook_one, cfg, hook_entries, opts)
 
     elif subcmd == "diff":
         entry, file = resolve_entry_file(cfg, positional, "diff")
