@@ -302,13 +302,13 @@ def local_keyed(
 
     The manifest walk under ``outpath``. ``sub`` (the entry-relative path that
     ``outpath`` corresponds to) re-anchors the walk's exclude matching at the
-    ENTRY root, so the entry's entry-rooted patterns prune the same paths they
+    ENTRY root, so the entry's entry-rooted patterns filter the same paths they
     would in a full walk - otherwise a sub-path ``pull --delete`` would treat an
     excluded local file as an extra and remove it. The emitted ``rel`` and sort
     key stay sub-relative, so they merge-join with ``manifest_keyed(sub)``. An
-    excluded path is invisible to the diff on both lanes (never compared, never a
-    local extra). A missing ``outpath`` yields nothing, so status degrades to
-    reporting every record D.
+    excluded local path never enters the diff (never compared, never a local
+    extra); every path is judged alone (docs/excludes.md), the walked sub root
+    included. A missing ``outpath`` yields nothing.
 
     ``warn`` (``status`` passes it) surfaces walk gaps - an unreadable directory
     hides its children, so ``status`` would otherwise report a clean tree while a
@@ -327,21 +327,6 @@ def local_keyed(
         if warn is not None:
             warn(f"cannot read {outpath}: {e}")
         return
-    if sub is not None:
-        prune, _skip = manifest.split_excludes(excludes)
-        # If the sub root itself - or any ancestor of it - is a pruned directory,
-        # the whole sub subtree is excluded. A full walk prunes it as a directory
-        # child before descending; a sub-path walk STARTS inside it (its own root
-        # is yielded unconditionally, and children of an already-excluded dir do
-        # not match the ancestor pattern), so detect it here and yield nothing -
-        # otherwise pull --delete would treat the excluded contents as extras.
-        # Records under an excluded sub are still applied via apply_manifest's
-        # direct-lstat fallback.
-        parts = sub.split("/")
-        for depth in range(len(parts)):
-            ancestor = "./" + "/".join(parts[: depth + 1])
-            if prune.match(ancestor):
-                return
     root_rel = "." if sub is None else f"./{sub}"
     rel_prefix = "./" if sub is None else f"./{sub}/"
     for rel, st, sym in localwalk.walk_tree(
@@ -760,9 +745,9 @@ def apply_manifest(
             )
             errors += outcome.errors
             if outcome.defer_symlink and dir_stack:
-                # This record's own directory parent is always the current
-                # stack top - every record has a recorded directory parent
-                # (validate_manifest), and the pop above already closed
+                # The current stack top is this record's nearest RECORDED
+                # ancestor (a parent record is optional - an excluded
+                # directory is unrecorded); the pop above already closed
                 # everything that is not an ancestor of it. Flag it so its
                 # pop-time settle is skipped in favor of the post-placement
                 # re-settle below.

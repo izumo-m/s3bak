@@ -97,11 +97,14 @@ def test_walk_tree_applies_excludes(tmp_path):
     assert rels == [".", "./keep.txt"]
 
 
-def test_walk_tree_excludes_symlink_at_pruned_name(tmp_path):
-    # A symlink occupying the name a prune pattern targets is excluded too.
+def test_walk_tree_keeps_symlink_at_a_dir_patterns_name(tmp_path):
+    # aws-cli semantics: every path is judged alone by its own key. A
+    # symlink named "pruned" has the key "pruned" (no trailing slash), which
+    # "pruned/*" does not match - so it stays, unlike the directory it is
+    # named after.
     os.symlink("elsewhere", tmp_path / "pruned")
     rels = [rel for rel, _st, _sym in localwalk.walk_tree(str(tmp_path), ["pruned/*"])]
-    assert rels == ["."]
+    assert rels == [".", "./pruned"]
 
 
 # --- iter_subtree (sub-path re-rooting) ------------------------------------------

@@ -238,22 +238,21 @@ def test_subpath_push_delete_offers_excluded_objects(ws, answers):
     assert "./sub/a.txt" in paths
 
 
-def test_subpath_push_of_excluded_subtree_backs_it_up(ws):
-    # Explicitly pushing an excluded sub-path wins over the exclude, exactly
-    # as the manifest walk (iter_subtree) already treats it: the sub's own
-    # subtree is walked, uploaded, AND recorded, so data and manifest agree.
-    # (The old both-sides filter uploaded nothing while the manifest patch
-    # recorded everything - records whose objects never existed.)
+def test_subpath_push_of_excluded_subtree_is_ignored(ws):
+    # Naming an excluded path does not override the exclude (docs/excludes.md):
+    # the filter leaves nothing visible at data/tmp, so the push does nothing
+    # and exits 0 - ignoring is the rule, not an error.
     ws.write("data/keep.txt", "k")
     ws.write("data/tmp/x.txt", "x")
     ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["tmp/*"]}})
     ws.run("push", "data", expect_rc=0)
     assert "data/tmp/x.txt" not in ws.keys()
 
-    ws.run("push", "data/tmp", expect_rc=0)
+    res = ws.run("push", "data/tmp", expect_rc=0)
 
-    assert "data/tmp/x.txt" in ws.keys()
-    assert "./tmp/x.txt" in _manifest_paths(ws)
+    assert res.out.strip() == ""
+    assert "data/tmp/x.txt" not in ws.keys()
+    assert "./tmp/x.txt" not in _manifest_paths(ws)
     res = ws.run("verify", "data", expect_rc=0)
     assert "data: OK" in res.out
 

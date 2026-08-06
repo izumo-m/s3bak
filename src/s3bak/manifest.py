@@ -37,10 +37,8 @@ pure apply.
 
 from __future__ import annotations
 
-import fnmatch
 import json
 import os
-import re
 import stat as stat_mod
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
@@ -261,10 +259,6 @@ def validate_manifest(manifest_path: str) -> str:
     kind: str | None = None
     previous_key: str | None = None
     count = 0
-    # Directory records must precede all of their descendants in key order.
-    # Keeping only the current ancestry proves every record has a recorded
-    # directory parent without turning validation into an O(tree-size) map.
-    directory_stack: list[tuple[str, ...]] = [()]
 
     for entry in iter_manifest(manifest_path):
         count += 1
@@ -315,13 +309,12 @@ def validate_manifest(manifest_path: str) -> str:
                     f"manifest path component is drive-qualified,"
                     f" unrestorable on Windows: {entry.path!r}"
                 )
-            parent = tuple(parts[:-1])
-            while directory_stack and len(directory_stack[-1]) > len(parent):
-                directory_stack.pop()
-            if not directory_stack or directory_stack[-1] != parent:
-                raise ManifestError(f"manifest record has no directory parent: {entry.path!r}")
-            if entry.is_dir:
-                directory_stack.append(tuple(parts))
+            # A record's parent directory record is OPTIONAL: an excluded
+            # directory is unrecorded while its visible children are
+            # (docs/excludes.md), and validation cannot know which excludes
+            # were in force when the manifest was written, so a missing
+            # parent is a valid manifest, never damage. Pull creates the
+            # missing levels as plain directories.
 
         is_symlink = stat_mod.S_ISLNK(entry.mode)
         if is_symlink != (entry.sym_target is not None):
@@ -633,77 +626,6 @@ def merge_journal(
                 raise ManifestError(f"journal drops an unrecorded path: {e.path!r}")
             if payload != old[2]:
                 raise ManifestError(f"journal drop does not match the record at {e.path!r}")
-
-
-# =============================================================================
-# Exclude pattern matching (find -path semantics: * matches /)
-# =============================================================================
-
-
-def path_match(path: str, pattern: str) -> bool:
-    # fnmatchcase is platform-neutral and, because it matches plain strings
-    # rather than filesystem components, ``*`` also matches ``/``. Its mature
-    # translator handles malformed/range-heavy bracket expressions without the
-    # regex compilation failures a hand-rolled translator can introduce. This
-    # is also PathMatcher's reference semantics (below) - the two must agree.
-    return fnmatch.fnmatchcase(path, pattern)
-
-
-class PathMatcher:
-    """A precompiled ``any(fnmatch.fnmatchcase(path, p) for p in patterns)``.
-
-    An exclude check runs once per walked path against every configured
-    pattern (localwalk's per-child prune/skip test, restore's sub-ancestor
-    test); scanning the pattern list with ``path_match`` costs one fnmatch
-    call per pattern per path - O(paths x patterns). Splitting the patterns
-    once at construction avoids that:
-
-    - a **literal** pattern (no ``*`` / ``?`` / ``[``) goes into a
-      ``frozenset``, an O(1) membership test;
-    - every **wildcard** pattern is translated with ``fnmatch.translate`` -
-      the same mature translator ``path_match`` relies on, so a malformed or
-      range-heavy bracket expression (an unterminated ``[``, an invalid
-      ``[z-a]`` range) still translates to a safe regex rather than failing
-      to compile - and every translation is OR'd into ONE compiled regex, so
-      matching costs one ``.match()`` call regardless of how many wildcard
-      patterns there are.
-
-    ``match`` is exactly ``any(path_match(path, p) for p in patterns)``: a
-    literal pattern under fnmatchcase is a plain equality test, which the
-    frozenset lookup replicates; each wildcard pattern's own
-    ``fnmatch.translate`` output keeps its trailing ``\\Z`` full-string
-    anchor inside the alternation, so one alternative reaching past the end
-    of ``path`` can never make a different, shorter alternative "match" -
-    the combined regex accepts iff at least one original pattern would have.
-    An empty pattern list matches nothing.
-    """
-
-    def __init__(self, patterns: Iterable[str]) -> None:
-        literals: set[str] = set()
-        translated: list[str] = []
-        for p in patterns:
-            if any(c in p for c in "*?["):
-                translated.append(fnmatch.translate(p))
-            else:
-                literals.add(p)
-        self._literals = frozenset(literals)
-        self._regex = re.compile("|".join(f"(?:{t})" for t in translated)) if translated else None
-
-    def match(self, path: str) -> bool:
-        if path in self._literals:
-            return True
-        return self._regex is not None and self._regex.match(path) is not None
-
-
-def split_excludes(excludes: list[str]) -> tuple[PathMatcher, PathMatcher]:
-    prune_patterns: list[str] = []
-    skip_patterns: list[str] = []
-    for ex in excludes:
-        if ex.endswith("/*"):
-            prune_patterns.append(f"./{ex[:-2]}")
-        else:
-            skip_patterns.append(f"./{ex}")
-    return PathMatcher(prune_patterns), PathMatcher(skip_patterns)
 
 
 # =============================================================================

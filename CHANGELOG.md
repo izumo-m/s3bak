@@ -34,6 +34,19 @@ a fix only (Fixed).
 
 ### Changed
 
+- `excludes` now match exactly like `aws s3 sync --exclude` — the engine is
+  boto3-s3's own, so the two cannot drift. Every path is judged alone
+  against its whole entry-rooted key, with a directory carrying a trailing
+  `/` on its key: `cache/*` still covers the directory and its whole
+  subtree, `cache/` matches the directory entry alone (its contents stay
+  backed up), and a bare `cache` matches only a file or symlink of that
+  name — exactly what aws-cli would exclude, where previously such patterns
+  were silently ignored. An absolute pattern (`/...`, or a drive letter on
+  Windows) now matches against the absolute local path. A symlink is no
+  longer covered by a directory pattern of its name. An excluded directory
+  is no longer recorded, so a record's parent directory record is now
+  optional in the manifest — a missing parent is a valid manifest, not
+  damage.
 - A pull that meets a file record whose S3 object is gone — the residue of
   an interrupted deletion or an out-of-band delete — now warns, skips the
   record in full, and restores everything else (exit 2), instead of failing

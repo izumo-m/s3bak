@@ -177,31 +177,24 @@ def test_validate_manifest_rejects_header_only_file(tmp_path):
         manifest.validate_manifest(str(p))
 
 
-@pytest.mark.parametrize(
-    "records",
-    [
-        ['{"path":"./missing/child","mode":"100644","size":1,"mtime_ns":0}'],
-        [
-            '{"path":"./link","mode":"120777","mtime_ns":0,"link":"target"}',
-            '{"path":"./link/child","mode":"100644","size":1,"mtime_ns":0}',
-        ],
-    ],
-)
-def test_validate_manifest_requires_recorded_directory_parents(tmp_path, records):
+def test_validate_manifest_accepts_a_missing_directory_parent(tmp_path):
+    # A record's parent directory record is optional: an excluded directory
+    # is unrecorded while its visible children are (docs/excludes.md), and
+    # validation cannot know which excludes were in force when the manifest
+    # was written - so a missing parent is a valid manifest, never damage.
     p = tmp_path / "m.jsonl"
     p.write_text(
         "\n".join(
             [
                 '{"s3bak_manifest":3}',
                 '{"path":".","mode":"40755","mtime_ns":0}',
-                *records,
+                '{"path":"./missing/child","mode":"100644","size":1,"mtime_ns":0}',
                 "",
             ]
         )
     )
 
-    with pytest.raises(manifest.ManifestError, match="directory parent"):
-        manifest.validate_manifest(str(p))
+    assert manifest.validate_manifest(str(p)) == "dir"
 
 
 # --- size+mtime check ----------------------------------------------------------
@@ -220,88 +213,7 @@ def test_matches_stat_window(tmp_path):
     assert not e.matches_stat(drifted, 0)  # strict
 
 
-# --- pattern matching / sort key ------------------------------------------------
-
-
-def test_path_match_negated_class():
-    # Glob negation is '!'; regex would read a verbatim '[!a]' as a class
-    # holding the literal '!' - the exact inverse (matching 'a', missing 'b').
-    # The translator must emit '^'.
-    assert manifest.path_match("b", "[!a]")
-    assert not manifest.path_match("a", "[!a]")
-
-
-def test_path_match_unterminated_class_is_literal():
-    # fnmatch behavior: an unterminated '[' matches itself rather than
-    # crashing the regex compile.
-    assert manifest.path_match("x[", "x[")
-    assert not manifest.path_match("x", "x[")
-
-
-def test_path_match_invalid_range_never_raises():
-    assert not manifest.path_match("a", "[z-a]")
-
-
-# --- PathMatcher ----------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "patterns",
-    [
-        [],
-        ["foo.txt"],
-        ["foo.txt", "bar.txt"],
-        ["*.txt"],
-        ["foo.txt", "*.log"],
-        ["dir/*"],
-        ["[!a]"],
-        ["x["],
-        ["[z-a]"],
-        ["foo.txt", "*.log", "[!a]", "x[", "[z-a]", "dir/*"],
-    ],
-)
-def test_path_matcher_matches_the_any_path_match_loop(patterns):
-    # PathMatcher.match must agree with any(path_match(path, p) for p in
-    # patterns) for every candidate, literal/wildcard mixed and every
-    # malformed-bracket case path_match's own docstring already tolerates.
-    candidates = ["foo.txt", "bar.txt", "x[", "x", "a", "b", "z", "dir/child", "other"]
-    matcher = manifest.PathMatcher(patterns)
-    for path in candidates:
-        expected = any(manifest.path_match(path, p) for p in patterns)
-        assert matcher.match(path) == expected, (path, patterns)
-
-
-def test_path_matcher_star_crosses_slash():
-    # fnmatch's '*' matches '/' too (find -path semantics, not shell
-    # globbing) - PathMatcher must keep that, not gain path-component
-    # awareness by combining patterns into one regex.
-    matcher = manifest.PathMatcher(["a/*"])
-    assert matcher.match("a/b/c")
-    assert manifest.path_match("a/b/c", "a/*")  # same reference behavior
-
-
-def test_path_matcher_empty_pattern_list_matches_nothing():
-    matcher = manifest.PathMatcher([])
-    assert not matcher.match("")
-    assert not matcher.match("anything")
-
-
-def test_path_matcher_construction_never_raises_on_malformed_patterns():
-    # fnmatch.translate must safely fall back for these (no regex compile
-    # failure) - the same guarantee path_match's docstring relies on.
-    # PathMatcher additionally ORs every wildcard pattern into ONE compiled
-    # regex, so this also proves that combination stays compilable.
-    manifest.PathMatcher(["x[", "[z-a]", "[!a]", "**", "?[", "[[[["])
-
-
-def test_split_excludes_returns_path_matchers():
-    prune, skip = manifest.split_excludes(["logs/*", "*.tmp"])
-    assert isinstance(prune, manifest.PathMatcher)
-    assert isinstance(skip, manifest.PathMatcher)
-    assert prune.match("./logs")
-    assert not prune.match("./logs/x")
-    assert skip.match("./a.tmp")
-    assert not skip.match("./a.txt")
+# --- sort key -------------------------------------------------------------------
 
 
 def test_entry_sort_key():
