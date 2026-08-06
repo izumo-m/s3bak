@@ -2372,11 +2372,18 @@ def _verify_dir(
     opts: Opts,
     local_base: str,
     content_reachable: bool = True,
+    excludes: Excludes | None = None,
 ) -> None:
     """Merge-join the manifest records against the S3 listing - both ascend in
     key byte order, so one streaming pass checks the whole correspondence:
     every file record has its object (size intact, class restorable), every
     non-file record has none, and every object is accounted for.
+
+    ``excludes`` (the entry's current patterns) drives the excluded-residue
+    warning (docs/verify.md): the integrity checks stay exclude-blind -
+    residue pairs are internally consistent and pass them - but with every
+    other command ignoring excluded paths, this count is the one passive
+    channel that surfaces what `push --delete` can retire.
 
     ``content_reachable`` False (a directory sub whose local root sits behind a
     symlinked ancestor) skips the --checksum content hash, which would otherwise
@@ -2384,6 +2391,21 @@ def _verify_dir(
     access needed)."""
     assert cfg.store is not None
     rel_base = f"{entry}/{sub}" if sub else entry
+    residue = 0
+
+    def excluded_residue(record: ManifestEntry, compare_key: str) -> bool:
+        # record.path is entry-rooted, exactly the space the patterns are
+        # defined over; the anchor is the record's local path (absolute
+        # patterns match it whether or not anything exists there - the
+        # judgment is on path strings alone).
+        if excludes is None or excludes.empty:
+            return False
+        rel = record.path.removeprefix("./")
+        key = rel + "/" if record.is_dir else rel
+        anchor = os.path.abspath(
+            os.path.join(local_base, *compare_key.rstrip("/").split("/"))
+        ).replace(os.sep, "/") + ("/" if record.is_dir else "")
+        return excludes.excluded(key, anchor)
 
     # An object at the tree's own key (the residue of a file that became this
     # directory) has no place in any restore: probe the exact key, the one spot
@@ -2430,6 +2452,8 @@ def _verify_dir(
             if obj is not None:
                 report.objects += 1
                 _check_archived(report, f"{cfg.prefix}/{rel_base}/{obj.key}", obj)
+            if record is not None and excluded_residue(record, key):
+                residue += 1
             if record is not None and obj is not None:
                 if key.endswith("/"):
                     # Only a directory record carries the trailing slash, and
@@ -2482,6 +2506,11 @@ def _verify_dir(
                     waiting.append(obj)
         for w in waiting:
             settle(w, conflict=False)
+        if residue:
+            report.warn(
+                f"{residue} recorded path(s) under excludes remain in the backup"
+                f" (push --delete retires them)"
+            )
     finally:
         if checker is not None:
             checker.close()
@@ -2543,6 +2572,7 @@ def cmd_verify(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
         console.err(f"no such entry: {entry}")
         return 1
     base_path: str = entry_cfg["path"]
+    verify_excludes = Excludes(entry_cfg.get("excludes", []))
     report = _VerifyReport(entry)
     assert cfg.store is not None
 
@@ -2595,6 +2625,7 @@ def cmd_verify(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
                     opts,
                     local_path,
                     content_reachable=content_reachable,
+                    excludes=verify_excludes,
                 )
             elif kind == "file":
                 record = next(
@@ -2615,9 +2646,21 @@ def cmd_verify(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
             else:
                 kind_name = "symlink" if kind == "symlink" else "special file"
                 _verify_objectless_record(cfg, report, rel_key, kind_name, opts)
+            if kind != "dir" and not verify_excludes.empty:
+                # A named non-directory sub is one record; count it as residue
+                # when its own key is excluded (a dir sub counts inside the
+                # merge above).
+                anchor = os.path.abspath(local_path).replace(os.sep, "/")
+                if verify_excludes.excluded(sub, anchor):
+                    report.warn(
+                        "1 recorded path(s) under excludes remain in the backup"
+                        " (push --delete retires them)"
+                    )
         elif entry_is_dir:
             _report_restore_conflict(report, manifest_path, None)
-            _verify_dir(cfg, entry, report, manifest_path, None, opts, base_path)
+            _verify_dir(
+                cfg, entry, report, manifest_path, None, opts, base_path, excludes=verify_excludes
+            )
         else:
             # A validated file-shaped manifest holds exactly one regular-file
             # record (validate_manifest), so there is nothing else to classify.

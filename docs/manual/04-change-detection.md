@@ -328,7 +328,7 @@ warning:
 
 ```console
 $ s3bak verify demo
-s3bak: demo: 2 recorded path(s) under excludes remain in the backup (push --delete retires them)
+warning: demo: 2 recorded path(s) under excludes remain in the backup (push --delete retires them)
 demo: 0 error(s), 1 warning(s) (5 file record(s), 5 data object(s))
 ```
 

@@ -11,6 +11,13 @@ a fix only (Fixed).
 
 ### Added
 
+- `verify` now reports excluded residue: records still sitting under the
+  entry's current `excludes` — the leftovers of an exclude added after the
+  paths were pushed — warn with one count per entry (exit 2), naming
+  `push --delete` as the remedy. With every other command ignoring
+  excluded paths, this is the one passive channel that surfaces them; the
+  integrity checks themselves stay exclude-blind, and an unrecorded object
+  under an excluded path keeps its own unrecorded-object warning.
 - `status --delete`: the preview of `push --delete`. Manifest-only records —
   locally deleted paths and residue under excluded paths alike — print as
   `D`, the candidates the push would offer. Like plain status it never

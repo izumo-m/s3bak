@@ -413,3 +413,64 @@ def test_subpath_push_delete_refuses_on_an_unreadable_excluded_dir(ws, answers):
     assert "kept 1 deletion candidate(s)" in res.err
     assert answers.prompts == []
     assert "data/cache/c.txt" in ws.keys()  # the backup survived the gap
+
+
+# --- verify's excluded-residue warning ---------------------------------------
+
+
+def test_verify_warns_about_excluded_residue(ws):
+    # Records under the entry's current excludes: with every other command
+    # ignoring them, verify's count is the one passive discovery channel.
+    ws.write("data/keep.txt", "k")
+    ws.write("data/cache/c.txt", "c")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["cache/*"]}})
+    res = ws.run("verify", "data", expect_rc=0)
+
+    # ./cache and ./cache/c.txt both sit under the exclude.
+    assert "2 recorded path(s) under excludes remain in the backup" in res.err
+    assert "push --delete retires them" in res.err
+    assert "1 warning(s)" in res.out
+
+
+def test_verify_without_residue_stays_ok(ws):
+    # An exclude nothing was ever recorded under adds no warning.
+    ws.write("data/keep.txt", "k")
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["cache/*"]}})
+    ws.run("push", "data", expect_rc=0)
+
+    res = ws.run("verify", "data", expect_rc=0)
+
+    assert "under excludes" not in res.err
+    assert "data: OK" in res.out
+
+
+def test_verify_residue_clears_after_push_delete(ws, answers):
+    ws.write("data/keep.txt", "k")
+    ws.write("data/cache/c.txt", "c")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["cache/*"]}})
+
+    ws.run("push", "--delete", "--yes", "data", expect_rc=0)
+    res = ws.run("verify", "data", expect_rc=0)
+
+    assert "under excludes" not in res.err
+    assert "data: OK" in res.out
+
+
+def test_verify_unrecorded_object_under_excludes_is_not_double_counted(ws):
+    # An unrecorded object under an excluded path keeps its own warning; the
+    # residue count covers RECORDS only, so it must not appear here.
+    ws.write("data/keep.txt", "k")
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["cache/*"]}})
+    ws.run("push", "data", expect_rc=0)
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/cache/stray.bin", Body=b"x")
+
+    res = ws.run("verify", "data", expect_rc=0)
+
+    assert "unrecorded object" in res.err
+    assert "under excludes" not in res.err
+    assert "1 warning(s)" in res.out
