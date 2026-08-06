@@ -31,6 +31,9 @@ class Excludes:
     """
 
     def __init__(self, patterns: list[str]) -> None:
+        #: True for the no-patterns case, so per-record hot paths can skip
+        #: key/anchor construction outright.
+        self.empty = not patterns
         self._matcher = globsieve.compile(globsieve.GlobPattern.exclude(p) for p in patterns)
         # The provable-prune shapes: a relative ``dir/*`` whose dir part is
         # wildcard-free covers, as a plain prefix, the directory key and

@@ -614,7 +614,7 @@ def test_remove_extras_reports_deletion_failure(tmp_path, monkeypatch, capfd):
 
     monkeypatch.setattr(restore.os, "remove", fail_remove)
 
-    item = ("extra.txt", str(extra), False)
+    item = ("extra.txt", str(extra), False, True)
     assert restore.remove_extras(iter([item]), aliases=set()) == (1, 0)
     assert extra.exists()
     assert "delete failed" in capfd.readouterr().err
@@ -749,7 +749,7 @@ def test_remove_extras_keeps_local_extra_whose_manifest_alias_would_sort_after_i
     report.parent.mkdir()
     report.write_text("restored content")
 
-    items = [("a/report", str(report), False)]
+    items = [("a/report", str(report), False, True)]
     aliases = {("a", restore.fs_alias_key("report."))}
     errors, removed = restore.remove_extras(iter(items), aliases=aliases)
 
@@ -769,7 +769,7 @@ def test_remove_extras_keeps_local_extra_whose_manifest_alias_would_sort_before_
     b.parent.mkdir()
     b.write_text("restored content")
 
-    items = [("a/b.txt", str(b), False)]
+    items = [("a/b.txt", str(b), False, True)]
     aliases = {("a", restore.fs_alias_key("B.txt"))}
     errors, removed = restore.remove_extras(iter(items), aliases=aliases)
 
@@ -787,7 +787,7 @@ def test_remove_extras_keeps_an_aliased_extra_directory_too(tmp_path, capfd):
     d = tmp_path / "a" / "b"
     d.mkdir(parents=True)
 
-    items = [("a/b", str(d), True)]
+    items = [("a/b", str(d), True, True)]
     aliases = {("a", restore.fs_alias_key("B"))}
     errors, removed = restore.remove_extras(iter(items), aliases=aliases)
 
@@ -806,7 +806,7 @@ def test_remove_extras_still_removes_an_unaliased_extra_next_to_an_alias_entry(t
     extra.parent.mkdir()
     extra.write_text("delete me")
 
-    items = [("a/unrelated.txt", str(extra), False)]
+    items = [("a/unrelated.txt", str(extra), False, True)]
     aliases = {("a", restore.fs_alias_key("deleted-elsewhere.txt"))}
     errors, removed = restore.remove_extras(iter(items), aliases=aliases)
 
@@ -826,10 +826,10 @@ def test_remove_extras_regression_nested_post_order_still_removes_plain_extras(t
     zzz.write_text("z")
 
     items = [
-        ("extradir", str(tmp_path / "extradir"), True),
-        ("extradir/sub", str(tmp_path / "extradir" / "sub"), True),
-        ("extradir/sub/deep.txt", str(deep), False),
-        ("zzz.txt", str(zzz), False),
+        ("extradir", str(tmp_path / "extradir"), True, True),
+        ("extradir/sub", str(tmp_path / "extradir" / "sub"), True, True),
+        ("extradir/sub/deep.txt", str(deep), False, True),
+        ("zzz.txt", str(zzz), False, True),
     ]
     errors, removed = restore.remove_extras(iter(items), aliases=set())
 

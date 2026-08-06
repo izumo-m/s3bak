@@ -675,11 +675,11 @@ def apply_manifest(
     ``window_ns`` is a match and stays as it is.
 
     A directory entry consumes one merge-join of the manifest against a fresh
-    local walk. The walk prunes ``excludes`` (an excluded subtree is never
-    scanned) but serves purely as a stat cache: a record the walk did not
-    pair up is judged from a direct lstat before anything is concluded, so a
-    record under an excluded path - pull's data sync is exclude-blind - is
-    still repaired, and a genuinely missing file still errors.
+    local walk. The walk filters ``excludes`` and serves purely as a stat
+    cache: a record the walk did not pair up is judged from a direct lstat
+    before anything is concluded. An EXCLUDED record is skipped in full
+    (docs/excludes.md): pull never downloads, recreates, or applies metadata
+    at an excluded path.
 
     Directory records settle their mode/mtime through an ancestor stack (see
     the module comment above ``_is_ancestor``): a directory pushes its frame
@@ -728,6 +728,8 @@ def apply_manifest(
         # is never matched; a SUB pull's own root is an ordinary judged
         # path. Anchored patterns match the restore destination's absolute
         # path (aws-cli's join-onto-root semantics).
+        if ex.empty:
+            return False
         if sub is None:
             base = "" if rel == "." else rel
         else:
@@ -858,17 +860,23 @@ class _ExtraFrame:
 
 
 def remove_extras(
-    extras: Iterator[tuple[str, str, bool]],
+    items: Iterator[tuple[str, str, bool, bool]],
     *,
     aliases: set[tuple[str, str]],
     dryrun: bool = False,
     confirm: DeleteConfirmer | None = None,
 ) -> tuple[int, int]:
     """Remove local extras (pull ``--delete``): an ascending ``(rel, path,
-    is_dir)`` stream - the local-only lane of the status/--delete merge-join,
-    in S3 key order, ``rel`` sub-relative and root-free (the caller drops
-    "."). ``is_dir`` is the lstat kind, so a symlink - even one pointing at a
-    directory - is unlinked, never rmdir'd.
+    is_dir, is_extra)`` stream - every LOCAL item of the status/--delete
+    merge-join, in S3 key order, ``rel`` sub-relative and root-free (the
+    caller drops "."). Only ``is_extra`` items (the local-only lane) are
+    removal candidates; a recorded local item flows through purely to PIN
+    the extra directories still open above it - a parent directory record is
+    optional (an excluded directory pushes as a local-only name whose
+    children are recorded, docs/excludes.md), and offering such a directory
+    would rmdir a tree the manifest still records. ``is_dir`` is the lstat
+    kind, so a symlink - even one pointing at a directory - is unlinked,
+    never rmdir'd.
 
     A directory extra is not removed as it arrives - it is pushed onto an
     ancestor stack and popped (and only then removed) once the stream proves
@@ -964,9 +972,15 @@ def remove_extras(
             return  # a kept descendant forces keeping the directory too - no confirm, no rmdir
         decide(frame.rel, frame.path, True)
 
-    for rel, path, is_dir_entry in extras:
+    for rel, path, is_dir_entry, is_extra in items:
         while stack and not _is_ancestor(stack[-1].rel, rel):
             close(stack.pop())
+        if not is_extra:
+            # A recorded local item: after the pops above, every frame still
+            # open is one of its extra ancestors - pin them all (their rmdir
+            # would take recorded content with it).
+            keep_open_ancestors()
+            continue
         if is_dir_entry:
             stack.append(_ExtraFrame(rel, path))
             continue

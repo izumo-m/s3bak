@@ -323,3 +323,93 @@ def test_pull_of_named_excluded_file_is_ignored(ws):
 
     assert res.out.strip() == ""
     assert not dest.exists()
+
+
+def test_pull_delete_keeps_a_local_dir_with_recorded_children(ws):
+    # A directory pushed while its own key was excluded has recorded
+    # children but no record of its own. After lifting the exclude, pull
+    # --delete must not offer (or fail on) the directory: the recorded
+    # children pin it.
+    ws.write("data/cache/c.txt", "c")
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["cache/"]}})
+    ws.run("push", "data", expect_rc=0)
+    assert "./cache" not in _manifest_paths(ws)
+
+    ws.config({"data": {"path": str(ws.root / "data")}})  # exclude lifted
+    res = ws.run("pull", "--delete", "--yes", "data", expect_rc=0)
+
+    assert "delete" not in res.out
+    assert (ws.root / "data" / "cache" / "c.txt").read_text() == "c"
+
+
+def test_pull_gate_ignores_an_excluded_mismatch(ws):
+    # Everything visible matches; only an excluded path drifted. The no-op
+    # gate must treat the tree as settled: a --dry-run plans no metadata
+    # apply and no transfers.
+    ws.write("data/keep.txt", "k")
+    c = ws.write("data/cache/c.txt", "c")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.run("pull", "data", expect_rc=0)  # settle metadata
+
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["cache/*"]}})
+    c.write_text("locally changed and longer")
+
+    res = ws.run("pull", "--dry-run", "data", expect_rc=0)
+
+    assert res.out.strip() == ""
+
+
+def test_pull_update_lane_vetoes_an_excluded_pair(ws):
+    # Force the pull past the no-op gate with a visible difference: the
+    # excluded pair must still not download, while the visible one does.
+    ws.write("data/keep.txt", "k")
+    c = ws.write("data/cache/c.txt", "recorded")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["cache/*"]}})
+    c.write_text("locally newer, different size")
+    (ws.root / "data" / "keep.txt").unlink()  # a visible difference
+
+    res = ws.run("pull", "data", expect_rc=0)
+
+    assert "keep.txt" in res.out
+    assert c.read_text() == "locally newer, different size"
+
+
+def test_push_delete_dry_run_of_a_named_excluded_path_previews(ws, answers):
+    ws.write("data/keep.txt", "k")
+    ws.write("data/uv/uv-receipt.json", "r")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["uv/uv-receipt.json"]}})
+
+    res = ws.run("push", str(ws.root / "data" / "uv" / "uv-receipt.json"), "--delete", "--dry-run")
+
+    assert res.rc == 0
+    assert answers.prompts == []
+    assert "(dry-run)" in res.out and "delete" in res.out
+    assert "data/uv/uv-receipt.json" in ws.keys()  # nothing actually deleted
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs an unreadable directory")
+def test_subpath_push_delete_refuses_on_an_unreadable_excluded_dir(ws, answers):
+    # An unreadable directory must not read as "nothing visible": treating a
+    # walk gap as invisibility would hand a live backup to the one-question
+    # subtree deletion. The push falls through to the normal branches, whose
+    # completeness gate refuses deletions on a partial view.
+    ws.write("data/cache/c.txt", "c")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["cache/"]}})
+    os.chmod(ws.root / "data" / "cache", 0)
+    try:
+        res = ws.run("push", "data/cache", "--delete", "--yes")
+    finally:
+        os.chmod(ws.root / "data" / "cache", 0o755)
+
+    assert res.rc == 0  # cli.run maps the warnings to exit 2
+    assert "kept 1 deletion candidate(s)" in res.err
+    assert answers.prompts == []
+    assert "data/cache/c.txt" in ws.keys()  # the backup survived the gap

@@ -609,9 +609,11 @@ class PushJournal:
 
     def record_ancestor(self, rel: str, st: os.stat_result) -> None:
         """A sub-path push's parent directory: journal only a drift (a missing
-        record, or a mode/mtime change) - every record needs a recorded directory
-        parent, but re-recording an unchanged ancestor was the old pipeline's
-        walked-path-wins artifact, not a requirement. A directory's own mtime is
+        record, or a mode/mtime change) - the ancestors' metadata should
+        restore on pull, but re-recording an unchanged ancestor was the old
+        pipeline's walked-path-wins artifact, not a requirement (and an
+        excluded ancestor is not journaled at all - a parent record is
+        optional, docs/excludes.md). A directory's own mtime is
         tracked like _journal_nonfile's dir branch, so a sub-path push that
         changed the ancestor's mtime (adding the new child does) refreshes it
         instead of leaving a stale value for pull to restore."""

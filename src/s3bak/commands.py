@@ -491,10 +491,16 @@ def _push_sub(
         ex = Excludes(excludes)
         sub_anchor = os.path.abspath(local_sub).replace(os.sep, "/")
         if sub_st is not None and stat_mod.S_ISDIR(sub_st.st_mode):
+            # "Nothing visible" must be PROVEN: a walk gap (an unreadable
+            # directory, a path racing away) means the tree may hold visible
+            # content the walk could not see, so the push falls through to
+            # the normal branches, whose completeness gate then refuses
+            # deletions - the same fail-closed rule as everywhere else.
+            gaps: list[str] = []
             walk = localwalk.walk_tree(
-                local_sub, excludes, root_rel=f"./{sub}", rel_prefix=f"./{sub}/"
+                local_sub, excludes, root_rel=f"./{sub}", rel_prefix=f"./{sub}/", warn=gaps.append
             )
-            nothing_visible = next(iter(walk), None) is None
+            nothing_visible = next(iter(walk), None) is None and not gaps
         elif sub_st is not None:
             nothing_visible = ex.excluded(sub, sub_anchor)
         else:
@@ -1028,7 +1034,7 @@ def _manifest_matches_local(
         base = "" if sub is None and (rel == "." or not is_dir) else rel
         if sub is not None:
             base = sub if rel == "." else f"{sub}/{rel}"
-        if base:
+        if base and not ex.empty:
             key = base + "/" if entry.is_dir else base
             anchor = os.path.abspath(target).replace(os.sep, "/") + ("/" if entry.is_dir else "")
             if ex.excluded(key, anchor):
@@ -1039,8 +1045,8 @@ def _manifest_matches_local(
 
 
 def _pull_exclude_lanes(
-    ex: Excludes, sub: str | None, outpath: str, compare: PairFilter | None
-) -> tuple[FileFilter, PairFilter | None]:
+    ex: Excludes, sub: str | None, outpath: str, compare: PairFilter
+) -> tuple[FileFilter, PairFilter]:
     """Veto excluded keys in pull's download lanes (docs/excludes.md): a
     create-lane key under an excluded path is never downloaded, and an
     excluded both-sides pair is left untouched without consulting the
@@ -1058,15 +1064,10 @@ def _pull_exclude_lanes(
         assert info.compare_key is not None  # the sync stamps every listed entry
         return not excluded_key(info.compare_key)
 
-    if compare is None:
-        return create, None
-
-    inner = compare
-
     def update(pair: SyncPair) -> bool:
         if excluded_key(pair.compare_key):
             return False
-        return inner(pair)
+        return compare(pair)
 
     return create, update
 
@@ -1144,12 +1145,20 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
 
         entry_is_dir = _entry_kind_from_manifest(manifest_path) == "dir"
 
+        excludes: list[str] = entry_cfg.get("excludes", []) if entry_cfg else []
+        ex = Excludes(excludes)
         if sub is not None:
             if not entry_is_dir:
                 console.err(f"sub path not allowed for single-file entry: {entry}")
                 return 1
             kind = _sub_kind_from_manifest(manifest_path, sub)
             if kind == "missing":
+                # Exclusion wins over "missing", like push: a named excluded
+                # path is ignored, not an error - with no record there is no
+                # kind to consult, so either spelling matching decides.
+                anchor = os.path.abspath(outpath).replace(os.sep, "/")
+                if ex.excluded(sub, anchor) or ex.excluded(f"{sub}/", anchor + "/"):
+                    return 0
                 console.err(f"not found on S3: {entry}/{sub}")
                 return 1
             is_dir = kind == "dir"
@@ -1180,8 +1189,6 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         #    blind spot --checksum exists to cover, so it must not stand
         #    between the user and the content comparison.
         window_ns = cfg.window_ns_for(entry)
-        excludes: list[str] = entry_cfg.get("excludes", []) if entry_cfg else []
-        ex = Excludes(excludes)
         # A named non-directory sub whose key is excluded is ignored in FULL
         # (docs/excludes.md): no download, no metadata, exit 0 - naming an
         # excluded path does not override the exclude. A directory sub is
@@ -1279,8 +1286,12 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 dest = os.path.join(stage_dir, "new") if stage_dir is not None else outpath
                 compare = sync_compare(cfg, opts, entry, manifest_path, sub=sub) if is_dir else None
                 create: bool | FileFilter = True
-                if is_dir and excludes:
-                    create, compare = _pull_exclude_lanes(ex, sub, dest, compare)
+                pair_filter = compare
+                if is_dir and excludes and compare is not None:
+                    # Anchored at OUTPATH, the final destination - on a staged
+                    # pull the sync writes into the stage, but absolute
+                    # patterns are defined against where the tree ends up.
+                    create, pair_filter = _pull_exclude_lanes(ex, sub, outpath, compare)
                 file_size = None if is_dir else _single_file_size(manifest_path)
                 try:
                     rc, changed = download_from_s3(
@@ -1290,7 +1301,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                         is_dir,
                         opts.verbose,
                         sub=sub,
-                        compare=compare,
+                        compare=pair_filter,
                         create=create,
                         size=file_size,
                         dryrun=opts.dryrun,
@@ -1298,7 +1309,8 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 finally:
                     # The streaming ManifestFilter holds the temp manifest open; close
                     # it before the outer finally unlinks it (Windows cannot remove an
-                    # open file).
+                    # open file). `compare` is the raw filter - the lane
+                    # wrapper (pair_filter) must not defeat this check.
                     if isinstance(compare, manifest.ManifestFilter):
                         compare.close()
                 if rc != 0:
@@ -1550,18 +1562,22 @@ def _delete_extras(
 
     aliases = _collect_extra_aliases(manifest_path, outpath, sub, excludes)
 
-    def extras() -> Iterator[tuple[str, str, bool]]:
+    def items() -> Iterator[tuple[str, str, bool, bool]]:
+        # Every LOCAL item flows: the local-only lane (m is None) are the
+        # removal candidates, and a recorded local item pins the extra
+        # directories still open above it (see remove_extras) - a parent
+        # record is optional, so an unrecorded directory can hold recorded
+        # children whose rmdir must never be offered.
         for _key, m, loc in manifest.merge_join(
             manifest_keyed(manifest_path, sub), local_keyed(outpath, excludes, sub)
         ):
-            if m is None and loc is not None:
-                rel, st, _sym = loc
-                if rel != ".":
-                    yield rel, os.path.join(outpath, rel), stat_mod.S_ISDIR(st.st_mode)
+            if loc is None:
+                continue
+            rel, st, _sym = loc
+            if rel != ".":
+                yield rel, os.path.join(outpath, rel), stat_mod.S_ISDIR(st.st_mode), m is None
 
-    errors, removed = remove_extras(
-        extras(), aliases=aliases, dryrun=opts.dryrun, confirm=confirmer
-    )
+    errors, removed = remove_extras(items(), aliases=aliases, dryrun=opts.dryrun, confirm=confirmer)
     return (1 if errors else 0), removed
 
 
