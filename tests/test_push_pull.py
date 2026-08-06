@@ -646,9 +646,25 @@ def test_push_dry_run_previews_the_kept_subtree_warning(ws):
     assert "data/d" not in ws.keys()  # the conflicting file was not uploaded
 
 
-def test_pull_single_file_reports_missing_object(ws):
-    # A recorded single-file object deleted out-of-band: the pull must say
-    # what is missing, not just exit 1.
+def test_single_file_pull_warns_when_object_is_gone(ws):
+    # The single-file lane matches the directory sync: a missing object
+    # downloads nothing, and the stale record is warned about and skipped.
+    target = ws.write("solo.conf", "cfg")
+    ws.config({"solo.conf": {"path": str(target)}})
+    ws.run("push", "solo.conf", expect_rc=0)
+    ws.s3.delete_object(Bucket=ws.bucket, Key=f"{ws.prefix}/solo.conf")
+
+    dest = ws.root / "restored.conf"
+    res = ws.run("pull", "solo.conf", "-o", str(dest), expect_rc=0)
+
+    assert "a push retires the stale record" in res.err
+    assert not dest.exists()
+
+
+def test_single_file_pull_fails_on_a_diverged_local_copy_with_no_object(ws):
+    # Object gone AND the local copy diverged: the pull can restore nothing
+    # and must not bless the local file - the size check fails it. The local
+    # file (possibly the only copy) is untouched.
     target = ws.write("solo.conf", "cfg")
     ws.config({"solo.conf": {"path": str(target)}})
     ws.run("push", "solo.conf", expect_rc=0)
@@ -658,7 +674,8 @@ def test_pull_single_file_reports_missing_object(ws):
     res = ws.run("pull", "solo.conf")
 
     assert res.rc == 1
-    assert "object missing on S3" in res.err
+    assert "size does not match" in res.err.lower()
+    assert target.read_text() == "locally changed"
 
 
 def test_pull_delete_removes_local_extras(ws):
@@ -1121,16 +1138,43 @@ def test_pull_detects_size_mismatched_object(ws):
     assert "size does not match" in res.err.lower()
 
 
-def test_pull_detects_missing_object(ws):
-    # A record whose object is gone restores nothing; the pull must say so
-    # rather than report a clean restore.
+def test_pull_warns_and_skips_a_record_whose_object_is_gone(ws):
+    # A record whose object is gone (an interrupted deletion, an out-of-band
+    # delete) is stale residue, not a reason to abort a restore: the pull
+    # warns, skips it, and restores everything else; the next push retires
+    # the record. run() maps the warning to exit 2.
+    ws.write("data/a.txt", "hello")
+    ws.write("data/b.txt", "beta")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.s3.delete_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/a.txt")
+
+    out = ws.root / "out"
+    res = ws.run("pull", "data", "-o", str(out), expect_rc=0)
+
+    assert "a push retires the stale record" in res.err
+    assert (out / "b.txt").read_text() == "beta"  # the rest still restored
+    assert not (out / "a.txt").exists()
+
+
+def test_pull_stale_record_maps_to_exit_2(ws, monkeypatch):
+    # Through the real entry point: the stale-record warning is a warning,
+    # so a pull that only met residue exits 2, not 0 and not 1.
     ws.write("data/a.txt", "hello")
     ws.config({"data": {"path": str(ws.root / "data")}})
     ws.run("push", "data", expect_rc=0)
     ws.s3.delete_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/a.txt")
-    res = ws.run("pull", "data", "-o", str(ws.root / "out"))
-    assert res.rc == 1
-    assert "missing" in res.err.lower()
+
+    import signal
+
+    monkeypatch.setattr("sys.argv", ["s3bak", "pull", "data", "-o", str(ws.root / "out")])
+    saved = signal.getsignal(signal.SIGINT)
+    try:
+        rc = cli.run()
+    finally:
+        signal.signal(signal.SIGINT, saved)
+
+    assert rc == 2
 
 
 def test_staged_pull_preserves_old_root_when_apply_fails(ws):

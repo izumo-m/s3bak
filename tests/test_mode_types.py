@@ -155,8 +155,8 @@ def test_pull_restores_recorded_mtime_ns(ws):
 
 def test_pull_unuploaded_file_is_not_restored_as_dir(ws):
     # real.txt has a data object; ghost.txt is recorded but never uploaded.
-    # The recorded type keeps it a (missing) regular file, reported as an
-    # error - not silently created as a directory.
+    # The recorded type keeps it a (missing) regular file - warned about and
+    # skipped as a stale record, never silently created as a directory.
     ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/real.txt", Body=b"real")
     _put_manifest(
         ws,
@@ -174,7 +174,8 @@ def test_pull_unuploaded_file_is_not_restored_as_dir(ws):
 
     assert (dest / "real.txt").read_text() == "real"
     assert not (dest / "ghost.txt").exists()  # never created as a directory
-    assert res.rc != 0  # the un-uploaded file is reported missing
+    assert "a push retires the stale record" in res.err  # warned, not fatal
+    assert res.rc == 0  # run() maps the warning to exit 2
 
 
 def test_pull_empty_dir_subpath_restores_directory(ws):

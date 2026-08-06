@@ -1215,7 +1215,13 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                     # The Windows writable prep is restored by the outer
                     # finally below, whichever way this function now returns.
                     return rc
-                if stage_dir is not None:
+                # A stage nothing arrived in - a single-file lane whose
+                # recorded object is gone downloads nothing - has nothing to
+                # swap in: the conflicting root stays as it is (the staging
+                # promise), the finally below retires the empty stage, and
+                # the metadata apply judges the record against the untouched
+                # root.
+                if stage_dir is not None and os.path.lexists(dest):
                     # The download is complete: swap in two atomic renames with
                     # the old root recoverable in between - the stage cleanup
                     # in the finally below then retires it (or, on a failed

@@ -768,6 +768,11 @@ def download_from_s3(
         console.out(f"(dry-run) download: {cfg.prefix}/{rel} -> {outpath}\n")
         return 0, True
     if not cfg.store.get_object(rel, outpath, size=size, verbose=verbose):
-        console.err(f"object missing on S3: {cfg.prefix}/{rel}")
-        return 1, False
+        # A recorded object that is gone is stale residue, not this pull's
+        # reason to abort: return clean and let the metadata apply judge the
+        # record against whatever is local - nothing there produces the
+        # stale-record warning, and a diverged local file fails its size
+        # check. Mirrors the directory sync, where a missing object simply
+        # never appears in the listing.
+        return 0, False
     return 0, True

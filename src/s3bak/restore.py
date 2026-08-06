@@ -612,7 +612,20 @@ def _apply_record(
     if compare_to_stat(m_entry, st, local_sym, window_ns=window_ns).is_match:
         return _ApplyOutcome(0)
     if st is None:
-        console.err(f"expected file missing (sync did not place it): {target}")
+        if m_entry.is_file:
+            # Nothing local and nothing downloaded: the record's object is
+            # gone (an interrupted deletion, an out-of-band delete). Stale
+            # residue must not abort a restore - warn, skip the record, and
+            # keep restoring; the next push retires the record
+            # (docs/sync.md, the pull pipeline).
+            console.warn(
+                f"warning: no data object behind this record - skipped"
+                f" (a push retires the stale record): {target}"
+            )
+            return _ApplyOutcome(0)
+        # A special file is never created by pull (storage.md#restore-fidelity):
+        # a missing one is a hard error, not residue.
+        console.err(f"expected special file missing (pull does not create it): {target}")
         return _ApplyOutcome(1)
     if stat_mod.S_IFMT(st.st_mode) != stat_mod.S_IFMT(m_entry.mode):
         # In particular, never chmod/utime through a local symlink where a

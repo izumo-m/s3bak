@@ -34,6 +34,13 @@ a fix only (Fixed).
 
 ### Changed
 
+- A pull that meets a file record whose S3 object is gone — the residue of
+  an interrupted deletion or an out-of-band delete — now warns, skips the
+  record, and restores everything else (exit 2), instead of failing the
+  whole restore over residue the next push retires anyway. A record whose
+  local file diverged while its object is gone still fails (the pull can
+  restore nothing and must not bless the local copy), and a missing
+  special-file record stays a hard error (pull never creates one).
 - A manifest file record whose S3 object is gone is now retired by any push,
   not only by `push --delete`: it describes a backup that no longer exists,
   so dropping it is repair rather than deletion and is done silently. A
