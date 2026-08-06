@@ -284,8 +284,14 @@ def test_status_leaf_subpath_through_symlinked_ancestor_shows_missing(ws):
     os.rmdir(ws.root / "data" / "d")
     os.symlink(outside, ws.root / "data" / "d")
 
-    res = ws.run("status", "data/d/f.txt", expect_rc=0)
+    res = ws.run("status", "--delete", "data/d/f.txt", expect_rc=0)
     assert any(ln.startswith("D ") for ln in res.out.splitlines())  # missing, not clean
+    assert "symlinked parent" in res.err
+    # Plain status must not read through the symlink and report clean either:
+    # it stays silent and warns.
+    res = ws.run("status", "data/d/f.txt", expect_rc=0)
+    assert res.out.strip() == ""
+    assert "symlinked parent" in res.err
 
 
 def test_diff_symlink_leaf_through_symlinked_ancestor_not_clean(ws):

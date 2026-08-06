@@ -26,7 +26,6 @@ from s3bak.compare import (
     _diff_color_flag,
     _fmt_mtime,
     _resolve_use_color,
-    check_metadata,
     compare_to_local,
     compare_to_stat,
     format_diff_block,
@@ -1667,31 +1666,36 @@ def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
             # no-follow, would show it D - so report D rather than compare a file
             # the record does not describe (reached through the symlink).
             through_symlink = sub is not None and _symlinked_ancestor(base_path, sub)
+            if through_symlink:
+                console.warn(
+                    f"warning: {entry}/{sub}: reached through a symlinked parent; not compared"
+                )
             for entry_obj in manifest.iter_manifest(manifest_path):
                 res = manifest_target(entry_obj, outpath, is_dir, sub)
                 if res is None:
                     continue
                 target, _rel = res
                 if through_symlink:
-                    console.out(f"D {target}\n")
+                    if opts.delete:
+                        console.out(f"D {target}\n")
                     continue
                 # An inaccessible file (EACCES on an unsearchable parent) is not
                 # missing: compare_to_local turns every OSError into st=None and
-                # would silently report D. Distinguish it and warn instead.
+                # would silently read as absent. Distinguish it and warn instead.
                 try:
                     os.lstat(target)
                 except FileNotFoundError:
-                    pass  # genuinely absent: check_metadata reports it D
+                    pass  # genuinely absent: a D under --delete, silence without
                 except OSError as e:
                     console.warn(f"warning: cannot access {target}: {e}")
                     continue
-                block = check_metadata(
-                    target,
-                    entry_obj,
-                    opts.verbose,
-                    window_ns,
-                    use_color=use_color,
-                )
+                diff = compare_to_local(entry_obj, target, window_ns=window_ns, use_color=use_color)
+                if diff.status == "D" and not opts.delete:
+                    # Only in the backup: a plain push touches nothing at its
+                    # key, so plain status says nothing - D is the
+                    # status --delete preview of push --delete.
+                    continue
+                block = format_diff_block(diff, target, opts.verbose)
                 if block:
                     console.out(block)
             return 0
@@ -1704,16 +1708,20 @@ def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
             console.warn(
                 f"warning: {entry}/{sub}: reached through a symlinked parent; not compared"
             )
-            for _key, (rel, _entry_obj) in manifest_keyed(manifest_path, sub):
-                if rel != ".":
-                    console.out(f"D {os.path.join(outpath, rel)}\n")
+            if opts.delete:
+                for _key, (rel, _entry_obj) in manifest_keyed(manifest_path, sub):
+                    if rel != ".":
+                        console.out(f"D {os.path.join(outpath, rel)}\n")
             return 0
 
         # Directory tree: one streaming merge-join of the manifest against a
-        # fresh walk decides everything - M (both sides, drifted), D
-        # (manifest-only), A (local-only) - in key order, holding only the
-        # current pair in memory. The walk's lstat/readlink feed the compare,
-        # so no path is stat'd twice.
+        # fresh walk decides everything in key order, holding only the
+        # current pair in memory: both-sides pairs report M when drifted (a
+        # type change included, tagged `type`), local-only paths report A,
+        # and manifest-only records print D under --delete ALONE - each
+        # variant previews its push, and a plain push touches nothing at a
+        # manifest-only key (docs/sync.md). The walk's lstat/readlink feed
+        # the compare, so no path is stat'd twice.
         for _key, m, loc in manifest.merge_join(
             manifest_keyed(manifest_path, sub),
             local_keyed(outpath, excludes, sub, warn=console.warn),
@@ -1722,7 +1730,8 @@ def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
                 rel, entry_obj = m
                 target = outpath if rel == "." else os.path.join(outpath, rel)
                 if loc is None:
-                    console.out(f"D {target}\n")
+                    if opts.delete:
+                        console.out(f"D {target}\n")
                     continue
                 _rel, st, sym = loc
                 diff = compare_to_stat(

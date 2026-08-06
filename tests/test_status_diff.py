@@ -35,7 +35,8 @@ def test_status_reports_m_d_a_interleaved_in_key_order(ws):
     # line - M, D, and A alike - comes out in S3 key order (A is no longer
     # batched at the end). The root's own record sorts first (empty compare
     # key) and shows M too: the additions and the deletion all bumped the
-    # directory's own mtime.
+    # directory's own mtime. D appears under --delete alone (a plain push
+    # touches nothing at a manifest-only key); plain status shows the rest.
     ws.write("data/b.txt", "b")
     ws.write("data/d.txt", "d")
     ws.config({"data": {"path": str(ws.root / "data")}})
@@ -43,10 +44,19 @@ def test_status_reports_m_d_a_interleaved_in_key_order(ws):
 
     (ws.root / "data" / "a.txt").write_text("new")  # A, sorts first
     (ws.root / "data" / "b.txt").write_text("changed!")  # M
-    (ws.root / "data" / "d.txt").unlink()  # D
+    (ws.root / "data" / "d.txt").unlink()  # D under --delete
     (ws.root / "data" / "e.txt").write_text("new2")  # A, sorts last
 
     res = ws.run("status", "data", expect_rc=0)
+    marks = [(line.split()[0], os.path.basename(line.split()[1])) for line in res.out.splitlines()]
+    assert marks == [
+        ("M", "data"),
+        ("A", "a.txt"),
+        ("M", "b.txt"),
+        ("A", "e.txt"),
+    ]
+
+    res = ws.run("status", "--delete", "data", expect_rc=0)
     marks = [(line.split()[0], os.path.basename(line.split()[1])) for line in res.out.splitlines()]
     assert marks == [
         ("M", "data"),
@@ -57,10 +67,10 @@ def test_status_reports_m_d_a_interleaved_in_key_order(ws):
     ]
 
 
-def test_status_excluded_paths_are_invisible_locally(ws):
-    # Excludes hide the local side of the diff on both lanes: an excluded
-    # local file is never an A, and a manifest record whose local file is now
-    # excluded reads D until the next push drops the record.
+def test_status_excluded_paths_are_invisible_to_plain_status(ws):
+    # An excluded path never reports at all in plain status - not the local
+    # file (never an A), not the residue record (plain status prints no D).
+    # status --delete, the preview of push --delete, shows the residue as D.
     ws.write("data/keep.txt", "k")
     ws.write("data/old.log", "o")
     ws.config({"data": {"path": str(ws.root / "data")}})
@@ -69,6 +79,13 @@ def test_status_excluded_paths_are_invisible_locally(ws):
     ws.write("data/new.log", "n")
     ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["*.log"]}})
     res = ws.run("status", "data", expect_rc=0)
+    lines = res.out.splitlines()
+    # Creating new.log bumped the root directory's own mtime - a genuine M a
+    # push would settle - but neither .log path reports anything.
+    assert not any(".log" in line for line in lines)
+    assert not any(line.startswith("D") for line in lines)
+
+    res = ws.run("status", "--delete", "data", expect_rc=0)
     lines = res.out.splitlines()
     assert not any("new.log" in line for line in lines)
     assert any(line.startswith("D") and "old.log" in line for line in lines)
@@ -99,10 +116,34 @@ def test_status_of_missing_directory_tree_reports_each_child(ws):
     shutil.rmtree(ws.root / "data")
 
     res = ws.run("status", "data", expect_rc=0)
+    assert res.out.strip() == ""  # a plain push would touch nothing
+
+    res = ws.run("status", "--delete", "data", expect_rc=0)
     d_targets = [ln.split(None, 1)[1] for ln in res.out.splitlines() if ln.startswith("D")]
     assert any(t.endswith("a.txt") for t in d_targets)
     assert any(t.endswith(os.path.join("sub", "b.txt")) for t in d_targets)
     assert len(d_targets) == len(set(d_targets))  # no folded duplicates
+
+
+def test_status_reports_type_change_as_m_with_type_tag(ws):
+    # A regular file replaced by a symlink keeps its key, so the pair
+    # reports M with a `type` tag - a plain push acts on it (re-records the
+    # kind) - never a D.
+    ws.write("data/real.txt", "content")
+    ws.write("data/u.txt", "u")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "u.txt").unlink()
+    os.symlink("real.txt", ws.root / "data" / "u.txt")
+
+    res = ws.run("status", "data", expect_rc=0)
+    lines = res.out.splitlines()
+    assert any(ln.startswith("M") and "u.txt" in ln and "type" in ln for ln in lines)
+    assert not any(ln.startswith("D") for ln in lines)
+
+    res = ws.run("status", "-v", "data", expect_rc=0)
+    assert "type: remote=regular file local=symlink" in res.out
 
 
 def test_status_detects_changed_symlink_target(ws):

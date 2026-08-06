@@ -59,10 +59,10 @@ def test_version_is_reported_without_loading_config(monkeypatch, capfd):
     assert captured.err == ""
 
 
-def test_status_rejects_delete(cfg_ws):
-    res = cfg_ws.run("status", "--delete", "data")
+def test_status_rejects_checksum(cfg_ws):
+    res = cfg_ws.run("status", "--checksum", "data")
     assert res.rc == 1
-    assert "delete" in res.err.lower()
+    assert "only applies to" in res.err
 
 
 def test_status_rejects_dry_run(cfg_ws):

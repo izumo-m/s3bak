@@ -565,7 +565,7 @@ def test_push_after_local_delete_keeps_backup_by_default(ws):
         "Body"
     ].read()
     assert b'"path":"./b.txt"' in manifest_body
-    res = ws.run("status", "data", expect_rc=0)
+    res = ws.run("status", "--delete", "data", expect_rc=0)
     assert f"D {ws.root / 'data' / 'b.txt'}" in res.out
 
     dest = ws.root / "restore"

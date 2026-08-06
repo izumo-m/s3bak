@@ -32,8 +32,22 @@ a fix only (Fixed).
   record describes. Re-running a `post_hook` on demand, the one job left to
   `push --meta-only`, is the `hook` command added in this release.
 
+### Added
+
+- `status --delete`: the preview of `push --delete`. Manifest-only records —
+  locally deleted paths and residue under excluded paths alike — print as
+  `D`, the candidates the push would offer. Like plain status it never
+  lists the bucket, so it previews only what the manifest records; the
+  exact rehearsal with the real listing stays `push --delete --dry-run`.
+
 ### Changed
 
+- Plain `status` prints no `D`: each status variant previews its push, and
+  a plain push touches nothing at a manifest-only key, so plain status says
+  nothing there — `D` is `status --delete`'s letter now. A type-changed
+  pair (a recorded file replaced by a local symlink, and the reverse)
+  reports `M` with a `type` tag instead of `D`: a plain push acts on it by
+  re-recording the kind.
 - Without `--delete`, an excluded path is now ignored in full, on both
   sides: push neither uploads nor deletes it and records nothing about it,
   and pull neither restores, overwrites, nor touches its metadata — a path

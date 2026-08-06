@@ -232,7 +232,9 @@ _OPTION_SPECS = {
     "all": _OptionSpec("--all", "Apply to all configured entries", "--all"),
     "dry_run": _OptionSpec("--dry-run", "Show changes without applying them", "--dry-run"),
     "delete": _OptionSpec(
-        "--delete", "Delete destination items absent from the source", "--delete"
+        "--delete",
+        "Delete destination items absent from the source (status: list them)",
+        "--delete",
     ),
     "yes": _OptionSpec("--yes", "Confirm every deletion", "--yes"),
     "checksum": _OptionSpec(
@@ -336,22 +338,23 @@ _COMMAND_SPECS = {
             "s3bak status [options] --all",
         ),
         arguments=(("<entry|path>...", "Entries or paths to compare"),),
-        options=("all", "mtime_window", "verbose", "color", "no_color", "help"),
+        options=("all", "delete", "mtime_window", "verbose", "color", "no_color", "help"),
         sections=(
             (
                 "Status letters",
                 (
-                    "These are push-oriented: they show what would change on the backup.",
-                    "M <path>  Metadata differs between local and backup",
-                    "A <path>  Only local; push would add it",
-                    "D <path>  Only in backup; push --delete would remove it",
+                    "These are push-oriented: each variant previews its push.",
+                    "M <path>  Differs from the backup; a push would update it",
+                    "A <path>  Only local; a push would add it",
+                    "D <path>  Only in backup; printed by --delete alone - the",
+                    "          candidates push --delete would offer to remove",
                 ),
             ),
         ),
         examples=(
             "s3bak status bin",
             "s3bak status --all",
-            "s3bak status -v bin",
+            "s3bak status --delete bin",
             "s3bak status bin/s3bak",
         ),
     ),

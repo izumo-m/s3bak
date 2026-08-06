@@ -235,8 +235,11 @@ def compare_to_stat(
     diff = EntryDiff(status=None, tags=[], details=[])
 
     if entry.sym_target is not None:
-        if st is None or not stat_mod.S_ISLNK(st.st_mode):
+        if st is None:
             diff.status = "D"
+            return diff
+        if not stat_mod.S_ISLNK(st.st_mode):
+            _mark_type_change(diff, entry.mode, st.st_mode)
             return diff
         loc_link = local_sym if local_sym is not None else ""
         if loc_link != entry.sym_target:
@@ -259,9 +262,10 @@ def compare_to_stat(
         return diff
 
     if stat_mod.S_IFMT(entry.mode) != stat_mod.S_IFMT(st.st_mode):
-        # A symlink or any other filesystem type where a different type was
-        # recorded is a replacement, not a metadata-only modification.
-        diff.status = "D"
+        # A type change is a modification the next push acts on (it
+        # re-records the new kind), so it prints as M with a `type` tag -
+        # unlike a manifest-only record, which a plain push leaves alone.
+        _mark_type_change(diff, entry.mode, st.st_mode)
         return diff
 
     is_dir_local = stat_mod.S_ISDIR(st.st_mode)
@@ -297,6 +301,22 @@ def compare_to_stat(
     return diff
 
 
+def _kind_name(mode: int) -> str:
+    if stat_mod.S_ISREG(mode):
+        return "regular file"
+    if stat_mod.S_ISDIR(mode):
+        return "directory"
+    if stat_mod.S_ISLNK(mode):
+        return "symlink"
+    return "special file"
+
+
+def _mark_type_change(diff: EntryDiff, recorded_mode: int, local_mode: int) -> None:
+    diff.status = "M"
+    diff.tags.append("type")
+    diff.details.append(f"type: remote={_kind_name(recorded_mode)} local={_kind_name(local_mode)}")
+
+
 def format_diff_block(diff: EntryDiff, target: str, verbose: bool) -> str | None:
     if diff.is_match:
         return None
@@ -308,14 +328,3 @@ def format_diff_block(diff: EntryDiff, target: str, verbose: bool) -> str | None
         for d in diff.details:
             block += f"      {d}\n"
     return block
-
-
-def check_metadata(
-    target: str,
-    entry: ManifestEntry,
-    verbose: bool,
-    window_ns: int,
-    use_color: bool = False,
-) -> str | None:
-    diff = compare_to_local(entry, target, window_ns=window_ns, use_color=use_color)
-    return format_diff_block(diff, target, verbose)

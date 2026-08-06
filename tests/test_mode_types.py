@@ -108,6 +108,9 @@ def test_status_clean_against_manifest(ws):
 
 def test_status_reports_type_mismatch(ws):
     # Manifest records a.txt as a directory; locally it is a regular file.
+    # The two sort to different keys, so nothing pairs them: plain status
+    # shows the local file as A (a push would add it), and the old record's
+    # D surfaces under --delete alone.
     ws.write("data/a.txt", "hello")
     os.chmod(ws.root / "data", 0o755)
     ws.config({"data": {"path": str(ws.root / "data")}})
@@ -119,6 +122,11 @@ def test_status_reports_type_mismatch(ws):
     )
 
     res = ws.run("status", "data", expect_rc=0)
+    lines = res.out.splitlines()
+    assert any(ln.startswith("A") and "a.txt" in ln for ln in lines)
+    assert not any(ln.startswith("D") for ln in lines)
+
+    res = ws.run("status", "--delete", "data", expect_rc=0)
     assert any(ln.startswith("D") and "a.txt" in ln for ln in res.out.splitlines())
 
 
