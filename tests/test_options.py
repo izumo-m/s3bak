@@ -1,4 +1,4 @@
-"""Option coverage: --all, --meta-only, --data-only, --dry-run, --color."""
+"""Option coverage: --all, --dry-run, --color."""
 
 from __future__ import annotations
 
@@ -33,9 +33,9 @@ def test_status_all_is_clean_after_push_all(ws):
     assert res.out.strip() == ""
 
 
-def test_push_meta_only_dry_run_validates_the_manifest(ws):
-    # A dry run performs the read-only work for real: the --meta-only refresh
-    # downloads and validates the old manifest, so a damaged one fails the
+def test_push_dry_run_validates_the_manifest(ws):
+    # A dry run performs the read-only work for real: every push downloads
+    # and validates the old manifest first, so a damaged one fails the
     # rehearsal exactly like the real push.
     ws.write("data/a.txt", "a")
     ws.config({"data": {"path": str(ws.root / "data")}})
@@ -44,7 +44,7 @@ def test_push_meta_only_dry_run_validates_the_manifest(ws):
     ws.s3.put_object(
         Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl", Body=b"not a manifest\n"
     )
-    res = ws.run("push", "--meta-only", "--dry-run", "data")
+    res = ws.run("push", "--dry-run", "data")
     assert res.rc == 1
 
 
@@ -210,10 +210,10 @@ def test_pull_allows_disjoint_destinations_from_trailing_slash(ws):
     assert (restore_root / "b" / "source-b.txt").read_text() == "b"
 
 
-def test_pull_without_meta_only_downloads_the_same_drift(ws):
-    # Contrast for the test above: the identical local/backup mismatch,
-    # without --meta-only, is certainly re-downloaded - proving that scenario
-    # is not something the size+mtime no-op gate would have skipped anyway.
+def test_pull_downloads_a_size_and_mtime_drift(ws):
+    # A local/backup mismatch in size and mtime is certainly re-downloaded -
+    # proving that scenario is not something the size+mtime no-op gate would
+    # have skipped anyway.
     ws.write("data/a.txt", "recorded-content")
     ws.config({"data": {"path": str(ws.root / "data")}})
     ws.run("push", "data", expect_rc=0)

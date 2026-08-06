@@ -256,14 +256,18 @@ def test_pull_rejects_destinations_differing_only_by_trailing_dot(ws):
     assert "inner" in res.err
 
 
-def test_ls_remote_rejects_data_only(cfg_ws):
-    res = cfg_ws.run("ls-remote", "--data-only")
+def test_ls_remote_rejects_checksum(cfg_ws):
+    # _validate_command_options: a known option on a command it does not
+    # apply to is rejected with the commands it does apply to.
+    res = cfg_ws.run("ls-remote", "--checksum")
     assert res.rc == 1
+    assert "only applies to" in res.err
 
 
-def test_show_rejects_meta_only(cfg_ws):
-    res = cfg_ws.run("show", "--meta-only", "data")
+def test_show_rejects_delete(cfg_ws):
+    res = cfg_ws.run("show", "--delete", "data")
     assert res.rc == 1
+    assert "only applies to" in res.err
 
 
 def test_mtime_window_flag_rejects_non_number(cfg_ws):
@@ -286,11 +290,7 @@ def test_mtime_window_flag_requires_value(cfg_ws):
 @pytest.mark.parametrize(
     "args",
     [
-        ("push", "--checksum", "--meta-only", "data"),
         ("push", "--checksum", "--mtime-window", "0", "data"),
-        ("pull", "--delete", "--meta-only", "data"),
-        ("push", "--meta-only", "--delete", "data"),
-        ("push", "--data-only", "--delete", "data"),
         ("push", "--yes", "data"),
         ("pull", "--yes", "data"),
     ],

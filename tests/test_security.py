@@ -85,11 +85,16 @@ def test_pull_rejects_manifest_descendant_below_symlink(ws):
     assert not (dest / "link").exists()  # fail closed before applying any record
 
 
-def test_pull_meta_only_does_not_apply_file_metadata_through_symlink(ws):
+def test_pull_does_not_apply_file_metadata_through_symlink(ws):
+    # A regular-file record whose object is gone downloads nothing, so the
+    # metadata apply meets whatever sits at the path - here a local symlink.
+    # It must refuse to chmod/utime through it (the link's target is outside
+    # the restore tree), not "repair" the victim the link points at.
     source = ws.write("data/a.txt", "backup")
     os.chmod(source, 0o600)
     ws.config({"data": {"path": str(ws.root / "data")}})
     ws.run("push", "data", expect_rc=0)
+    ws.s3.delete_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/a.txt")
 
     victim = ws.write("victim.txt", "do not touch")
     os.chmod(victim, 0o644)
@@ -98,9 +103,10 @@ def test_pull_meta_only_does_not_apply_file_metadata_through_symlink(ws):
     dest.mkdir()
     os.symlink(victim, dest / "a.txt")
 
-    res = ws.run("pull", "--meta-only", "data", "-o", str(dest))
+    res = ws.run("pull", "data", "-o", str(dest))
 
     assert res.rc == 1
+    assert "recorded file type" in res.err
     after = os.lstat(victim)
     assert (after.st_mode, after.st_mtime_ns) == (before.st_mode, before.st_mtime_ns)
     assert (dest / "a.txt").is_symlink()
