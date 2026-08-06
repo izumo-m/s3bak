@@ -23,7 +23,7 @@ header version only changes when an existing key's meaning does.
 
 The sorted-order invariant is what keeps everything here streaming: the walk
 (localwalk.py, boto3-s3's engine) emits in S3 key order, the writer streams
-walk -> file, and the push-journal merge, the ``--meta-only`` rewrite, the
+walk -> file, and the push-journal merge, the
 pull compare (ManifestFilter), and the status / pull ``--delete`` diff
 (merge_join) are all merges of sorted streams instead of a read-all + sort.
 
@@ -433,7 +433,7 @@ def format_entry(path: str, st: os.stat_result, sym_target: str | None) -> str:
 
 def write_manifest(out: IO[str], entries: Iterable[tuple[str, os.stat_result, str | None]]) -> None:
     """Stream ``(path, lstat, sym_target)`` items to ``out`` as a v3 manifest.
-    The items must already be in walk order (localwalk.walk_tree / iter_subtree)."""
+    The items must already be in walk order (localwalk.walk_tree)."""
     out.write(_header_line() + "\n")
     for path, st, sym_target in entries:
         out.write(format_entry(path, st, sym_target) + "\n")
@@ -524,59 +524,6 @@ class _RestorabilityWarner:
         self._out.write(text)
 
 
-def write_merged(
-    out: IO[str],
-    old_manifest: str | None,
-    sub: str | None,
-    new_entries: Iterable[tuple[str, os.stat_result, str | None]],
-    *,
-    keep_old: bool = False,
-    warn: Callable[[str], None] | None = None,
-) -> None:
-    """Write a v3 manifest merging a fresh local walk into the old manifest -
-    the ``--meta-only`` rewrite (an ordinary push merges its journal instead,
-    see ``merge_journal``).
-
-    Old records outside the replaced range (everything when ``sub`` is None,
-    the records at/under ``sub`` otherwise) are copied verbatim (preserving
-    any unknown keys). Inside the range, a walked path always wins over its
-    old record and old-only records survive when ``keep_old`` is True (the
-    ``--meta-only`` keep merge; False drops them - the sub-path removal).
-    Everything streams in sort-key order: one record of lookahead per input
-    (merge_join).
-
-    ``warn`` receives the ``_RestorabilityWarner`` message for records kept
-    under a non-directory path.
-    """
-    out.write(_header_line() + "\n")
-    warner = _RestorabilityWarner(out, warn)
-
-    def old_items() -> Iterator[tuple[str, tuple[str, ManifestEntry, str]]]:
-        if old_manifest is None:
-            return
-        for key, rel, e, line in iter_manifest_raw(old_manifest):
-            yield key, (rel, e, line)
-
-    def walk_items() -> Iterator[tuple[str, tuple[str, os.stat_result, str | None]]]:
-        for item in new_entries:
-            path, st, _sym = item
-            yield entry_sort_key(path, stat_mod.S_ISDIR(st.st_mode)), item
-
-    for _key, old, new in merge_join(old_items(), walk_items()):
-        if new is not None:  # the fresh walk record wins over any old record
-            path, st, sym_target = new
-            rel = "." if path == "." else path.removeprefix("./")
-            line = format_entry(path, st, sym_target) + "\n"
-            warner.emit(rel, stat_mod.S_ISDIR(st.st_mode), line)
-            continue
-        assert old is not None
-        rel, e, line = old
-        in_range = sub is None or rel == sub or rel.startswith(sub + "/")
-        if in_range and not keep_old:
-            continue
-        warner.emit(rel, e.is_dir, line + "\n")
-
-
 # =============================================================================
 # The push journal (docs/journal.md)
 # =============================================================================
@@ -643,8 +590,8 @@ def merge_journal(
     whose key exists, a ``!`` / ``-`` / ``" "`` whose key does not, or a
     ``-`` / ``" "`` payload that differs from the old record is an emitter
     bug and raises ``ManifestError`` rather than publishing a manifest built
-    on it. ``warn`` receives the same restorability message as
-    ``write_merged``.
+    on it. ``warn`` receives the ``_RestorabilityWarner`` message for records
+    kept under a non-directory path.
     """
     out.write(_header_line() + "\n")
     warner = _RestorabilityWarner(out, warn)
@@ -828,7 +775,7 @@ class ManifestFilter:
     (a content edit with a restored mtime, or an S3-side write that bypassed
     s3bak at the same size) is invisible here; ``--checksum`` covers those.
 
-    A STALE manifest (``push --data-only``, or out-of-band S3 writes) makes
+    A STALE manifest (an interrupted push, or out-of-band S3 writes) makes
     affected pairs re-transfer on every pull until a real push refreshes the
     record - pull never rewrites the manifest. Deliberate: the manifest is
     the record of the last real push, and only a push may change it.

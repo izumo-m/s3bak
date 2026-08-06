@@ -234,10 +234,6 @@ _OPTION_SPECS = {
         "--delete", "Delete destination items absent from the source", "--delete"
     ),
     "yes": _OptionSpec("--yes", "Confirm every deletion", "--yes"),
-    "meta_only": _OptionSpec("--meta-only", "Sync only metadata; skip file data", "--meta-only"),
-    "data_only": _OptionSpec(
-        "--data-only", "Sync only file data; leave metadata unchanged", "--data-only"
-    ),
     "checksum": _OptionSpec(
         "--checksum", "Compare file contents instead of size and mtime", "--checksum"
     ),
@@ -278,8 +274,6 @@ _COMMAND_SPECS = {
             "dry_run",
             "delete",
             "yes",
-            "meta_only",
-            "data_only",
             "checksum",
             "mtime_window",
             "verbose",
@@ -306,8 +300,6 @@ _COMMAND_SPECS = {
             "dry_run",
             "delete",
             "yes",
-            "meta_only",
-            "data_only",
             "checksum",
             "mtime_window",
             "output",
@@ -632,8 +624,6 @@ def main(argv: list[str] | None = None) -> int:
     opt_dryrun = False
     opt_delete = False
     opt_yes = False
-    opt_meta_only = False
-    opt_data_only = False
     opt_verbose = False
     opt_checksum = False
     opt_mtime_window: float | None = None
@@ -666,12 +656,6 @@ def main(argv: list[str] | None = None) -> int:
         elif a == "--yes":
             opt_yes = True
             used_options.append("yes")
-        elif a == "--meta-only":
-            opt_meta_only = True
-            used_options.append("meta_only")
-        elif a == "--data-only":
-            opt_data_only = True
-            used_options.append("data_only")
         elif a in ("-v", "--verbose"):
             opt_verbose = True
             used_options.append("verbose")
@@ -730,8 +714,6 @@ def main(argv: list[str] | None = None) -> int:
         dryrun=opt_dryrun,
         delete=opt_delete,
         yes=opt_yes,
-        meta_only=opt_meta_only,
-        data_only=opt_data_only,
         verbose=opt_verbose,
         checksum=opt_checksum,
         outpath=opt_outpath,
@@ -744,22 +726,9 @@ def main(argv: list[str] | None = None) -> int:
     # a preview.
     if opt_all and positional:
         console.die("--all cannot be combined with explicit entries")
-    if opt_meta_only and opt_data_only:
-        console.die("--meta-only and --data-only are mutually exclusive")
 
     if opt_yes and not opt_delete:
         console.die("--yes requires --delete (it answers deletion confirmations)")
-    if subcmd == "push" and opt_delete and opt_meta_only:
-        console.die(
-            "push --delete cannot be combined with --meta-only (a deletion drops the object too)"
-        )
-    if subcmd == "push" and opt_delete and opt_data_only:
-        console.die(
-            "push --delete cannot be combined with --data-only (a deletion drops the record too)"
-        )
-
-    if opt_checksum and opt_meta_only:
-        console.die("--checksum cannot be combined with --meta-only (no file data is compared)")
     # push/pull --checksum replaces the size+mtime check entirely, so a window is
     # meaningless there. verify --checksum is the opposite: the window feeds the
     # stat classification of content mismatches, and is useless without it.
@@ -772,8 +741,6 @@ def main(argv: list[str] | None = None) -> int:
         console.die(
             "--mtime-window cannot be combined with --checksum (content comparison ignores it)"
         )
-    if subcmd == "pull" and opt_delete and opt_meta_only:
-        console.die("pull --delete cannot be combined with --meta-only")
 
     if opt_outpath == "":
         console.die("-o/--output requires a non-empty path")

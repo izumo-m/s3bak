@@ -300,19 +300,6 @@ def test_single_file_push_checksum_refreshes_manifest_on_mode_change(ws):
     assert '"mode":"100600"' in _manifest_body(ws, "solo")
 
 
-def test_single_file_push_data_only_ignores_mode_change(ws):
-    local = ws.write("solo.txt", "content")
-    os.chmod(local, 0o644)
-    ws.config({"solo": {"path": str(local)}})
-    ws.run("push", "solo", expect_rc=0)
-    os.chmod(local, 0o600)
-
-    res = ws.run("push", "--data-only", "solo", expect_rc=0)
-
-    assert "Updating" not in res.err  # --data-only never touches the manifest
-    assert '"mode":"100644"' in _manifest_body(ws, "solo")
-
-
 def test_push_refreshes_manifest_on_entry_root_mode_change(ws):
     ws.write("data/a.txt", "alpha")
     os.chmod(ws.root / "data", 0o755)
@@ -626,21 +613,6 @@ def test_push_keeps_records_of_locally_deleted_symlink_and_empty_dir(ws):
     ].read()
     assert b'"path":"./link"' in manifest_body
     assert b'"path":"./emptydir"' in manifest_body
-
-
-def test_push_meta_only_keeps_records_of_locally_deleted_files(ws):
-    ws.write("data/a.txt", "a")
-    ws.write("data/b.txt", "b")
-    ws.config({"data": {"path": str(ws.root / "data")}})
-    ws.run("push", "data", expect_rc=0)
-
-    (ws.root / "data" / "b.txt").unlink()
-    ws.run("push", "--meta-only", "data", expect_rc=0)
-
-    manifest_body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl")[
-        "Body"
-    ].read()
-    assert b'"path":"./b.txt"' in manifest_body
 
 
 def test_push_warns_when_a_kept_subtree_ends_up_under_a_file(ws):
@@ -1136,40 +1108,27 @@ def test_verify_checksum_warns_on_unreadable_local_file(ws):
     assert "1 warning(s)" in res.out  # surfaced in the summary, not reported OK
 
 
-def test_pull_meta_only_ignores_size_difference(ws):
-    # --meta-only applies metadata over whatever data is already present; it
-    # never downloads, so it must NOT fail on a size difference from the record
-    # (the presence/size check is for real data pulls only).
-    p = ws.write("data/a.txt", "hello")
-    os.chmod(p, 0o644)
-    ws.config({"data": {"path": str(ws.root / "data")}})
-    ws.run("push", "data", expect_rc=0)
-
-    p.write_text("a much longer replacement body")  # size now differs from the record
-    os.chmod(p, 0o600)  # and a mode drift for --meta-only to settle
-    res = ws.run("pull", "--meta-only", "data")
-    assert res.rc == 0
-    assert (os.lstat(p).st_mode & 0o777) == 0o644  # metadata applied despite the size
-
-
-def test_pull_data_only_detects_size_mismatched_object(ws):
-    # --data-only skips apply_manifest; the integrity check must still catch an
-    # object whose size no longer matches the record (out-of-band overwrite).
+def test_pull_detects_size_mismatched_object(ws):
+    # The metadata apply must catch an object whose restored size no longer
+    # matches the record (out-of-band overwrite): applying metadata over
+    # wrong content would report a successful restore that is not one.
     ws.write("data/a.txt", "hello")
     ws.config({"data": {"path": str(ws.root / "data")}})
     ws.run("push", "data", expect_rc=0)
     ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/a.txt", Body=b"x")  # 1 byte
-    res = ws.run("pull", "--data-only", "data", "-o", str(ws.root / "out"))
+    res = ws.run("pull", "data", "-o", str(ws.root / "out"))
     assert res.rc == 1
     assert "size does not match" in res.err.lower()
 
 
-def test_pull_data_only_detects_missing_object(ws):
+def test_pull_detects_missing_object(ws):
+    # A record whose object is gone restores nothing; the pull must say so
+    # rather than report a clean restore.
     ws.write("data/a.txt", "hello")
     ws.config({"data": {"path": str(ws.root / "data")}})
     ws.run("push", "data", expect_rc=0)
     ws.s3.delete_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/a.txt")
-    res = ws.run("pull", "--data-only", "data", "-o", str(ws.root / "out"))
+    res = ws.run("pull", "data", "-o", str(ws.root / "out"))
     assert res.rc == 1
     assert "missing" in res.err.lower()
 
@@ -1294,23 +1253,17 @@ def test_pull_output_trailing_slash_is_exact(ws):
 
 
 def test_diff_ignores_conflicting_unrecorded_orphans(ws):
-    # --data-only pushes leave unrecorded objects; two that conflict (a file and
-    # a directory recorded at one path) cannot be materialized together by a bulk
-    # prefix sync. diff must ignore unrecorded objects (download only recorded
-    # files), not fail trying to download them all.
+    # Out-of-band uploads leave unrecorded objects; two that conflict (a file
+    # and a directory shape at one path) cannot be materialized together by a
+    # bulk prefix sync. diff must ignore unrecorded objects (download only
+    # recorded files), not fail trying to download them all.
     (ws.root / "data").mkdir()
     ws.config({"data": {"path": str(ws.root / "data")}})
     ws.run("push", "data", expect_rc=0)  # empty dir entry: manifest = root only
 
-    foo = ws.write("data/foo", "i am a file")
-    ws.run("push", "--data-only", "data/foo", expect_rc=0)  # unrecorded object data/foo
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/foo", Body=b"i am a file")
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/foo/bar", Body=b"under a dir")
 
-    os.remove(foo)
-    (ws.root / "data" / "foo").mkdir()
-    ws.write("data/foo/bar", "i am under a dir")
-    ws.run("push", "--data-only", "data/foo/bar", expect_rc=0)  # unrecorded data/foo/bar
-
-    shutil.rmtree(ws.root / "data" / "foo")  # local foo gone; S3 has conflicting orphans
     res = ws.run("diff", "data")
     assert res.rc == 0  # nothing recorded, nothing local: no diff, not a download failure
 

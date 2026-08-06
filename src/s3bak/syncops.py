@@ -1,16 +1,15 @@
 # Requires Python 3.10+
 """The manifest <-> S3 bridge and download orchestration.
 
-Writes v3 manifests to S3 (the journal merge, the ``--meta-only`` rewrite,
-and the sub-tree patch), downloads a manifest or a data tree, and owns the
-push's journal emitter (``PushJournal``) and pull's compare strategy. This is
-the seam between the pure manifest format (manifest.py), the S3 backend
+Writes v3 manifests to S3 (the journal merge, and the single-file entry's
+one-record write), downloads a manifest or a data tree, and owns the push's
+journal emitter (``PushJournal``) and pull's compare strategy. This is the
+seam between the pure manifest format (manifest.py), the S3 backend
 (store.py), and the command layer (commands.py).
 """
 
 from __future__ import annotations
 
-import itertools
 import json
 import os
 import stat as stat_mod
@@ -41,24 +40,15 @@ def write_manifest_to_aws(
     cfg: Config,
     entry: str,
     target: str,
-    excludes: list[str],
     verbose: bool,
     *,
-    old_manifest: str | None = None,
-    keep_old: bool = False,
     upload: bool = True,
 ) -> None:
-    """Walk `target` in S3 key order, stream the v3 manifest to a temp file,
-    and upload it - the ``--meta-only`` rewrite (an ordinary push merges its
-    journal instead, see ``publish_journal_manifest``). For a directory entry
-    the walk is merged with `old_manifest` under the `keep_old` policy, so
-    records of kept-but-locally-vanished files survive the rewrite (see
-    manifest.write_merged). A single-file entry has one record and no merge.
-    The walk itself warns (exit 2) when it cannot see the whole tree - an
-    unreadable directory, a path racing away mid-walk - since the manifest it
-    feeds is the record of what the push saw. ``upload=False`` is the dry-run
-    preview: the walk and merge run for real - emitting the same warnings as
-    a real push - and only the S3 write is skipped."""
+    """Write a single-file entry's one-record v3 manifest from a fresh lstat
+    to a temp file and upload it (an ordinary directory push merges its
+    journal instead, see ``publish_journal_manifest``). ``upload=False`` is
+    the dry-run preview: the record write and validation run for real and
+    only the S3 write is skipped."""
     key = manifest.manifest_key(entry)
     if upload:
         console.diag(f"Updating {cfg.prefix}/{key}\n")
@@ -66,19 +56,9 @@ def write_manifest_to_aws(
     fd, tmp = tempfile.mkstemp(suffix=".jsonl")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            if os.path.isdir(target):
-                manifest.write_merged(
-                    f,
-                    old_manifest,
-                    None,
-                    localwalk.walk_tree(target, excludes, warn=_walk_warning),
-                    keep_old=keep_old,
-                    warn=console.warn,
-                )
-            else:
-                st = os.lstat(target)
-                sym = os.readlink(target) if stat_mod.S_ISLNK(st.st_mode) else None
-                manifest.write_manifest(f, [(os.path.basename(target), st, sym)])
+            st = os.lstat(target)
+            sym = os.readlink(target) if stat_mod.S_ISLNK(st.st_mode) else None
+            manifest.write_manifest(f, [(os.path.basename(target), st, sym)])
         _validate_before_publish(entry, tmp)
         if upload:
             assert cfg.store is not None
@@ -99,85 +79,6 @@ def _validate_before_publish(entry: str, path: str) -> None:
         raise manifest.ManifestError(
             f"{entry}: refusing to publish an invalid manifest ({e})"
         ) from e
-
-
-def patch_manifest_subtree(
-    cfg: Config,
-    entry: str,
-    target_root: str,
-    sub: str,
-    excludes: list[str],
-    opts: Opts,
-    *,
-    keep_old: bool = False,
-    old_manifest: str | None = None,
-) -> bool:
-    """Replace the manifest records under `sub` and re-upload - the
-    ``--meta-only`` sub-path rewrite (an ordinary sub-path push journals
-    instead, see ``PushJournal``).
-
-    target_root/sub may be a file, a symlink, or a directory. If it does not
-    exist locally, the records under `sub` are simply removed. Old and new
-    records are both in sort-key order, so this is a streaming merge
-    (manifest.write_merged), not a read-all + sort. `old_manifest` is the
-    caller's already-validated copy of the current manifest - every sub-path
-    push downloads it before mutating S3 - and None means the entry has no
-    manifest yet. A dry run computes the whole patch for real - the walk, the
-    merge and its warnings - and skips only the S3 write.
-    """
-    key = manifest.manifest_key(entry)
-    if old_manifest is None and not os.path.lexists(target_root):
-        # Deleting a never-backed sub-path beneath a root that is gone has
-        # no manifest state to update (and no root metadata from which to
-        # create a valid directory manifest).
-        return False
-    fd_new, new_path = tempfile.mkstemp(suffix=".jsonl")
-    os.close(fd_new)  # reopened by name below; closing now avoids an fd leak on error
-    try:
-        local_sub = os.path.join(target_root, sub)
-        new_entries: Iterator[tuple[str, os.stat_result, str | None]] = iter(())
-        if os.path.lexists(local_sub):
-            # Ancestor directory records for sub's parents: every record needs
-            # a recorded directory parent (the validator's rule), and neither
-            # a first-ever manifest nor one that predates a newly created
-            # nested directory has them. Re-recording an already-recorded
-            # ancestor is harmless - a walked path wins the merge, exactly as
-            # a full push would re-record it.
-            ancestors: list[tuple[str, os.stat_result, str | None]] = []
-            acc = target_root
-            rel = "."
-            for part in sub.split("/")[:-1]:
-                acc = os.path.join(acc, part)
-                rel = f"{rel}/{part}"
-                ancestors.append((rel, os.lstat(acc), None))
-            new_entries = itertools.chain(
-                ancestors, localwalk.iter_subtree(local_sub, sub, excludes, warn=_walk_warning)
-            )
-        if old_manifest is None:
-            # First-ever manifest for this entry, born from a sub-path push:
-            # record the entry root too, so the manifest keeps the dir-entry
-            # shape ('.'-rooted) and the root's metadata restores on pull.
-            root_record = (".", os.lstat(target_root), None)
-            new_entries = itertools.chain([root_record], new_entries)
-        with open(new_path, "w", encoding="utf-8") as out:
-            manifest.write_merged(
-                out,
-                old_manifest,
-                sub,
-                new_entries,
-                keep_old=keep_old,
-                warn=console.warn,
-            )
-        _validate_before_publish(entry, new_path)
-        if opts.dryrun:
-            console.out(f"(dry-run) would patch manifest: {key} (sub={sub})\n")
-        else:
-            console.diag(f"Updating {cfg.prefix}/{key}\n")
-            assert cfg.store is not None
-            cfg.store.put_file(key, new_path, verbose=opts.verbose)
-        return True
-    finally:
-        os.unlink(new_path)
 
 
 def download_manifest(cfg: Config, entry: str, dest: str, verbose: bool = False) -> bool:
@@ -312,11 +213,6 @@ class PushJournal:
         # question could be asked; folded into the kept-candidates warning
         # (object candidates are counted at the lane's own gate check).
         self.refused_records = 0
-        # Uploads with no owning file record - the birth (create lane) and
-        # re-upload (update lane) faces of an unrecorded object. Read by the
-        # push --data-only warning, so it repeats while the object stays
-        # unrecorded.
-        self.unrecorded_uploads = 0
         # Kind-conflict pairs seen under --delete: a local non-file occupies a
         # key holding a real S3 object, so the object pairs (update lane)
         # instead of orphaning (delete lane). Offered out-of-lane after the
@@ -569,8 +465,6 @@ class PushJournal:
             if copy and not self._probe_readable(src):
                 return False
         if copy:
-            if e is None or not e.is_file:
-                self.unrecorded_uploads += 1
             self._emit_new(
                 manifest.JOURNAL_ADD if old is None else manifest.JOURNAL_REPLACE,
                 self._record_path(key, is_dir=False),
@@ -619,9 +513,6 @@ class PushJournal:
         # missing (the self-heal).
         if not self._probe_readable(info):
             return False
-        e = old[0] if old is not None else None
-        if e is None or not e.is_file:
-            self.unrecorded_uploads += 1
         self._emit_new(
             manifest.JOURNAL_ADD if old is None else manifest.JOURNAL_REPLACE,
             self._record_path(key, is_dir=False),

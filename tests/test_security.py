@@ -543,7 +543,7 @@ def test_pull_replaces_symlink_directory_root_without_writing_through_it(ws):
     assert not (victim / "a.txt").exists()
 
 
-def test_meta_only_pull_replaces_empty_directory_root_symlink_safely(ws):
+def test_pull_replaces_empty_directory_root_symlink_safely(ws):
     (ws.root / "empty").mkdir()
     ws.config({"empty": {"path": str(ws.root / "empty")}})
     ws.run("push", "empty", expect_rc=0)
@@ -555,7 +555,7 @@ def test_meta_only_pull_replaces_empty_directory_root_symlink_safely(ws):
     dest = ws.root / "out"
     os.symlink(victim, dest)
 
-    ws.run("pull", "--meta-only", "empty", "-o", str(dest), expect_rc=0)
+    ws.run("pull", "empty", "-o", str(dest), expect_rc=0)
 
     assert dest.is_dir() and not dest.is_symlink()
     assert marker.read_text() == "keep"

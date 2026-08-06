@@ -219,8 +219,8 @@ def windows_collect_writable_prep(
     # difference under --checksum), and prep must never under-approximate
     # what apply may need to overwrite, remove, or replace. Temporarily add
     # owner-write so that can proceed; apply_manifest re-applies the recorded
-    # modes afterwards (or windows_restore_modes on the failure/--data-only
-    # paths). Returns [(path, original_mode), ...].
+    # modes afterwards (or windows_restore_modes on the failure paths).
+    # Returns [(path, original_mode), ...].
     targets: list[tuple[str, int]] = []
     try:
         for entry in manifest.iter_manifest(manifest_path):
@@ -552,7 +552,6 @@ def _apply_record(
     window_ns: int,
     is_dir_entry: bool,
     deferred_symlinks: list[tuple[str, ManifestEntry]],
-    enforce_size: bool,
 ) -> _ApplyOutcome:
     """Repair one manifest record against its local lstat; a record whose
     local state already matches (the shared ``compare_to_stat`` predicate) is
@@ -617,20 +616,18 @@ def _apply_record(
         return _ApplyOutcome(1)
     if stat_mod.S_IFMT(st.st_mode) != stat_mod.S_IFMT(m_entry.mode):
         # In particular, never chmod/utime through a local symlink where a
-        # regular file is recorded: --meta-only must not mutate the link's
+        # regular file is recorded: the apply must not mutate the link's
         # target outside the restore tree.
         console.err(f"expected {m_entry.path} to have its recorded file type: {target}")
         return _ApplyOutcome(1)
-    if enforce_size and m_entry.is_file and m_entry.size is not None and st.st_size != m_entry.size:
+    if m_entry.is_file and m_entry.size is not None and st.st_size != m_entry.size:
         # After the data sync a regular file must have its recorded size: the
         # ManifestFilter re-downloads any pair whose size drifted, so a surviving
         # mismatch means the S3 object itself does not match the record (an
         # out-of-band overwrite, a truncated object, or one that was missing so
         # a stale local file was left in place). Applying metadata would report
         # success on wrong content, so fail instead - restore fidelity is the
-        # point of the backup. Only checked when the data sync ran: --meta-only
-        # applies metadata over whatever data is already there and must not fail
-        # on a size difference it was never asked to reconcile.
+        # point of the backup.
         console.err(
             f"restored size does not match manifest ({st.st_size} != {m_entry.size}),"
             f" the stored object does not match the record: {target}"
@@ -648,7 +645,6 @@ def apply_manifest(
     *,
     window_ns: int,
     excludes: list[str] | None = None,
-    enforce_size: bool = True,
 ) -> int:
     """Repair local state to match the manifest, touching (and reporting)
     only records whose local state differs - the shared size+mtime predicate
@@ -682,11 +678,8 @@ def apply_manifest(
     this adds at most one deferred entry per such symlink, the same bounded
     allowance as the directory-conflict deferral above.
 
-    ``enforce_size`` (True after a real data sync) makes a regular file whose
-    on-disk size differs from its record a hard error - the object does not
-    match the backup. ``--meta-only`` passes False: it applies metadata over
-    whatever data is already present and must not fail on a size it never
-    downloaded."""
+    A regular file whose on-disk size differs from its record is a hard
+    error - the object does not match the backup."""
     deferred_symlinks: list[tuple[str, ManifestEntry]] = []
     dir_stack: list[_DirFrame] = []
     post_symlink_dirs: list[tuple[str, ManifestEntry]] = []
@@ -745,7 +738,6 @@ def apply_manifest(
                 window_ns=window_ns,
                 is_dir_entry=True,
                 deferred_symlinks=deferred_symlinks,
-                enforce_size=enforce_size,
             )
             errors += outcome.errors
             if outcome.defer_symlink and dir_stack:
@@ -774,7 +766,6 @@ def apply_manifest(
                 window_ns=window_ns,
                 is_dir_entry=False,
                 deferred_symlinks=deferred_symlinks,
-                enforce_size=enforce_size,
             )
             errors += outcome.errors
 

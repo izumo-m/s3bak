@@ -8,7 +8,7 @@ import os
 
 import pytest
 
-from s3bak import localwalk, manifest
+from s3bak import manifest
 
 # --- format / parse -----------------------------------------------------------
 
@@ -353,111 +353,6 @@ def _manifest_text(lines: list[str]) -> str:
     return "\n".join(['{"s3bak_manifest":3}', *lines]) + "\n"
 
 
-def test_write_merged_replaces_subtree_in_order(tmp_path):
-    # Old manifest holds ., a.txt, sub.txt, sub/, sub/old.txt, z.txt. Patch
-    # `sub` from a local tree now holding new.txt. "sub.txt" (key 'sub.')
-    # interleaves BETWEEN the file key 'sub' and the dir key 'sub/'.
-    old = tmp_path / "old.jsonl"
-    old.write_text(
-        _manifest_text(
-            [
-                '{"path":".","mode":"40755","mtime_ns":0}',
-                '{"path":"./a.txt","mode":"100644","size":1,"mtime_ns":0}',
-                '{"path":"./sub.txt","mode":"100644","size":1,"mtime_ns":0}',
-                '{"path":"./sub","mode":"40755","mtime_ns":0}',
-                '{"path":"./sub/old.txt","mode":"100644","size":1,"mtime_ns":0}',
-                '{"path":"./z.txt","mode":"100644","size":1,"mtime_ns":0}',
-            ]
-        )
-    )
-    local_sub = tmp_path / "sub"
-    local_sub.mkdir()
-    (local_sub / "new.txt").write_text("n")
-
-    out = io.StringIO()
-    manifest.write_merged(out, str(old), "sub", localwalk.iter_subtree(str(local_sub), "sub", []))
-    lines = out.getvalue().splitlines()
-    assert json.loads(lines[0]) == {"s3bak_manifest": 3}
-    rels = [json.loads(ln)["path"] for ln in lines[1:]]
-    assert rels == [".", "./a.txt", "./sub.txt", "./sub", "./sub/new.txt", "./z.txt"]
-
-
-def test_write_merged_removes_deleted_subtree(tmp_path):
-    old = tmp_path / "old.jsonl"
-    old.write_text(
-        _manifest_text(
-            [
-                '{"path":".","mode":"40755","mtime_ns":0}',
-                '{"path":"./gone","mode":"40755","mtime_ns":0}',
-                '{"path":"./gone/x","mode":"100644","size":1,"mtime_ns":0}',
-                '{"path":"./keep.txt","mode":"100644","size":1,"mtime_ns":0}',
-            ]
-        )
-    )
-    out = io.StringIO()
-    manifest.write_merged(out, str(old), "gone", [])
-    rels = [json.loads(ln)["path"] for ln in out.getvalue().splitlines()[1:]]
-    assert rels == [".", "./keep.txt"]
-
-
-def test_write_merged_whole_entry_mirror_drops_old_only_records(tmp_path):
-    # sub=None makes the whole tree the replaced range: with keep_old=False the
-    # output is exactly the fresh walk, regardless of what the old manifest held.
-    old = tmp_path / "old.jsonl"
-    old.write_text(
-        _manifest_text(
-            [
-                '{"path":".","mode":"40755","mtime_ns":0}',
-                '{"path":"./gone.txt","mode":"100644","size":1,"mtime_ns":0}',
-                '{"path":"./keep.txt","mode":"100644","size":1,"mtime_ns":0}',
-            ]
-        )
-    )
-    root = tmp_path / "root"
-    root.mkdir()
-    (root / "keep.txt").write_text("k")
-
-    out = io.StringIO()
-    manifest.write_merged(out, str(old), None, localwalk.walk_tree(str(root), []))
-    rels = [json.loads(ln)["path"] for ln in out.getvalue().splitlines()[1:]]
-    assert rels == [".", "./keep.txt"]
-
-
-def test_write_merged_keep_all_retains_old_only_records_verbatim(tmp_path):
-    # keep_old=True: locally-vanished files, symlinks, and empty dirs all keep
-    # their records, copied verbatim (unknown JSON keys survive). A path present
-    # on both sides takes the fresh walk record.
-    old = tmp_path / "old.jsonl"
-    old.write_text(
-        _manifest_text(
-            [
-                '{"path":".","mode":"40755","mtime_ns":0}',
-                '{"path":"./emptydir","mode":"40755","mtime_ns":0,"future":"kept"}',
-                '{"path":"./gone.txt","mode":"100644","size":1,"mtime_ns":0}',
-                '{"path":"./keep.txt","mode":"100644","size":1,"mtime_ns":7}',
-                '{"path":"./link","mode":"120777","mtime_ns":0,"link":"gone.txt"}',
-            ]
-        )
-    )
-    root = tmp_path / "root"
-    root.mkdir()
-    (root / "keep.txt").write_text("changed")
-
-    out = io.StringIO()
-    manifest.write_merged(out, str(old), None, localwalk.walk_tree(str(root), []), keep_old=True)
-    lines = out.getvalue().splitlines()[1:]
-    entries = [json.loads(ln) for ln in lines]
-    assert [e["path"] for e in entries] == [
-        ".",
-        "./emptydir",
-        "./gone.txt",
-        "./keep.txt",
-        "./link",
-    ]
-    assert entries[1]["future"] == "kept"  # verbatim copy, unknown key preserved
-    assert entries[3]["mtime_ns"] != 7  # both sides: the fresh walk record won
-
-
 # --- the push journal ----------------------------------------------------------
 
 
@@ -576,44 +471,6 @@ def test_merge_journal_warns_when_records_survive_under_a_file(tmp_path):
     journal = _write_journal(tmp_path, ['+{"path":"./d","mode":"100644","size":1,"mtime_ns":0}'])
     warnings: list[str] = []
     manifest.merge_journal(io.StringIO(), str(old), journal, warn=warnings.append)
-    assert len(warnings) == 1
-    assert "./d" in warnings[0]
-
-
-def test_write_merged_warns_once_when_records_survive_under_a_file(tmp_path):
-    # The local dir `d` became a regular file while its old records are kept:
-    # the manifest is no longer restorable as a tree. One warning per subtree,
-    # even with several surviving descendants, and the sibling "d.txt" (which
-    # sorts between the file key `d` and the range `d/`) must not reset it.
-    old = tmp_path / "old.jsonl"
-    old.write_text(
-        _manifest_text(
-            [
-                '{"path":".","mode":"40755","mtime_ns":0}',
-                '{"path":"./d.txt","mode":"100644","size":1,"mtime_ns":0}',
-                '{"path":"./d","mode":"40755","mtime_ns":0}',
-                '{"path":"./d/x.txt","mode":"100644","size":1,"mtime_ns":0}',
-                '{"path":"./d/y.txt","mode":"100644","size":1,"mtime_ns":0}',
-            ]
-        )
-    )
-    root = tmp_path / "root"
-    root.mkdir()
-    (root / "d").write_text("now a file")
-    (root / "d.txt").write_text("sibling")
-
-    warnings: list[str] = []
-    out = io.StringIO()
-    manifest.write_merged(
-        out,
-        str(old),
-        None,
-        localwalk.walk_tree(str(root), []),
-        keep_old=True,
-        warn=warnings.append,
-    )
-    rels = [json.loads(ln)["path"] for ln in out.getvalue().splitlines()[1:]]
-    assert rels == [".", "./d", "./d.txt", "./d", "./d/x.txt", "./d/y.txt"]
     assert len(warnings) == 1
     assert "./d" in warnings[0]
 

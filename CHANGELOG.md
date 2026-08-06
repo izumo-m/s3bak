@@ -9,6 +9,18 @@ a fix only (Fixed).
 
 ## [Unreleased]
 
+### Removed
+
+- `--meta-only` and `--data-only`, on push and pull both. A one-sided push
+  could record local state S3 does not hold (`--meta-only`, which then hides
+  a never-pushed edit from every later size+mtime check) or upload objects
+  the manifest does not record (`--data-only`) — both broke the manifest's
+  correspondence with S3, and the journal-driven push refreshes metadata and
+  records uploads in the same scan, leaving them no job. A one-sided pull
+  restored data without its recorded metadata, or the reverse — a tree no
+  record describes. Re-running a `post_hook` on demand, the one job left to
+  `push --meta-only`, is the `hook` command added in this release.
+
 ### Changed
 
 - A manifest file record whose S3 object is gone is now retired by any push,

@@ -107,29 +107,6 @@ def test_walk_tree_excludes_symlink_at_pruned_name(tmp_path):
 # --- iter_subtree (sub-path re-rooting) ------------------------------------------
 
 
-def test_iter_subtree_reroots_rels_and_excludes(tmp_path):
-    # rels stay anchored at the ENTRY root ("./sub/..."), so the entry's
-    # exclude patterns keep their meaning inside a sub-path push.
-    sub = tmp_path / "sub"
-    sub.mkdir()
-    (sub / "keep.txt").write_text("k")
-    (sub / "skip.log").write_text("s")
-
-    items = list(localwalk.iter_subtree(str(sub), "sub", ["sub/*.log"]))
-    assert [rel for rel, _st, _sym in items] == ["./sub", "./sub/keep.txt"]
-
-
-def test_iter_subtree_single_file_and_symlink(tmp_path):
-    (tmp_path / "f.txt").write_text("x")
-    os.symlink("f.txt", tmp_path / "ln")
-
-    files = list(localwalk.iter_subtree(str(tmp_path / "f.txt"), "f.txt", []))
-    assert [(rel, sym) for rel, _st, sym in files] == [("./f.txt", None)]
-
-    links = list(localwalk.iter_subtree(str(tmp_path / "ln"), "ln", []))
-    assert [(rel, sym) for rel, _st, sym in links] == [("./ln", "f.txt")]
-
-
 def test_walk_tree_warns_when_symlink_races_away(tmp_path, monkeypatch):
     # A symlink that changes underfoot between the scan and its readlink is
     # skipped; the wired warn hook must hear about the gap instead of the

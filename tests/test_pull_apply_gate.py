@@ -112,32 +112,6 @@ def test_pull_applies_metadata_under_excluded_path(ws):
     assert _mode(c) == recorded_mode
 
 
-def test_pull_meta_only_repairs_only_mismatched_records(ws):
-    a = ws.write("data/a.txt", "alpha")
-    ws.write("data/b.txt", "beta")
-    ws.config({"data": {"path": str(ws.root / "data")}})
-    ws.run("push", "data", expect_rc=0)
-    recorded_mode = _mode(a)
-    recorded_mtime = _mtime_ns(a)
-
-    # Drift a.txt's content, size, and mtime - not just its mode - so a
-    # plain pull would certainly re-download it (see test_pull_reports_only_
-    # repaired_records above for the same size+mtime-drift-forces-download
-    # property). --meta-only must still touch only the metadata: if it ever
-    # ran the data lane, this local content would be overwritten with "alpha".
-    a.write_text("a-totally-different-and-much-longer-local-content")
-    os.utime(a, (1_000_000_000, 1_000_000_000))
-    os.chmod(a, 0o600 if recorded_mode != 0o600 else 0o640)
-
-    res = ws.run("pull", "--meta-only", "data", expect_rc=0)
-
-    assert a.read_text() == "a-totally-different-and-much-longer-local-content"  # never downloaded
-    assert _mode(a) == recorded_mode  # metadata still repaired
-    assert _mtime_ns(a) == recorded_mtime
-    assert "a.txt" in res.out
-    assert "b.txt" not in res.out
-
-
 def test_pull_checksum_dryrun_clean_tree_prints_nothing(ws):
     # --checksum bypasses the early no-op gate, so this exercises the dry-run
     # stand-in condition itself: a settled tree plans no transfers and no

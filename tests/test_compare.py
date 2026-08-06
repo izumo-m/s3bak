@@ -383,14 +383,14 @@ def test_single_file_push_size_mtime_check_and_self_heal(ws):
     assert "upload:" not in res.out  # manifest refreshed -> healed
 
 
-def test_single_file_push_after_meta_only_uploads_object(ws):
-    # --meta-only writes a manifest with no data object behind it; a later
-    # plain push must notice the missing object (head-object probe) and
-    # upload instead of trusting the manifest record forever.
+def test_single_file_push_reuploads_when_object_missing(ws):
+    # A manifest whose object is gone (an S3-side delete, an interrupted
+    # deletion): a later plain push must notice the missing object
+    # (head-object probe) and upload instead of trusting the record forever.
     f = ws.write("solo.txt", "x")
     ws.config({"solo.txt": {"path": str(f)}})
-    ws.run("push", "--meta-only", "solo.txt", expect_rc=0)
-    assert "solo.txt" not in ws.keys()  # only the manifest exists
+    ws.run("push", "solo.txt", expect_rc=0)
+    ws.s3.delete_object(Bucket=ws.bucket, Key=f"{ws.prefix}/solo.txt")
 
     res = ws.run("push", "solo.txt", expect_rc=0)
     assert "upload:" in res.out

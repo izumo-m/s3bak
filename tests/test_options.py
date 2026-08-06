@@ -33,47 +33,6 @@ def test_status_all_is_clean_after_push_all(ws):
     assert res.out.strip() == ""
 
 
-def test_push_meta_only_updates_manifest_not_data(ws):
-    ws.write("data/a.txt", "original-content")
-    ws.config({"data": {"path": str(ws.root / "data")}})
-    ws.run("push", "data", expect_rc=0)
-    original_body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/a.txt")["Body"].read()
-
-    # Drift the already-pushed file's content (a real content+size change, not
-    # just a new untracked path) and add a brand-new file.
-    ws.write("data/a.txt", "edited-locally-and-never-pushed")
-    ws.write("data/new.txt", "new")
-    ws.run("push", "--meta-only", "data", expect_rc=0)
-
-    assert "data/new.txt" not in ws.keys()  # the new file was not uploaded either
-    body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/a.txt")["Body"].read()
-    assert body == original_body  # the existing object still holds the OLD bytes
-    manifest_body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl")[
-        "Body"
-    ].read()
-    assert "new.txt" in manifest_body.decode()  # but it is recorded in the manifest
-
-    # The refresh is a fresh local walk (docs/sync.md): it now records a.txt's
-    # edited size/mtime too, so --meta-only "asserts S3 matches local without
-    # making it true" - status goes clean even though the object is stale.
-    res = ws.run("status", "data", expect_rc=0)
-    assert res.out.strip() == ""
-
-
-def test_meta_only_records_mode_change_and_clears_status(ws):
-    f = ws.write("data/a.txt", "a")
-    ws.config({"data": {"path": str(ws.root / "data")}})
-    ws.run("push", "data", expect_rc=0)
-
-    os.chmod(f, 0o600)
-    res = ws.run("status", "data", expect_rc=0)
-    assert "mode" in res.out  # the sync transfers nothing over a mode change
-
-    ws.run("push", "--meta-only", "data", expect_rc=0)
-    res = ws.run("status", "data", expect_rc=0)
-    assert res.out.strip() == ""
-
-
 def test_push_meta_only_dry_run_validates_the_manifest(ws):
     # A dry run performs the read-only work for real: the --meta-only refresh
     # downloads and validates the old manifest, so a damaged one fails the
@@ -87,120 +46,6 @@ def test_push_meta_only_dry_run_validates_the_manifest(ws):
     )
     res = ws.run("push", "--meta-only", "--dry-run", "data")
     assert res.rc == 1
-
-
-def test_push_data_only_skips_manifest_refresh(ws):
-    ws.write("data/a.txt", "a")
-    ws.config({"data": {"path": str(ws.root / "data")}})
-    ws.run("push", "data", expect_rc=0)
-    before = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl")[
-        "Body"
-    ].read()
-
-    (ws.root / "data" / "a.txt").write_text("a-much-bigger-content")
-    ws.run("push", "--data-only", "data", expect_rc=0)
-
-    obj = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/a.txt")["Body"].read()
-    assert obj == b"a-much-bigger-content"  # data was uploaded
-    after = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl")[
-        "Body"
-    ].read()
-    assert before == after  # but the manifest was not rewritten
-
-
-def test_push_data_only_warns_about_unrecorded_uploads(ws):
-    # A --data-only upload of a file the manifest never recorded leaves an
-    # unrecorded object (storage.md); the push must say so. cli.run maps the
-    # warning to exit 2; in-process main() reports it on stderr only.
-    ws.write("data/a.txt", "a")
-    ws.config({"data": {"path": str(ws.root / "data")}})
-    ws.run("push", "data", expect_rc=0)
-
-    (ws.root / "data" / "a.txt").write_text("a-changed")  # recorded: update lane
-    ws.write("data/new.txt", "n")  # unrecorded: create lane
-
-    res = ws.run("push", "--data-only", "data", expect_rc=0)
-    assert "1 object(s) the manifest does not record" in res.err
-    assert "./new.txt" not in _manifest_paths(ws)
-
-
-def test_push_data_only_warns_again_for_an_object_it_left_unrecorded(ws):
-    # The creating run counts the upload on the create lane; the object then
-    # exists on S3, so the next --data-only run meets it as an update pair -
-    # ManifestFilter re-uploads the manifest-unknown key and the warning must
-    # repeat, not go silent after the first run (the cron case). A push
-    # without --data-only then records it and ends the warnings.
-    ws.write("data/a.txt", "a")
-    ws.config({"data": {"path": str(ws.root / "data")}})
-    ws.run("push", "data", expect_rc=0)
-    ws.write("data/new.txt", "n")
-
-    for _ in range(2):
-        res = ws.run("push", "--data-only", "data", expect_rc=0)
-        assert "1 object(s) the manifest does not record" in res.err
-
-    res = ws.run("push", "data", expect_rc=0)
-    assert "does not record" not in res.err
-    assert "./new.txt" in _manifest_paths(ws)
-
-
-def test_push_data_only_of_recorded_files_does_not_warn(ws):
-    ws.write("data/a.txt", "a")
-    ws.config({"data": {"path": str(ws.root / "data")}})
-    ws.run("push", "data", expect_rc=0)
-
-    (ws.root / "data" / "a.txt").write_text("a-changed")
-    res = ws.run("push", "--data-only", "data", expect_rc=0)
-    assert "does not record" not in res.err
-
-
-def test_first_push_data_only_warns_for_every_upload(ws):
-    # No manifest on S3 at all: every upload is unrecorded.
-    ws.write("data/a.txt", "a")
-    ws.write("data/b.txt", "b")
-    ws.config({"data": {"path": str(ws.root / "data")}})
-
-    res = ws.run("push", "--data-only", "data", expect_rc=0)
-    assert "2 object(s) the manifest does not record" in res.err
-
-
-def test_push_checksum_data_only_still_warns(ws):
-    # --checksum --data-only used to skip the manifest download entirely; the
-    # unrecorded-upload warning is why every dir push now fetches it.
-    ws.write("data/a.txt", "a")
-    ws.config({"data": {"path": str(ws.root / "data")}})
-    ws.run("push", "data", expect_rc=0)
-
-    ws.write("data/new.txt", "n")
-    res = ws.run("push", "--checksum", "--data-only", "data", expect_rc=0)
-    assert "1 object(s) the manifest does not record" in res.err
-
-
-def test_push_data_only_dry_run_previews_the_warning(ws):
-    # The dry run makes the same lane decisions as the real push, so it
-    # previews the warning ("would upload") while transferring nothing.
-    ws.write("data/a.txt", "a")
-    ws.config({"data": {"path": str(ws.root / "data")}})
-    ws.run("push", "data", expect_rc=0)
-
-    ws.write("data/new.txt", "n")
-    res = ws.run("push", "--data-only", "--dry-run", "data", expect_rc=0)
-    assert "would upload 1 object(s) the manifest does not record" in res.err
-    assert "new.txt" in res.out
-    assert "data/new.txt" not in ws.keys()  # nothing was actually uploaded
-
-
-def test_subpath_push_data_only_warns_about_unrecorded_uploads(ws):
-    # The sub-relative compare key must be entry-rooted before the manifest
-    # lookup, or a recorded sub file would be miscounted as unrecorded.
-    ws.write("data/sub/x.txt", "x")
-    ws.config({"data": {"path": str(ws.root / "data")}})
-    ws.run("push", "data", expect_rc=0)
-
-    (ws.root / "data" / "sub" / "x.txt").write_text("x-changed")
-    ws.write("data/sub/new.txt", "n")
-    res = ws.run("push", "--data-only", "data/sub", expect_rc=0)
-    assert "1 object(s) the manifest does not record" in res.err
 
 
 def test_push_dryrun_uploads_nothing(ws):
@@ -365,52 +210,6 @@ def test_pull_allows_disjoint_destinations_from_trailing_slash(ws):
     assert (restore_root / "b" / "source-b.txt").read_text() == "b"
 
 
-def test_pull_meta_only_restores_mode_without_download(ws, monkeypatch):
-    import botocore.client
-
-    f = ws.write("data/a.txt", "recorded-content")
-    ws.config({"data": {"path": str(ws.root / "data")}})
-    os.chmod(f, 0o640)
-    ws.run("push", "data", expect_rc=0)
-    recorded_mtime_ns = os.stat(f).st_mtime_ns
-
-    dest = ws.root / "restore"
-    dest.mkdir()
-    # Content, size, and mtime all disagree with the backup - the exact
-    # condition under which a plain pull is certain to re-download (see
-    # test_pull_without_meta_only_downloads_the_same_drift below). If
-    # --meta-only ever ran the data lane, this local content would be
-    # overwritten with "recorded-content".
-    (dest / "a.txt").write_text("locally-drifted-content-of-a-different-length")
-    os.utime(dest / "a.txt", (1_000_000_000, 1_000_000_000))
-    os.chmod(dest / "a.txt", 0o600)  # the mode is wrong too
-
-    calls: list[tuple[str, dict]] = []
-    original_make_api_call = botocore.client.BaseClient._make_api_call
-
-    def spy(self, operation_name, api_params):
-        calls.append((operation_name, dict(api_params)))
-        return original_make_api_call(self, operation_name, api_params)
-
-    monkeypatch.setattr(botocore.client.BaseClient, "_make_api_call", spy)
-    ws.run("pull", "--meta-only", "data", "-o", str(dest), expect_rc=0)
-
-    # Never downloaded: the local (wrong) content survives untouched.
-    assert (dest / "a.txt").read_text() == "locally-drifted-content-of-a-different-length"
-    # But the recorded metadata IS applied: mode and the file's own mtime.
-    assert (os.stat(dest / "a.txt").st_mode & 0o777) == 0o640
-    assert os.stat(dest / "a.txt").st_mtime_ns == recorded_mtime_ns
-
-    # Direct observation of the data lane, not just its absence of effect:
-    # the data object's key is never fetched. (The manifest key IS fetched
-    # by every pull, --meta-only included - a distinct GetObject this does
-    # not, and must not, assert away.)
-    data_key = f"{ws.prefix}/data/a.txt"
-    assert not any(
-        op in ("GetObject", "HeadObject") and params.get("Key") == data_key for op, params in calls
-    )
-
-
 def test_pull_without_meta_only_downloads_the_same_drift(ws):
     # Contrast for the test above: the identical local/backup mismatch,
     # without --meta-only, is certainly re-downloaded - proving that scenario
@@ -427,44 +226,6 @@ def test_pull_without_meta_only_downloads_the_same_drift(ws):
     ws.run("pull", "data", "-o", str(dest), expect_rc=0)
 
     assert (dest / "a.txt").read_text() == "recorded-content"
-
-
-def test_pull_meta_only_repairs_dir_mode_and_symlink_target(ws):
-    # --meta-only's gated apply covers more than a file's mode: a directory's
-    # own mode/mtime and a symlink's target are also repaired - both
-    # objectless records, so there was never data to download for them either
-    # way, but this pins that --meta-only still reaches them.
-    ws.write("data/sub/keep.txt", "keep")
-    os.symlink("keep.txt", ws.root / "data" / "sub" / "link")
-    ws.config({"data": {"path": str(ws.root / "data")}})
-    ws.run("push", "data", expect_rc=0)
-
-    sub = ws.root / "data" / "sub"
-    link = ws.root / "data" / "sub" / "link"
-    recorded_dir_mode = os.stat(sub).st_mode & 0o777
-
-    os.chmod(sub, 0o700 if recorded_dir_mode != 0o700 else 0o750)
-    os.remove(link)
-    os.symlink("nope.txt", link)  # wrong target
-
-    ws.run("pull", "--meta-only", "data", expect_rc=0)
-
-    assert (os.stat(sub).st_mode & 0o777) == recorded_dir_mode
-    assert os.readlink(link) == "keep.txt"
-
-
-def test_pull_data_only_downloads_without_metadata(ws):
-    f = ws.write("data/a.txt", "hello")
-    old = 1_600_000_000
-    os.utime(f, (old, old))
-    ws.config({"data": {"path": str(ws.root / "data")}})
-    ws.run("push", "data", expect_rc=0)
-
-    dest = ws.root / "restore"
-    ws.run("pull", "--data-only", "data", "-o", str(dest), expect_rc=0)
-
-    assert (dest / "a.txt").read_text() == "hello"  # data downloaded
-    assert int((dest / "a.txt").stat().st_mtime) != old  # mtime NOT restored
 
 
 def test_push_single_file_dryrun_uploads_nothing(ws):
@@ -497,14 +258,6 @@ def test_push_single_file_dryrun_prints_upload_once(ws):
     res = ws.run("push", "--dry-run", "solo.txt", expect_rc=0)
     uploads = [ln for ln in res.out.splitlines() if ln.startswith("(dry-run) upload:")]
     assert len(uploads) == 1
-
-
-def test_push_git_entry_meta_only_writes_manifest_like_any_other_entry(ws):
-    ws.write("repo.git/HEAD", "ref")
-    ws.config({"repo.git": {"path": str(ws.root / "repo.git")}})
-
-    ws.run("push", "--meta-only", "repo.git", expect_rc=0)
-    assert "repo.git-manifest.jsonl" in ws.keys()
 
 
 # --- push --delete (confirmed deletions) ---------------------------------------

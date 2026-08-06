@@ -60,7 +60,6 @@ from s3bak.syncops import (
     download_from_s3,
     download_manifest,
     drop_subtree_records,
-    patch_manifest_subtree,
     publish_journal_manifest,
     sync_compare,
     write_manifest_to_aws,
@@ -115,41 +114,20 @@ def _run_hook(
     return 1 if rc == 2 else rc
 
 
-def upload_manifest(
-    cfg: Config,
-    entry: str,
-    target: str,
-    excludes: list[str],
-    opts: Opts,
-    *,
-    old_manifest: str | None = None,
-    keep_old: bool = False,
-) -> int:
-    """Write the manifest from a fresh walk (the ``--meta-only`` rewrite, and
-    the single-file entry's one-record write), then run the entry's
-    post_hook. An ordinary directory push publishes its journal instead."""
+def upload_manifest(cfg: Config, entry: str, target: str, opts: Opts) -> int:
+    """Write the single-file entry's one-record manifest from a fresh lstat,
+    then run the entry's post_hook. An ordinary directory push publishes its
+    journal instead."""
     post_hook: list[str] | None = cfg.entries[entry].get("post_hook")
 
     if opts.dryrun:
         console.out(f"(dry-run) would update manifest: {manifest.manifest_key(entry)}\n")
-        # The walk and merge write only a local temp file: run them so the
-        # rehearsal emits the same structural warnings as the real push,
-        # skipping only the upload.
-        write_manifest_to_aws(
-            cfg,
-            entry,
-            target,
-            excludes,
-            opts.verbose,
-            old_manifest=old_manifest,
-            keep_old=keep_old,
-            upload=False,
-        )
+        # The record write and validation run against a local temp file: the
+        # rehearsal fails where the real push would, skipping only the upload.
+        write_manifest_to_aws(cfg, entry, target, opts.verbose, upload=False)
         return _run_hook("post_hook", post_hook, opts)
 
-    write_manifest_to_aws(
-        cfg, entry, target, excludes, opts.verbose, old_manifest=old_manifest, keep_old=keep_old
-    )
+    write_manifest_to_aws(cfg, entry, target, opts.verbose)
 
     return _run_hook("post_hook", post_hook, opts)
 
@@ -326,22 +304,6 @@ def _warn_aborted_push(entry: str) -> None:
     )
 
 
-def _warn_unrecorded_uploads(entry: str, opts: Opts, journal: PushJournal) -> None:
-    """Emit the --data-only unrecorded-upload warning after a successful sync.
-    The journal tallies uploads with no owning file record at decision time
-    (create and update lanes both - the birth and the re-upload faces of an
-    unrecorded object), so the warning repeats on every push while the object
-    stays unrecorded. A dry run makes the same decisions without
-    transferring, so it previews the warning (and its exit 2) with "would
-    upload" wording."""
-    if opts.data_only and journal.unrecorded_uploads:
-        verb = "would upload" if opts.dryrun else "uploaded"
-        console.warn(
-            f"warning: {entry}: --data-only {verb} {journal.unrecorded_uploads} object(s)"
-            f" the manifest does not record; run a push without --data-only to record them"
-        )
-
-
 def _delete_conflict_objects(
     cfg: Config, entry: str, plan: _PushDeletePlan, journal: PushJournal, opts: Opts
 ) -> tuple[int, bool]:
@@ -500,9 +462,8 @@ def _push_sub(
                     f"local path does not exist (use --delete to remove its backup): {local_sub}"
                 )
                 return 1
-            # --delete cannot combine with --meta-only/--data-only (rejected at
-            # the CLI), so this is always the full deletion: one confirmation
-            # covers the subtree's objects and manifest records together.
+            # The full deletion: one confirmation covers the subtree's
+            # objects and manifest records together.
             if not opts.dryrun and not confirm_subtree_delete(
                 resolve_answer_mode(yes=opts.yes), entry, s3_sub_path
             ):
@@ -513,20 +474,6 @@ def _push_sub(
                 return result.returncode
             did_work = result.results > 0
             did_work = drop_subtree_records(cfg, entry, old_manifest, sub, opts) or did_work
-            return _run_hook("post_hook", post_hook, opts) if did_work else 0
-
-        if opts.meta_only:
-            # --meta-only --delete is rejected at the CLI: always the keep policy.
-            did_work = patch_manifest_subtree(
-                cfg,
-                entry,
-                target_root,
-                sub,
-                excludes,
-                opts,
-                keep_old=True,
-                old_manifest=old_manifest,
-            )
             return _run_hook("post_hook", post_hook, opts) if did_work else 0
 
         st = os.lstat(local_sub)
@@ -599,7 +546,6 @@ def _push_sub(
                         return result.returncode
                     if result.results > 0:
                         did_work = True
-                    _warn_unrecorded_uploads(entry, opts, journal)
                 else:
                     # Regular file: an explicit sub-path push always uploads,
                     # and always re-records - naming the path is the
@@ -628,7 +574,7 @@ def _push_sub(
             # After the conflict candidates: their refusals (incomplete scan)
             # must count in the summary too.
             _warn_refused_deletes(entry, plan, journal)
-            if journal.has_events and not opts.data_only:
+            if journal.has_events:
                 publish_journal_manifest(cfg, entry, old_manifest, journal_path, opts)
                 did_work = True
             if conflict_deleted:
@@ -654,7 +600,7 @@ def _single_file_compare(
 
     Upload unless the manifest holds a regular-file record for exactly this
     basename, the local stat matches it, AND the S3 object exists at the
-    recorded size - a `--meta-only` push or an S3-side delete leaves a
+    recorded size - an interrupted deletion or an S3-side delete leaves a
     manifest with no object behind it, and an out-of-band overwrite leaves
     one at the wrong size; only this head-object probe can see either (a dir
     entry self-heals via the sync listing; a single file has no listing).
@@ -772,12 +718,10 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
 
     # Hook contract: pre_hook runs before every push attempt. post_hook is
     # deliberately asymmetric - it runs only after a push that did work, i.e.
-    # that transferred data and/or refreshed the manifest (see upload_manifest,
-    # the data-only branch below, and _push_sub), or whenever --meta-only is
-    # given (which always refreshes the manifest and runs the hook). A pure
-    # no-op push runs no post_hook on purpose, so side-effecting hooks (e.g.
-    # rclone) do not fire when nothing changed; use --meta-only to run the hook
-    # on demand. By design, not a bug.
+    # that transferred data and/or refreshed the manifest (see upload_manifest
+    # and _push_sub). A pure no-op push runs no post_hook on purpose, so
+    # side-effecting hooks (e.g. rclone) do not fire when nothing changed;
+    # `s3bak hook post <entry>` runs the hook on demand. By design, not a bug.
     pre_hook: list[str] | None = entry_cfg.get("pre_hook")
     if pre_hook:
         st = _run_hook("pre_hook", pre_hook, opts)
@@ -821,50 +765,21 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
     fd, manifest_path = tempfile.mkstemp(suffix=".jsonl")
     os.close(fd)
     try:
-        # Every push - every mode - downloads and validates the manifest
-        # first: an ordinary push compares against it, any push uses it to
-        # notice objectless tree changes or an entry kind change, --data-only
-        # reads it to warn about the uploads it leaves unrecorded, and a
-        # damaged manifest must abort the push before anything on S3 moves.
-        # All of that is read-only, so it runs under --dry-run too - a
-        # rehearsal surfaces problems here.
+        # Every push downloads and validates the manifest first: an ordinary
+        # push compares against it, any push uses it to notice objectless
+        # tree changes or an entry kind change, and a damaged manifest must
+        # abort the push before anything on S3 moves. All of that is
+        # read-only, so it runs under --dry-run too - a rehearsal surfaces
+        # problems here.
         have_manifest = download_manifest(cfg, entry, manifest_path, opts.verbose)
         is_dir_target = os.path.isdir(target)
         if have_manifest and (_entry_kind_from_manifest(manifest_path) == "dir") != is_dir_target:
-            if opts.meta_only:
-                # --meta-only moves no data, so it cannot migrate a kind
-                # change; recording the new kind anyway would silently orphan
-                # the old tree or corrupt the manifest.
-                console.err(
-                    f"{entry}: the backup and the local path disagree on kind"
-                    f" (file vs directory); push --delete migrates it"
-                )
-                return 1
             st = _migrate_entry_kind(cfg, entry, is_dir_target, opts)
             if st != 0:
                 return st
             have_manifest = False  # the old backup is gone: record from scratch
         if have_manifest:
             plan.old_manifest = manifest_path
-
-        # --meta-only refreshes the manifest and runs the post_hook even with
-        # no data change: the supported way to re-run the post_hook on demand
-        # (intended). A directory refresh merges against the old manifest with
-        # every old-only record kept: --meta-only moves no data, so it must
-        # not drop the records of objects that are still on S3
-        # (--meta-only --delete is rejected).
-        if opts.meta_only:
-            if not is_dir_target:
-                return upload_manifest(cfg, entry, target, excludes, opts)
-            return upload_manifest(
-                cfg,
-                entry,
-                target,
-                excludes,
-                opts,
-                old_manifest=manifest_path if have_manifest else None,
-                keep_old=True,
-            )
 
         if is_dir_target:
             journal_fd, journal_path = tempfile.mkstemp(suffix=".journal")
@@ -909,7 +824,6 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 if result.returncode != 0:
                     return result.returncode
                 results = result.results
-                _warn_unrecorded_uploads(entry, opts, journal)
                 if journal.pending_object_deletes > 0:
                     st_del, conflict_deleted = _delete_conflict_objects(
                         cfg, entry, plan, journal, opts
@@ -931,7 +845,7 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 # no-op push journals nothing; a --delete run whose record
                 # candidates were all kept leaves only no-change lines, which
                 # must not republish an identical manifest.
-                if journal.has_events and not opts.data_only:
+                if journal.has_events:
                     publish_journal_manifest(
                         cfg,
                         entry,
@@ -968,7 +882,7 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                         return result.returncode
                     results = result.results
                 refresh_manifest = results > 0
-            elif not opts.data_only:
+            else:
                 if opts.checksum:
                     # ETag equality can skip an already-present data object even
                     # when its manifest was deleted, still names an older
@@ -995,14 +909,10 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         # a directory delete-only push would). An mtime drift inside the
         # window does not refresh an existing manifest (the window is a
         # rounding tolerance).
-        if refresh_manifest and not opts.data_only:
-            st = upload_manifest(cfg, entry, target, excludes, opts)
+        if refresh_manifest:
+            st = upload_manifest(cfg, entry, target, opts)
             if st != 0:
                 return st
-
-        if results and opts.data_only:
-            post_hook_file: list[str] | None = entry_cfg.get("post_hook")
-            return _run_hook("post_hook", post_hook_file, opts)
 
         return 0
     except DeletionAbortedError:
@@ -1063,38 +973,6 @@ def _manifest_matches_local(
     return True
 
 
-def _verify_restored_sizes(manifest_path: str, outpath: str, is_dir: bool, sub: str | None) -> int:
-    """After a --data-only sync, verify every recorded regular file was placed
-    with its recorded size. --data-only skips apply_manifest (and the
-    presence/size check it carries), so without this a missing or size-drifted
-    object would let the pull report success on incomplete/wrong data. Read-only
-    (never writes); returns 1 if any record failed, else 0."""
-    errors = 0
-    for entry in manifest.iter_manifest(manifest_path):
-        if not entry.is_file or entry.sym_target is not None or entry.size is None:
-            continue  # only regular files own an object with a size to check
-        res = manifest_target(entry, outpath, is_dir, sub)
-        if res is None:
-            continue
-        target, _rel = res
-        try:
-            st = os.lstat(target)
-        except OSError:
-            console.err(f"expected file missing (sync did not place it): {target}")
-            errors += 1
-            continue
-        if not stat_mod.S_ISREG(st.st_mode):
-            console.err(f"expected {entry.path} to be a regular file: {target}")
-            errors += 1
-        elif st.st_size != entry.size:
-            console.err(
-                f"restored size does not match manifest ({st.st_size} != {entry.size}),"
-                f" the stored object does not match the record: {target}"
-            )
-            errors += 1
-    return 1 if errors else 0
-
-
 def _manifest_restore_conflict(manifest_path: str, sub: str | None) -> str | None:
     """Return the entry-relative path of the first non-directory record (a file
     or symlink) in the pulled range that another record contradicts by treating
@@ -1106,7 +984,7 @@ def _manifest_restore_conflict(manifest_path: str, sub: str | None) -> str | Non
     pull and verify therefore fail closed on it (push --delete prunes the stale
     records). Streams the manifest in sort order with a stack of "blockers" (the
     non-directory records whose descendant key range is still open), the shape
-    write_merged's restorability warning uses. Works in ENTRY-RELATIVE space
+    the merge's restorability warning uses. Works in ENTRY-RELATIVE space
     (not sub-rebased): a conflict AT the sub root itself - a symlink ``./d`` and a
     directory ``./d`` both recorded when pulling ``entry/d`` - would be invisible
     if both collapsed to ``.``; the ``sub`` filter only restricts the range to the
@@ -1214,7 +1092,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             manifest_path, outpath, is_dir, sub, window_ns
         )
         if manifest_matches and not opts.checksum:
-            if not opts.meta_only and opts.delete and is_dir:
+            if opts.delete and is_dir:
                 return _mirror_extras(
                     manifest_path,
                     outpath,
@@ -1247,7 +1125,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         # ordinary part of the repair) - so the outer finally's restore below
         # is skipped there and only fires on a path that never got that far.
         prep_repaired = False
-        if has_data and not opts.meta_only and os.path.lexists(outpath):
+        if has_data and os.path.lexists(outpath):
             if is_dir:
                 conflict = os.path.islink(outpath) or not os.path.isdir(outpath)
             else:
@@ -1270,7 +1148,6 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             if (
                 is_dir
                 and has_data
-                and not opts.meta_only
                 and not opts.dryrun
                 and stage_dir is None
                 and os.path.isdir(outpath)
@@ -1283,11 +1160,11 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             # symlinked restore root and chmod a file outside the destination. A
             # staged pull downloads into a fresh stage, where nothing needs prep
             # (and the conflicting root itself must not be walked into).
-            if IS_WINDOWS and not opts.meta_only and not opts.dryrun and stage_dir is None:
+            if IS_WINDOWS and not opts.dryrun and stage_dir is None:
                 prep = windows_collect_writable_prep(outpath, is_dir, manifest_path, sub)
 
             changed = False
-            if not opts.meta_only and has_data:
+            if has_data:
                 # The compare only matters for the dir sync; a single-file transfer
                 # always happens (we only reach it on a manifest mismatch). Its
                 # size (from the manifest) routes a large file through multipart.
@@ -1350,17 +1227,8 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             #    recorded mtime back; a stamp landing inside the mtime window is a
             #    match and stays, like any other within-window drift. The gate also
             #    re-applies the recorded modes over the writable prep on success -
-            #    the outer finally below covers every other case. Skipped with
-            #    --data-only, which never touches the prep itself either way.
-            if opts.data_only:
-                # --data-only skips apply_manifest, so run its presence+size
-                # integrity check directly - but only after a real download (a
-                # dry run placed nothing; a symlink/special sub has no data).
-                if opts.dryrun or not has_data:
-                    st = 0
-                else:
-                    st = _verify_restored_sizes(manifest_path, outpath, is_dir, sub)
-            elif opts.dryrun:
+            #    the outer finally below covers every other case.
+            if opts.dryrun:
                 # One stand-in line for the metadata apply (mode / mtime /
                 # symlinks), printed only when the real apply could repair
                 # something: a stat-gate difference, or a planned transfer.
@@ -1368,9 +1236,6 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                     console.out(f"(dry-run) would apply manifest metadata: {outpath}\n")
                 st = 0
             else:
-                # enforce_size only when the data sync ran: --meta-only applies
-                # metadata over the existing data and must not fail on a size it
-                # was never asked to download.
                 st = apply_manifest(
                     outpath,
                     is_dir,
@@ -1378,7 +1243,6 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                     sub=sub,
                     window_ns=window_ns,
                     excludes=excludes,
-                    enforce_size=not opts.meta_only,
                 )
                 if st == 0:
                     # A clean apply already re-chmod'd every prepped path to its
@@ -1390,7 +1254,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                     # symlink placement), so only then does it still apply.
                     prep_repaired = True
 
-            if not opts.meta_only and opts.delete and is_dir:
+            if opts.delete and is_dir:
                 if st != 0:
                     # The local tree is not in the recorded state; extras built
                     # on that view are not trustworthy deletion candidates.
@@ -1438,7 +1302,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         finally:
             # Put every prepped path back to its original mode on every exit
             # this function did not already resolve on its own (download
-            # failure, --data-only, a failed apply_manifest, an early
+            # failure, a failed apply_manifest, an early
             # conflict-clearing return, or an exception) - never after a clean
             # apply, which already re-chmod'd them itself (prep_repaired,
             # above). This is the one place that restores the prep, so it can
@@ -1496,8 +1360,8 @@ def _collect_extra_aliases(
     ``_mirror_extras`` (the caller two levels up) is invoked from two call
     sites in ``cmd_pull`` - one of them a no-op short-circuit where
     ``apply_manifest`` never runs at all (the "manifest already matches
-    local" fast path) - and ``--data-only`` skips ``apply_manifest`` too; all
-    three of those paths must get alias protection uniformly, so collecting
+    local" fast path); both paths must get alias protection uniformly, so
+    collecting
     it has to be self-contained here, independent of whether or how apply
     ran.
 
@@ -1588,9 +1452,9 @@ def _mirror_extras(
     re-settle: every removal bumps its parent directory's mtime, so when
     anything was actually removed the manifest metadata is applied once more -
     the gated apply touches exactly the directories the removals dirtied.
-    Skipped under --data-only and --dry-run, which never apply metadata."""
+    Skipped under --dry-run, which never applies metadata."""
     status, removed = _delete_extras(manifest_path, outpath, sub, excludes, opts=opts, entry=entry)
-    if removed and not opts.dryrun and not opts.data_only:
+    if removed and not opts.dryrun:
         settle = apply_manifest(
             outpath, True, manifest_path, sub=sub, window_ns=window_ns, excludes=excludes
         )
@@ -1880,7 +1744,7 @@ def diff_backup(
         # record on each side, not the whole manifest. The manifest, not every
         # object under the prefix, defines the backup: only its recorded
         # regular files are ever downloaded, one at a time (see below), so
-        # orphan objects (from --data-only / interrupted pushes) are ignored,
+        # orphan objects (from interrupted pushes) are ignored,
         # as pull/status do - and, crucially, conflicting orphans (a file and
         # a directory recorded at one path by out-of-band pushes) that a bulk
         # prefix sync could not even materialize onto one filesystem never
@@ -2518,7 +2382,7 @@ def cmd_verify(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
     os.close(fd)
     try:
         if not download_manifest(cfg, entry, manifest_path, opts.verbose):
-            # No manifest: an unrecorded backup (interrupted push, --data-only)
+            # No manifest: an unrecorded backup (an interrupted push)
             # and no backup at all are different emergencies - tell them apart.
             # Count the stray objects (streaming) so the summary's object tally
             # reflects what was actually found instead of a misleading 0.

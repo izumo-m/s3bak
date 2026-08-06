@@ -1,7 +1,7 @@
 # Requires Python 3.10+
 """The manifest walk, on boto3-s3's directory engine.
 
-``walk_tree`` / ``iter_subtree`` yield the ``(rel, lstat, sym_target)`` items
+``walk_tree`` yields the ``(rel, lstat, sym_target)`` items
 ``manifest.write_manifest`` records, in S3 key byte order (``foo.txt`` before
 ``foo/bar``). The traversal itself is boto3-s3's ``LocalFileGenerator`` - the
 same engine (and therefore the same sort definition) the data sync walks with -
@@ -27,7 +27,6 @@ pull ``--delete`` diff) or an S3 listing (``ManifestFilter``) in one pass.
 from __future__ import annotations
 
 import os
-import stat as stat_mod
 from typing import TYPE_CHECKING
 
 from boto3_s3 import LocalFileGenerator, LocalStorage, WalkChild
@@ -198,22 +197,3 @@ def walk_tree(
                     warn(f"Skipping file {info.key}. File changed during the walk.")
                 continue
         yield rel_prefix + info.compare_key, info.stat_result, sym
-
-
-def iter_subtree(
-    local_sub: str, sub: str, excludes: list[str], *, warn: Callable[[str], None] | None = None
-) -> Iterator[tuple[str, os.stat_result, str | None]]:
-    """Walk items for a sub-path push: ``local_sub`` as recorded under
-    ``./{sub}``. Handles the file / symlink / directory cases. The walk rels
-    are entry-rooted, so the entry's exclude patterns apply exactly as they
-    would in a full push."""
-    st = os.lstat(local_sub)
-    if stat_mod.S_ISLNK(st.st_mode):
-        yield f"./{sub}", st, os.readlink(local_sub)
-        return
-    if not os.path.isdir(local_sub):
-        yield f"./{sub}", st, None
-        return
-    yield from walk_tree(
-        local_sub, excludes, root_rel=f"./{sub}", rel_prefix=f"./{sub}/", warn=warn
-    )

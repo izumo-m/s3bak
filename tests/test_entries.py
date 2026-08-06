@@ -597,26 +597,6 @@ def test_single_file_post_hook_has_no_journal(ws):
     assert info.read_text() == "UNSET"
 
 
-def test_meta_only_post_hook_has_no_journal(ws):
-    info = ws.root / "journal-path.txt"
-    copy = ws.root / "journal-copy.jsonl"
-    ws.write("data/a.txt", "a")
-    ws.config(
-        {
-            "data": {
-                "path": str(ws.root / "data"),
-                "post_hook": _journal_hook(ws, info, copy),
-            }
-        }
-    )
-    ws.run("push", "data", expect_rc=0)  # journal-driven: sets info to a path
-    info.unlink()
-
-    ws.run("push", "--meta-only", "data", expect_rc=0)
-
-    assert info.read_text() == "UNSET"
-
-
 def test_noop_push_does_not_run_post_hook(ws):
     marker = ws.root / "hook-ran"
     ws.write("data/a.txt", "a")
@@ -883,25 +863,6 @@ def test_special_file_subpath_is_rejected(ws):
     assert "regular file, directory, or symlink" in res.err
 
 
-def test_noop_subpath_data_only_push_does_not_run_post_hook(ws):
-    marker = ws.root / "hook-ran"
-    ws.write("data/sub/a.txt", "a")
-    ws.config(
-        {
-            "data": {
-                "path": str(ws.root / "data"),
-                "post_hook": _marker_hook(ws, marker),
-            }
-        }
-    )
-    ws.run("push", "data", expect_rc=0)
-    marker.unlink()
-
-    ws.run("push", "--data-only", "data/sub", expect_rc=0)
-
-    assert not marker.exists()
-
-
 def test_hook_string_is_rejected(ws):
     ws.write("data/a.txt", "x")
     ws.config({"data": {"path": str(ws.root / "data"), "pre_hook": "do-something"}})
@@ -928,36 +889,6 @@ def test_local_path_resolution_handles_an_entry_at_filesystem_root(tmp_path):
 
     assert entry == "root"
     assert sub == str(tmp_path / "child.txt").removeprefix(root).replace(os.sep, "/")
-
-
-def test_meta_only_refuses_entry_kind_change(ws):
-    # --meta-only moves no data and cannot migrate a kind change; recording
-    # the new kind would orphan the old tree (dir->file) or publish a manifest
-    # mixing both shapes (file->dir). Both directions must refuse untouched.
-    import shutil
-
-    ws.write("data/a.txt", "hello")
-    ws.config({"data": {"path": str(ws.root / "data")}})
-    ws.run("push", "data", expect_rc=0)
-    shutil.rmtree(ws.root / "data")
-    (ws.root / "data").write_text("now a file")
-
-    res = ws.run("push", "--meta-only", "data")
-    assert res.rc == 1
-    assert "disagree on kind" in res.err
-    assert "data/a.txt" in ws.keys()
-    ws.run("verify", "data", expect_rc=0)  # the old backup is intact
-
-    solo = ws.write("solo", "s")
-    ws.config({"solo": {"path": str(solo)}})
-    ws.run("push", "solo", expect_rc=0)
-    os.remove(solo)
-    ws.write("solo/inner.txt", "i")
-
-    res = ws.run("push", "--meta-only", "solo")
-    assert res.rc == 1
-    assert "disagree on kind" in res.err
-    ws.run("verify", "solo", expect_rc=0)
 
 
 def test_first_nested_subpath_push_writes_valid_manifest(ws):

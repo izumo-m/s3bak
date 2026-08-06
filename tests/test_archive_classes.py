@@ -286,27 +286,6 @@ def test_pull_dir_entry_over_unrestored_archived_object_fails_closed(ws, storage
     assert "InvalidObjectState" in res.err
 
 
-def test_pull_data_only_over_unrestored_archived_object_fails_closed(ws):
-    """The same failure as above, pinned again with --data-only: that flag
-    only skips apply_manifest (and, with it, _verify_restored_sizes), it does
-    not change how the data is fetched. The forced sync still hits
-    InvalidObjectState at the GetObject and download_from_s3 still returns
-    the sync's nonzero rc immediately, so --data-only is not a bypass for
-    this failure. Pinned separately because a single test on the default
-    lane would leave that open."""
-    _push_dir_entry(ws)
-    ws.s3.put_object(
-        Bucket=ws.bucket,
-        Key=f"{ws.prefix}/data/a.txt",
-        Body=b"alpha",
-        StorageClass="GLACIER",
-    )
-    dest = ws.root / "fresh"
-    res = ws.run("pull", "--data-only", "data", "-o", str(dest), expect_rc=1)
-    assert not (dest / "a.txt").exists()
-    assert "InvalidObjectState" in res.err
-
-
 @pytest.mark.parametrize("storage_class", _ARCHIVED_CLASSES)
 def test_pull_single_file_entry_over_unrestored_archived_object_fails_closed(
     ws, monkeypatch, capfd, storage_class

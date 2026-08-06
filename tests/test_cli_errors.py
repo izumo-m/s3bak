@@ -15,10 +15,15 @@ def cfg_ws(ws):
     return ws
 
 
-def test_meta_only_and_data_only_are_mutually_exclusive(cfg_ws):
-    res = cfg_ws.run("push", "--meta-only", "--data-only", "data")
+def test_meta_only_and_data_only_flags_are_gone(cfg_ws):
+    # Removed in 0.6: a one-sided push/pull broke the manifest's
+    # correspondence with S3. The options must be rejected, not ignored.
+    res = cfg_ws.run("push", "--meta-only", "data")
     assert res.rc == 1
-    assert "mutually exclusive" in res.err.lower()
+    assert "unknown option" in res.err
+    res = cfg_ws.run("pull", "--data-only", "data")
+    assert res.rc == 1
+    assert "unknown option" in res.err
 
 
 def test_all_with_explicit_entry_errors(cfg_ws):

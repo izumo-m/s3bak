@@ -473,7 +473,7 @@ class Boto3S3Store:
                     existing_mode = None
                 if existing_mode is not None and stat_mod.S_ISREG(existing_mode):
                     # Atomic replacement uses a new inode. Preserve the mode of
-                    # an existing regular destination so --data-only does not
+                    # an existing regular destination so the replacement does not
                     # turn it into tempfile's 0600 merely as a side effect.
                     os.chmod(temp_path, stat_mod.S_IMODE(existing_mode))
                 # Match s3transfer's safety property: finish into a sibling temp
