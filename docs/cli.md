@@ -70,6 +70,26 @@ remote service are unavailable. Entry and path resolution needs the loaded
 configuration and therefore runs after the store exists. The `list` command loads configuration
 without constructing an S3 client because its result is entirely local.
 
+## Hook invocation (`hook pre|post`)
+
+`s3bak hook pre <entry>` and `s3bak hook post <entry>` run one configured
+hook on demand, outside any push — the way to re-run an off-site copy after
+the far side changed, or to test a dump script. The first positional argument
+selects the hook; the remaining arguments are entry names, resolved and
+aggregated exactly as for other multi-entry commands (`--all` included).
+
+The hook executes under the same contract as a push-run hook: an argument
+vector run without a shell, stdin detached, and the same exit-status
+normalization. `S3BAK_JOURNAL` is unset — there is no push, hence no journal —
+which the hook contract already defines as "no per-file detail; assume
+anything may have changed".
+
+An entry that does not configure the named hook fails (exit 1): naming the
+hook is an instruction, and silence would read as success. `--dry-run` prints
+the command line that would run, without running it. Like `list`, the command
+loads configuration without constructing an S3 client — a hook run touches
+no S3 state.
+
 ## Concurrent entry results
 
 Commands that operate on several entries may run them concurrently. Results

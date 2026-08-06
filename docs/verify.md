@@ -41,6 +41,16 @@ storage class, so none of these checks costs an extra S3 call:
 - **Unrecorded object** — an object the manifest does not record (see
   [storage.md](storage.md#unrecorded-objects)). Until verify, these surfaced
   only inside a `push --delete` confirmation; verify lists them passively.
+- **Excluded residue** — records still sitting under the entry's *current*
+  `excludes` ([excludes.md](excludes.md)): the leftovers of an exclude added
+  after the paths were pushed. Every other command without `--delete`
+  ignores excluded paths entirely — push neither uploads nor deletes them,
+  pull does not restore them, `status` does not mention them — so this
+  warning is the one passive channel that surfaces the residue. It is
+  reported as one count per entry (the objects those records own travel
+  with them), naming `push --delete` as the remedy; an unrecorded object
+  under an excluded path is already covered by the unrecorded-object
+  warning.
 - **Folder object** — a `/`-terminated key, the manual-folder convention of
   the S3 console and some tools. s3bak never writes one. The zero-byte marker
   form is skipped by the data sync and is reported as noise to remove; one
@@ -109,7 +119,8 @@ Findings map onto the standard [exit codes](cli.md#exit-codes):
 - **Warnings (exit 2)** — the backup itself is not in question, only
   something around it: an object sitting outside the recorded backup
   (unrecorded objects, zero-byte folder objects, everything the `--all` sweep
-  reports), or a recorded object that is intact but currently archived.
+  reports), recorded residue under the entry's current excludes, or a
+  recorded object that is intact but currently archived.
 - **Informational** — pending changes (`--checksum`); no exit-code effect.
 
 Every entry also prints a one-line summary (`OK` or finding counts, with

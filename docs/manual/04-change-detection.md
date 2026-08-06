@@ -68,25 +68,46 @@ own modification time, which s3bak records and restores like any other.
 
 The letters describe what a push would do to the backup, not what happened
 locally. `M` is a path both sides know about whose record no longer matches,
-`A` exists only locally, `D` only in the backup. Silence means everything
-matched.
+`A` exists only locally. Silence means everything matched — including
+everything an ordinary push would leave alone: the record of a locally
+deleted file is kept, so plain `status` says nothing about it.
 
-A path whose *type* changed reports a replacement rather than a modification,
-and how it prints depends on the new type. A regular file replaced by a
-symlink is a single `D`, because the two still occupy the same key:
+`status --delete` previews `push --delete` instead, and that is where `D`
+appears: a path that exists only in the backup — a locally deleted file, or
+residue under a later-added exclude — that `push --delete` would offer to
+remove:
+
+```console
+$ mv /home/you/demo/old-notes.txt /tmp/
+$ s3bak status --delete demo
+M /home/you/demo	mtime
+D /home/you/demo/old-notes.txt
+```
+
+Plain `status` shows only the `M` line: an ordinary push updates the
+directory's record and keeps the backup of `old-notes.txt`, exactly as the
+absent `D` suggests. `status` never lists the bucket, so the preview covers
+what the manifest records; an object the manifest does not know about is
+`verify`'s to report, and the exact rehearsal — with the real listing and
+the real confirmations — is `push --delete --dry-run`.
+
+A path whose *type* changed is a modification: a push re-records the new
+kind, so the pair prints as `M` with a `type` tag. A regular file replaced
+by a symlink stays one line, because the two occupy the same key:
 
 ```console
 $ s3bak status demo
 M /home/you/demo/lib	mtime
-D /home/you/demo/lib/util.sh
+M /home/you/demo/lib/util.sh	type
 ```
 
-A regular file replaced by a **directory** prints both letters for the one
-path — the record and the local directory sort to different keys, so nothing
-pairs them up:
+A regular file replaced by a **directory** sorts to a different key, so
+nothing pairs them up: the new directory prints `A`, and the old file's
+record — kept by an ordinary push — surfaces as `D` only under
+`status --delete`:
 
 ```console
-$ s3bak status demo
+$ s3bak status --delete demo
 M /home/you/demo	mtime
 D /home/you/demo/run.sh
 A /home/you/demo/run.sh
@@ -189,12 +210,6 @@ A smaller `mtime_window` is not an alternative. It closes only the case where
 the modification time did move but landed inside the tolerance — never the
 case where it did not move at all.
 
-One habit widens the blind spot rather than narrowing it: `push --meta-only`
-records the local state as though it had been uploaded, without uploading it.
-A local edit that was never pushed becomes invisible to every later size+mtime
-comparison. See [Command reference](05-command-reference.md) before reaching
-for it.
-
 ### Keeping it short-lived
 
 Run `verify --checksum` on a schedule — weekly is a reasonable starting point
@@ -253,8 +268,8 @@ modification time are all the comparison has; that push records the new
 modification time, and the run after it is quiet again.
 
 The reverse does not hold, because a pull never rewrites the manifest. A record
-that has gone stale — left by `push --data-only`, or by a write to the bucket
-that went around s3bak — is something no pull can repair, so every pull that
+that has gone stale — left by a push interrupted after its uploads, or by a
+write to the bucket that went around s3bak — is something no pull can repair, so every pull that
 transfers anything downloads that file again, and so does the one after it.
 Only a push settles it. The asymmetry is deliberate: the manifest is the record
 of what a push saw, so only a push may change it.
@@ -265,66 +280,78 @@ can sit unnoticed until some other difference gives that pull work to do.
 
 ## Excludes
 
-An entry's `excludes` are glob patterns for paths to leave out. Each is
-matched against the path relative to the entry root, and the matching is
-deliberately literal:
+An entry's `excludes` are glob patterns for paths to leave out. They work
+exactly like `aws s3 sync --exclude` — the same pattern engine does the
+matching — and the matching is deliberately literal:
 
-- a pattern is compared against the **whole relative path**, not one name at a
-  time, and `*` matches across `/`. `*.elc` therefore excludes `*.elc` files
-  at every depth;
-- a pattern ending in `/*` names a **directory** and prunes it: the walk never
-  descends, so an excluded subtree costs nothing to skip;
-- anything else is matched against individual paths.
+- a relative pattern is compared against the **whole path relative to the
+  entry root**, not one name at a time, and `*` matches across `/`. `*.elc`
+  therefore excludes `*.elc` files at every depth;
+- a pattern that starts at the filesystem root (`/home/you/...`, or a drive
+  letter on Windows) is compared against the absolute path instead;
+- every path is judged **on its own**. A directory is matched with a
+  trailing `/` on its name: `cache/` matches the directory `cache` and
+  nothing inside it, and a bare `cache` matches only a *file* named `cache`.
+  Excluding a directory together with its contents is spelled `cache/*` —
+  the `*` is allowed to match nothing, so the pattern covers the directory
+  itself and everything below it.
 
 The consequence worth remembering is that a pattern without a leading wildcard
 is anchored at the entry root. `__pycache__/*` prunes the one at the top of
 the entry and nothing else; `*/__pycache__/*` prunes every one below the top
 and not the top itself. Covering both takes both patterns.
 
-### Excludes prune the local side only
+### What excluded means
 
-The S3 listing is never filtered. This has consequences that surprise people,
-and all of them follow from that one sentence.
+An excluded path does not exist, as far as s3bak is concerned — on either
+side. A push does not upload it and records nothing about it. A pull does not
+restore it, does not overwrite it, and leaves its metadata alone; a
+`pull --delete` never removes it; `status` does not mention it. Local or S3,
+present or absent: ignored. The exceptions are `push --delete`, which can
+retire what the backup still holds, and `verify`, which reports it — both
+described below.
 
-**A path excluded after it was backed up stays in the backup.** Its record and
-its object are still there, and since the local walk no longer produces the
-path, the comparison sees a record with nothing beside it:
+One visible consequence: an excluded directory is never recorded, so when a
+pull restores a file inside one, the directory is created as a plain
+directory — default permissions, nothing applied afterwards. s3bak does not
+manage it.
+
+### The backup keeps what it already holds
+
+Excludes decide what s3bak touches from now on; they have no opinion about
+what is already stored. A path excluded *after* it was backed up therefore
+stays in the backup — record and object both — and every ordinary command
+then ignores it: a push neither uploads nor deletes it, a pull does not
+bring it back, and plain `status` shows nothing. The leftovers surface in
+`status --delete`, the preview of the cleanup, and in `verify`'s routine
+warning:
 
 ```console
-$ s3bak status demo
-D /home/you/demo/cache
-D /home/you/demo/cache/tmp.bin
+$ s3bak verify demo
+s3bak: demo: 2 recorded path(s) under excludes remain in the backup (push --delete retires them)
+demo: 0 error(s), 1 warning(s) (5 file record(s), 5 data object(s))
 ```
 
-An ordinary push keeps both, as it keeps any `D`. Clearing them out is a
-deletion, and deletions are opt-in — see
+Clearing them out is a deletion, and deletions are opt-in — see
 [Deleting safely](06-deleting-safely.md). This is the intended path for
 retiring an accidentally backed-up `node_modules`: add the exclude, then let
 `push --delete` offer the leftovers. The local files are untouched either way;
-being excluded, they are invisible to the walk that would have looked at them.
+being excluded, they are invisible to everything.
 
-**An excluded path is never reported as `A`.** It is not compared at all, so
-it cannot show up as something a push would add.
+**An excluded path is never reported by plain `status`** — not as an `A`
+(its local copy is invisible), and not as a `D` (plain status prints no `D`
+at all). Under `status --delete` its leftovers print as `D`: the candidates
+`push --delete` would offer.
 
-**A pull still restores it.** The download side is driven by the backup, not
-by the local walk, so an object that is in the backup comes back whether or
-not the current configuration would have uploaded it:
-
-```console
-$ rm /home/you/demo/cache/tmp.bin
-$ s3bak pull demo
-download: s3://my-bucket/backup/demo/cache/tmp.bin to /home/you/demo/cache/tmp.bin
-644 /home/you/demo/cache/tmp.bin
-755 /home/you/demo/cache
-```
-
-Excludes decide what gets backed up. They do not decide what gets restored,
-and they have no opinion at all about what is already stored.
+**A pull does not bring it back.** The object may still sit in the backup,
+but as long as the path is excluded, a pull skips it: deleted locally, it
+stays deleted; present locally, it is not overwritten. To restore it, lift
+the exclude first.
 
 ## Next
 
 - [Command reference](05-command-reference.md) for `--checksum`,
-  `--mtime-window`, `--meta-only` and the rest, command by command.
+  `--mtime-window` and the rest, command by command.
 - [Deleting safely](06-deleting-safely.md) for turning a `D` into a removal.
 - [Platform notes](09-platform-notes.md) for the `mtime_window` a given
   filesystem needs.

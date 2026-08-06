@@ -94,8 +94,10 @@ memory bounded by one directory level rather than the whole tree:
 - **The walk** (`localwalk.walk_tree`) uses boto3-s3's complete, no-follow local
   enumeration — the data sync's own engine, so the sort definition cannot drift
   between the two. It returns directories, lstat-based symlink leaves, special
-  files, and unreadable entries before filtering. s3bak customizes only exclude
-  subtree pruning; boto3-s3 emits each directory record in-stream just before
+  files, and unreadable entries before filtering. s3bak customizes only the
+  exclude filtering ([excludes.md](excludes.md)); skipping the descent into an
+  excluded subtree is an optimization applied only where the patterns provably
+  cover all of it. boto3-s3 emits each directory record in-stream just before
   its children. An unreadable directory keeps its own record and loses its
   children; every walk reports that gap as a warning (exit 2) — the
   manifest-writing walk and the read-only status / diff walks alike — so a
@@ -105,11 +107,11 @@ memory bounded by one directory level rather than the whole tree:
   manifest.
 - **The status / pull `--delete` diff** (`merge_join`) pairs the manifest
   stream against a fresh walk on their shared sort keys with a one-record
-  lookahead per side — a both-sides pair of the same type is compared (M), a
-  both-sides pair whose type changed reports D (it is a replacement, not a
-  metadata edit), a manifest-only record reports D, and a local-only path
-  reports A / becomes a delete candidate — so a manifest far larger than RAM
-  still diffs in one pass.
+  lookahead per side — a both-sides pair is compared (a type change is a
+  modification, tagged `type`), a manifest-only record is a
+  `status --delete` D (plain status prints nothing for it), and a local-only
+  path reports A / becomes a pull `--delete` extras candidate — so a
+  manifest far larger than RAM still diffs in one pass.
 - **The push rewrite** (`merge_journal`) applies the push journal to the old
   manifest: a 2-way streaming merge in which a key with no event copies its
   old record verbatim (preserving any unknown keys), `+` / `!` copy the event
@@ -117,11 +119,6 @@ memory bounded by one directory level rather than the whole tree:
   ordering (strictly ascending, at most one event per key) and its marker
   consistency against the old manifest are validated fail closed — see
   [journal.md](journal.md) for the format and the emitter that writes it.
-- **The `--meta-only` rewrite** (`write_merged`) merges a fresh local walk
-  into the old manifest: a walked path always wins over its old record,
-  records outside a sub-path patch's replaced range are copied verbatim, and
-  old-only records are kept (`--meta-only` moves no data, so it must not drop
-  the records of objects still on S3).
 - **Pull's update strategy** (`ManifestFilter`) reads the manifest once,
   front to back, merge-joining its records against `S3.sync`'s ascending
   compare-key pairs (`iter_compare_records` keys a directory as `name/` to match
@@ -154,6 +151,12 @@ against either side of a sync without materializing it.
   damaged one blocks pushes too; to recover, remove the manifest object with
   `aws s3 rm` and push the entry again — with no manifest on S3 the push
   transfers every pair and writes a fresh one, like a first push.
+- A record's parent directory record is optional. An excluded directory is
+  not recorded while its visible children are ([excludes.md](excludes.md)),
+  so a missing parent record is a valid manifest, not damage; pull creates
+  the missing levels as plain directories. Validation cannot condition this
+  on the excludes in force — a manifest is read under whatever configuration
+  the reader has — so parents are optional unconditionally.
 - Unknown record keys remain accepted and are preserved by sub-tree patches,
   so additive metadata does not require a version bump.
 

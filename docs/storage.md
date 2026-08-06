@@ -43,11 +43,19 @@ restoration, including filesystem type, mode, size, mtime, symbolic-link
 target, owner, and group. Owner and group are retained for reporting only;
 s3bak does not change ownership during restore.
 
-The manifest represents the state explicitly recorded by a push. Pull and
-read-only commands never rewrite it. A normal push and `push --meta-only` may
-refresh it; `push --data-only` deliberately leaves it unchanged. Consequently,
-an out-of-band S3 change or a data-only push can leave the manifest stale until
-a later push refreshes it.
+The manifest represents the state of S3 as the last push recorded it: for
+every data object, the metadata its restore needs; plus the records that ARE
+the backup for the objectless kinds (directories, symlinks, special files).
+Push is the manifest's only writer — pull and read-only commands never
+rewrite it — and a push repairs whatever divergence it can prove: a record
+whose object is gone, with nothing visible locally at its path, is dropped by
+any push (repair, not deletion). What a push cannot prove is left visible
+rather than guessed at: an unrecorded object with no visible local source
+cannot be truthfully recorded (`verify` reports it; `push --delete` retires
+it), and a content drift hiding behind an unchanged size+mtime takes
+`verify --checksum` to detect and `push --checksum` to repair. An
+out-of-band S3 change therefore leaves the manifest stale only until the
+next push that can see it.
 
 ## Unrecorded objects
 
@@ -66,23 +74,27 @@ Directory, symlink, and special-file records stand alone by design, as described
 above.
 
 The correspondence has one gap s3bak cannot close: a data object the manifest
-never recorded — uploaded out-of-band with other S3 tooling, or the fresh
-upload of a push that was interrupted before it wrote the manifest, where the
-local file has since been deleted. Such an object is outside the backup:
+never recorded and whose local path shows the push nothing — uploaded
+out-of-band with other S3 tooling, the fresh upload of a push that was
+interrupted before it wrote the manifest and whose local file has since been
+deleted, or an object under an excluded path, whose local side is invisible
+by rule ([excludes.md](excludes.md)). Such an object is outside the backup:
 `status` cannot see it (it diffs the manifest against the local tree), and
 pull applies no metadata to it, although pull's listing-driven download does
-fetch its bytes. Its local counterpart, when one exists (a `--data-only` push
-uploaded it), is invisible the same way: `pull --delete` sees a file the
-manifest does not record — a local extra — and offers to remove it. Those two
-confirmations, `pull --delete`'s and a later `push --delete`'s, are all that
-stand between such a file and total loss, which is why both prompt per item
-and why a `--data-only` push warns whenever it uploads one.
-`push --delete` offers its deletion like any other orphan,
+fetch its bytes (never for an excluded path). When the unrecorded object's
+local counterpart exists and is visible, the gap heals itself — the next push
+uploads and records the pair; the dangerous case is a local file that was
+never recorded anywhere: `pull --delete` sees a file the manifest does not
+record — a local extra — and offers to remove it, and that confirmation plus
+a later `push --delete`'s are all that stand between such a file and total
+loss, which is why both prompt per item.
+`push --delete` offers an unrecorded object's deletion like any other orphan,
 flagging the prompt with `(not in manifest)`; answering n keeps the object
 for this run only. A manifest record is a stat snapshot of a local file, and
-with no local file there is nothing truthful to record, so the object stays
-unrecorded and is asked about again on every later `--delete`. To adopt it
-into the backup, materialize it locally (a pull downloads it) and push. To
+with no visible local file there is nothing truthful to record, so the object
+stays unrecorded and is asked about again on every later `--delete`. To adopt
+it into the backup, materialize it locally (a pull downloads it) and push —
+an excluded one needs its exclude lifted first. To
 retire it, answer y or run the `--yes` mirror. To keep it long-term without
 adopting it, move it outside the entry prefix. `verify` reports every
 unrecorded object passively — no `--delete` run required (see

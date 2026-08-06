@@ -59,7 +59,10 @@ record-dropping manifest publishes only after every delete batch succeeded.
 Pull never writes to S3, so an interruption can only leave the local tree
 partly updated. Every record is re-judged from scratch on the next run, so a
 plain `pull` converges the metadata and any missing data, and `pull --delete`
-finishes the extras pass.
+finishes the extras pass. A pull that meets another run's residue — a record
+whose object an interrupted deletion already removed — warns and skips it
+(exit 2) and restores everything else; the record itself is retired by the
+next push, never by the pull.
 
 | Interrupted during | Surviving local state | Converged by |
 | --- | --- | --- |

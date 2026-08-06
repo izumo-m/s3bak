@@ -32,8 +32,10 @@ are foundational modules used from several layers.
   its streaming merge, sorted-stream joins, and the stat-based manifest
   comparison pull uses.
 - **localwalk** enumerates local trees in the same key order as the data sync
-  and owns exclude pruning; the data sync's local side walks with the same
-  walker (`sync_walker`), so excludes prune only the local side of a sync.
+  and applies the entry's excludes ([excludes.md](excludes.md)); the data
+  sync's local side walks with the same walker (`sync_walker`), so the sync
+  and the manifest cannot disagree on what an exclude means, and excludes
+  filter only the local side of a sync.
 - **store** is the S3 boundary. `Boto3S3Store` wraps transfers, listing, and
   object inspection.
 - **confirm** owns the deletion confirmations: answer modes, the per-item

@@ -21,8 +21,8 @@ re-transfers — the ordinary self-healing.
 
 The sync's local side enumerates the **complete view** — directories,
 symlinks as lstat leaves, special files — the same complete, no-follow
-enumeration the manifest walk uses (`localwalk`), with excludes pruned
-identically. boto3-s3's `Comparator` merge-joins that walk against the S3
+enumeration the manifest walk uses (`localwalk`), with the entry's excludes
+filtered identically ([excludes.md](excludes.md)). boto3-s3's `Comparator` merge-joins that walk against the S3
 listing into **one ascending stream of pairs**: both-sides (the update lane),
 local-only (the create lane), S3-only (the delete lane).
 
@@ -186,20 +186,23 @@ identical manifest forever).
 
 Every keep/drop policy — keep-by-default, the `--delete` confirmation, the
 `--yes` auto-confirmation, the incomplete-scan gate — lives in the emitter as
-"write a `-` or don't"; the merge applies events and knows no policy. (The
-`--meta-only` rewrite is the one non-journal writer left: `write_merged`, a
-keep-everything merge of a fresh walk.)
+"write a `-` or don't"; the merge applies events and knows no policy. (A
+single-file entry's one-record write is the one non-journal manifest writer
+left.)
 
 ## Scopes and mode flags
 
 - **A sub-path push** applies the same scheme scoped to its range: the sub
   walk feeds the pair stream, the journal stays entry-rooted, and events land
-  only at/under `sub` — plus a missing or drifted ancestor-directory record,
-  and the `.` root record when the push births the manifest, journaled as
+  only at/under `sub` — plus a missing or drifted ancestor-directory record
+  (excluded ancestors stay unrecorded), and the `.` root record when the push
+  births the manifest, journaled as
   ordinary `+` / `!`. Records outside the range have no events and copy
-  verbatim. An explicitly named file or symlink sub-path always re-records
+  verbatim. An explicitly named, non-excluded file or symlink sub-path always
+  re-records
   (naming the path is the instruction to back up its current state); a
-  removed sub-path confirmed under `--delete` journals `-` for every record
+  removed or excluded sub-path confirmed under `--delete` journals `-` for
+  every record
   in the range. Skip-over drops apply only strictly *below* `sub`, and only
   when the sub-path push runs a sync at all: an object at exactly the `sub`
   key (a kind-changed former file) sits outside the slash-bounded sub
@@ -208,13 +211,6 @@ keep-everything merge of a fresh walk.)
   sub-path, which lists nothing, proves nothing about any record below it.
 - **A single-file entry** has no tree walk and no journal: its one-record
   manifest is rewritten from a fresh lstat.
-- **`--meta-only`** runs no sync, so it keeps the full-walk manifest rebuild —
-  itself a single scan.
-- **`--data-only`** never rewrites the manifest, but the journal itself is
-  ordinary: it still records every event the sync decided and transferred,
-  and is still handed to `post_hook` through `S3BAK_JOURNAL` when the push
-  did work - a hook reading it under `--data-only` sees what was transferred,
-  not what the manifest now says (the manifest did not change).
 - **`--dry-run`** runs the journal and the merge for real (to a local temp
   file, surfacing the same warnings a real push would) and skips only the S3
   upload — the same rehearsal contract as every no-change step.

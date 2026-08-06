@@ -97,7 +97,7 @@ Each entry is a dictionary of these keys:
 | Key | Type | Default | What it sets |
 | --- | --- | --- | --- |
 | `path` | non-empty, NUL-free string | *required* | the absolute local path to back up: a directory or a regular file, never a path root (`/`, or `C:\` or `\\server\share` on Windows), a symlink, or a special file; `~` is not expanded |
-| `excludes` | list of NUL-free strings | nothing excluded | glob patterns to leave out of the backup, matched against paths relative to the entry root |
+| `excludes` | list of NUL-free strings | nothing excluded | aws-cli-style glob patterns to leave out of the backup: a relative pattern matches the path relative to the entry root, an absolute pattern the absolute path |
 | `pre_hook` | non-empty list of NUL-free strings | no hook | argument vector run before every push attempt, without a shell; a failure stops the push |
 | `post_hook` | non-empty list of NUL-free strings | no hook | argument vector run after a push that did work, without a shell; never runs after a push that changed nothing |
 | `mtime_window` | number of seconds >= 0 | the top-level value | the same tolerance, for this entry alone |
@@ -142,19 +142,22 @@ here: `/mnt/data` is a perfectly good entry.
 
 ### `excludes`
 
-A list of strings: glob patterns for paths to leave out of the backup, matched
-against paths relative to the entry root.
+A list of strings: glob patterns for paths to leave out of the backup. They
+work exactly like `aws s3 sync --exclude` — the same engine does the
+matching.
 
 ```python
 "excludes": ["*.elc", "elpa/*"]
 ```
 
-A pattern ending in `/*` names a directory, and drops it with everything under
-it before the walk descends, so an excluded subtree costs nothing to skip. Any
-other pattern is matched against individual paths. The patterns behave less
-like a shell's than they look — each is matched against a whole relative path
-rather than one name at a time, and `*` matches across directory separators —
-so [How s3bak detects changes](04-change-detection.md) covers the language and
+A relative pattern is matched against the whole path relative to the entry
+root — not one name at a time — and `*` matches across directory separators,
+so `*.elc` excludes `.elc` files at every depth. A pattern that starts at the
+filesystem root (`/home/you/...`, or a drive letter on Windows) is matched
+against the absolute path instead. Excluding a directory together with its
+contents is spelled `elpa/*`; a bare `elpa` matches only a *file* named
+`elpa`, exactly as it would in aws-cli.
+[How s3bak detects changes](04-change-detection.md) covers the language and
 its consequences properly.
 
 ### `pre_hook` and `post_hook`

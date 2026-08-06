@@ -152,8 +152,10 @@ A /home/you/bin/lib/extra.sh
 ```
 
 The letters describe what a push would change in the backup: `M` the stored
-copy differs, `A` this exists only locally, `D` this exists only in the
-backup. The tags after `M` name the properties that differ. `lib` is listed
+copy differs, `A` this exists only locally. (A third letter, `D` — this
+exists only in the backup — appears under `status --delete` alone; it
+previews the opt-in `push --delete`.) The tags after `M` name the properties
+that differ. `lib` is listed
 because adding a file to a directory changes that directory's modification
 time, and s3bak records and restores directory times like any other.
 
@@ -178,12 +180,12 @@ Move a file out of the tree to stand in for losing it:
 $ mv ~/bin/sync-notes /tmp/
 $ s3bak status bin
 M /home/you/bin	mtime
-D /home/you/bin/sync-notes
 ```
 
-`D` reads as a warning but is not one. The letters are push-oriented, so `D`
-only means the backup has something the local tree does not; an ordinary push
-keeps it. Deleting is opt-in in both directions, and
+The missing file itself is not listed. The letters are push-oriented, an
+ordinary push keeps the backup of a locally missing file, and `status`
+reports only what a push would change. `status --delete` lists it as a `D` —
+the preview of `push --delete`. Deleting is opt-in in both directions, and
 [Deleting safely](06-deleting-safely.md) covers it.
 
 Pull the entry back:

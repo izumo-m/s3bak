@@ -137,6 +137,8 @@ which one is wrong is decided case by case, and that side is fixed.
   ordering, and streaming invariants.
 - **[Sync model](sync.md)** — comparison and transfer strategies, concurrency,
   and the push and pull pipelines.
+- **[Exclusion model](excludes.md)** — the aws-cli pattern semantics behind
+  `excludes`, the ignore rule, and what exclusion does to the manifest.
 - **[Push journal](journal.md)** — the single-scan push: the journal of
   manifest changes the compare emits, its format, and the streaming manifest
   rewrite it drives.
