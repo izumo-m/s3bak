@@ -742,8 +742,10 @@ def main(argv: list[str] | None = None) -> int:
 
     # The hook selector is a positional subargument, consumed here so the
     # generic --all/positional compatibility check below sees only entries.
+    # Skipped under --help: `s3bak hook --help` must print the help a user
+    # needs to learn this very syntax, not die on the missing selector.
     hook_kind: str | None = None
-    if subcmd == "hook":
+    if subcmd == "hook" and not help_requested:
         if not positional:
             console.die("hook requires 'pre' or 'post' as its first argument")
         hook_kind = positional.pop(0)

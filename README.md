@@ -103,6 +103,7 @@ Commands:
   show        Print a backed-up file
   status      Compare local files with the backup
   verify      Verify backup integrity on S3
+  hook        Run an entry's pre_hook or post_hook on demand
   diff        Show content differences
   list        List locally configured entries
   ls-remote   List entries or files stored on S3

@@ -77,8 +77,10 @@ def test_hook_requires_pre_or_post(ws):
 
 
 def test_hook_rejects_sub_paths(ws):
+    # Rejected during argument resolution, before any hook could run, so no
+    # hook is configured here on purpose.
     ws.write("data/a.txt", "x")
-    ws.config({"data": {"path": str(ws.root / "data"), "post_hook": ["true"]}})
+    ws.config({"data": {"path": str(ws.root / "data")}})
 
     res = ws.run("hook", "post", "data/a.txt")
 
