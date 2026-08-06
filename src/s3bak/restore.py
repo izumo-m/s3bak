@@ -552,6 +552,7 @@ def _apply_record(
     window_ns: int,
     is_dir_entry: bool,
     deferred_symlinks: list[tuple[str, ManifestEntry]],
+    warn_stale: bool,
 ) -> _ApplyOutcome:
     """Repair one manifest record against its local lstat; a record whose
     local state already matches (the shared ``compare_to_stat`` predicate) is
@@ -617,11 +618,14 @@ def _apply_record(
             # gone (an interrupted deletion, an out-of-band delete). Stale
             # residue must not abort a restore - warn, skip the record, and
             # keep restoring; the next push retires the record
-            # (docs/sync.md, the pull pipeline).
-            console.warn(
-                f"warning: no data object behind this record - skipped"
-                f" (a push retires the stale record): {target}"
-            )
+            # (docs/sync.md, the pull pipeline). ``warn_stale`` False is the
+            # pull --delete re-settle, which already warned on its first
+            # pass over the same records.
+            if warn_stale:
+                console.warn(
+                    f"warning: no data object behind this record - skipped"
+                    f" (a push retires the stale record): {target}"
+                )
             return _ApplyOutcome(0)
         # A special file is never created by pull (storage.md#restore-fidelity):
         # a missing one is a hard error, not residue.
@@ -658,6 +662,7 @@ def apply_manifest(
     *,
     window_ns: int,
     excludes: list[str] | None = None,
+    warn_stale: bool = True,
 ) -> int:
     """Repair local state to match the manifest, touching (and reporting)
     only records whose local state differs - the shared size+mtime predicate
@@ -751,6 +756,7 @@ def apply_manifest(
                 window_ns=window_ns,
                 is_dir_entry=True,
                 deferred_symlinks=deferred_symlinks,
+                warn_stale=warn_stale,
             )
             errors += outcome.errors
             if outcome.defer_symlink and dir_stack:
@@ -779,6 +785,7 @@ def apply_manifest(
                 window_ns=window_ns,
                 is_dir_entry=False,
                 deferred_symlinks=deferred_symlinks,
+                warn_stale=warn_stale,
             )
             errors += outcome.errors
 

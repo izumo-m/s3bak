@@ -1215,13 +1215,18 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                     # The Windows writable prep is restored by the outer
                     # finally below, whichever way this function now returns.
                     return rc
-                # A stage nothing arrived in - a single-file lane whose
-                # recorded object is gone downloads nothing - has nothing to
-                # swap in: the conflicting root stays as it is (the staging
-                # promise), the finally below retires the empty stage, and
-                # the metadata apply judges the record against the untouched
-                # root.
-                if stage_dir is not None and os.path.lexists(dest):
+                if not is_dir and not changed:
+                    # The single-file lane downloaded nothing: its recorded
+                    # object is gone (download_from_s3 warned - stale residue
+                    # a push retires). Skip the record in FULL: no swap (the
+                    # finally retires the empty stage, so a conflicting root
+                    # stays as it is), and no metadata apply - stamping the
+                    # record's mode/mtime onto content that was never
+                    # restored would bless a local file this pull cannot
+                    # vouch for, and erase the very drift that would surface
+                    # the divergence later.
+                    return 0
+                if stage_dir is not None:
                     # The download is complete: swap in two atomic renames with
                     # the old root recoverable in between - the stage cleanup
                     # in the finally below then retires it (or, on a failed
@@ -1283,6 +1288,10 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                     prep_repaired = True
 
             if opts.delete and is_dir:
+                # A stale record (warned about and skipped above) does not
+                # gate this pass: its path has no local counterpart to
+                # misjudge, and extras are judged by the manifest, which
+                # still records it.
                 if st != 0:
                     # The local tree is not in the recorded state; extras built
                     # on that view are not trustworthy deletion candidates.
@@ -1483,8 +1492,16 @@ def _mirror_extras(
     Skipped under --dry-run, which never applies metadata."""
     status, removed = _delete_extras(manifest_path, outpath, sub, excludes, opts=opts, entry=entry)
     if removed and not opts.dryrun:
+        # warn_stale=False: the pull's first apply already warned about any
+        # stale records; the re-settle must not repeat those warnings.
         settle = apply_manifest(
-            outpath, True, manifest_path, sub=sub, window_ns=window_ns, excludes=excludes
+            outpath,
+            True,
+            manifest_path,
+            sub=sub,
+            window_ns=window_ns,
+            excludes=excludes,
+            warn_stale=False,
         )
         status = status or settle
     return status

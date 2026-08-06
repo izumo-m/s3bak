@@ -512,11 +512,15 @@ Re-running a hook on demand, the one job `--meta-only` still had, is
    record. Directory and symlink conflicts are recreated from the manifest
    (a symlink replacing a local directory as the deferred placement above); a
    regular-file conflict is reported instead of following a hostile local
-   symlink. A regular file the manifest records but that no object placed —
+   symlink. A regular-file record whose object is gone —
    the residue of a deletion that outran its manifest rewrite, or an object
-   removed out-of-band — is warned about and skipped (exit 2), the warning
-   noting that the next push retires the record; the pull restores
-   everything else rather than aborting a recovery over residue.
+   removed out-of-band — is warned about and skipped in full (exit 2), the
+   warning noting that the next push retires the record; the pull restores
+   everything else rather than aborting a recovery over residue. Skipped in
+   full means the local path is left exactly as it is, its metadata
+   included: applying the record's mode/mtime over content the pull never
+   restored would report a restore that did not happen, and hide a diverged
+   local copy from every later size+mtime comparison.
    Recorded owner and group names are not applied.
 
 What a pull can reproduce is bounded by what the backup records — see

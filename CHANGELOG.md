@@ -36,10 +36,12 @@ a fix only (Fixed).
 
 - A pull that meets a file record whose S3 object is gone — the residue of
   an interrupted deletion or an out-of-band delete — now warns, skips the
-  record, and restores everything else (exit 2), instead of failing the
-  whole restore over residue the next push retires anyway. A record whose
-  local file diverged while its object is gone still fails (the pull can
-  restore nothing and must not bless the local copy), and a missing
+  record in full, and restores everything else (exit 2), instead of failing
+  the whole restore over residue the next push retires anyway. Skipped in
+  full means the local path is left exactly as it is: no download, and no
+  metadata applied — stamping the record's mode/mtime over content that was
+  never restored would report a restore that did not happen and hide a
+  diverged local copy from every later size+mtime comparison. A missing
   special-file record stays a hard error (pull never creates one).
 - A manifest file record whose S3 object is gone is now retired by any push,
   not only by `push --delete`: it describes a backup that no longer exists,

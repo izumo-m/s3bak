@@ -769,10 +769,15 @@ def download_from_s3(
         return 0, True
     if not cfg.store.get_object(rel, outpath, size=size, verbose=verbose):
         # A recorded object that is gone is stale residue, not this pull's
-        # reason to abort: return clean and let the metadata apply judge the
-        # record against whatever is local - nothing there produces the
-        # stale-record warning, and a diverged local file fails its size
-        # check. Mirrors the directory sync, where a missing object simply
-        # never appears in the listing.
+        # reason to abort: warn here - the one place that knows the object
+        # is missing rather than merely "nothing local" - and return clean
+        # with changed=False, which tells cmd_pull to skip this record in
+        # full. Whatever is local stays untouched: applying the record's
+        # metadata over content that was never restored would report a
+        # restore that did not happen.
+        console.warn(
+            f"warning: no data object behind this record - skipped"
+            f" (a push retires the stale record): {cfg.prefix}/{rel}"
+        )
         return 0, False
     return 0, True
