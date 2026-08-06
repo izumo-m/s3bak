@@ -114,9 +114,10 @@ def test_hook_propagates_the_hook_exit_status(ws):
     assert "post_hook failed" in res.err
 
 
-def test_hook_all_runs_every_entry_and_reports_the_missing_hook(ws):
-    # --all runs each entry's hook; an entry without one fails the command
-    # (first-configured-entry ordering) while the others still run.
+def test_hook_all_runs_configured_hooks_and_skips_the_rest(ws):
+    # --all means "run every configured hook of that kind": a hook-less
+    # entry is outside the operation's domain, not an error - so a real
+    # hook failure's exit status is never shadowed by one.
     marker = ws.root / "ran-b"
     ws.config(
         {
@@ -125,11 +126,42 @@ def test_hook_all_runs_every_entry_and_reports_the_missing_hook(ws):
         }
     )
 
+    res = ws.run("hook", "post", "--all", expect_rc=0)
+
+    assert marker.exists()
+    assert "no post_hook configured" not in res.err
+
+    res = ws.run("hook", "post", "--all", "-v", expect_rc=0)
+    assert "skipped (no post_hook): a" in res.err + res.out
+
+
+def test_hook_all_with_no_configured_hooks_fails(ws):
+    # Every entry outside the domain: the instruction is a no-op in full,
+    # which - like a named entry without the hook - must not read as success.
+    ws.config({"a": {"path": str(ws.root / "a")}, "b": {"path": str(ws.root / "b")}})
+
     res = ws.run("hook", "post", "--all")
 
     assert res.rc == 1
-    assert "a: no post_hook configured" in res.err
-    assert marker.exists()
+    assert "no entry configures a post_hook" in res.err
+
+
+def test_hook_all_does_not_shadow_a_real_failure(ws):
+    # A hook-less entry sorting first must not mask a genuine hook failure's
+    # exit status.
+    ws.config(
+        {
+            "a": {"path": str(ws.root / "a")},
+            "b": {
+                "path": str(ws.root / "b"),
+                "post_hook": [sys.executable, "-c", "raise SystemExit(3)"],
+            },
+        }
+    )
+
+    res = ws.run("hook", "post", "--all")
+
+    assert res.rc == 3
 
 
 def test_hook_needs_no_s3_client(ws, monkeypatch):

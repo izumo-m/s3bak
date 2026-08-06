@@ -76,7 +76,11 @@ without constructing an S3 client because its result is entirely local.
 hook on demand, outside any push — the way to re-run an off-site copy after
 the far side changed, or to test a dump script. The first positional argument
 selects the hook; the remaining arguments are entry names, resolved and
-aggregated exactly as for other multi-entry commands (`--all` included).
+aggregated exactly as for other multi-entry commands. `--all` runs every
+CONFIGURED hook of that kind: an entry without one is outside the
+operation's domain and is skipped (reported under `-v`), so a real hook
+failure's exit status is never shadowed by a hook-less entry — the command
+errors only when no entry configures the hook at all.
 
 The hook executes under the same contract as a push-run hook: an argument
 vector run without a shell, stdin detached, and the same exit-status

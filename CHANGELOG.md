@@ -28,9 +28,12 @@ a fix only (Fixed).
   far side changed, or testing a dump script. The hook executes under the
   same contract as a push-run hook (argument vector, no shell, stdin
   detached, the same exit-status normalization), with `S3BAK_JOURNAL`
-  unset. An entry without the named hook fails (exit 1); `--dry-run`
-  prints the command line without running it; like `list`, the command
-  needs no S3 client.
+  unset. An entry NAMED without the hook configured fails (exit 1) — the
+  config ignores misspelled keys silently, so this error is where a
+  `post_hok:` typo surfaces; `--all` instead runs every configured hook of
+  that kind, skipping hook-less entries (shown under `-v`), and errors
+  only when no entry configures one. `--dry-run` prints the command line
+  without running it; like `list`, the command needs no S3 client.
 
 ### Removed
 

@@ -879,7 +879,23 @@ def main(argv: list[str] | None = None) -> int:
     elif subcmd == "hook":
         assert hook_kind is not None
         if opt_all:
-            hook_entries = sorted(cfg.entries.keys())
+            # --all means "run every CONFIGURED <kind>_hook": an entry
+            # without one is outside the operation's domain and is skipped -
+            # like push --all not failing over an entry with no changes -
+            # so a real hook failure's exit status is never shadowed by a
+            # hook-less entry's would-be error. Naming an entry stays an
+            # instruction (cmd_hook errors on a missing hook there): the
+            # config silently ignores misspelled keys, and that error is
+            # where a `post_hok:` typo surfaces.
+            hook_entries = [
+                e for e in sorted(cfg.entries.keys()) if cfg.entries[e].get(f"{hook_kind}_hook")
+            ]
+            if not hook_entries:
+                console.err(f"no entry configures a {hook_kind}_hook")
+                return 1
+            if opt_verbose:
+                for skipped in sorted(cfg.entries.keys() - set(hook_entries)):
+                    console.diag(f"skipped (no {hook_kind}_hook): {skipped}\n")
         else:
             resolved = resolve_entry_files(cfg, positional, "hook")
             for hook_entry, hook_sub in resolved:
