@@ -495,7 +495,7 @@ def test_push_delete_interactive_drops_objectless_records_on_y(ws, answers):
     # The retired records stay retired: nothing left to ask, nothing to D.
     second = ws.run("push", "--delete", "data", expect_rc=0)
     assert second.out == ""
-    status = ws.run("status", "data", expect_rc=0)
+    status = ws.run("status", "--delete", "data", expect_rc=0)
     assert "D " not in status.out
 
 
@@ -535,7 +535,7 @@ def test_push_delete_offers_directory_records_post_order(ws, answers):
         assert probe in prompt
     assert _manifest_paths(ws) == [".", "./keep.txt"]
     assert ws.keys() == {"data/keep.txt", "data-manifest.jsonl"}
-    status = ws.run("status", "data", expect_rc=0)
+    status = ws.run("status", "--delete", "data", expect_rc=0)
     assert "D " not in status.out
     # Converged: nothing left to offer, nothing to rewrite.
     second = ws.run("push", "--delete", "data", expect_rc=0)

@@ -1659,6 +1659,14 @@ def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
         use_color = _resolve_use_color(opts.color)
         window_ns = cfg.window_ns_for(entry)
 
+        # A missing ENTRY root is the one state where plain status cannot be
+        # the preview of its push - the push refuses to run at all - so it
+        # must not read as a clean tree. Warn (exit 2); --delete still lists
+        # every record as D. A missing SUB root is an ordinary D-state (a
+        # deleted subtree) and stays quiet.
+        if sub is None and not os.path.lexists(outpath):
+            console.warn(f"warning: local path does not exist (a push would refuse): {outpath}")
+
         if not is_dir:
             # Single-file entry (or a file/symlink sub): one direct compare. A
             # leaf sub reached through a local symlinked ancestor is not cleanly

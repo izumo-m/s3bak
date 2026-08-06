@@ -11,6 +11,11 @@ a fix only (Fixed).
 
 ### Added
 
+- `status --delete`: the preview of `push --delete`. Manifest-only records —
+  locally deleted paths and residue under excluded paths alike — print as
+  `D`, the candidates the push would offer. Like plain status it never
+  lists the bucket, so it previews only what the manifest records; the
+  exact rehearsal with the real listing stays `push --delete --dry-run`.
 - `s3bak hook pre <entry>` / `s3bak hook post <entry>`: run one configured
   hook on demand, outside any push — re-running an off-site copy after the
   far side changed, or testing a dump script. The hook executes under the
@@ -31,14 +36,6 @@ a fix only (Fixed).
   restored data without its recorded metadata, or the reverse — a tree no
   record describes. Re-running a `post_hook` on demand, the one job left to
   `push --meta-only`, is the `hook` command added in this release.
-
-### Added
-
-- `status --delete`: the preview of `push --delete`. Manifest-only records —
-  locally deleted paths and residue under excluded paths alike — print as
-  `D`, the candidates the push would offer. Like plain status it never
-  lists the bucket, so it previews only what the manifest records; the
-  exact rehearsal with the real listing stays `push --delete --dry-run`.
 
 ### Changed
 

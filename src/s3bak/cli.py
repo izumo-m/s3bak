@@ -232,9 +232,10 @@ _OPTION_SPECS = {
     "all": _OptionSpec("--all", "Apply to all configured entries", "--all"),
     "dry_run": _OptionSpec("--dry-run", "Show changes without applying them", "--dry-run"),
     "delete": _OptionSpec(
-        "--delete",
-        "Delete destination items absent from the source (status: list them)",
-        "--delete",
+        "--delete", "Delete destination items absent from the source", "--delete"
+    ),
+    "status_delete": _OptionSpec(
+        "--delete", "List what push --delete would offer to remove (removes nothing)", "--delete"
     ),
     "yes": _OptionSpec("--yes", "Confirm every deletion", "--yes"),
     "checksum": _OptionSpec(
@@ -338,7 +339,7 @@ _COMMAND_SPECS = {
             "s3bak status [options] --all",
         ),
         arguments=(("<entry|path>...", "Entries or paths to compare"),),
-        options=("all", "delete", "mtime_window", "verbose", "color", "no_color", "help"),
+        options=("all", "status_delete", "mtime_window", "verbose", "color", "no_color", "help"),
         sections=(
             (
                 "Status letters",
@@ -685,7 +686,9 @@ def main(argv: list[str] | None = None) -> int:
             used_options.append("dry_run")
         elif a == "--delete":
             opt_delete = True
-            used_options.append("delete")
+            # status carries its own spec for the flag (same label, its own
+            # help wording: it removes nothing).
+            used_options.append("status_delete" if subcmd == "status" else "delete")
         elif a == "--yes":
             opt_yes = True
             used_options.append("yes")

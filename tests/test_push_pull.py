@@ -1401,6 +1401,16 @@ def test_status_warns_on_inaccessible_single_file_entry(ws):
     finally:
         os.chmod(ws.root / "locked", 0o755)
     assert "cannot access" in res.err.lower()
+    # status --delete is where a missing file would print D, so it is where
+    # a false "missing" must be proven absent.
+    os.chmod(ws.root / "locked", 0o755)
+    ws.run("push", "solo", expect_rc=0)  # no-op; keeps the fixture coherent
+    os.chmod(ws.root / "locked", 0)
+    try:
+        res = ws.run("status", "--delete", "solo")
+    finally:
+        os.chmod(ws.root / "locked", 0o755)
+    assert "cannot access" in res.err.lower()
     assert not res.out.strip().startswith("D ")  # not falsely reported missing
 
 

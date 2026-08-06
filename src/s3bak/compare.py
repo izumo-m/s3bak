@@ -168,7 +168,7 @@ def mode_differs(entry: ManifestEntry, st: os.stat_result) -> bool:
 
 @dataclass
 class EntryDiff:
-    status: str | None  # None=match, "M"=modified, "D"=missing/wrong-type
+    status: str | None  # None=match, "M"=modified (a type change included), "D"=nothing local
     tags: list[str]  # ["mode", "mtime", "size", "link"]
     details: list[str]  # human-readable per-field detail lines
 

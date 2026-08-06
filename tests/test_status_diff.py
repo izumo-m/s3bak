@@ -101,7 +101,7 @@ def test_status_missing_subpath_errors(ws):
     assert "not found" in (res.err + res.out).lower()
 
 
-def test_status_of_missing_directory_tree_reports_each_child(ws):
+def test_status_of_missing_directory_tree_reports_children_under_delete(ws):
     # When the whole local tree is gone, status must classify the entry as a
     # directory from the manifest (not os.path.isdir of the missing path), so
     # each record maps to its own child path instead of folding onto one and
@@ -116,7 +116,8 @@ def test_status_of_missing_directory_tree_reports_each_child(ws):
     shutil.rmtree(ws.root / "data")
 
     res = ws.run("status", "data", expect_rc=0)
-    assert res.out.strip() == ""  # a plain push would touch nothing
+    assert res.out.strip() == ""  # a plain push would touch nothing...
+    assert "does not exist" in res.err  # ...because it would refuse to run
 
     res = ws.run("status", "--delete", "data", expect_rc=0)
     d_targets = [ln.split(None, 1)[1] for ln in res.out.splitlines() if ln.startswith("D")]
@@ -144,6 +145,62 @@ def test_status_reports_type_change_as_m_with_type_tag(ws):
 
     res = ws.run("status", "-v", "data", expect_rc=0)
     assert "type: remote=regular file local=symlink" in res.out
+
+
+def test_status_reports_symlink_replaced_by_file_as_m_type(ws):
+    # The other direction: a recorded symlink whose local path is now a
+    # regular file - the pair reports M with a `type` tag too.
+    ws.write("data/real.txt", "content")
+    os.symlink("real.txt", ws.root / "data" / "u")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    (ws.root / "data" / "u").unlink()
+    ws.write("data/u", "now a file")
+
+    res = ws.run("status", "-v", "data", expect_rc=0)
+    lines = res.out.splitlines()
+    assert any(ln.startswith("M") and ln.endswith("type") and "data/u" in ln for ln in lines)
+    assert "type: remote=symlink local=regular file" in res.out
+
+
+def test_single_file_status_deleted_local_prints_d_under_delete_only(ws):
+    f = ws.write("solo.txt", "content")
+    ws.config({"solo.txt": {"path": str(f)}})
+    ws.run("push", "solo.txt", expect_rc=0)
+    f.unlink()
+
+    res = ws.run("status", "solo.txt", expect_rc=0)
+    assert res.out.strip() == ""
+    assert "does not exist" in res.err  # the push-would-refuse warning
+
+    res = ws.run("status", "--delete", "solo.txt", expect_rc=0)
+    assert any(ln.startswith("D ") for ln in res.out.splitlines())
+
+
+def test_status_dir_sub_through_symlinked_ancestor(ws):
+    # A directory sub reached through a symlinked parent cannot be compared
+    # cleanly: plain status warns and stays silent; --delete lists the
+    # records as D with the same warning.
+    ws.write("data/d/e/f.txt", "hello")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    outside = ws.root / "outside"
+    (outside / "e").mkdir(parents=True)
+    (outside / "e" / "f.txt").write_text("hello")
+    import shutil
+
+    shutil.rmtree(ws.root / "data" / "d")
+    os.symlink(outside, ws.root / "data" / "d")
+
+    res = ws.run("status", "data/d/e", expect_rc=0)
+    assert res.out.strip() == ""
+    assert "symlinked parent" in res.err
+
+    res = ws.run("status", "--delete", "data/d/e", expect_rc=0)
+    assert any(ln.startswith("D ") and "f.txt" in ln for ln in res.out.splitlines())
+    assert "symlinked parent" in res.err
 
 
 def test_status_detects_changed_symlink_target(ws):

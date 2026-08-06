@@ -121,7 +121,8 @@ examples.
 ```sh
 s3bak push --all              # back up every configured entry
 s3bak push --all --dry-run    # preview without uploading
-s3bak status bin              # M/A/D summary for one entry
+s3bak status bin              # what a push would change (M/A)
+s3bak status --delete bin     # also list what push --delete would offer (D)
 s3bak pull bin home-docs      # restore selected entries in parallel
 s3bak pull bin -o /tmp/out    # restore the bin entry to /tmp/out
 s3bak pull bin --delete --dry-run  # preview a mirror restore
@@ -132,10 +133,11 @@ s3bak verify --all --checksum # also compare local content to S3 ETags
 s3bak ls-remote               # list entries stored on S3
 ```
 
-The `status` letters are push-oriented (what a push would change on the backup):
-`M` modified, `A` only local (push would add), `D` only in backup
-(`push --delete` would remove; a plain push keeps it, unless its stored object
-is already gone — a record backing nothing is retired by any push).
+The `status` letters are push-oriented — each variant previews its push:
+`M` modified (a type change included), `A` only local (a push would add it),
+and `D` only in backup, printed by `status --delete` alone — the candidates
+`push --delete` would offer (a plain push keeps them, unless the stored
+object is already gone — a record backing nothing is retired by any push).
 
 ## Design
 

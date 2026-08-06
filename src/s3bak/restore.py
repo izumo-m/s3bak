@@ -338,11 +338,11 @@ def local_keyed(
     try:
         os.lstat(outpath)
     except FileNotFoundError:
-        return  # missing locally: status degrades to reporting every record D
+        return  # missing locally: every record is manifest-only (cmd_status warns)
     except OSError as e:
         # An unreadable outpath (an unsearchable parent, say) is NOT "absent":
-        # os.path.lexists would swallow the error and status would then print
-        # every record D and exit 0, hiding that the comparison never happened.
+        # os.path.lexists would swallow the error and status would then read
+        # as a clean tree (exit 0), hiding that the comparison never happened.
         # Report it as a walk gap so status warns and the run exits 2.
         if warn is not None:
             warn(f"cannot read {outpath}: {e}")
