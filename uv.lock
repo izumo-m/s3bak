@@ -30,17 +30,18 @@ wheels = [
 
 [[package]]
 name = "boto3-s3"
-version = "0.9.0"
+version = "0.10.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "boto3" },
     { name = "botocore" },
+    { name = "python-dateutil" },
     { name = "s3transfer" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/7b/0f/0b2ffb4e0c33c551d23b47d72896334d09afd2d7aea80e74aa5ee335f87a/boto3_s3-0.9.0.tar.gz", hash = "sha256:51d799cf43f1b7275408777bef8e8a7bed14c860ebe6229694a033fbb7ac8332", size = 214683, upload-time = "2026-07-31T23:15:43.908Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/40/20/48107573de25b0356d4f3c6cccef56811628cb938f8d98a8f4e5ed7319a7/boto3_s3-0.10.0.tar.gz", hash = "sha256:85ca13e21d0948e08defa72b88a0f88be7aeef2f3cc85c0b99a7aa807c1ac534", size = 243717, upload-time = "2026-08-13T14:52:54.664Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/54/5f/8055ab21d532983b6311963c6163d8e2ddc5854e9b34c64ab9b47a989003/boto3_s3-0.9.0-py3-none-any.whl", hash = "sha256:02d7759a76199a05edd63cb0bbc6498e24fca5a923c9c617d7408b0b81fb7733", size = 231464, upload-time = "2026-07-31T23:15:42.795Z" },
+    { url = "https://files.pythonhosted.org/packages/e8/5b/30dbc2ff46a5da111f9b5290bbbbd220562c04808182019b5a1f533a82e7/boto3_s3-0.10.0-py3-none-any.whl", hash = "sha256:ecc1b721b8e79f7217f9d4676f87608c7035f3697b6bc9e7f60a5e836d5ae906", size = 257239, upload-time = "2026-08-13T14:52:53.367Z" },
 ]
 
 [[package]]
@@ -355,7 +356,7 @@ name = "exceptiongroup"
 version = "1.3.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
+    { name = "typing-extensions" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/50/79/66800aadf48771f6b62f7eb014e352e5d06856655206165d775e675a02c9/exceptiongroup-1.3.1.tar.gz", hash = "sha256:8b412432c6055b0b7d14c310000ae93352ed6754f70fa8f7c34141f91c4e3219", size = 30371, upload-time = "2025-11-21T23:01:54.787Z" }
 wheels = [
@@ -741,7 +742,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "boto3", specifier = ">=1.28" },
-    { name = "boto3-s3", specifier = ">=0.8,<0.10" },
+    { name = "boto3-s3", specifier = ">=0.8,<0.11" },
 ]
 
 [package.metadata.requires-dev]
