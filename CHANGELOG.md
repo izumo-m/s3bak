@@ -9,6 +9,8 @@ a fix only (Fixed).
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-08-14
+
 ### Fixed
 
 - `cryptography`, pulled in transitively by the `moto` test dependency,

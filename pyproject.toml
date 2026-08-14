@@ -1,6 +1,6 @@
 [project]
 name = "s3bak"
-version = "0.6.0"
+version = "0.6.1"
 description = "Unified S3 backup/restore tool"
 readme = "README.md"
 requires-python = ">=3.10"
