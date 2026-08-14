@@ -144,12 +144,6 @@ def load_config(*, create_store: bool = True) -> Config:
         config_path = expand_home("~/.config/s3bak/config.py")
 
     if not os.path.isfile(config_path):
-        config_sh = expand_home("~/.config/s3bak/config.sh")
-        if os.path.isfile(config_sh):
-            console.die(
-                f"found {config_sh} but s3bak now requires config.py\n"
-                f"  Please create: {config_path}"
-            )
         console.die(
             f"config file not found: {config_path}\n\n"
             f"Create it with contents like:\n\n"

@@ -37,6 +37,10 @@ a fix only (Fixed).
 
 ### Removed
 
+- The migration hint for `~/.config/s3bak/config.sh`, printed instead of the
+  ordinary "config file not found" message when that file existed. s3bak has
+  read `config.py` for its whole documented life, and the skeleton the plain
+  message offers is more useful than a pointer to a format nothing describes.
 - `--meta-only` and `--data-only`, on push and pull both. A one-sided push
   could record local state S3 does not hold (`--meta-only`, which then hides
   a never-pushed edit from every later size+mtime check) or upload objects
