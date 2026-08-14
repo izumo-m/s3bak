@@ -9,6 +9,16 @@ a fix only (Fixed).
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-08-14
+
+### Fixed
+
+- `cryptography`, pulled in transitively by the `moto` test dependency,
+  bumped from 49.0.0 to 50.0.0, fixing
+  [GHSA-g6cj-pr64-35w5](https://github.com/pyca/cryptography/security/advisories/GHSA-g6cj-pr64-35w5)
+  (CVE-2026-69247). The dependency is test-only — it never ships with an
+  installed s3bak — but `uv.lock` had it pinned below the fixed version.
+
 ## [0.6.0] - 2026-08-14
 
 ### Added
