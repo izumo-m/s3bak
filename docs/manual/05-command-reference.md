@@ -373,10 +373,11 @@ stale stays stale. Where the backup no longer holds the object a record names,
 the pull says so, skips that one path and carries on:
 
 ```console
-warning: no data object behind this record - skipped (a push retires the stale record): s3://my-bucket/backup/demo/gone.txt
+warning: no data object behind this record - skipped (a push retires the stale record): /home/you/demo/gone.txt
 ```
 
-That is a warning, so the run finishes and exits 2.
+That is a warning, so the run finishes and exits 2. A single-file entry names
+the object instead of the local path, since there is no tree to place it in.
 [Recovery and troubleshooting](08-recovery-troubleshooting.md) covers what
 leaves such a record behind, and `pull --delete` is in
 [Deleting safely](06-deleting-safely.md).
