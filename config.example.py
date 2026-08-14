@@ -67,9 +67,9 @@ prefix = "s3://my-bucket/backup"
 # directory push, or a sub-path push whose target still exists), post_hook
 # also gets S3BAK_JOURNAL in its environment: the path of that push's journal
 # file (see docs/journal.md), readable only until the hook returns. It is
-# unset for a --meta-only refresh, a single-file entry, and a sub-path
-# deletion - a hook must treat "unset" as "no per-file detail, assume
-# anything may have changed".
+# unset for a single-file entry, a sub-path deletion, and the on-demand
+# "s3bak hook" command - a hook must treat "unset" as "no per-file detail,
+# assume anything may have changed".
 entries = {
     ".ssh": {"path": f"{HOME}/.ssh", "excludes": ["agent/*"]},
     "bin": {"path": f"{HOME}/bin", "excludes": ["__pycache__/*"], "mtime_window": 0},

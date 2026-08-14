@@ -433,15 +433,6 @@ Deleting is opt-in and confirmed:
   record-only candidates as `(dry-run) delete record:` lines.
   Applies to pull too (see below).
 
-Push has no one-sided modes. The former `--meta-only` (manifest without
-data) could record local state S3 does not hold, and the former `--data-only`
-(data without manifest) uploaded objects the manifest does not record — both
-broke the manifest's correspondence with S3
-([storage.md](storage.md#the-manifest)), and the journal-driven push, which
-refreshes metadata and records uploads in the same scan, left them no job.
-Re-running a hook on demand, the one job `--meta-only` still had, is
-`s3bak hook post <entry>`.
-
 ## The pull pipeline
 
 `cmd_pull`:
@@ -582,9 +573,3 @@ names).
   transfer report can differ from what the real (staged) pull transfers.
 - **`-o/--output`** restores one target to an alternative path instead of the
   entry's configured path. It is not available for multi-target pulls.
-
-Pull has no one-sided modes either: data without its recorded metadata, or
-metadata without its data, is a tree no record describes, so the former
-`--meta-only` / `--data-only` were removed together with push's. A plain
-pull applies both sides and touches only what differs; `--mtime-window 0`
-covers the exact-refresh use.

@@ -360,8 +360,8 @@ def test_diff_ignores_s3_object_not_in_manifest(ws):
     ws.config({"data": {"path": str(ws.root / "data")}})
     ws.run("push", "data", expect_rc=0)
 
-    # An orphan object (e.g. left by a --meta-only push after a local delete)
-    # is not part of the backup: the source-of-truth manifest defines it.
+    # An orphan object (e.g. left by a push interrupted before its manifest
+    # write) is not part of the backup: the source-of-truth manifest defines it.
     ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/sub/orphan.txt", Body=b"old\n")
 
     res = ws.run("diff", "data", expect_rc=0)

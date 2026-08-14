@@ -319,9 +319,8 @@ def test_windows_pull_restores_writable_prep_when_apply_manifest_fails(ws, monke
     restored: list[list[tuple[str, int]]] = []
     monkeypatch.setattr(commands, "windows_collect_writable_prep", spy_collect)
     monkeypatch.setattr(commands, "windows_restore_modes", lambda prep: restored.append(list(prep)))
-    # apply_manifest ran (unlike the download-failure / --data-only paths,
-    # which already restored the prep before this fix) and reported a
-    # metadata-apply failure - the exact gap this fix closes.
+    # Simulate apply_manifest running and reporting a metadata-apply failure:
+    # windows_restore_modes must still run on the way out.
     monkeypatch.setattr(commands, "apply_manifest", lambda *a, **k: 1)
 
     res = ws.run("pull", "data", "-o", str(dest))
