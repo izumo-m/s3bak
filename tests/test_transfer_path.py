@@ -329,3 +329,56 @@ def test_get_object_propagates_a_glacier_transfer_failure(ws, monkeypatch):
     monkeypatch.setattr(store._s3, "cp", fake_cp)
     with pytest.raises(Boto3S3Error):
         store.get_object("big", str(ws.root / "x.out"), size=store._small_limit)
+
+
+# --- the single-file pull names the lane it took ---------------------------
+#
+# A directory pull's lines come from boto3-s3, which reports each transfer it
+# makes. Nothing reports a single-object transfer, so download_from_s3 prints
+# the line itself - and since the two lanes differ in more than part count
+# (multipart parallelism, the glacier handling), the line names which ran.
+
+
+def _single_file_ws(ws):
+    f = ws.write("solo.txt", "content")
+    ws.config({"solo.txt": {"path": str(f)}})
+    ws.run("push", "solo.txt", expect_rc=0)
+    f.write_text("locally changed, so the pull has work")
+    return f
+
+
+def test_single_file_pull_reports_the_direct_get_object(ws):
+    _single_file_ws(ws)
+    res = ws.run("pull", "solo.txt", expect_rc=0)
+    assert "download: s3://" in res.out
+    assert "(boto3 get_object)" in res.out
+
+
+def test_single_file_pull_reports_the_cp_lane_for_a_large_object(ws, monkeypatch):
+    # Forced with a tiny limit rather than an 8 MiB fixture, like the upload
+    # test above.
+    monkeypatch.setattr(cli.Boto3S3Store, "_resolve_small_limit", lambda self: 4)
+    _single_file_ws(ws)
+    res = ws.run("pull", "solo.txt", expect_rc=0)
+    assert "(boto3-s3 cp)" in res.out
+
+
+def test_single_file_pull_dry_run_names_the_same_lane(ws):
+    f = _single_file_ws(ws)
+    before = f.read_text()
+    res = ws.run("pull", "--dry-run", "solo.txt", expect_rc=0)
+    assert "(dry-run) download: s3://" in res.out
+    assert "(boto3 get_object)" in res.out
+    assert f.read_text() == before  # a rehearsal, as promised
+
+
+def test_single_file_pull_prints_no_download_line_for_a_stale_record(ws):
+    # The line is printed after the transfer, so the record whose object is
+    # gone warns and prints nothing - a line up front would have announced a
+    # download that never happened.
+    _single_file_ws(ws)
+    ws.s3.delete_object(Bucket=ws.bucket, Key=f"{ws.prefix}/solo.txt")
+
+    res = ws.run("pull", "solo.txt", expect_rc=0)
+    assert "download:" not in res.out
+    assert "no data object behind this record" in res.err

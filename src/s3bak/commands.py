@@ -989,6 +989,12 @@ def _entry_kind_from_manifest(manifest_path: str) -> str:
     return "dir" if first.path == "." else "file"
 
 
+# How the kinds `_sub_kind_from_manifest` returns are named to the user. The
+# regular file (`file`) and the absent path (`missing`) are left out: every
+# caller here reports those in its own terms.
+_BACKUP_KIND_NAMES = {"dir": "directory", "symlink": "symlink", "special": "special file"}
+
+
 def _sub_kind_from_manifest(manifest_path: str, sub: str) -> str:
     """Return file, dir, symlink, special, or missing for a manifest sub-path.
 
@@ -1626,7 +1632,48 @@ def cmd_show(cfg: Config, entry: str, opts: Opts, file: str | None = None) -> in
         rel = entry
 
     assert cfg.store is not None
-    return cfg.store.stream_object_to_stdout(rel, verbose=opts.verbose)
+    if cfg.store.stream_object_to_stdout(rel, verbose=opts.verbose):
+        return 0
+    console.err(_show_absent_reason(cfg, entry, file, opts))
+    return 1
+
+
+def _show_absent_reason(cfg: Config, entry: str, file: str | None, opts: Opts) -> str:
+    """Why `show` found no object at that key.
+
+    The manifest is consulted only here, after the stream already failed: the
+    common case stays one request, and `show` keeps working when the manifest
+    itself cannot be read - the one command that does, which is what makes it
+    usable while a damaged manifest is being repaired. So a manifest that
+    cannot explain the absence simply reports the absence."""
+    target = f"{entry}/{file}" if file else entry
+    fd, manifest_path = tempfile.mkstemp(suffix=".jsonl")
+    os.close(fd)
+    try:
+        if download_manifest(cfg, entry, manifest_path, opts.verbose):
+            entry_is_dir = _entry_kind_from_manifest(manifest_path) == "dir"
+            if file and not entry_is_dir:
+                return f"sub path not allowed for single-file entry: {entry}"
+            if file:
+                kind = _sub_kind_from_manifest(manifest_path, file)
+            else:
+                kind = "dir" if entry_is_dir else "file"
+            if kind in _BACKUP_KIND_NAMES:
+                return (
+                    f"only a regular file can be shown, not a {_BACKUP_KIND_NAMES[kind]}: {target}"
+                )
+            if kind == "file":
+                # Recorded as a regular file, yet its object is gone: the same
+                # stale residue a pull skips over (docs/sync.md).
+                return (
+                    f"no data object behind this record"
+                    f" (a push retires the stale record): {cfg.prefix}/{target}"
+                )
+    except manifest.ManifestError:
+        pass
+    finally:
+        os.unlink(manifest_path)
+    return f"not found on S3: {target}"
 
 
 def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int:
@@ -2111,10 +2158,9 @@ def cmd_diff(cfg: Config, entry: str, opts: Opts, file: str | None = None) -> in
                 # entry-outside target (content, link, or type), whatever the
                 # recorded kind. Report it unreachable. (diff_backup's own guards
                 # only cover ancestors at/under the sub root, not above it.)
-                backup_desc = {"dir": "directory", "symlink": "symlink", "special": "special file"}
                 _write_leaf_type_diff(
                     f"{entry}/{file}",
-                    backup_desc.get(kind, "regular file"),
+                    _BACKUP_KIND_NAMES.get(kind, "regular file"),
                     "unreachable (through a symlinked parent)",
                 )
                 return 1

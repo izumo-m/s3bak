@@ -418,6 +418,12 @@ class Boto3S3Store:
         code = e.response.get("Error", {}).get("Code", "")
         return code in ("404", "NoSuchKey", "NotFound")
 
+    def multipart_download(self, size: int | None) -> bool:
+        """Which lane ``get_object`` takes for an object of ``size``: True for
+        S3.cp's parallel multipart download, False for a single GetObject.
+        Callers report the lane a single-object transfer used."""
+        return size is not None and size >= self._small_limit
+
     def get_object(
         self,
         rel_key: str,
@@ -431,7 +437,7 @@ class Boto3S3Store:
         limit) goes through S3.cp for parallel multipart download; everything
         else - and any object of unknown size - is a single streamed
         GetObject, avoiding s3transfer's pre-transfer HeadObject probe."""
-        if size is not None and size >= self._small_limit:
+        if self.multipart_download(size):
             from boto3_s3 import NotFoundError
 
             if verbose:
@@ -596,7 +602,9 @@ class Boto3S3Store:
 
         return self.delete_objects(doomed_keys(), dryrun=dryrun, verbose=verbose)
 
-    def stream_object_to_stdout(self, rel_key: str, *, verbose: bool = False) -> int:
+    def stream_object_to_stdout(self, rel_key: str, *, verbose: bool = False) -> bool:
+        """Write the object to stdout; False if it is absent, so the caller can
+        say why in its own words (other errors propagate to run())."""
         from botocore.exceptions import ClientError
 
         if verbose:
@@ -604,12 +612,13 @@ class Boto3S3Store:
         try:
             resp = self._client.get_object(Bucket=self.bucket, Key=self._api_key(rel_key))
         except ClientError as e:
-            console.diag(f"{e}\n")
-            return 1
+            if self._is_not_found(e):
+                return False
+            raise
         with closing(resp["Body"]) as body:
             shutil.copyfileobj(body, sys.stdout.buffer)
         sys.stdout.buffer.flush()
-        return 0
+        return True
 
     def sync_down(
         self,

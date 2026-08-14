@@ -135,6 +135,14 @@ accordingly; a manifest download (small, size unknown) always takes the direct
 path. Directory syncs (`sync_up` / `sync_down`) always use `S3.cp` — moving many
 files is exactly what its machinery is for.
 
+A single-object download therefore reports its own transfer line, naming the
+lane (`boto3-s3 cp` or `boto3 get_object`): a sync's lines come from
+boto3-s3's result callback, which knows nothing of a transfer made outside
+it, so without this the pull of a single-file entry would be silent where its
+`--dry-run` announced a download. The line prints after the transfer, like
+the callback's own, so the stale-record branch (no object behind the record)
+warns instead of announcing a download that never happened.
+
 ## Concurrency
 
 - Multi-entry commands run entries through a thread pool, capped at 4 by

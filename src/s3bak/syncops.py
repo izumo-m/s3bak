@@ -764,12 +764,16 @@ def download_from_s3(
     # dry-run stand-in line ("would apply manifest metadata") printed for it.
     # `size` (from the manifest record) routes a
     # large file through multipart download; a small one is a direct GetObject.
+    # The lane is named on the transfer line: a directory sync's lines come
+    # from boto3-s3, which reports its own transfers, but nothing else would
+    # say how this one object travelled.
+    lane = "boto3-s3 cp" if cfg.store.multipart_download(size) else "boto3 get_object"
     if dryrun:
         # The download writes the local file, so it is a mutation and stays
         # skipped. No substitute probe either: a HeadObject can succeed or
         # fail under different IAM permissions than the real GetObject, and a
         # dry run must only make the calls the real run would make.
-        console.out(f"(dry-run) download: {cfg.prefix}/{rel} -> {outpath}\n")
+        console.out(f"(dry-run) download: {cfg.prefix}/{rel} to {outpath} ({lane})\n")
         return 0, True
     if not cfg.store.get_object(rel, outpath, size=size, verbose=verbose):
         # A recorded object that is gone is stale residue, not this pull's
@@ -784,4 +788,7 @@ def download_from_s3(
             f" (a push retires the stale record): {cfg.prefix}/{rel}"
         )
         return 0, False
+    # Reported after the fact, like the sync's own lines: a line printed up
+    # front would announce a download the stale-record branch above never made.
+    console.out(f"download: {cfg.prefix}/{rel} to {outpath} ({lane})\n")
     return 0, True

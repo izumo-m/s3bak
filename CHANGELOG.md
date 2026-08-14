@@ -101,12 +101,27 @@ a fix only (Fixed).
 - An entry path with no parent is now refused as a "path root" rather than a
   "filesystem root". The check has always been on the path alone, so the old
   wording suggested a mount point was refused too, which it never was.
+- A single-file entry's pull now prints its `download:` line, naming the
+  transfer path it took — `(boto3-s3 cp)` for an object at or above the
+  multipart threshold, `(boto3 get_object)` below it. A directory pull's
+  lines come from boto3-s3, which reports its own transfers; nothing
+  reported this one, so a real run was silent where its `--dry-run` had
+  announced a download. That dry-run line now carries the same lane and the
+  `to` spelling the sync's lines use.
 
 ### Fixed
 
 - A `--delete` confirmation is no longer scrolled away by the transfer result
   lines of the same run: the question holds the terminal until it is
   answered, and the output that arrives meanwhile prints afterwards.
+- `show` now says why it cannot print something instead of leaking the
+  storage service's `NoSuchKey` text: a directory or a symlink has no stored
+  content, a record whose object is gone is named as the stale residue it is,
+  and a path the backup does not hold is reported as not found. The manifest
+  that knows the difference is fetched only after the stream has already
+  failed, so the ordinary case is still one request — and `show` remains the
+  one command that works while a manifest is damaged, reporting the bare
+  absence when the manifest cannot explain it.
 
 ## [0.5.0] - 2026-07-31
 
