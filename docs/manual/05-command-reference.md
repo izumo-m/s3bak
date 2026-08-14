@@ -211,7 +211,12 @@ $ s3bak push --mtime-window abc demo
 s3bak: --mtime-window requires a non-negative number of seconds (got 'abc')
 $ s3bak push --mtime-window -1 demo
 s3bak: --mtime-window must be >= 0 (got -1.0)
+$ s3bak push --mtime-window 1e300 demo
+s3bak: --mtime-window is too large to use (got 1e+300)
 ```
+
+The last one is not pedantry: the window is held in nanoseconds internally, so
+a value that large stops being a number s3bak can compare with.
 
 `-o` refuses a value that begins with a dash, because that is nearly always a
 forgotten argument rather than a filename:
@@ -440,7 +445,9 @@ M /home/you/demo/run.sh	mode
 `remote` is what the manifest recorded and `local` is what is there now; the
 `<` and `>` point at the larger or later of the two, and colour marks the same
 side green. A `type` line names the two kinds — `type: remote=symlink
-local=regular file`.
+local=regular file`. Larger differences also print a readable form of
+themselves: `(+3145728 bytes (+3.00 MB))` for a size, `(+2d 3h)` for a time,
+and fractional seconds when the drift is under a second.
 
 Silence means everything matched. What the letters mean, and why a plain
 `status` never prints `D`, is [How s3bak detects
@@ -458,7 +465,24 @@ A missing entry root is the one state a plain `status` cannot describe as a
 push preview, because the push would not run at all. The other two are a path
 s3bak cannot look at (`warning: cannot access <path>: <error>`) and a
 sub-path reached through a symlinked parent, which is reported instead of
-compared.
+compared:
+
+```console
+$ s3bak status demo/lib/util.sh
+warning: demo/lib/util.sh: reached through a symlinked parent; not compared
+```
+
+Adding `--delete` to either of the two changes what follows the warning. There
+is nothing local that s3bak is willing to compare, so every record in range
+prints as `D` — the backup a `push --delete` would offer to retire:
+
+```console
+$ s3bak status --delete demo
+warning: local path does not exist (a push would refuse): /home/you/demo
+D /home/you/demo
+D /home/you/demo/link
+D /home/you/demo/notes.txt
+```
 
 ## `verify`
 

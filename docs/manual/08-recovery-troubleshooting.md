@@ -181,6 +181,17 @@ must replace the restore root itself, it downloads into `<stage>/new` and
 moves the old root to `<stage>/replaced`; a kill in between can leave the
 configured path missing while the old tree sits there.
 
+A pull that fails *after* that swap — during the metadata pass, say — keeps
+the old root rather than cleaning it away, and says where it went:
+
+```console
+s3bak: demo: pull failed after replacing /home/you/demo; the previous /home/you/demo is preserved at /home/you/demo.s3bak-stage-ab12cd/replaced
+```
+
+That is an ordinary failure rather than a hard kill, so the message is there
+to read: fix what failed, pull again, and remove the stage once you are
+satisfied with what came back.
+
 ## What `verify` found
 
 `verify` reports in three severities, and the exit status follows the worst

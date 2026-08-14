@@ -171,6 +171,9 @@ back.
   and `s3bak push demo/lib` mean the same thing.
 - **A path root is refused** as an entry path — `C:\` and `\\server\share`
   alike — for the same reason `/` is.
+- **Exclude patterns are written with `/`**, though `\` works too: a backslash
+  in a pattern folds to `/` before matching. A drive-relative pattern like
+  `C:cache` anchors to the entry root as `cache` rather than to a drive.
 - **`s3bak diff` needs a `diff` executable** on `PATH`. Windows has none by
   default; the one shipped with Git for Windows works.
 

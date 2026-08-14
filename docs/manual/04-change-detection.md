@@ -269,8 +269,9 @@ modification time, and the run after it is quiet again.
 
 The reverse does not hold, because a pull never rewrites the manifest. A record
 that has gone stale — left by a push interrupted after its uploads, or by a
-write to the bucket that went around s3bak — is something no pull can repair, so every pull that
-transfers anything downloads that file again, and so does the one after it.
+write to the bucket that went around s3bak — is something no pull can repair,
+so every pull that transfers anything downloads that file again, and so does
+the one after it.
 Only a push settles it. The asymmetry is deliberate: the manifest is the record
 of what a push saw, so only a push may change it.
 
@@ -300,6 +301,25 @@ The consequence worth remembering is that a pattern without a leading wildcard
 is anchored at the entry root. `__pycache__/*` prunes the one at the top of
 the entry and nothing else; `*/__pycache__/*` prunes every one below the top
 and not the top itself. Covering both takes both patterns.
+
+Three more properties are worth knowing before you write a list of them:
+
+- **Order does not matter.** s3bak has no include patterns to play against
+  excludes, so the list means "excluded if any pattern matches" — unlike
+  `.gitignore`, where a later rule can take a path back.
+- **A symbolic link is matched by its own name only.** Whatever it points at,
+  a link named `cache` has no trailing slash in the comparison, so neither
+  `cache/` nor `cache/*` excludes it; `cache` does.
+- **The entry root itself is never matched.** Patterns apply to what is
+  *inside* an entry, so `*` excludes everything under it and never the entry.
+  A single-file entry *is* its own root, which means `excludes` on such an
+  entry does nothing at all.
+
+Naming an excluded path on the command line does not override the exclude,
+either: `s3bak push demo/cache` where `cache/*` is excluded pushes nothing and
+exits 0, since ignoring the path is the rule rather than an error. (Compare a
+sub-path that simply does not exist locally, which is an error unless
+`--delete` says to retire its backup.)
 
 ### What excluded means
 
