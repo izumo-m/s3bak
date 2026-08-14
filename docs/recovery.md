@@ -91,8 +91,10 @@ not `fsync` the file or its parent directory, so it is not durable against a
 power loss. On a write-back filesystem the rename and the applied mode/mtime
 can survive while the file's contents do not. Because size and mtime then
 still match the record, a later plain `pull` and `status` both call it a
-match, and only `pull --checksum` finds it. `verify` cannot: it checks the
-manifest against the stored objects, never against the local tree.
+match, and `pull --checksum` is what repairs it. The listing check cannot see
+it — it pairs the manifest with the stored objects — but `verify --checksum`
+reads the local file and reports it as the size+mtime blind spot, which is
+what a lost write is indistinguishable from ([verify.md](verify.md)).
 
 The alternative — fsyncing every restored file — would cost every pull to
 protect against a case the next `--checksum` run repairs, so the durability

@@ -154,8 +154,11 @@ s3bak pull --checksum demo
 ```
 
 That compares content instead, and re-downloads anything that does not match.
-`verify` does not help here: it checks the manifest against S3, never against
-the local tree.
+A plain `verify` cannot see it: that check pairs the manifest with S3 and
+never reads the local tree. `verify --checksum` does read it, and reports the
+loss as `content differs but size+mtime match` — from outside, a file whose
+contents were lost looks exactly like one edited behind the size and
+modification time.
 
 ## Leftovers a hard kill can leave
 

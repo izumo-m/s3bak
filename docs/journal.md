@@ -22,9 +22,10 @@ re-transfers — the ordinary self-healing.
 The sync's local side enumerates the **complete view** — directories,
 symlinks as lstat leaves, special files — the same complete, no-follow
 enumeration the manifest walk uses (`localwalk`), with the entry's excludes
-filtered identically ([excludes.md](excludes.md)). boto3-s3's `Comparator` merge-joins that walk against the S3
-listing into **one ascending stream of pairs**: both-sides (the update lane),
-local-only (the create lane), S3-only (the delete lane).
+filtered identically ([excludes.md](excludes.md)). boto3-s3's `Comparator`
+merge-joins that walk against the S3 listing into **one ascending stream of
+pairs**: both-sides (the update lane), local-only (the create lane), S3-only
+(the delete lane).
 
 - **One manifest cursor serves everything.** The old manifest is streamed
   once, front to back, advancing in lockstep with the pair stream. It backs
@@ -66,8 +67,7 @@ local-only (the create lane), S3-only (the delete lane).
   touch) and is exempted.
 - **Every decision is serial, in ascending key order** — the property the
   journal's ordering rests on. `--checksum` therefore runs its content
-  comparison serially too; the parallel compare pool (`compare_workers`,
-  `ParallelFilter`) is gone.
+  comparison inline on the sync's own thread, with no compare pool.
 
 ## Journal format
 
@@ -154,13 +154,14 @@ change to a published contract. s3bak deletes the file once the hook returns
 - **` ` (no change)**: the reserved line of a directory-record delete
   candidate. The decision is post-order — ask only once everything beneath
   the directory resolved deleted, keep it silently (no question) the moment
-  anything beneath survives — the same ancestor-stack pattern `pull
-  --delete` uses for local extras ([sync.md](sync.md#deleting-backups---delete---yes)).
-  But the journal is strictly ascending, and a directory's line belongs
-  before its children's, where the answer is not yet known. So the emitter
-  writes the candidate as a no-change line the moment the cursor skips over
-  it, remembers the offset (one open frame per ancestor directory, memory
-  bounded by depth), and, when the drop is confirmed at the subtree's close,
+  anything beneath survives — the same ancestor-stack pattern `pull --delete`
+  uses for local extras
+  ([sync.md](sync.md#deleting-backups---delete---yes)). But the journal is
+  strictly ascending, and a directory's line belongs before its children's,
+  where the answer is not yet known. So the emitter writes the candidate as a
+  no-change line the moment the cursor skips over it, remembers the offset
+  (one open frame per ancestor directory, memory bounded by depth), and, when
+  the drop is confirmed at the subtree's close,
   flips that line's marker byte to `-` in place — ` ` and `-` are the same
   one byte, so nothing shifts, and the journal is well-formed at every
   moment. A kept candidate simply remains a no-op line; no cleanup pass
@@ -232,5 +233,5 @@ pinned by a contract test in boto3-s3's suite so s3bak can depend on it:
    manifest's own sort order), and every local entry carries its full lstat
    (`stat_result`), from which journal records are built.
 3. Lane decisions run serially, in ascending key order, whenever no filter
-   is wrapped in `ParallelFilter` — s3bak simply stops wrapping its
+   is wrapped in `ParallelFilter` — s3bak simply does not wrap its
    `--checksum` comparison.

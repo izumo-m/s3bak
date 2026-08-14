@@ -295,7 +295,7 @@ s3bak push [options] --all
 Copies the local state of each entry to S3 and records it in the manifest. A
 push is what makes the backup; every other command reads what it left.
 
-In order, one entry at a time: `pre_hook` runs, the manifest is downloaded,
+Within one entry, in order: `pre_hook` runs, the manifest is downloaded,
 the local tree is compared against it, the differences are uploaded, the new
 manifest is written, and — only if the push did some work — `post_hook` runs.
 
@@ -453,8 +453,8 @@ Silence means everything matched. What the letters mean, and why a plain
 `status` never prints `D`, is [How s3bak detects
 changes](04-change-detection.md).
 
-Three situations produce a warning rather than a letter, and each makes the
-run exit 2:
+Some situations produce a warning rather than a letter, and each makes the run
+exit 2:
 
 ```console
 $ s3bak status vault
@@ -462,19 +462,28 @@ warning: local path does not exist (a push would refuse): /home/you/vault
 ```
 
 A missing entry root is the one state a plain `status` cannot describe as a
-push preview, because the push would not run at all. The other two are a path
-s3bak cannot look at (`warning: cannot access <path>: <error>`) and a
-sub-path reached through a symlinked parent, which is reported instead of
-compared:
+push preview, because the push would not run at all. A path s3bak cannot look
+at is the next (`warning: cannot access <path>: <error>`), and so is a gap in
+the walk — an unreadable directory hides whatever is behind it, so a silent
+comparison would report a clean tree that is not one:
+
+```console
+$ s3bak status demo
+Skipping file /home/you/demo/locked/. File/Directory is not readable.
+```
+
+The last is a sub-path reached through a symlinked parent, which is reported
+instead of compared:
 
 ```console
 $ s3bak status demo/lib/util.sh
 warning: demo/lib/util.sh: reached through a symlinked parent; not compared
 ```
 
-Adding `--delete` to either of the two changes what follows the warning. There
-is nothing local that s3bak is willing to compare, so every record in range
-prints as `D` — the backup a `push --delete` would offer to retire:
+Adding `--delete` to the missing root or the symlinked parent changes what
+follows the warning: there is nothing local that s3bak is willing to compare,
+so every record in range prints as `D` — the backup a `push --delete` would
+offer to retire:
 
 ```console
 $ s3bak status --delete demo
@@ -633,8 +642,8 @@ $ s3bak diff demo/notes.txt
 +THIRD line!
 ```
 
-Pointed at a whole entry, it covers every recorded file, including the ones
-that exist on only one side:
+Pointed at a whole entry, it covers every path either side knows about — the
+recorded files, and the local files no record mentions:
 
 ```console
 $ s3bak diff demo

@@ -54,11 +54,11 @@ without uploading anything ([verify.md](verify.md)).
 
 **Self-healing (push):** a spurious mtime-only difference re-transfers the file
 once; that push refreshes the manifest with the new mtime, and later runs pass
-the size+mtime check again. The converse does **not** hold for a *stale* manifest
-(an out-of-band S3 write, or a push interrupted after its uploads): `pull` never
-rewrites the manifest, so affected pairs re-transfer on every pull until a real
-`push` refreshes the record. This is deliberate — the manifest is the record of
-the last real push, and only a push may change it.
+the size+mtime check again. The converse does **not** hold for a *stale*
+manifest (an out-of-band S3 write, or a push interrupted after its uploads):
+`pull` never rewrites the manifest, so affected pairs re-transfer on every pull
+until a real `push` refreshes the record. This is deliberate — the manifest is
+the record of the last real push, and only a push may change it.
 
 ### Opt-in: ETag content comparison (`--checksum`)
 

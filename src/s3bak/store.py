@@ -177,9 +177,9 @@ class Boto3S3Store:
 
         The bare `EtagComparison` PairFilter, run inline on the sync's own
         thread: push's journal emission needs every lane decision serial and
-        in ascending key order (docs/journal.md), so the pre-journal
-        `ParallelFilter` compare pool is gone - pull's checksum compare runs
-        serially too. It copies a pair only when the S3 ETag differs from the
+        in ascending key order (docs/journal.md), so no filter is wrapped in
+        `ParallelFilter` - pull's checksum compare runs serially too. It
+        copies a pair only when the S3 ETag differs from the
         local file's reconstructed ETag, so a same-size, same-mtime content
         change is still transferred and an mtime-only drift is not; it reads
         and hashes every candidate file locally, which is why it is opt-in
