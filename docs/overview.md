@@ -131,6 +131,10 @@ which one is wrong is decided case by case, and that side is fixed.
 
 ### Design documents
 
+Each records why its part of s3bak is built the way it is and what the
+implementation must preserve, and leaves the observable behavior it produces
+to the manual.
+
 - **[Storage model](storage.md)** — how local trees, data objects, and manifests
   are represented under the configured S3 prefix.
 - **[Manifest format](manifest.md)** — the JSONL format, validation rules,
@@ -143,11 +147,11 @@ which one is wrong is decided case by case, and that side is fixed.
   manifest changes the compare emits, its format, and the streaming manifest
   rewrite it drives.
 - **[Verification model](verify.md)** — the read-only manifest ↔ S3 integrity
-  check, its finding severities, and the suggested verification routine.
-- **[Interruption and recovery](recovery.md)** — what an unfinished command
-  leaves behind, which run converges it, and the residues a hard kill needs
-  resolved by hand.
+  check: what each pass can prove, and the severity rule behind its findings.
+- **[Interruption and recovery](recovery.md)** — the fail-old ordering that
+  makes a re-run sufficient, what an unfinished command leaves behind, and the
+  residues a hard kill cannot clean up.
 - **[CLI contract](cli.md)** — argument resolution, explicit option handling,
-  concurrent result aggregation, and exit codes.
+  concurrent result aggregation, and the reasoning behind the exit codes.
 - **[Internal architecture](architecture.md)** — module responsibilities,
   dependency direction, and shared S3 client construction.

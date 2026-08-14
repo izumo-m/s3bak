@@ -8,13 +8,11 @@ checks the manifest against the stored objects — until a restore fails,
 nothing does. `verify` closes that gap, and it is strictly read-only: it needs
 only `s3:ListBucket` and `s3:GetObject` (the manifest download), changes
 nothing, and reports through the standard exit codes, which makes it safe to
-run unattended from cron on any host — including one that has no local copy of
-the tree.
+run unattended on any host — including one that has no local copy of the tree.
 
-```
-s3bak verify [options] <entry|path>...
-s3bak verify [options] --all
-```
+What each finding means to a user, and what settles it, is the manual
+([recovery and troubleshooting](manual/08-recovery-troubleshooting.md)); this
+document is why the checks are shaped the way they are.
 
 ## The listing check (always on)
 
@@ -27,9 +25,7 @@ storage class, so none of these checks costs an extra S3 call:
 
 - **Missing data object** — a regular-file record with no object behind it. A
   pull of that file fails. Detects S3-side deletions, an interrupted
-  `push --delete`, and lifecycle misconfiguration. A push settles it either
-  way: it re-uploads the file if it is still there locally, and retires the
-  record if it is not.
+  `push --delete`, and lifecycle misconfiguration.
 - **Size mismatch** — the object's size differs from the record. Restoring it
   would produce a file the push never saw: the residue of an out-of-band
   overwrite or a torn upload.
@@ -39,42 +35,39 @@ storage class, so none of these checks costs an extra S3 call:
   restore of the recorded tree. The entry's own key is probed too, so a
   directory-shaped manifest with a leftover single-file object is caught.
 - **Unrecorded object** — an object the manifest does not record (see
-  [storage.md](storage.md#unrecorded-objects)). Until verify, these surfaced
+  [storage.md](storage.md#unrecorded-objects)). Without verify these surface
   only inside a `push --delete` confirmation; verify lists them passively.
 - **Excluded residue** — records still sitting under the entry's *current*
   `excludes` ([excludes.md](excludes.md)): the leftovers of an exclude added
-  after the paths were pushed. Every other command without `--delete`
-  ignores excluded paths entirely — push neither uploads nor deletes them,
-  pull does not restore them, `status` does not mention them — so this
-  warning is the one passive channel that surfaces the residue. It is
-  reported as one count per entry (the objects those records own travel
-  with them), naming `push --delete` as the remedy; an unrecorded object
-  under an excluded path is already covered by the unrecorded-object
-  warning.
+  after the paths were pushed. Every other command without `--delete` ignores
+  excluded paths entirely, so this warning is the one passive channel that
+  surfaces the residue. It is reported as one count per entry (the objects
+  those records own travel with them); an unrecorded object under an excluded
+  path is already covered by the unrecorded-object warning.
 - **Folder object** — a `/`-terminated key, the manual-folder convention of
   the S3 console and some tools. s3bak never writes one. The zero-byte marker
   form is skipped by the data sync and is reported as noise to remove; one
   carrying data cannot restore to any local path and is an error.
 - **Archived storage class** — an object in `GLACIER` or `DEEP_ARCHIVE`
-  rejects `get_object` until manually restored via `RestoreObject`, so a pull
-  cannot fetch it yet. The manifest and the object still agree; only the
-  storage tier differs, and it can change on its own (a lifecycle transition,
-  a completed restore, a restore expiring) without the backup changing at
-  all — so this is reported as a warning, not an error. This is checked for
-  every listed object, recorded or not, since pull's listing-driven download
-  fetches unrecorded objects too. (An `INTELLIGENT_TIERING` object in an
-  archive tier fails the same way but is indistinguishable in a listing — a
-  known limit.)
+  rejects `get_object` until manually restored, so a pull cannot fetch it yet.
+  The manifest and the object still agree; only the storage tier differs, and
+  it can change on its own (a lifecycle transition, a completed restore, a
+  restore expiring) without the backup changing at all — so this is a warning,
+  not an error. It is checked for every listed object, recorded or not, since
+  pull's listing-driven download fetches unrecorded objects too. (An
+  `INTELLIGENT_TIERING` object in an archive tier fails the same way but is
+  indistinguishable in a listing — a known limit.)
 - **Missing backup** — a configured entry with no manifest. Data objects
   without any manifest (a push interrupted before its manifest write) are
-  distinguished from an entry that was never pushed at all.
+  distinguished from an entry that was never pushed at all, because the two
+  are different emergencies.
 
 A single-file entry has no listing to stream; its one record is checked with
 an exact head-object probe (existence and size) instead, plus one
 slash-bounded listing of `entry/` that reports anything there as unrecorded —
 the residue of a directory that became this file, or an out-of-band upload,
-which no other command's listing can see (`push --delete` retires them). A
-sub-path (`verify entry/sub`) scopes the join to that subtree, like `status`.
+which no other command's listing can see. A sub-path (`verify entry/sub`)
+scopes the join to that subtree, like `status`.
 
 ## The content check (`--checksum`)
 
@@ -83,14 +76,11 @@ both can agree and still be stale. On a machine that holds the local tree,
 `--checksum` additionally compares every recorded file's local content against
 the S3 ETag the listing already delivered (the same reconstruction as
 `push --checksum`, hashed on a pool sized by `max_concurrency`, zero extra S3
-calls). A
-mismatch is split by the manifest stat, and the split is the point:
+calls). A mismatch is split by the manifest stat, and the split is the point:
 
 - **Content differs but size+mtime match** — an error. The default push skips
-  this file forever: the size+mtime blind spot (an mtime-preserving edit, a
-  same-size out-of-band overwrite, a torn upload of a since-settled file).
-  Nothing else in s3bak reports this case before a restore does. The fix is
-  `push --checksum`.
+  this file forever: the size+mtime blind spot. Nothing else in s3bak reports
+  this case before a restore does.
 - **Pending change** — the stat drifted too, so this is an ordinary
   not-yet-pushed edit the next push picks up. Reported informationally,
   without affecting the exit code, so a routine edit does not page anyone.
@@ -98,9 +88,9 @@ mismatch is split by the manifest stat, and the split is the point:
 A recorded file with no local counterpart (a kept deletion) or whose local
 path changed type is skipped — the former is a normal backup state, the latter
 is `status`'s finding. A record under the entry's current excludes is skipped
-too: a local copy the config excludes is outside the backup's purview, and
-the check's remedies (`push --checksum`, a plain push) cannot touch an
-excluded path — the excluded-residue warning already points at the pair. ETags that are not content MD5s (SSE-KMS) fail the
+too: a local copy the config excludes is outside the backup's purview, and the
+check's remedies cannot touch an excluded path — the excluded-residue warning
+already points at the pair. ETags that are not content MD5s (SSE-KMS) fail the
 comparison loudly; the constraint is inherited from `--checksum` push.
 `--mtime-window` tunes the classification stat and therefore requires
 `--checksum` on this command.
@@ -112,19 +102,18 @@ warns about anything no configured entry accounts for: a stale manifest left
 by a removed entry, a data tree with no manifest beside it, or a stray
 top-level object. One command inventories the whole backup area.
 
-## Severities and exit codes
+## Severities
 
-Findings map onto the standard [exit codes](cli.md#exit-codes):
+The severity rule, which decides both the exit code and how loud a finding is:
 
-- **Errors (exit 1)** — the backup does not hold what the manifest promises:
-  missing object, size mismatch, type conflict, data-carrying folder object,
-  silent content divergence, missing backup, damaged manifest.
-- **Warnings (exit 2)** — the backup itself is not in question, only
-  something around it: an object sitting outside the recorded backup
-  (unrecorded objects, zero-byte folder objects, everything the `--all` sweep
-  reports), recorded residue under the entry's current excludes, or a
-  recorded object that is intact but currently archived.
-- **Informational** — pending changes (`--checksum`); no exit-code effect.
+- **Error** — the backup does not hold what the manifest promises. A restore
+  would fail or produce something the push never saw.
+- **Warning** — the backup itself is not in question; something sits outside
+  it (unrecorded objects, folder objects, the `--all` sweep's findings,
+  excluded residue), or is intact but momentarily unfetchable (an archived
+  object), or could not be checked at all.
+- **Informational** — pending changes under `--checksum`: a difference that is
+  simply not pushed yet.
 
 Every entry also prints a one-line summary (`OK` or finding counts, with
 record and object tallies), so a quiet cron log still shows the check ran.
@@ -133,23 +122,8 @@ record and object tallies), so a quiet cron log still shows the check ran.
 
 - **No local metadata comparison.** S3's `LastModified` is the upload time,
   not the file's mtime; local-vs-manifest drift is `status`.
-- **No repair.** Remediation is `push` (missing/changed data),
-  `push --checksum` (silent divergence), `push --delete` (unrecorded
-  objects), or `aws s3 rm` (folder objects, stale manifests).
+- **No repair.** Every remedy is another command's job, which keeps verify
+  safe to run with a read-only credential.
 - **No restore drill.** verify proves the pieces are present and intact, not
-  that a restore workflow works end to end. Periodically pull into a scratch
-  directory (`pull <entry> -o /tmp/drill`) and inspect the result; back up
-  live databases via a `pre_hook` dump, as
-  [storage.md](storage.md#restore-fidelity) describes.
-
-## Suggested routine
-
-- `s3bak verify --all` daily — listing-only: per entry, one manifest GET,
-  one HEAD of the tree's own key, and one LIST page per ~1000 objects.
-- `s3bak verify --all --checksum` weekly — reads and hashes every recorded
-  local file.
-- A restore drill quarterly, or after changing excludes, entries, or bucket
-  policy.
-
-Under a credential-separation policy, the verifying host's credentials need no
-write or delete permissions at all.
+  that a restore workflow works end to end. Only an actual pull proves that
+  ([operating](manual/07-operating.md)).

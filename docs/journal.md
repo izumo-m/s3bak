@@ -78,8 +78,10 @@ purely internal: a journal-driven push (the ordinary directory push and the
 sub-path push) exposes the file to `post_hook` through the `S3BAK_JOURNAL`
 environment variable (see [sync.md](sync.md#the-push-pipeline)) before
 deleting it, which makes this format a hook-facing interface, not just an
-implementation detail. s3bak deletes the file once the hook returns (or
-immediately, on a push where no hook fires).
+implementation detail — the manual documents it for hook authors
+([operating](manual/07-operating.md#s3bak_journal)), so a change here is a
+change to a published contract. s3bak deletes the file once the hook returns
+(or immediately, on a push where no hook fires).
 
 ```
 +{"path":"./docs/new.txt","mode":"100644","owner":"iz","group":"iz","size":12,"mtime_ns":1789000000000000001}

@@ -133,13 +133,19 @@ s3bak verify --all --checksum # also compare local content to S3 ETags
 s3bak ls-remote               # list entries stored on S3
 ```
 
-The `status` letters are push-oriented — each variant previews its push:
-`M` modified (a type change included), `A` only local (a push would add it),
-and `D` only in backup, printed by `status --delete` alone — the candidates
-`push --delete` would offer (a plain push keeps them, unless the stored
-object is already gone — a record backing nothing is retired by any push).
+The `status` letters are push-oriented — each variant previews its push. What
+each one means, and every other command's output, is the manual's
+[command reference](docs/manual/05-command-reference.md).
 
-## Design
+## Documentation
+
+The [**user manual**](docs/manual/README.md) is the complete guide and the
+authoritative description of what s3bak does: configuration, change detection,
+every command, `--delete`, the operating routine, recovery, and platform
+notes. Start at [chapter 1](docs/manual/01-introduction.md), or
+[chapter 2](docs/manual/02-getting-started.md) to set a backup up.
+
+For how s3bak is built and why:
 
 - [`docs/overview.md`](docs/overview.md) — project goals and the design document
   index.
