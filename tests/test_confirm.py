@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import pytest
 
 from s3bak import confirm
 from s3bak.confirm import AnswerMode, DeleteConfirmer, DeletionAbortedError
+from s3bak.console import PromptSession, console
 
 
 @pytest.fixture(autouse=True)
@@ -169,20 +172,17 @@ def test_confirm_subtree_delete_modes(answers, capfd):
     assert capfd.readouterr().err.count("keep it") == 2
 
 
-def test_confirm_subtree_delete_rechecks_abort_after_acquiring_lock(monkeypatch):
+def test_confirm_subtree_delete_rechecks_abort_after_acquiring_the_terminal(monkeypatch):
     # Another entry answers q (sets _abort) while this subtree confirmation is
-    # blocked waiting for the prompt lock. After acquiring the lock it must
+    # blocked waiting for the prompt session. Once the session opens it must
     # re-check _abort and abort, not show the prompt and delete on a y.
-    monkeypatch.setattr(confirm, "read_prompt_answer", lambda _p: "y")
+    monkeypatch.setattr(console, "read_answer", lambda _p: "y")
 
-    class AbortOnEnter:
-        def __enter__(self):
-            confirm._abort.set()  # simulate the concurrent q during the lock wait
-            return self
+    @contextmanager
+    def abort_while_waiting():
+        confirm._abort.set()  # simulate the concurrent q during the wait
+        yield PromptSession(console)
 
-        def __exit__(self, *_a):
-            return False
-
-    monkeypatch.setattr(confirm, "_prompt_lock", AbortOnEnter())
+    monkeypatch.setattr(console, "prompt", abort_while_waiting)
     with pytest.raises(DeletionAbortedError):
         confirm.confirm_subtree_delete(AnswerMode.ASK, "entry", "s3://bucket/entry/sub")

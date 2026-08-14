@@ -2,24 +2,21 @@
 
 The CLI turns command-line input into an entry and an optional entry-relative
 subpath, rejects ambiguous or inapplicable input before doing work, and maps
-command outcomes to stable process exit codes. The complete command and option
-reference is split between `s3bak --help` and `s3bak <command> --help`; this
-document records the design contracts behind that interface.
+command outcomes to stable process exit codes. The reference for what each
+command and option does is the manual's
+[command reference](manual/05-command-reference.md) and `s3bak <command>
+--help`; this document records the design contracts behind that interface.
 
 ## Help output
 
-`s3bak --help` is an overview for choosing a command. It lists the commands,
-the global `--help` and `--version` options, and the active configuration path.
-It does not include command-specific options or examples.
+`s3bak --help` is an overview for choosing a command; `s3bak <command> --help`
+is the reference for one command, including its status letters and examples.
+The split keeps the top-level help readable as the number of commands grows.
 
-`s3bak <command> --help` is the reference for one command. It shows that
-command's exact usage, arguments, applicable options, and examples. Status
-letters are documented only by `s3bak status --help`.
-
-Explicit help is written to standard output and exits with status 0. Usage
-shown because of missing input or an unknown command is written to standard
-error and exits with status 1. Help never loads configuration or creates an S3
-client.
+Explicit help is written to standard output and exits 0; usage shown because
+of missing input or an unknown command goes to standard error and exits 1.
+Help never loads configuration or creates an S3 client, so it works on a
+machine that has neither.
 
 ## Entry and path resolution
 
@@ -34,8 +31,10 @@ A positional `<entry|path>` argument is resolved by shape:
 - If equally specific entries match, or no entry contains the path, resolution
   fails instead of choosing implicitly.
 
-The rules are shared by commands that accept entries or paths, so the same
-argument denotes the same stored object or subtree across commands.
+The rules are shared by every command that accepts entries or paths, so the
+same argument denotes the same stored object or subtree across commands — the
+property that lets a user copy an argument from one command to another without
+re-reading its rules.
 
 ## Multiple pull targets
 
@@ -49,10 +48,9 @@ Equal destinations and ancestor/descendant pairs are rejected before S3 work;
 the same check applies to `pull --all`. Existing symlinks in each destination's
 parent chain are resolved for this comparison, while the final component is not
 followed because pull may replace it. Case-only and Unicode-normalization-only
-variants are conservatively treated as the same path on every platform; on a
-case-sensitive filesystem, restore such entries separately. This prevents one
-restore, especially a `--delete` restore, from writing or removing another
-restore's files.
+variants are conservatively treated as the same path on every platform, since
+the cost of being wrong is one restore deleting or overwriting another's
+files — especially under `--delete`.
 
 `-o/--output` names the exact destination for one target and is therefore
 rejected with multiple explicit targets as well as with `--all`.
@@ -67,50 +65,66 @@ as if it were a dry run.
 Option and syntax validation happens before configuration creates an S3
 client, so an option typo reports the typo even when credentials or the
 remote service are unavailable. Entry and path resolution needs the loaded
-configuration and therefore runs after the store exists. The `list` command loads configuration
-without constructing an S3 client because its result is entirely local.
+configuration and therefore runs after the store exists. The `list` command
+and `hook` load configuration without constructing an S3 client, because
+neither touches S3 state.
+
+## Hook invocation (`hook pre|post`)
+
+`s3bak hook pre|post <entry>` runs one configured hook on demand, outside any
+push, under the same contract as a push-run hook (argument vector, no shell,
+stdin detached, the same exit-status normalization) with `S3BAK_JOURNAL`
+unset — there is no push, hence no journal. The first positional argument
+selects the hook; the rest are entry names, resolved and aggregated by the
+same machinery every other multi-entry command uses.
+
+The two ways of naming entries mean different things, which is why they behave
+differently when an entry has no such hook:
+
+- **Naming an entry is an instruction**, so an entry without that hook fails
+  (exit 1): silence would read as success, and a `post_hok:` typo in the
+  configuration would be invisible.
+- **`--all` means "every configured hook of this kind"**, so an entry without
+  one is outside the operation's domain and is skipped (reported under `-v`).
+  This keeps a real hook failure's exit status from being shadowed by a
+  hook-less entry. The command errors only when no entry configures the hook
+  at all — an instruction that turns out to be a no-op in full is not success.
 
 ## Concurrent entry results
 
 Commands that operate on several entries may run them concurrently. Results
 are retained in input order, and the process returns the first non-zero status
 in that order rather than the first worker to finish. Under `--all`, entries
-are sorted first, making the aggregate result deterministic.
+are sorted first, making the aggregate result deterministic — a repeated run
+gives a repeatable answer.
 
 Worker exceptions are reported for the affected entry and converted to status
 1. Completed work from other entries is retained.
 
 ## Exit codes
 
-`cli.run` translates command results and operational exceptions into process
-exit codes:
+`cli.run` translates command results and operational exceptions into the
+process exit codes the manual documents
+([exit codes](manual/05-command-reference.md#exit-codes)). The design points
+behind that mapping:
 
-| Code | Meaning |
-| ---: | ------- |
-| `0` | The command completed successfully without warnings. |
-| `1` | A usage, configuration, local I/O, S3, or manifest error prevented a successful result. |
-| `2` | Work completed but emitted at least one warning, such as a skipped unreadable entry. |
-| `3+` | A failing hook or another command result propagated its non-zero status. |
-| `130` | The process was interrupted by `SIGINT`. |
-| `141` | Output ended because of a broken pipe. |
-
-A hook status that would collide with the reserved meanings is normalized: a
-hook exiting `2` maps to `1` (2 is the warnings-only signal), and a hook killed
-by signal `N` maps to `128+N` instead of leaking a negative value.
-
-Status 2 distinguishes retained but incomplete work from both success and a
-hard failure, allowing scripts to require inspection without discarding work
-that did complete.
-
-`diff` overloads exit `1`: besides the operational errors in the table, it also
-exits `1` when the comparison ran successfully but the backup and local content
-differ — the `diff(1)` / `git diff` convention. Exit `0` from `diff` therefore
-means "identical", not merely "ran without error". A broken output pipe still
-maps to `141`.
-
-A `--delete` confirmation answered no — including the automatic no of a
-non-interactive run without `--yes` — is a successful outcome (status 0), not
-a warning: keeping a backup is a valid answer. Answering q aborts the command
-with status 1. The exception is the explicit backup-subtree deletion
-(`push --delete entry/gone-sub`): declining its one confirmation exits 1,
-because the deletion was the command's entire purpose.
+- **Status 2 exists to separate retained-but-incomplete work from both success
+  and failure.** A run that skipped an unreadable file did its job and still
+  needs a human, and a script must be able to tell that from a clean run
+  without discarding the work that completed.
+- **Hook statuses are normalized where they would collide** with s3bak's own
+  meanings: a hook exiting 2 maps to 1 (2 is the warnings-only signal), and a
+  hook killed by signal `N` maps to `128+N` rather than leaking a negative
+  returncode into `sys.exit`.
+- **`diff` overloads exit 1** with "content differs", the `diff(1)` / `git
+  diff` convention, so exit 0 from `diff` means identical rather than merely
+  "ran without error".
+- **A `--delete` answered no is a success**, including the automatic no of a
+  non-interactive run without `--yes`: keeping a backup is a valid answer.
+  Aborting with `q` is a failure, and so is declining the explicit
+  backup-subtree deletion — in both cases the command did not do what it was
+  asked ([sync.md](sync.md#deleting-backups---delete---yes)).
+- **Operational exceptions do not reach the user as tracebacks.** `run()`
+  catches the SDK, OS, and manifest error families and reports what the layer
+  below said, because a backup tool's failures are ordinary operational
+  events rather than bugs.

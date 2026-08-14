@@ -8,7 +8,7 @@ import os
 
 import pytest
 
-from s3bak import localwalk, manifest
+from s3bak import manifest
 
 # --- format / parse -----------------------------------------------------------
 
@@ -177,31 +177,24 @@ def test_validate_manifest_rejects_header_only_file(tmp_path):
         manifest.validate_manifest(str(p))
 
 
-@pytest.mark.parametrize(
-    "records",
-    [
-        ['{"path":"./missing/child","mode":"100644","size":1,"mtime_ns":0}'],
-        [
-            '{"path":"./link","mode":"120777","mtime_ns":0,"link":"target"}',
-            '{"path":"./link/child","mode":"100644","size":1,"mtime_ns":0}',
-        ],
-    ],
-)
-def test_validate_manifest_requires_recorded_directory_parents(tmp_path, records):
+def test_validate_manifest_accepts_a_missing_directory_parent(tmp_path):
+    # A record's parent directory record is optional: an excluded directory
+    # is unrecorded while its visible children are (docs/excludes.md), and
+    # validation cannot know which excludes were in force when the manifest
+    # was written - so a missing parent is a valid manifest, never damage.
     p = tmp_path / "m.jsonl"
     p.write_text(
         "\n".join(
             [
                 '{"s3bak_manifest":3}',
                 '{"path":".","mode":"40755","mtime_ns":0}',
-                *records,
+                '{"path":"./missing/child","mode":"100644","size":1,"mtime_ns":0}',
                 "",
             ]
         )
     )
 
-    with pytest.raises(manifest.ManifestError, match="directory parent"):
-        manifest.validate_manifest(str(p))
+    assert manifest.validate_manifest(str(p)) == "dir"
 
 
 # --- size+mtime check ----------------------------------------------------------
@@ -220,88 +213,7 @@ def test_matches_stat_window(tmp_path):
     assert not e.matches_stat(drifted, 0)  # strict
 
 
-# --- pattern matching / sort key ------------------------------------------------
-
-
-def test_path_match_negated_class():
-    # Glob negation is '!'; regex would read a verbatim '[!a]' as a class
-    # holding the literal '!' - the exact inverse (matching 'a', missing 'b').
-    # The translator must emit '^'.
-    assert manifest.path_match("b", "[!a]")
-    assert not manifest.path_match("a", "[!a]")
-
-
-def test_path_match_unterminated_class_is_literal():
-    # fnmatch behavior: an unterminated '[' matches itself rather than
-    # crashing the regex compile.
-    assert manifest.path_match("x[", "x[")
-    assert not manifest.path_match("x", "x[")
-
-
-def test_path_match_invalid_range_never_raises():
-    assert not manifest.path_match("a", "[z-a]")
-
-
-# --- PathMatcher ----------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "patterns",
-    [
-        [],
-        ["foo.txt"],
-        ["foo.txt", "bar.txt"],
-        ["*.txt"],
-        ["foo.txt", "*.log"],
-        ["dir/*"],
-        ["[!a]"],
-        ["x["],
-        ["[z-a]"],
-        ["foo.txt", "*.log", "[!a]", "x[", "[z-a]", "dir/*"],
-    ],
-)
-def test_path_matcher_matches_the_any_path_match_loop(patterns):
-    # PathMatcher.match must agree with any(path_match(path, p) for p in
-    # patterns) for every candidate, literal/wildcard mixed and every
-    # malformed-bracket case path_match's own docstring already tolerates.
-    candidates = ["foo.txt", "bar.txt", "x[", "x", "a", "b", "z", "dir/child", "other"]
-    matcher = manifest.PathMatcher(patterns)
-    for path in candidates:
-        expected = any(manifest.path_match(path, p) for p in patterns)
-        assert matcher.match(path) == expected, (path, patterns)
-
-
-def test_path_matcher_star_crosses_slash():
-    # fnmatch's '*' matches '/' too (find -path semantics, not shell
-    # globbing) - PathMatcher must keep that, not gain path-component
-    # awareness by combining patterns into one regex.
-    matcher = manifest.PathMatcher(["a/*"])
-    assert matcher.match("a/b/c")
-    assert manifest.path_match("a/b/c", "a/*")  # same reference behavior
-
-
-def test_path_matcher_empty_pattern_list_matches_nothing():
-    matcher = manifest.PathMatcher([])
-    assert not matcher.match("")
-    assert not matcher.match("anything")
-
-
-def test_path_matcher_construction_never_raises_on_malformed_patterns():
-    # fnmatch.translate must safely fall back for these (no regex compile
-    # failure) - the same guarantee path_match's docstring relies on.
-    # PathMatcher additionally ORs every wildcard pattern into ONE compiled
-    # regex, so this also proves that combination stays compilable.
-    manifest.PathMatcher(["x[", "[z-a]", "[!a]", "**", "?[", "[[[["])
-
-
-def test_split_excludes_returns_path_matchers():
-    prune, skip = manifest.split_excludes(["logs/*", "*.tmp"])
-    assert isinstance(prune, manifest.PathMatcher)
-    assert isinstance(skip, manifest.PathMatcher)
-    assert prune.match("./logs")
-    assert not prune.match("./logs/x")
-    assert skip.match("./a.tmp")
-    assert not skip.match("./a.txt")
+# --- sort key -------------------------------------------------------------------
 
 
 def test_entry_sort_key():
@@ -351,111 +263,6 @@ def test_merge_join_is_lazy():
 
 def _manifest_text(lines: list[str]) -> str:
     return "\n".join(['{"s3bak_manifest":3}', *lines]) + "\n"
-
-
-def test_write_merged_replaces_subtree_in_order(tmp_path):
-    # Old manifest holds ., a.txt, sub.txt, sub/, sub/old.txt, z.txt. Patch
-    # `sub` from a local tree now holding new.txt. "sub.txt" (key 'sub.')
-    # interleaves BETWEEN the file key 'sub' and the dir key 'sub/'.
-    old = tmp_path / "old.jsonl"
-    old.write_text(
-        _manifest_text(
-            [
-                '{"path":".","mode":"40755","mtime_ns":0}',
-                '{"path":"./a.txt","mode":"100644","size":1,"mtime_ns":0}',
-                '{"path":"./sub.txt","mode":"100644","size":1,"mtime_ns":0}',
-                '{"path":"./sub","mode":"40755","mtime_ns":0}',
-                '{"path":"./sub/old.txt","mode":"100644","size":1,"mtime_ns":0}',
-                '{"path":"./z.txt","mode":"100644","size":1,"mtime_ns":0}',
-            ]
-        )
-    )
-    local_sub = tmp_path / "sub"
-    local_sub.mkdir()
-    (local_sub / "new.txt").write_text("n")
-
-    out = io.StringIO()
-    manifest.write_merged(out, str(old), "sub", localwalk.iter_subtree(str(local_sub), "sub", []))
-    lines = out.getvalue().splitlines()
-    assert json.loads(lines[0]) == {"s3bak_manifest": 3}
-    rels = [json.loads(ln)["path"] for ln in lines[1:]]
-    assert rels == [".", "./a.txt", "./sub.txt", "./sub", "./sub/new.txt", "./z.txt"]
-
-
-def test_write_merged_removes_deleted_subtree(tmp_path):
-    old = tmp_path / "old.jsonl"
-    old.write_text(
-        _manifest_text(
-            [
-                '{"path":".","mode":"40755","mtime_ns":0}',
-                '{"path":"./gone","mode":"40755","mtime_ns":0}',
-                '{"path":"./gone/x","mode":"100644","size":1,"mtime_ns":0}',
-                '{"path":"./keep.txt","mode":"100644","size":1,"mtime_ns":0}',
-            ]
-        )
-    )
-    out = io.StringIO()
-    manifest.write_merged(out, str(old), "gone", [])
-    rels = [json.loads(ln)["path"] for ln in out.getvalue().splitlines()[1:]]
-    assert rels == [".", "./keep.txt"]
-
-
-def test_write_merged_whole_entry_mirror_drops_old_only_records(tmp_path):
-    # sub=None makes the whole tree the replaced range: with keep_old=False the
-    # output is exactly the fresh walk, regardless of what the old manifest held.
-    old = tmp_path / "old.jsonl"
-    old.write_text(
-        _manifest_text(
-            [
-                '{"path":".","mode":"40755","mtime_ns":0}',
-                '{"path":"./gone.txt","mode":"100644","size":1,"mtime_ns":0}',
-                '{"path":"./keep.txt","mode":"100644","size":1,"mtime_ns":0}',
-            ]
-        )
-    )
-    root = tmp_path / "root"
-    root.mkdir()
-    (root / "keep.txt").write_text("k")
-
-    out = io.StringIO()
-    manifest.write_merged(out, str(old), None, localwalk.walk_tree(str(root), []))
-    rels = [json.loads(ln)["path"] for ln in out.getvalue().splitlines()[1:]]
-    assert rels == [".", "./keep.txt"]
-
-
-def test_write_merged_keep_all_retains_old_only_records_verbatim(tmp_path):
-    # keep_old=True: locally-vanished files, symlinks, and empty dirs all keep
-    # their records, copied verbatim (unknown JSON keys survive). A path present
-    # on both sides takes the fresh walk record.
-    old = tmp_path / "old.jsonl"
-    old.write_text(
-        _manifest_text(
-            [
-                '{"path":".","mode":"40755","mtime_ns":0}',
-                '{"path":"./emptydir","mode":"40755","mtime_ns":0,"future":"kept"}',
-                '{"path":"./gone.txt","mode":"100644","size":1,"mtime_ns":0}',
-                '{"path":"./keep.txt","mode":"100644","size":1,"mtime_ns":7}',
-                '{"path":"./link","mode":"120777","mtime_ns":0,"link":"gone.txt"}',
-            ]
-        )
-    )
-    root = tmp_path / "root"
-    root.mkdir()
-    (root / "keep.txt").write_text("changed")
-
-    out = io.StringIO()
-    manifest.write_merged(out, str(old), None, localwalk.walk_tree(str(root), []), keep_old=True)
-    lines = out.getvalue().splitlines()[1:]
-    entries = [json.loads(ln) for ln in lines]
-    assert [e["path"] for e in entries] == [
-        ".",
-        "./emptydir",
-        "./gone.txt",
-        "./keep.txt",
-        "./link",
-    ]
-    assert entries[1]["future"] == "kept"  # verbatim copy, unknown key preserved
-    assert entries[3]["mtime_ns"] != 7  # both sides: the fresh walk record won
 
 
 # --- the push journal ----------------------------------------------------------
@@ -576,44 +383,6 @@ def test_merge_journal_warns_when_records_survive_under_a_file(tmp_path):
     journal = _write_journal(tmp_path, ['+{"path":"./d","mode":"100644","size":1,"mtime_ns":0}'])
     warnings: list[str] = []
     manifest.merge_journal(io.StringIO(), str(old), journal, warn=warnings.append)
-    assert len(warnings) == 1
-    assert "./d" in warnings[0]
-
-
-def test_write_merged_warns_once_when_records_survive_under_a_file(tmp_path):
-    # The local dir `d` became a regular file while its old records are kept:
-    # the manifest is no longer restorable as a tree. One warning per subtree,
-    # even with several surviving descendants, and the sibling "d.txt" (which
-    # sorts between the file key `d` and the range `d/`) must not reset it.
-    old = tmp_path / "old.jsonl"
-    old.write_text(
-        _manifest_text(
-            [
-                '{"path":".","mode":"40755","mtime_ns":0}',
-                '{"path":"./d.txt","mode":"100644","size":1,"mtime_ns":0}',
-                '{"path":"./d","mode":"40755","mtime_ns":0}',
-                '{"path":"./d/x.txt","mode":"100644","size":1,"mtime_ns":0}',
-                '{"path":"./d/y.txt","mode":"100644","size":1,"mtime_ns":0}',
-            ]
-        )
-    )
-    root = tmp_path / "root"
-    root.mkdir()
-    (root / "d").write_text("now a file")
-    (root / "d.txt").write_text("sibling")
-
-    warnings: list[str] = []
-    out = io.StringIO()
-    manifest.write_merged(
-        out,
-        str(old),
-        None,
-        localwalk.walk_tree(str(root), []),
-        keep_old=True,
-        warn=warnings.append,
-    )
-    rels = [json.loads(ln)["path"] for ln in out.getvalue().splitlines()[1:]]
-    assert rels == [".", "./d", "./d.txt", "./d", "./d/x.txt", "./d/y.txt"]
     assert len(warnings) == 1
     assert "./d" in warnings[0]
 

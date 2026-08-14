@@ -300,19 +300,6 @@ def test_single_file_push_checksum_refreshes_manifest_on_mode_change(ws):
     assert '"mode":"100600"' in _manifest_body(ws, "solo")
 
 
-def test_single_file_push_data_only_ignores_mode_change(ws):
-    local = ws.write("solo.txt", "content")
-    os.chmod(local, 0o644)
-    ws.config({"solo": {"path": str(local)}})
-    ws.run("push", "solo", expect_rc=0)
-    os.chmod(local, 0o600)
-
-    res = ws.run("push", "--data-only", "solo", expect_rc=0)
-
-    assert "Updating" not in res.err  # --data-only never touches the manifest
-    assert '"mode":"100644"' in _manifest_body(ws, "solo")
-
-
 def test_push_refreshes_manifest_on_entry_root_mode_change(ws):
     ws.write("data/a.txt", "alpha")
     os.chmod(ws.root / "data", 0o755)
@@ -508,7 +495,7 @@ def test_push_broken_pipe_from_transfer_output_maps_to_141(ws, monkeypatch):
     # s3transfer's own futures.py wraps that callback in a bare `except
     # Exception` that only logs - it never re-raises. Without _transfer's own
     # catch/reraise, a closed stdout during a transfer (`s3bak push data |
-    # head -n 0`) would make write_output's BrokenPipeError vanish inside
+    # head -n 0`) would make the result line's BrokenPipeError vanish inside
     # s3transfer instead of surfacing: the run would look like a clean
     # success (exit 0) instead of the documented exit 141, like the
     # sigpipe-mapping tests below (test_run_diff_maps_sigpipe_to_broken_pipe
@@ -516,16 +503,16 @@ def test_push_broken_pipe_from_transfer_output_maps_to_141(ws, monkeypatch):
     import signal
 
     from s3bak import cli
-    from s3bak import store as store_mod
+    from s3bak.console import console
 
     ws.write("data/a.txt", "alpha")
     ws.write("data/b.txt", "beta")
     ws.config({"data": {"path": str(ws.root / "data")}})
 
-    def broken_write_output(text: str) -> None:
+    def broken_out(text: str) -> None:
         raise BrokenPipeError
 
-    monkeypatch.setattr(store_mod, "write_output", broken_write_output)
+    monkeypatch.setattr(console, "out", broken_out)
     monkeypatch.setattr("sys.argv", ["s3bak", "push", "data"])
     saved = signal.getsignal(signal.SIGINT)
     try:
@@ -578,7 +565,7 @@ def test_push_after_local_delete_keeps_backup_by_default(ws):
         "Body"
     ].read()
     assert b'"path":"./b.txt"' in manifest_body
-    res = ws.run("status", "data", expect_rc=0)
+    res = ws.run("status", "--delete", "data", expect_rc=0)
     assert f"D {ws.root / 'data' / 'b.txt'}" in res.out
 
     dest = ws.root / "restore"
@@ -628,21 +615,6 @@ def test_push_keeps_records_of_locally_deleted_symlink_and_empty_dir(ws):
     assert b'"path":"./emptydir"' in manifest_body
 
 
-def test_push_meta_only_keeps_records_of_locally_deleted_files(ws):
-    ws.write("data/a.txt", "a")
-    ws.write("data/b.txt", "b")
-    ws.config({"data": {"path": str(ws.root / "data")}})
-    ws.run("push", "data", expect_rc=0)
-
-    (ws.root / "data" / "b.txt").unlink()
-    ws.run("push", "--meta-only", "data", expect_rc=0)
-
-    manifest_body = ws.s3.get_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data-manifest.jsonl")[
-        "Body"
-    ].read()
-    assert b'"path":"./b.txt"' in manifest_body
-
-
 def test_push_warns_when_a_kept_subtree_ends_up_under_a_file(ws):
     # dir -> file replacement while the old records are kept: the manifest can
     # no longer restore as a tree, which the default (no-prompt) push must
@@ -674,19 +646,56 @@ def test_push_dry_run_previews_the_kept_subtree_warning(ws):
     assert "data/d" not in ws.keys()  # the conflicting file was not uploaded
 
 
-def test_pull_single_file_reports_missing_object(ws):
-    # A recorded single-file object deleted out-of-band: the pull must say
-    # what is missing, not just exit 1.
+def test_single_file_pull_warns_when_object_is_gone(ws):
+    # The single-file lane matches the directory sync: a missing object
+    # downloads nothing, and the stale record is warned about and skipped.
+    target = ws.write("solo.conf", "cfg")
+    ws.config({"solo.conf": {"path": str(target)}})
+    ws.run("push", "solo.conf", expect_rc=0)
+    ws.s3.delete_object(Bucket=ws.bucket, Key=f"{ws.prefix}/solo.conf")
+
+    dest = ws.root / "restored.conf"
+    res = ws.run("pull", "solo.conf", "-o", str(dest), expect_rc=0)
+
+    assert "a push retires the stale record" in res.err
+    assert not dest.exists()
+
+
+def test_single_file_pull_leaves_a_diverged_local_copy_untouched(ws):
+    # Object gone AND the local copy diverged - here at the SAME size, the
+    # case a size check could never catch: the record is skipped in full, so
+    # the local content, mode, and mtime stay exactly as they were. Stamping
+    # the record's mtime over the divergence would hide it from every later
+    # size+mtime comparison while reporting a restore that never happened.
     target = ws.write("solo.conf", "cfg")
     ws.config({"solo.conf": {"path": str(target)}})
     ws.run("push", "solo.conf", expect_rc=0)
 
     ws.s3.delete_object(Bucket=ws.bucket, Key=f"{ws.prefix}/solo.conf")
-    target.write_text("locally changed")  # defeat the all-matching short-circuit
-    res = ws.run("pull", "solo.conf")
+    target.write_text("xyz")  # same size, different content and mtime
+    before = os.lstat(target)
+    res = ws.run("pull", "solo.conf", expect_rc=0)
 
-    assert res.rc == 1
-    assert "object missing on S3" in res.err
+    assert "a push retires the stale record" in res.err
+    assert target.read_text() == "xyz"
+    after = os.lstat(target)
+    assert (after.st_mode, after.st_mtime_ns) == (before.st_mode, before.st_mtime_ns)
+
+
+def test_subpath_file_pull_warns_when_object_is_gone(ws):
+    # The sub-path file lane takes the same skip: warn, restore nothing,
+    # leave the local path alone.
+    ws.write("data/a.txt", "alpha")
+    ws.write("data/b.txt", "beta")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.s3.delete_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/a.txt")
+
+    dest = ws.root / "restored.txt"
+    res = ws.run("pull", "data/a.txt", "-o", str(dest), expect_rc=0)
+
+    assert "a push retires the stale record" in res.err
+    assert not dest.exists()
 
 
 def test_pull_delete_removes_local_extras(ws):
@@ -864,7 +873,7 @@ def test_pull_delete_interactive_q_aborts(ws, answers):
     res = ws.run("pull", "--delete", "data")
 
     assert res.rc == 1
-    assert "aborted" in res.err
+    assert "aborted" in res.err and "pull again to finish" in res.err
     assert not (ws.root / "data" / "extra1.txt").exists()
     assert (ws.root / "data" / "extra2.txt").exists()
 
@@ -887,10 +896,11 @@ def test_pull_delete_confirms_on_the_clean_tree_short_circuit_too(ws, answers):
 # --- data-safety guarantees: staged root replacement, delete gating, re-settle ---
 
 
-def test_pull_keeps_conflicting_dir_root_when_download_fails(ws):
-    # A single-file entry restoring over a local DIRECTORY must not destroy it
-    # before the download has succeeded: with the data object gone from S3,
-    # the pull fails and the directory (and its contents) survive.
+def test_pull_keeps_conflicting_dir_root_when_object_is_gone(ws):
+    # A single-file entry restoring over a local DIRECTORY, with the data
+    # object gone from S3: nothing arrives in the stage, so there is nothing
+    # to swap in - the directory (and its contents) survive, the stale
+    # record is warned about, and the empty stage is retired.
     ws.write("data", "payload")
     ws.config({"data": {"path": str(ws.root / "data")}})
     ws.run("push", "data", expect_rc=0)
@@ -899,8 +909,8 @@ def test_pull_keeps_conflicting_dir_root_when_download_fails(ws):
     dest = ws.root / "out"
     keep = ws.write("out/precious.txt", "keep me")
 
-    res = ws.run("pull", "data", "-o", str(dest))
-    assert res.rc == 1
+    res = ws.run("pull", "data", "-o", str(dest), expect_rc=0)
+    assert "a push retires the stale record" in res.err
     assert keep.read_text() == "keep me"
     assert not list(ws.root.glob("*.s3bak-stage*"))
 
@@ -1136,42 +1146,75 @@ def test_verify_checksum_warns_on_unreadable_local_file(ws):
     assert "1 warning(s)" in res.out  # surfaced in the summary, not reported OK
 
 
-def test_pull_meta_only_ignores_size_difference(ws):
-    # --meta-only applies metadata over whatever data is already present; it
-    # never downloads, so it must NOT fail on a size difference from the record
-    # (the presence/size check is for real data pulls only).
-    p = ws.write("data/a.txt", "hello")
-    os.chmod(p, 0o644)
-    ws.config({"data": {"path": str(ws.root / "data")}})
-    ws.run("push", "data", expect_rc=0)
-
-    p.write_text("a much longer replacement body")  # size now differs from the record
-    os.chmod(p, 0o600)  # and a mode drift for --meta-only to settle
-    res = ws.run("pull", "--meta-only", "data")
-    assert res.rc == 0
-    assert (os.lstat(p).st_mode & 0o777) == 0o644  # metadata applied despite the size
-
-
-def test_pull_data_only_detects_size_mismatched_object(ws):
-    # --data-only skips apply_manifest; the integrity check must still catch an
-    # object whose size no longer matches the record (out-of-band overwrite).
+def test_pull_detects_size_mismatched_object(ws):
+    # The metadata apply must catch an object whose restored size no longer
+    # matches the record (out-of-band overwrite): applying metadata over
+    # wrong content would report a successful restore that is not one.
     ws.write("data/a.txt", "hello")
     ws.config({"data": {"path": str(ws.root / "data")}})
     ws.run("push", "data", expect_rc=0)
     ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/a.txt", Body=b"x")  # 1 byte
-    res = ws.run("pull", "--data-only", "data", "-o", str(ws.root / "out"))
+    res = ws.run("pull", "data", "-o", str(ws.root / "out"))
     assert res.rc == 1
     assert "size does not match" in res.err.lower()
 
 
-def test_pull_data_only_detects_missing_object(ws):
+def test_pull_warns_and_skips_a_record_whose_object_is_gone(ws):
+    # A record whose object is gone (an interrupted deletion, an out-of-band
+    # delete) is stale residue, not a reason to abort a restore: the pull
+    # warns, skips it, and restores everything else; the next push retires
+    # the record. run() maps the warning to exit 2.
+    ws.write("data/a.txt", "hello")
+    ws.write("data/b.txt", "beta")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.s3.delete_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/a.txt")
+
+    out = ws.root / "out"
+    res = ws.run("pull", "data", "-o", str(out), expect_rc=0)
+
+    assert "a push retires the stale record" in res.err
+    assert (out / "b.txt").read_text() == "beta"  # the rest still restored
+    assert not (out / "a.txt").exists()
+
+
+def test_pull_delete_warns_once_per_stale_record(ws):
+    # The --delete re-settle re-applies metadata after removals; it must not
+    # repeat the stale-record warning the first apply already emitted.
+    ws.write("data/a.txt", "alpha")
+    ws.write("data/b.txt", "beta")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.s3.delete_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/a.txt")
+    (ws.root / "data" / "a.txt").unlink()
+
+    out = ws.root / "out"
+    ws.run("pull", "data", "-o", str(out), expect_rc=0)  # restore b.txt
+    ws.write("out/extra.txt", "x")  # an extra, so the re-settle runs
+    res = ws.run("pull", "--delete", "--yes", "data", "-o", str(out), expect_rc=0)
+
+    assert res.err.count("a push retires the stale record") == 1
+    assert not (out / "extra.txt").exists()
+
+
+def test_pull_stale_record_maps_to_exit_2(ws, monkeypatch):
+    # Through the real entry point: the stale-record warning is a warning,
+    # so a pull that only met residue exits 2, not 0 and not 1.
     ws.write("data/a.txt", "hello")
     ws.config({"data": {"path": str(ws.root / "data")}})
     ws.run("push", "data", expect_rc=0)
     ws.s3.delete_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/a.txt")
-    res = ws.run("pull", "--data-only", "data", "-o", str(ws.root / "out"))
-    assert res.rc == 1
-    assert "missing" in res.err.lower()
+
+    import signal
+
+    monkeypatch.setattr("sys.argv", ["s3bak", "pull", "data", "-o", str(ws.root / "out")])
+    saved = signal.getsignal(signal.SIGINT)
+    try:
+        rc = cli.run()
+    finally:
+        signal.signal(signal.SIGINT, saved)
+
+    assert rc == 2
 
 
 def test_staged_pull_preserves_old_root_when_apply_fails(ws):
@@ -1294,23 +1337,17 @@ def test_pull_output_trailing_slash_is_exact(ws):
 
 
 def test_diff_ignores_conflicting_unrecorded_orphans(ws):
-    # --data-only pushes leave unrecorded objects; two that conflict (a file and
-    # a directory recorded at one path) cannot be materialized together by a bulk
-    # prefix sync. diff must ignore unrecorded objects (download only recorded
-    # files), not fail trying to download them all.
+    # Out-of-band uploads leave unrecorded objects; two that conflict (a file
+    # and a directory shape at one path) cannot be materialized together by a
+    # bulk prefix sync. diff must ignore unrecorded objects (download only
+    # recorded files), not fail trying to download them all.
     (ws.root / "data").mkdir()
     ws.config({"data": {"path": str(ws.root / "data")}})
     ws.run("push", "data", expect_rc=0)  # empty dir entry: manifest = root only
 
-    foo = ws.write("data/foo", "i am a file")
-    ws.run("push", "--data-only", "data/foo", expect_rc=0)  # unrecorded object data/foo
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/foo", Body=b"i am a file")
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/foo/bar", Body=b"under a dir")
 
-    os.remove(foo)
-    (ws.root / "data" / "foo").mkdir()
-    ws.write("data/foo/bar", "i am under a dir")
-    ws.run("push", "--data-only", "data/foo/bar", expect_rc=0)  # unrecorded data/foo/bar
-
-    shutil.rmtree(ws.root / "data" / "foo")  # local foo gone; S3 has conflicting orphans
     res = ws.run("diff", "data")
     assert res.rc == 0  # nothing recorded, nothing local: no diff, not a download failure
 
@@ -1361,6 +1398,16 @@ def test_status_warns_on_inaccessible_single_file_entry(ws):
     os.chmod(ws.root / "locked", 0)
     try:
         res = ws.run("status", "solo")
+    finally:
+        os.chmod(ws.root / "locked", 0o755)
+    assert "cannot access" in res.err.lower()
+    # status --delete is where a missing file would print D, so it is where
+    # a false "missing" must be proven absent.
+    os.chmod(ws.root / "locked", 0o755)
+    ws.run("push", "solo", expect_rc=0)  # no-op; keeps the fixture coherent
+    os.chmod(ws.root / "locked", 0)
+    try:
+        res = ws.run("status", "--delete", "solo")
     finally:
         os.chmod(ws.root / "locked", 0o755)
     assert "cannot access" in res.err.lower()

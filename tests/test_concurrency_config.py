@@ -24,13 +24,17 @@ def _store(ws) -> cli.Boto3S3Store:
     return store
 
 
-def test_defaults_leave_concurrency_unset(ws):
+def test_defaults_fall_through_to_the_library_concurrency(ws):
     ws.write("data/a.txt", "x")
     ws.config({"data": {"path": str(ws.root / "data")}})
 
     store = _store(ws)
     assert store.max_concurrency is None
-    assert store._s3._transfer_config is None  # library default (10) applies
+    # A TransferConfig is built either way and handed to the library, so an
+    # unset max_concurrency resolves to the library's own default inside it -
+    # never to the separate branch the library takes when given no config.
+    assert store._transfer_config.max_concurrency == 10
+    assert store._s3._transfer_config is store._transfer_config
     # content_compare is the bare EtagComparison, run inline on the sync
     # thread (the journal needs ordered lane decisions).
     assert type(store.content_compare()).__name__ == "EtagComparison"
@@ -71,8 +75,8 @@ def test_max_concurrency_sizes_transfers_and_verify_pool(ws):
 
     store = _store(ws)
     assert store.max_concurrency == 6
-    tc = store._s3._transfer_config
-    assert tc is not None and tc.max_concurrency == 6
+    assert store._transfer_config.max_concurrency == 6
+    assert store._s3._transfer_config is store._transfer_config
     # verify's hashing pool follows max_concurrency.
     assert store.compare_pool_size() == 6
 

@@ -22,7 +22,8 @@ from dataclasses import dataclass
 from s3bak import localwalk, manifest
 from s3bak.compare import SYMLINK_MTIME_SUPPORTED, compare_to_stat
 from s3bak.confirm import DeleteConfirmer
-from s3bak.console import IS_WINDOWS, err, is_junction, note_warning, write_output
+from s3bak.console import IS_WINDOWS, console, is_junction
+from s3bak.excludes import Excludes
 from s3bak.manifest import ManifestEntry
 
 # =============================================================================
@@ -149,11 +150,16 @@ def within_root(root_real: str, target: str) -> bool:
 
 
 def prepare_dir_conflicts(outpath: str, manifest_path: str, sub: str | None) -> int:
-    """Replace a local symlink or Windows directory junction sitting where the
-    manifest records a directory, BEFORE the data sync runs: the sync opens
-    ``dir/file`` paths through whatever is at ``dir``, so a pre-existing
-    symlink or junction there would route the downloads outside the restore
-    tree. The metadata apply would repair the type anyway - this makes the
+    """Replace a local symlink or Windows directory junction sitting at any
+    directory position the restore will write through, BEFORE the data sync
+    runs: the sync opens ``dir/file`` paths through whatever is at ``dir``,
+    so a pre-existing symlink or junction there would route the downloads
+    outside the restore tree. The positions are every recorded directory AND
+    every record's ancestor directories - a parent directory record is
+    optional (an excluded directory is unrecorded while its children are,
+    docs/excludes.md), so the unrecorded levels must be vetted from the
+    child records' paths, not only from directory records. The metadata
+    apply would repair a recorded directory's type anyway - this makes the
     repair happen before any bytes move. Other conflicting types stay
     untouched here: a write through a regular file fails loudly instead of
     escaping, and apply_manifest settles it after the download. A symlink is
@@ -162,29 +168,27 @@ def prepare_dir_conflicts(outpath: str, manifest_path: str, sub: str | None) -> 
     the number of conflicts that could not be cleared (each reported)."""
     errors = 0
     root_real = canonical_restore_path(outpath)
-    for entry in manifest.iter_manifest(manifest_path):
-        if not entry.is_dir:
-            continue
-        rel = resolve_manifest_rel(entry.path, sub)
-        if rel is None or rel == ".":
-            continue  # the pull corrects the restore root itself
+    # The ancestor chain already vetted, innermost last - records arrive in
+    # sorted order, so the chain changes incrementally and memory stays
+    # bounded by directory depth, never tree size.
+    vetted: list[str] = []
+
+    def vet(rel: str, recorded_path: str) -> None:
+        nonlocal errors
         target = os.path.join(outpath, rel)
-        # Records arrive parents-first, so by the time a child is checked its
-        # ancestors are real directories and one lstat per record is enough (a
-        # link or junction behind a fixed parent cannot survive to this point).
         try:
             st = os.lstat(target)
         except OSError:
-            continue
+            return
         is_symlink = stat_mod.S_ISLNK(st.st_mode)
         # A junction lstats as an ordinary directory (Windows does not model
         # it as a symlink), so it needs its own check alongside S_ISLNK.
         if not is_symlink and not is_junction(st):
-            continue
+            return
         if not within_root(root_real, target):
-            err(f"manifest path escapes restore root, skipped: {entry.path}")
+            console.err(f"manifest path escapes restore root, skipped: {recorded_path}")
             errors += 1
-            continue
+            return
         try:
             if is_symlink:
                 os.remove(target)
@@ -192,8 +196,26 @@ def prepare_dir_conflicts(outpath: str, manifest_path: str, sub: str | None) -> 
                 os.rmdir(target)  # a junction is removed like an (empty) directory
             os.makedirs(target, exist_ok=True)
         except OSError as e:
-            err(f"cannot replace symlink or junction with recorded directory: {target}: {e}")
+            console.err(
+                f"cannot replace symlink or junction with recorded directory: {target}: {e}"
+            )
             errors += 1
+
+    for entry in manifest.iter_manifest(manifest_path):
+        rel = resolve_manifest_rel(entry.path, sub)
+        if rel is None or rel == ".":
+            continue  # the pull corrects the restore root itself
+        # Vet the ancestor directories this record restores through, then -
+        # for a directory record - the recorded position itself.
+        parts = rel.split("/")
+        chain = ["/".join(parts[: depth + 1]) for depth in range(len(parts) - 1)]
+        if entry.is_dir:
+            chain.append(rel)
+        while vetted and (len(vetted) > len(chain) or vetted[-1] != chain[len(vetted) - 1]):
+            vetted.pop()
+        for ancestor in chain[len(vetted) :]:
+            vet(ancestor, entry.path)
+            vetted.append(ancestor)
     return errors
 
 
@@ -217,8 +239,8 @@ def windows_collect_writable_prep(
     # difference under --checksum), and prep must never under-approximate
     # what apply may need to overwrite, remove, or replace. Temporarily add
     # owner-write so that can proceed; apply_manifest re-applies the recorded
-    # modes afterwards (or windows_restore_modes on the failure/--data-only
-    # paths). Returns [(path, original_mode), ...].
+    # modes afterwards (or windows_restore_modes on the failure paths).
+    # Returns [(path, original_mode), ...].
     targets: list[tuple[str, int]] = []
     try:
         for entry in manifest.iter_manifest(manifest_path):
@@ -262,12 +284,12 @@ def _apply_meta(target: str, mode: int, mtime_ns: int | None) -> bool:
         # which run() would let escape as a traceback. Treat it as an ordinary
         # metadata-apply failure (exit 1) like any other utime error.
         except (OSError, OverflowError, ValueError) as e:
-            err(f"utime failed: {target}: {e}")
+            console.err(f"utime failed: {target}: {e}")
             ok = False
     try:
         os.chmod(target, mode)
     except OSError as e:
-        err(f"chmod failed: {target}: {e}")
+        console.err(f"chmod failed: {target}: {e}")
         ok = False
     return ok
 
@@ -300,13 +322,13 @@ def local_keyed(
 
     The manifest walk under ``outpath``. ``sub`` (the entry-relative path that
     ``outpath`` corresponds to) re-anchors the walk's exclude matching at the
-    ENTRY root, so the entry's entry-rooted patterns prune the same paths they
+    ENTRY root, so the entry's entry-rooted patterns filter the same paths they
     would in a full walk - otherwise a sub-path ``pull --delete`` would treat an
     excluded local file as an extra and remove it. The emitted ``rel`` and sort
     key stay sub-relative, so they merge-join with ``manifest_keyed(sub)``. An
-    excluded path is invisible to the diff on both lanes (never compared, never a
-    local extra). A missing ``outpath`` yields nothing, so status degrades to
-    reporting every record D.
+    excluded local path never enters the diff (never compared, never a local
+    extra); every path is judged alone (docs/excludes.md), the walked sub root
+    included. A missing ``outpath`` yields nothing.
 
     ``warn`` (``status`` passes it) surfaces walk gaps - an unreadable directory
     hides its children, so ``status`` would otherwise report a clean tree while a
@@ -316,30 +338,15 @@ def local_keyed(
     try:
         os.lstat(outpath)
     except FileNotFoundError:
-        return  # missing locally: status degrades to reporting every record D
+        return  # missing locally: every record is manifest-only (cmd_status warns)
     except OSError as e:
         # An unreadable outpath (an unsearchable parent, say) is NOT "absent":
-        # os.path.lexists would swallow the error and status would then print
-        # every record D and exit 0, hiding that the comparison never happened.
+        # os.path.lexists would swallow the error and status would then read
+        # as a clean tree (exit 0), hiding that the comparison never happened.
         # Report it as a walk gap so status warns and the run exits 2.
         if warn is not None:
             warn(f"cannot read {outpath}: {e}")
         return
-    if sub is not None:
-        prune, _skip = manifest.split_excludes(excludes)
-        # If the sub root itself - or any ancestor of it - is a pruned directory,
-        # the whole sub subtree is excluded. A full walk prunes it as a directory
-        # child before descending; a sub-path walk STARTS inside it (its own root
-        # is yielded unconditionally, and children of an already-excluded dir do
-        # not match the ancestor pattern), so detect it here and yield nothing -
-        # otherwise pull --delete would treat the excluded contents as extras.
-        # Records under an excluded sub are still applied via apply_manifest's
-        # direct-lstat fallback.
-        parts = sub.split("/")
-        for depth in range(len(parts)):
-            ancestor = "./" + "/".join(parts[: depth + 1])
-            if prune.match(ancestor):
-                return
     root_rel = "." if sub is None else f"./{sub}"
     rel_prefix = "./" if sub is None else f"./{sub}/"
     for rel, st, sym in localwalk.walk_tree(
@@ -432,7 +439,7 @@ def _place_symlink(
             except OSError:
                 pass
             raise
-    write_output(f"{target} -> {sym_target}\n")
+    console.out(f"{target} -> {sym_target}\n")
     if not SYMLINK_MTIME_SUPPORTED or mtime_ns is None:
         return True
     try:
@@ -442,7 +449,7 @@ def _place_symlink(
     # which run() would let escape as a traceback. Treat it as an ordinary
     # metadata-apply failure (exit 1) like any other utime error.
     except (OSError, OverflowError, ValueError) as e:
-        err(f"utime failed: {target}: {e}")
+        console.err(f"utime failed: {target}: {e}")
         return False
     return True
 
@@ -500,11 +507,11 @@ def _settle_dir(target: str, m_entry: ManifestEntry, window_ns: int) -> int:
     always re-lstats rather than trusting an earlier one."""
     st, _sym = _lstat_readlink(target)
     if st is None or not stat_mod.S_ISDIR(st.st_mode):
-        err(f"expected {m_entry.path} to be a directory: {target}")
+        console.err(f"expected {m_entry.path} to be a directory: {target}")
         return 1
     if compare_to_stat(m_entry, st, None, window_ns=window_ns).is_match:
         return 0
-    write_output(f"{m_entry.perm_str} {target}\n")
+    console.out(f"{m_entry.perm_str} {target}\n")
     return 0 if _apply_meta(target, m_entry.perm_bits, m_entry.mtime_ns) else 1
 
 
@@ -550,7 +557,7 @@ def _apply_record(
     window_ns: int,
     is_dir_entry: bool,
     deferred_symlinks: list[tuple[str, ManifestEntry]],
-    enforce_size: bool,
+    warn_stale: bool,
 ) -> _ApplyOutcome:
     """Repair one manifest record against its local lstat; a record whose
     local state already matches (the shared ``compare_to_stat`` predicate) is
@@ -611,30 +618,44 @@ def _apply_record(
     if compare_to_stat(m_entry, st, local_sym, window_ns=window_ns).is_match:
         return _ApplyOutcome(0)
     if st is None:
-        err(f"expected file missing (sync did not place it): {target}")
+        if m_entry.is_file:
+            # Nothing local and nothing downloaded: the record's object is
+            # gone (an interrupted deletion, an out-of-band delete). Stale
+            # residue must not abort a restore - warn, skip the record, and
+            # keep restoring; the next push retires the record
+            # (docs/sync.md, the pull pipeline). ``warn_stale`` False is the
+            # pull --delete re-settle, which already warned on its first
+            # pass over the same records.
+            if warn_stale:
+                console.warn(
+                    f"warning: no data object behind this record - skipped"
+                    f" (a push retires the stale record): {target}"
+                )
+            return _ApplyOutcome(0)
+        # A special file is never created by pull (storage.md#restore-fidelity):
+        # a missing one is a hard error, not residue.
+        console.err(f"expected special file missing (pull does not create it): {target}")
         return _ApplyOutcome(1)
     if stat_mod.S_IFMT(st.st_mode) != stat_mod.S_IFMT(m_entry.mode):
         # In particular, never chmod/utime through a local symlink where a
-        # regular file is recorded: --meta-only must not mutate the link's
+        # regular file is recorded: the apply must not mutate the link's
         # target outside the restore tree.
-        err(f"expected {m_entry.path} to have its recorded file type: {target}")
+        console.err(f"expected {m_entry.path} to have its recorded file type: {target}")
         return _ApplyOutcome(1)
-    if enforce_size and m_entry.is_file and m_entry.size is not None and st.st_size != m_entry.size:
+    if m_entry.is_file and m_entry.size is not None and st.st_size != m_entry.size:
         # After the data sync a regular file must have its recorded size: the
         # ManifestFilter re-downloads any pair whose size drifted, so a surviving
         # mismatch means the S3 object itself does not match the record (an
         # out-of-band overwrite, a truncated object, or one that was missing so
         # a stale local file was left in place). Applying metadata would report
         # success on wrong content, so fail instead - restore fidelity is the
-        # point of the backup. Only checked when the data sync ran: --meta-only
-        # applies metadata over whatever data is already there and must not fail
-        # on a size difference it was never asked to reconcile.
-        err(
+        # point of the backup.
+        console.err(
             f"restored size does not match manifest ({st.st_size} != {m_entry.size}),"
             f" the stored object does not match the record: {target}"
         )
         return _ApplyOutcome(1)
-    write_output(f"{m_entry.perm_str} {target}\n")
+    console.out(f"{m_entry.perm_str} {target}\n")
     return _ApplyOutcome(0 if _apply_meta(target, m_entry.perm_bits, m_entry.mtime_ns) else 1)
 
 
@@ -646,7 +667,7 @@ def apply_manifest(
     *,
     window_ns: int,
     excludes: list[str] | None = None,
-    enforce_size: bool = True,
+    warn_stale: bool = True,
 ) -> int:
     """Repair local state to match the manifest, touching (and reporting)
     only records whose local state differs - the shared size+mtime predicate
@@ -654,11 +675,11 @@ def apply_manifest(
     ``window_ns`` is a match and stays as it is.
 
     A directory entry consumes one merge-join of the manifest against a fresh
-    local walk. The walk prunes ``excludes`` (an excluded subtree is never
-    scanned) but serves purely as a stat cache: a record the walk did not
-    pair up is judged from a direct lstat before anything is concluded, so a
-    record under an excluded path - pull's data sync is exclude-blind - is
-    still repaired, and a genuinely missing file still errors.
+    local walk. The walk filters ``excludes`` and serves purely as a stat
+    cache: a record the walk did not pair up is judged from a direct lstat
+    before anything is concluded. An EXCLUDED record is skipped in full
+    (docs/excludes.md): pull never downloads, recreates, or applies metadata
+    at an excluded path.
 
     Directory records settle their mode/mtime through an ancestor stack (see
     the module comment above ``_is_ancestor``): a directory pushes its frame
@@ -680,11 +701,8 @@ def apply_manifest(
     this adds at most one deferred entry per such symlink, the same bounded
     allowance as the directory-conflict deferral above.
 
-    ``enforce_size`` (True after a real data sync) makes a regular file whose
-    on-disk size differs from its record a hard error - the object does not
-    match the backup. ``--meta-only`` passes False: it applies metadata over
-    whatever data is already present and must not fail on a size it never
-    downloaded."""
+    A regular file whose on-disk size differs from its record is a hard
+    error - the object does not match the backup."""
     deferred_symlinks: list[tuple[str, ManifestEntry]] = []
     dir_stack: list[_DirFrame] = []
     post_symlink_dirs: list[tuple[str, ManifestEntry]] = []
@@ -702,6 +720,25 @@ def apply_manifest(
     # bless the outside target and make later children look spuriously outside
     # the newly created root.
     root_real = canonical_restore_path(outpath)
+    ex = Excludes(excludes or [])
+
+    def excluded_record(rel: str, is_dir_rec: bool, target: str) -> bool:
+        # rel is sub-relative ("." = the walked root); re-anchor at the
+        # entry root, where the patterns are defined. The entry root itself
+        # is never matched; a SUB pull's own root is an ordinary judged
+        # path. Anchored patterns match the restore destination's absolute
+        # path (aws-cli's join-onto-root semantics).
+        if ex.empty:
+            return False
+        if sub is None:
+            base = "" if rel == "." else rel
+        else:
+            base = sub if rel == "." else f"{sub}/{rel}"
+        if not base:
+            return False
+        key = base + "/" if is_dir_rec else base
+        anchor = os.path.abspath(target).replace(os.sep, "/") + ("/" if is_dir_rec else "")
+        return ex.excluded(key, anchor)
 
     if is_dir:
         for _key, m, loc in manifest.merge_join(
@@ -725,13 +762,15 @@ def apply_manifest(
                 continue  # local-only: pull --delete's lane, not apply's
             rel, m_entry = m
             target = outpath if rel == "." else os.path.join(outpath, rel)
+            if excluded_record(rel, m_entry.is_dir, target):
+                continue  # pull never touches an excluded path
             if loc is not None:
                 _lrel, st, local_sym = loc
             else:
-                # The walk prunes excludes, so "not walked" may mean hidden
-                # rather than missing: judge from a direct lstat.
+                # The walk filters excludes, so "not walked" may mean
+                # hidden rather than missing: judge from a direct lstat.
                 if rel != "." and not within_root(root_real, target):
-                    err(f"manifest path escapes restore root, skipped: {m_entry.path}")
+                    console.err(f"manifest path escapes restore root, skipped: {m_entry.path}")
                     errors += 1
                     continue
                 st, local_sym = _lstat_readlink(target)
@@ -743,13 +782,13 @@ def apply_manifest(
                 window_ns=window_ns,
                 is_dir_entry=True,
                 deferred_symlinks=deferred_symlinks,
-                enforce_size=enforce_size,
+                warn_stale=warn_stale,
             )
             errors += outcome.errors
             if outcome.defer_symlink and dir_stack:
-                # This record's own directory parent is always the current
-                # stack top - every record has a recorded directory parent
-                # (validate_manifest), and the pop above already closed
+                # The current stack top is this record's nearest RECORDED
+                # ancestor (a parent record is optional - an excluded
+                # directory is unrecorded); the pop above already closed
                 # everything that is not an ancestor of it. Flag it so its
                 # pop-time settle is skipped in favor of the post-placement
                 # re-settle below.
@@ -762,7 +801,11 @@ def apply_manifest(
             res = manifest_target(m_entry, outpath, is_dir, sub)
             if res is None:
                 continue
-            target, _rel = res
+            target, rel = res
+            # A single-file entry's one record IS the entry root (sub None):
+            # excludes never apply to it. A file/symlink SUB is judged.
+            if sub is not None and excluded_record(rel, m_entry.is_dir, target):
+                continue  # pull never touches an excluded path
             st, local_sym = _lstat_readlink(target)
             outcome = _apply_record(
                 m_entry,
@@ -772,7 +815,7 @@ def apply_manifest(
                 window_ns=window_ns,
                 is_dir_entry=False,
                 deferred_symlinks=deferred_symlinks,
-                enforce_size=enforce_size,
+                warn_stale=warn_stale,
             )
             errors += outcome.errors
 
@@ -817,17 +860,23 @@ class _ExtraFrame:
 
 
 def remove_extras(
-    extras: Iterator[tuple[str, str, bool]],
+    items: Iterator[tuple[str, str, bool, bool]],
     *,
     aliases: set[tuple[str, str]],
     dryrun: bool = False,
     confirm: DeleteConfirmer | None = None,
 ) -> tuple[int, int]:
     """Remove local extras (pull ``--delete``): an ascending ``(rel, path,
-    is_dir)`` stream - the local-only lane of the status/--delete merge-join,
-    in S3 key order, ``rel`` sub-relative and root-free (the caller drops
-    "."). ``is_dir`` is the lstat kind, so a symlink - even one pointing at a
-    directory - is unlinked, never rmdir'd.
+    is_dir, is_extra)`` stream - every LOCAL item of the status/--delete
+    merge-join, in S3 key order, ``rel`` sub-relative and root-free (the
+    caller drops "."). Only ``is_extra`` items (the local-only lane) are
+    removal candidates; a recorded local item flows through purely to PIN
+    the extra directories still open above it - a parent directory record is
+    optional (an excluded directory pushes as a local-only name whose
+    children are recorded, docs/excludes.md), and offering such a directory
+    would rmdir a tree the manifest still records. ``is_dir`` is the lstat
+    kind, so a symlink - even one pointing at a directory - is unlinked,
+    never rmdir'd.
 
     A directory extra is not removed as it arrives - it is pushed onto an
     ancestor stack and popped (and only then removed) once the stream proves
@@ -852,7 +901,7 @@ def remove_extras(
     at its own pop) both look themselves up in it the instant they are
     judged - no deferral needed. A hit is NOT removed (it may be the very
     file ``pull`` just restored under its recorded spelling), a warning is
-    printed (exit 2 via ``note_warning``), and no confirmation is asked for
+    printed (exit 2 via ``console.warn``), and no confirmation is asked for
     it. This is a choice, not a failure - like a kept item, it silently
     keeps every extra directory still open above it too (their ``rmdir``
     could only fail on a directory that still holds it).
@@ -881,9 +930,9 @@ def remove_extras(
             else:
                 os.remove(path)
             removed += 1
-            write_output(f"delete: {path}\n")
+            console.out(f"delete: {path}\n")
         except OSError as e:
-            err(f"delete failed: {path}: {e}")
+            console.err(f"delete failed: {path}: {e}")
             errors += 1
 
     def keep_open_ancestors() -> None:
@@ -904,14 +953,14 @@ def remove_extras(
         # removal decision (judged at its pop, below) - both look up their
         # OWN (parent, basename) in the pre-collected alias set the same way.
         if (parent_of(rel), fs_alias_key(basename_of(rel))) in aliases:
-            note_warning(
+            console.warn(
                 f"warning: not removed (a local name the filesystem may fold onto"
                 f" a recorded path): {path}"
             )
             keep_open_ancestors()
             return
         if dryrun:
-            write_output(f"(dry-run) delete: {path}\n")
+            console.out(f"(dry-run) delete: {path}\n")
             return
         if confirm is not None and not confirm.confirm(path):
             keep_open_ancestors()
@@ -923,9 +972,15 @@ def remove_extras(
             return  # a kept descendant forces keeping the directory too - no confirm, no rmdir
         decide(frame.rel, frame.path, True)
 
-    for rel, path, is_dir_entry in extras:
+    for rel, path, is_dir_entry, is_extra in items:
         while stack and not _is_ancestor(stack[-1].rel, rel):
             close(stack.pop())
+        if not is_extra:
+            # A recorded local item: after the pops above, every frame still
+            # open is one of its extra ancestors - pin them all (their rmdir
+            # would take recorded content with it).
+            keep_open_ancestors()
+            continue
         if is_dir_entry:
             stack.append(_ExtraFrame(rel, path))
             continue

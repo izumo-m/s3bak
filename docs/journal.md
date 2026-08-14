@@ -21,10 +21,11 @@ re-transfers — the ordinary self-healing.
 
 The sync's local side enumerates the **complete view** — directories,
 symlinks as lstat leaves, special files — the same complete, no-follow
-enumeration the manifest walk uses (`localwalk`), with excludes pruned
-identically. boto3-s3's `Comparator` merge-joins that walk against the S3
-listing into **one ascending stream of pairs**: both-sides (the update lane),
-local-only (the create lane), S3-only (the delete lane).
+enumeration the manifest walk uses (`localwalk`), with the entry's excludes
+filtered identically ([excludes.md](excludes.md)). boto3-s3's `Comparator`
+merge-joins that walk against the S3 listing into **one ascending stream of
+pairs**: both-sides (the update lane), local-only (the create lane), S3-only
+(the delete lane).
 
 - **One manifest cursor serves everything.** The old manifest is streamed
   once, front to back, advancing in lockstep with the pair stream. It backs
@@ -66,8 +67,7 @@ local-only (the create lane), S3-only (the delete lane).
   touch) and is exempted.
 - **Every decision is serial, in ascending key order** — the property the
   journal's ordering rests on. `--checksum` therefore runs its content
-  comparison serially too; the parallel compare pool (`compare_workers`,
-  `ParallelFilter`) is gone.
+  comparison inline on the sync's own thread, with no compare pool.
 
 ## Journal format
 
@@ -78,8 +78,10 @@ purely internal: a journal-driven push (the ordinary directory push and the
 sub-path push) exposes the file to `post_hook` through the `S3BAK_JOURNAL`
 environment variable (see [sync.md](sync.md#the-push-pipeline)) before
 deleting it, which makes this format a hook-facing interface, not just an
-implementation detail. s3bak deletes the file once the hook returns (or
-immediately, on a push where no hook fires).
+implementation detail — the manual documents it for hook authors
+([operating](manual/07-operating.md#s3bak_journal)), so a change here is a
+change to a published contract. s3bak deletes the file once the hook returns
+(or immediately, on a push where no hook fires).
 
 ```
 +{"path":"./docs/new.txt","mode":"100644","owner":"iz","group":"iz","size":12,"mtime_ns":1789000000000000001}
@@ -129,9 +131,15 @@ immediately, on a push where no hook fires).
   directory or special-file own-mtime drift; objectless additions (empty
   directory, symlink, special file); the root record when its metadata
   drifted.
-- **`-`**: only on `--delete` runs — a confirmed object deletion (the object
-  and its record travel together), a stale old-only file record with no
-  object behind it (dropped silently: the record restores nothing), and a
+- **`-`**: a stale old-only file record with no object behind it, dropped
+  silently by **any** push — the record restores nothing, so retiring it is
+  repair rather than deletion and needs neither `--delete` nor a question
+  (this is why the delete lane is observed even without `--delete`: an
+  object that is still there has to reach the emitter through that lane
+  instead of arriving as a skip-over, and a run that lists no objects at all
+  — a single-file or symlink sub-path push — proves nothing and keeps every
+  record). The rest are `--delete` runs only: a confirmed object deletion
+  (the object and its record travel together), and a
   confirmed record-only drop (a vanished symlink or special-file record,
   asked as its skip-over arrives; a vanished directory record, decided
   post-order through its ` ` line — next bullet). `--yes` is not a separate
@@ -146,13 +154,14 @@ immediately, on a push where no hook fires).
 - **` ` (no change)**: the reserved line of a directory-record delete
   candidate. The decision is post-order — ask only once everything beneath
   the directory resolved deleted, keep it silently (no question) the moment
-  anything beneath survives — the same ancestor-stack pattern `pull
-  --delete` uses for local extras ([sync.md](sync.md#deleting-backups---delete---yes)).
-  But the journal is strictly ascending, and a directory's line belongs
-  before its children's, where the answer is not yet known. So the emitter
-  writes the candidate as a no-change line the moment the cursor skips over
-  it, remembers the offset (one open frame per ancestor directory, memory
-  bounded by depth), and, when the drop is confirmed at the subtree's close,
+  anything beneath survives — the same ancestor-stack pattern `pull --delete`
+  uses for local extras
+  ([sync.md](sync.md#deleting-backups---delete---yes)). But the journal is
+  strictly ascending, and a directory's line belongs before its children's,
+  where the answer is not yet known. So the emitter writes the candidate as a
+  no-change line the moment the cursor skips over it, remembers the offset
+  (one open frame per ancestor directory, memory bounded by depth), and, when
+  the drop is confirmed at the subtree's close,
   flips that line's marker byte to `-` in place — ` ` and `-` are the same
   one byte, so nothing shifts, and the journal is well-formed at every
   moment. A kept candidate simply remains a no-op line; no cleanup pass
@@ -180,33 +189,31 @@ identical manifest forever).
 
 Every keep/drop policy — keep-by-default, the `--delete` confirmation, the
 `--yes` auto-confirmation, the incomplete-scan gate — lives in the emitter as
-"write a `-` or don't"; the merge applies events and knows no policy. (The
-`--meta-only` rewrite is the one non-journal writer left: `write_merged`, a
-keep-everything merge of a fresh walk.)
+"write a `-` or don't"; the merge applies events and knows no policy. (A
+single-file entry's one-record write is the one non-journal manifest writer
+left.)
 
 ## Scopes and mode flags
 
 - **A sub-path push** applies the same scheme scoped to its range: the sub
   walk feeds the pair stream, the journal stays entry-rooted, and events land
-  only at/under `sub` — plus a missing or drifted ancestor-directory record,
-  and the `.` root record when the push births the manifest, journaled as
+  only at/under `sub` — plus a missing or drifted ancestor-directory record
+  (excluded ancestors stay unrecorded), and the `.` root record when the push
+  births the manifest, journaled as
   ordinary `+` / `!`. Records outside the range have no events and copy
-  verbatim. An explicitly named file or symlink sub-path always re-records
+  verbatim. An explicitly named, non-excluded file or symlink sub-path always
+  re-records
   (naming the path is the instruction to back up its current state); a
-  removed sub-path confirmed under `--delete` journals `-` for every record
-  in the range. Skip-over drops apply only strictly *below* `sub`: an object
-  at exactly the `sub` key (a kind-changed former file) sits outside the
-  slash-bounded sub listing, so its record is not provably stale and
-  survives until a directory-level `push --delete` retires the pair.
+  removed or excluded sub-path confirmed under `--delete` journals `-` for
+  every record
+  in the range. Skip-over drops apply only strictly *below* `sub`, and only
+  when the sub-path push runs a sync at all: an object at exactly the `sub`
+  key (a kind-changed former file) sits outside the slash-bounded sub
+  listing, so its record is not provably stale and survives until a
+  directory-level `push --delete` retires the pair — and a file or symlink
+  sub-path, which lists nothing, proves nothing about any record below it.
 - **A single-file entry** has no tree walk and no journal: its one-record
   manifest is rewritten from a fresh lstat.
-- **`--meta-only`** runs no sync, so it keeps the full-walk manifest rebuild —
-  itself a single scan.
-- **`--data-only`** never rewrites the manifest, but the journal itself is
-  ordinary: it still records every event the sync decided and transferred,
-  and is still handed to `post_hook` through `S3BAK_JOURNAL` when the push
-  did work - a hook reading it under `--data-only` sees what was transferred,
-  not what the manifest now says (the manifest did not change).
 - **`--dry-run`** runs the journal and the merge for real (to a local temp
   file, surfacing the same warnings a real push would) and skips only the S3
   upload — the same rehearsal contract as every no-change step.
@@ -226,5 +233,5 @@ pinned by a contract test in boto3-s3's suite so s3bak can depend on it:
    manifest's own sort order), and every local entry carries its full lstat
    (`stat_result`), from which journal records are built.
 3. Lane decisions run serially, in ascending key order, whenever no filter
-   is wrapped in `ParallelFilter` — s3bak simply stops wrapping its
+   is wrapped in `ParallelFilter` — s3bak simply does not wrap its
    `--checksum` comparison.

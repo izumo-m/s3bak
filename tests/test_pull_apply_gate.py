@@ -93,49 +93,23 @@ def test_pull_repairs_mode_only_change_without_download(ws):
     assert "a.txt" in res.out
 
 
-def test_pull_applies_metadata_under_excluded_path(ws):
-    # The apply walk prunes excludes, but a record it therefore never paired
-    # up is judged from a direct lstat - so a record left from a push before
-    # the exclude was added is still repaired, matching pull's exclude-blind
-    # data sync.
+def test_pull_leaves_an_excluded_path_untouched(ws):
+    # The ignore rule (docs/excludes.md): a record under a path the config
+    # now excludes is skipped in full - no download, no metadata repair -
+    # whatever its local state.
     c = ws.write("data/cache/c.txt", "cached")
     ws.write("data/a.txt", "alpha")
     ws.config({"data": {"path": str(ws.root / "data")}})
     ws.run("push", "data", expect_rc=0)  # cache/ recorded: no excludes yet
     recorded_mode = _mode(c)
+    drifted = 0o600 if recorded_mode != 0o600 else 0o640
 
     ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["cache/*"]}})
-    os.chmod(c, 0o600 if recorded_mode != 0o600 else 0o640)
+    os.chmod(c, drifted)
 
     res = ws.run("pull", "data", expect_rc=0)
     assert "download:" not in res.out
-    assert _mode(c) == recorded_mode
-
-
-def test_pull_meta_only_repairs_only_mismatched_records(ws):
-    a = ws.write("data/a.txt", "alpha")
-    ws.write("data/b.txt", "beta")
-    ws.config({"data": {"path": str(ws.root / "data")}})
-    ws.run("push", "data", expect_rc=0)
-    recorded_mode = _mode(a)
-    recorded_mtime = _mtime_ns(a)
-
-    # Drift a.txt's content, size, and mtime - not just its mode - so a
-    # plain pull would certainly re-download it (see test_pull_reports_only_
-    # repaired_records above for the same size+mtime-drift-forces-download
-    # property). --meta-only must still touch only the metadata: if it ever
-    # ran the data lane, this local content would be overwritten with "alpha".
-    a.write_text("a-totally-different-and-much-longer-local-content")
-    os.utime(a, (1_000_000_000, 1_000_000_000))
-    os.chmod(a, 0o600 if recorded_mode != 0o600 else 0o640)
-
-    res = ws.run("pull", "--meta-only", "data", expect_rc=0)
-
-    assert a.read_text() == "a-totally-different-and-much-longer-local-content"  # never downloaded
-    assert _mode(a) == recorded_mode  # metadata still repaired
-    assert _mtime_ns(a) == recorded_mtime
-    assert "a.txt" in res.out
-    assert "b.txt" not in res.out
+    assert _mode(c) == drifted  # untouched: pull never repairs an excluded path
 
 
 def test_pull_checksum_dryrun_clean_tree_prints_nothing(ws):

@@ -1,16 +1,15 @@
 # Requires Python 3.10+
 """The manifest <-> S3 bridge and download orchestration.
 
-Writes v3 manifests to S3 (the journal merge, the ``--meta-only`` rewrite,
-and the sub-tree patch), downloads a manifest or a data tree, and owns the
-push's journal emitter (``PushJournal``) and pull's compare strategy. This is
-the seam between the pure manifest format (manifest.py), the S3 backend
+Writes v3 manifests to S3 (the journal merge, and the single-file entry's
+one-record write), downloads a manifest or a data tree, and owns the push's
+journal emitter (``PushJournal``) and pull's compare strategy. This is the
+seam between the pure manifest format (manifest.py), the S3 backend
 (store.py), and the command layer (commands.py).
 """
 
 from __future__ import annotations
 
-import itertools
 import json
 import os
 import stat as stat_mod
@@ -24,7 +23,7 @@ from boto3_s3 import LocalFileInfo
 from s3bak import localwalk, manifest
 from s3bak.compare import SYMLINK_MTIME_SUPPORTED, mode_differs
 from s3bak.config import Config, Opts
-from s3bak.console import err, note_warning, write_output, write_stderr
+from s3bak.console import console
 from s3bak.manifest import ManifestEntry
 
 if TYPE_CHECKING:
@@ -34,51 +33,32 @@ if TYPE_CHECKING:
 def _walk_warning(body: str) -> None:
     """The manifest walk's warn hook: boto3-s3 message bodies -> one warning
     line each (exit 2), aws-cli's own prefix included."""
-    note_warning(f"warning: {body}")
+    console.warn(f"warning: {body}")
 
 
 def write_manifest_to_aws(
     cfg: Config,
     entry: str,
     target: str,
-    excludes: list[str],
     verbose: bool,
     *,
-    old_manifest: str | None = None,
-    keep_old: bool = False,
     upload: bool = True,
 ) -> None:
-    """Walk `target` in S3 key order, stream the v3 manifest to a temp file,
-    and upload it - the ``--meta-only`` rewrite (an ordinary push merges its
-    journal instead, see ``publish_journal_manifest``). For a directory entry
-    the walk is merged with `old_manifest` under the `keep_old` policy, so
-    records of kept-but-locally-vanished files survive the rewrite (see
-    manifest.write_merged). A single-file entry has one record and no merge.
-    The walk itself warns (exit 2) when it cannot see the whole tree - an
-    unreadable directory, a path racing away mid-walk - since the manifest it
-    feeds is the record of what the push saw. ``upload=False`` is the dry-run
-    preview: the walk and merge run for real - emitting the same warnings as
-    a real push - and only the S3 write is skipped."""
+    """Write a single-file entry's one-record v3 manifest from a fresh lstat
+    to a temp file and upload it (an ordinary directory push merges its
+    journal instead, see ``publish_journal_manifest``). ``upload=False`` is
+    the dry-run preview: the record write and validation run for real and
+    only the S3 write is skipped."""
     key = manifest.manifest_key(entry)
     if upload:
-        write_stderr(f"Updating {cfg.prefix}/{key}\n")
+        console.diag(f"Updating {cfg.prefix}/{key}\n")
 
     fd, tmp = tempfile.mkstemp(suffix=".jsonl")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            if os.path.isdir(target):
-                manifest.write_merged(
-                    f,
-                    old_manifest,
-                    None,
-                    localwalk.walk_tree(target, excludes, warn=_walk_warning),
-                    keep_old=keep_old,
-                    warn=note_warning,
-                )
-            else:
-                st = os.lstat(target)
-                sym = os.readlink(target) if stat_mod.S_ISLNK(st.st_mode) else None
-                manifest.write_manifest(f, [(os.path.basename(target), st, sym)])
+            st = os.lstat(target)
+            sym = os.readlink(target) if stat_mod.S_ISLNK(st.st_mode) else None
+            manifest.write_manifest(f, [(os.path.basename(target), st, sym)])
         _validate_before_publish(entry, tmp)
         if upload:
             assert cfg.store is not None
@@ -99,85 +79,6 @@ def _validate_before_publish(entry: str, path: str) -> None:
         raise manifest.ManifestError(
             f"{entry}: refusing to publish an invalid manifest ({e})"
         ) from e
-
-
-def patch_manifest_subtree(
-    cfg: Config,
-    entry: str,
-    target_root: str,
-    sub: str,
-    excludes: list[str],
-    opts: Opts,
-    *,
-    keep_old: bool = False,
-    old_manifest: str | None = None,
-) -> bool:
-    """Replace the manifest records under `sub` and re-upload - the
-    ``--meta-only`` sub-path rewrite (an ordinary sub-path push journals
-    instead, see ``PushJournal``).
-
-    target_root/sub may be a file, a symlink, or a directory. If it does not
-    exist locally, the records under `sub` are simply removed. Old and new
-    records are both in sort-key order, so this is a streaming merge
-    (manifest.write_merged), not a read-all + sort. `old_manifest` is the
-    caller's already-validated copy of the current manifest - every sub-path
-    push downloads it before mutating S3 - and None means the entry has no
-    manifest yet. A dry run computes the whole patch for real - the walk, the
-    merge and its warnings - and skips only the S3 write.
-    """
-    key = manifest.manifest_key(entry)
-    if old_manifest is None and not os.path.lexists(target_root):
-        # Deleting a never-backed sub-path beneath a root that is gone has
-        # no manifest state to update (and no root metadata from which to
-        # create a valid directory manifest).
-        return False
-    fd_new, new_path = tempfile.mkstemp(suffix=".jsonl")
-    os.close(fd_new)  # reopened by name below; closing now avoids an fd leak on error
-    try:
-        local_sub = os.path.join(target_root, sub)
-        new_entries: Iterator[tuple[str, os.stat_result, str | None]] = iter(())
-        if os.path.lexists(local_sub):
-            # Ancestor directory records for sub's parents: every record needs
-            # a recorded directory parent (the validator's rule), and neither
-            # a first-ever manifest nor one that predates a newly created
-            # nested directory has them. Re-recording an already-recorded
-            # ancestor is harmless - a walked path wins the merge, exactly as
-            # a full push would re-record it.
-            ancestors: list[tuple[str, os.stat_result, str | None]] = []
-            acc = target_root
-            rel = "."
-            for part in sub.split("/")[:-1]:
-                acc = os.path.join(acc, part)
-                rel = f"{rel}/{part}"
-                ancestors.append((rel, os.lstat(acc), None))
-            new_entries = itertools.chain(
-                ancestors, localwalk.iter_subtree(local_sub, sub, excludes, warn=_walk_warning)
-            )
-        if old_manifest is None:
-            # First-ever manifest for this entry, born from a sub-path push:
-            # record the entry root too, so the manifest keeps the dir-entry
-            # shape ('.'-rooted) and the root's metadata restores on pull.
-            root_record = (".", os.lstat(target_root), None)
-            new_entries = itertools.chain([root_record], new_entries)
-        with open(new_path, "w", encoding="utf-8") as out:
-            manifest.write_merged(
-                out,
-                old_manifest,
-                sub,
-                new_entries,
-                keep_old=keep_old,
-                warn=note_warning,
-            )
-        _validate_before_publish(entry, new_path)
-        if opts.dryrun:
-            write_output(f"(dry-run) would patch manifest: {key} (sub={sub})\n")
-        else:
-            write_stderr(f"Updating {cfg.prefix}/{key}\n")
-            assert cfg.store is not None
-            cfg.store.put_file(key, new_path, verbose=opts.verbose)
-        return True
-    finally:
-        os.unlink(new_path)
 
 
 def download_manifest(cfg: Config, entry: str, dest: str, verbose: bool = False) -> bool:
@@ -218,9 +119,9 @@ class _DirFrame:
     Its no-change placeholder line is already in the journal at ``offset``;
     the pop - once the ascending stream has left the subtree - decides
     whether to flip that line's marker to a drop. ``kept`` is set the moment
-    anything beneath survives, because dropping the directory record while a
-    descendant record remains would publish a manifest the validator rejects
-    (every record needs a recorded directory parent)."""
+    anything beneath survives: the directory record carries the metadata the
+    surviving records' restore settles into, so it travels with them rather
+    than being asked about on its own."""
 
     prefix: str  # the dir record's sort key ("sub/"): prefixes every descendant key
     rel: str  # entry-rooted display path ("sub")
@@ -271,6 +172,7 @@ class PushJournal:
         walker: localwalk.ManifestWalker,
         sub: str | None = None,
         content: PairFilter | None = None,
+        dest_listed: bool = False,
         delete_mode: bool = False,
         record_delete: Callable[[str, ManifestEntry], bool] | None = None,
     ) -> None:
@@ -293,6 +195,12 @@ class PushJournal:
         self._walker = walker
         self._sub = sub
         self._content = content
+        # Whether this run's pair stream covers every S3 object in the
+        # journal's range - true when the push runs a directory sync, false
+        # for a single-file or symlink sub-path push, which lists nothing.
+        # Only then does "the stream never keyed this record" prove that the
+        # record's object is gone (see _skip_over).
+        self._dest_listed = dest_listed
         self._delete_mode = delete_mode
         self._record_delete = record_delete
         # Open directory-record delete candidates, innermost last - the same
@@ -305,11 +213,6 @@ class PushJournal:
         # question could be asked; folded into the kept-candidates warning
         # (object candidates are counted at the lane's own gate check).
         self.refused_records = 0
-        # Uploads with no owning file record - the birth (create lane) and
-        # re-upload (update lane) faces of an unrecorded object. Read by the
-        # push --data-only warning, so it repeats while the object stays
-        # unrecorded.
-        self.unrecorded_uploads = 0
         # Kind-conflict pairs seen under --delete: a local non-file occupies a
         # key holding a real S3 object, so the object pairs (update lane)
         # instead of orphaning (delete lane). Offered out-of-lane after the
@@ -365,11 +268,23 @@ class PushJournal:
     def _skip_over(self, record: tuple[str, str, ManifestEntry, str]) -> None:
         """A record the pair stream never keyed: nothing exists at its key on
         either side (an S3 object would have formed a delete-lane pair, a
-        local item an update/create pair). Keep-by-default keeps it. A
-        ``--delete`` run retires it by kind: a stale file record drops
-        silently (its object is already gone, the interrupted-deletion
-        self-heal); a directory record opens a frame whose drop is decided
-        post-order (see ``_resolve_frame``); a symlink or special-file
+        local item an update/create pair).
+
+        A **file** record here has no object left, so it restores nothing:
+        every push drops it, ``--delete`` or not, and without a question.
+        Retiring it is repair, not deletion - there is no backup at the key
+        to protect - and it is the self-heal for a push interrupted (or
+        aborted by q) after some of its deletions had already run. This is
+        why the delete lane is observed even without ``--delete``
+        (commands._journal_delete_lane): a record whose object is still there
+        must reach the journal through that lane instead of arriving here.
+        Where the run lists no objects at all (``dest_listed`` false - a
+        single-file or symlink sub-path push), nothing is provably stale and
+        the record is kept.
+
+        Every other kind IS the backup at its key, so only a ``--delete`` run
+        retires it: a directory record opens a frame whose drop is decided
+        post-order (see ``_resolve_frame``), and a symlink or special-file
         record is confirmed on arrival through ``record_delete``. ``--yes``
         is not a separate lane: it auto-confirms the same candidates through
         the same paths without prompting. All of it only while the scan is
@@ -383,12 +298,10 @@ class PushJournal:
         with its object. The surviving pair reads as the restorability
         warning until a directory-level ``push --delete`` retires it."""
         key, rel, e, line = record
-        if not self._delete_mode:
-            return
         if self._sub is not None and not rel.startswith(self._sub + "/"):
             return
         if self._walker.scan_incomplete:
-            if not e.is_file:
+            if self._delete_mode and not e.is_file:
                 # A record-only candidate kept without a question: count it,
                 # or a record-only run would keep silently with no warning
                 # at all. (A gated stale file record is not a candidate -
@@ -397,7 +310,13 @@ class PushJournal:
             self._mark_record_kept()
             return
         if e.is_file:
-            self._emit(manifest.JOURNAL_DROP, line)
+            if self._dest_listed:
+                self._emit(manifest.JOURNAL_DROP, line)
+            else:
+                self._mark_record_kept()
+            return
+        if not self._delete_mode:
+            self._mark_record_kept()
             return
         if e.is_dir:
             # Claim the drop's line position now (the journal is strictly
@@ -414,11 +333,12 @@ class PushJournal:
 
     # --- directory-record frames ---------------------------------------------
     def _mark_record_kept(self) -> None:
-        """A record survives beneath the innermost open directory frame: the
-        directory record can no longer be dropped (every record needs its
-        recorded directory parent), so the frame resolves silently kept -
-        matching pull --delete, where keeping an item keeps every extra
-        directory still open above it without a question of its own."""
+        """A record survives beneath the innermost open directory frame:
+        the directory record travels with it (it carries the metadata the
+        surviving record's restore settles into), so the frame resolves
+        silently kept - matching pull --delete, where keeping an item keeps
+        every extra directory still open above it without a question of its
+        own."""
         if self._frames:
             self._frames[-1].kept = True
 
@@ -546,8 +466,6 @@ class PushJournal:
             if copy and not self._probe_readable(src):
                 return False
         if copy:
-            if e is None or not e.is_file:
-                self.unrecorded_uploads += 1
             self._emit_new(
                 manifest.JOURNAL_ADD if old is None else manifest.JOURNAL_REPLACE,
                 self._record_path(key, is_dir=False),
@@ -596,9 +514,6 @@ class PushJournal:
         # missing (the self-heal).
         if not self._probe_readable(info):
             return False
-        e = old[0] if old is not None else None
-        if e is None or not e.is_file:
-            self.unrecorded_uploads += 1
         self._emit_new(
             manifest.JOURNAL_ADD if old is None else manifest.JOURNAL_REPLACE,
             self._record_path(key, is_dir=False),
@@ -694,9 +609,11 @@ class PushJournal:
 
     def record_ancestor(self, rel: str, st: os.stat_result) -> None:
         """A sub-path push's parent directory: journal only a drift (a missing
-        record, or a mode/mtime change) - every record needs a recorded directory
-        parent, but re-recording an unchanged ancestor was the old pipeline's
-        walked-path-wins artifact, not a requirement. A directory's own mtime is
+        record, or a mode/mtime change) - the ancestors' metadata should
+        restore on pull, but re-recording an unchanged ancestor was the old
+        pipeline's walked-path-wins artifact, not a requirement (and an
+        excluded ancestor is not journaled at all - a parent record is
+        optional, docs/excludes.md). A directory's own mtime is
         tracked like _journal_nonfile's dir branch, so a sub-path push that
         changed the ancestor's mtime (adding the new child does) refreshes it
         instead of leaving a stale value for pull to restore."""
@@ -761,12 +678,12 @@ def publish_journal_manifest(
     fd, tmp = tempfile.mkstemp(suffix=".jsonl")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            manifest.merge_journal(f, old_manifest, journal_path, warn=note_warning)
+            manifest.merge_journal(f, old_manifest, journal_path, warn=console.warn)
         _validate_before_publish(entry, tmp)
         if opts.dryrun:
-            write_output(f"(dry-run) would update manifest: {key}\n")
+            console.out(f"(dry-run) would update manifest: {key}\n")
         else:
-            write_stderr(f"Updating {cfg.prefix}/{key}\n")
+            console.diag(f"Updating {cfg.prefix}/{key}\n")
             assert cfg.store is not None
             cfg.store.put_file(key, tmp, verbose=opts.verbose)
     finally:
@@ -807,6 +724,7 @@ def download_from_s3(
     verbose: bool,
     sub: str | None = None,
     compare: PairFilter | None = None,
+    create: bool | FileFilter = True,
     size: int | None = None,
     dryrun: bool = False,
 ) -> tuple[int, bool]:
@@ -829,7 +747,7 @@ def download_from_s3(
                 probe = parent
         try:
             result = cfg.store.sync_down(
-                rel, outpath, compare=compare, dryrun=dryrun, verbose=verbose
+                rel, outpath, compare=compare, create=create, dryrun=dryrun, verbose=verbose
             )
         finally:
             for path in created:  # leaf-first, so each rmdir empties its parent
@@ -846,14 +764,31 @@ def download_from_s3(
     # dry-run stand-in line ("would apply manifest metadata") printed for it.
     # `size` (from the manifest record) routes a
     # large file through multipart download; a small one is a direct GetObject.
+    # The lane is named on the transfer line: a directory sync's lines come
+    # from boto3-s3, which reports its own transfers, but nothing else would
+    # say how this one object travelled.
+    lane = "boto3-s3 cp" if cfg.store.multipart_download(size) else "boto3 get_object"
     if dryrun:
         # The download writes the local file, so it is a mutation and stays
         # skipped. No substitute probe either: a HeadObject can succeed or
         # fail under different IAM permissions than the real GetObject, and a
         # dry run must only make the calls the real run would make.
-        write_output(f"(dry-run) download: {cfg.prefix}/{rel} -> {outpath}\n")
+        console.out(f"(dry-run) download: {cfg.prefix}/{rel} to {outpath} ({lane})\n")
         return 0, True
     if not cfg.store.get_object(rel, outpath, size=size, verbose=verbose):
-        err(f"object missing on S3: {cfg.prefix}/{rel}")
-        return 1, False
+        # A recorded object that is gone is stale residue, not this pull's
+        # reason to abort: warn here - the one place that knows the object
+        # is missing rather than merely "nothing local" - and return clean
+        # with changed=False, which tells cmd_pull to skip this record in
+        # full. Whatever is local stays untouched: applying the record's
+        # metadata over content that was never restored would report a
+        # restore that did not happen.
+        console.warn(
+            f"warning: no data object behind this record - skipped"
+            f" (a push retires the stale record): {cfg.prefix}/{rel}"
+        )
+        return 0, False
+    # Reported after the fact, like the sync's own lines: a line printed up
+    # front would announce a download the stale-record branch above never made.
+    console.out(f"download: {cfg.prefix}/{rel} to {outpath} ({lane})\n")
     return 0, True

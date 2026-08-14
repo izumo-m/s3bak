@@ -246,10 +246,10 @@ def test_transfer_lines_print_as_each_item_completes(ws, monkeypatch):
     # F1: a sync's result lines print from on_result as each item finishes,
     # not accumulated and flushed once as a single write after the whole sync
     # completes - the old shape, which held O(transfer count) lines in memory
-    # and stayed silent until the very end. Wrapping write_output itself (not
-    # just counting output lines) proves the store issues one print call per
-    # transferred file, rather than one big join.
-    from s3bak import store as store_mod
+    # and stayed silent until the very end. Wrapping the console write itself
+    # (not just counting output lines) proves the store issues one print call
+    # per transferred file, rather than one big join.
+    from s3bak.console import console
 
     for i in range(5):
         ws.write(f"data/f{i}.txt", f"payload-{i}")
@@ -257,10 +257,8 @@ def test_transfer_lines_print_as_each_item_completes(ws, monkeypatch):
     store = _store(ws)
 
     calls: list[str] = []
-    real_write_output = store_mod.write_output
-    monkeypatch.setattr(
-        store_mod, "write_output", lambda text: (calls.append(text), real_write_output(text))[0]
-    )
+    real_out = console.out
+    monkeypatch.setattr(console, "out", lambda text: (calls.append(text), real_out(text))[0])
 
     # sync_up's create lane defaults to "copy every new local entry" - directories
     # included (LocalStorage enumerates the complete tree, docs/journal.md); a
@@ -274,7 +272,7 @@ def test_transfer_lines_print_as_each_item_completes(ws, monkeypatch):
     assert result.returncode == 0
     assert result.results == 5
     upload_calls = [c for c in calls if c.startswith("upload:")]
-    # One write_output call per uploaded file, each carrying exactly its own
+    # One console.out call per uploaded file, each carrying exactly its own
     # line - never one call joining every line after the sync finished.
     assert len(upload_calls) == 5
     assert all(c.count("\n") == 1 for c in upload_calls)
@@ -331,3 +329,56 @@ def test_get_object_propagates_a_glacier_transfer_failure(ws, monkeypatch):
     monkeypatch.setattr(store._s3, "cp", fake_cp)
     with pytest.raises(Boto3S3Error):
         store.get_object("big", str(ws.root / "x.out"), size=store._small_limit)
+
+
+# --- the single-file pull names the lane it took ---------------------------
+#
+# A directory pull's lines come from boto3-s3, which reports each transfer it
+# makes. Nothing reports a single-object transfer, so download_from_s3 prints
+# the line itself - and since the two lanes differ in more than part count
+# (multipart parallelism, the glacier handling), the line names which ran.
+
+
+def _single_file_ws(ws):
+    f = ws.write("solo.txt", "content")
+    ws.config({"solo.txt": {"path": str(f)}})
+    ws.run("push", "solo.txt", expect_rc=0)
+    f.write_text("locally changed, so the pull has work")
+    return f
+
+
+def test_single_file_pull_reports_the_direct_get_object(ws):
+    _single_file_ws(ws)
+    res = ws.run("pull", "solo.txt", expect_rc=0)
+    assert "download: s3://" in res.out
+    assert "(boto3 get_object)" in res.out
+
+
+def test_single_file_pull_reports_the_cp_lane_for_a_large_object(ws, monkeypatch):
+    # Forced with a tiny limit rather than an 8 MiB fixture, like the upload
+    # test above.
+    monkeypatch.setattr(cli.Boto3S3Store, "_resolve_small_limit", lambda self: 4)
+    _single_file_ws(ws)
+    res = ws.run("pull", "solo.txt", expect_rc=0)
+    assert "(boto3-s3 cp)" in res.out
+
+
+def test_single_file_pull_dry_run_names_the_same_lane(ws):
+    f = _single_file_ws(ws)
+    before = f.read_text()
+    res = ws.run("pull", "--dry-run", "solo.txt", expect_rc=0)
+    assert "(dry-run) download: s3://" in res.out
+    assert "(boto3 get_object)" in res.out
+    assert f.read_text() == before  # a rehearsal, as promised
+
+
+def test_single_file_pull_prints_no_download_line_for_a_stale_record(ws):
+    # The line is printed after the transfer, so the record whose object is
+    # gone warns and prints nothing - a line up front would have announced a
+    # download that never happened.
+    _single_file_ws(ws)
+    ws.s3.delete_object(Bucket=ws.bucket, Key=f"{ws.prefix}/solo.txt")
+
+    res = ws.run("pull", "solo.txt", expect_rc=0)
+    assert "download:" not in res.out
+    assert "no data object behind this record" in res.err

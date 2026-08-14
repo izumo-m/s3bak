@@ -74,11 +74,6 @@ def _manifest_bytes(kind: str) -> bytes:
         z_txt = _rec("./z.txt", "100644", size=1)
         a_txt = _rec("./a.txt", "100644", size=1)
         return ("\n".join([HEADER, _ROOT, z_txt, a_txt]) + "\n").encode()
-    if kind == "no_directory_parent":
-        # validate_manifest's directory-stack check: "./sub/child.txt" with
-        # no preceding "./sub" directory record.
-        child = _rec("./sub/child.txt", "100644", size=1)
-        return ("\n".join([HEADER, _ROOT, child]) + "\n").encode()
     if kind == "zero_records":
         # validate_manifest: a header with no records at all.
         return (HEADER + "\n").encode()
@@ -96,7 +91,6 @@ DAMAGE_CASES = [
     ("missing_field", "invalid manifest record"),
     ("bad_type", "invalid manifest record"),
     ("out_of_order", "out of order"),
-    ("no_directory_parent", "directory parent"),
     ("zero_records", "no records"),
     ("truncated", "invalid manifest record"),
 ]

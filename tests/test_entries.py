@@ -158,8 +158,11 @@ def test_push_delete_answer_n_keeps_excluded_object_and_record(ws, answers):
     assert len(answers.prompts) == 1
     assert "data/cache/c.txt" in ws.keys()
     assert "./cache/c.txt" in _manifest_paths(ws)
+    # The kept pair is intact residue: no integrity error, and verify's
+    # excluded-residue warning keeps pointing at it until a --delete retires it.
     res = ws.run("verify", "data", expect_rc=0)
-    assert "data: OK" in res.out
+    assert "0 error(s)" in res.out
+    assert "under excludes remain in the backup" in res.err
 
 
 def test_push_delete_dry_run_lists_excluded_orphans_without_prompting(ws, answers):
@@ -186,8 +189,11 @@ def test_plain_push_neither_uploads_nor_deletes_excluded_paths(ws):
     assert "upload:" not in res.out
     assert "delete:" not in res.out
     assert "data/cache/c.txt" in ws.keys()
+    # Record and object still correspond (no integrity error); the residue
+    # itself is what verify warns about.
     res = ws.run("verify", "data", expect_rc=0)
-    assert "data: OK" in res.out
+    assert "0 error(s)" in res.out
+    assert "under excludes remain in the backup" in res.err
 
 
 def test_push_delete_retires_unrecorded_excluded_object(ws, answers):
@@ -238,22 +244,21 @@ def test_subpath_push_delete_offers_excluded_objects(ws, answers):
     assert "./sub/a.txt" in paths
 
 
-def test_subpath_push_of_excluded_subtree_backs_it_up(ws):
-    # Explicitly pushing an excluded sub-path wins over the exclude, exactly
-    # as the manifest walk (iter_subtree) already treats it: the sub's own
-    # subtree is walked, uploaded, AND recorded, so data and manifest agree.
-    # (The old both-sides filter uploaded nothing while the manifest patch
-    # recorded everything - records whose objects never existed.)
+def test_subpath_push_of_excluded_subtree_is_ignored(ws):
+    # Naming an excluded path does not override the exclude (docs/excludes.md):
+    # the filter leaves nothing visible at data/tmp, so the push does nothing
+    # and exits 0 - ignoring is the rule, not an error.
     ws.write("data/keep.txt", "k")
     ws.write("data/tmp/x.txt", "x")
     ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["tmp/*"]}})
     ws.run("push", "data", expect_rc=0)
     assert "data/tmp/x.txt" not in ws.keys()
 
-    ws.run("push", "data/tmp", expect_rc=0)
+    res = ws.run("push", "data/tmp", expect_rc=0)
 
-    assert "data/tmp/x.txt" in ws.keys()
-    assert "./tmp/x.txt" in _manifest_paths(ws)
+    assert res.out.strip() == ""
+    assert "data/tmp/x.txt" not in ws.keys()
+    assert "./tmp/x.txt" not in _manifest_paths(ws)
     res = ws.run("verify", "data", expect_rc=0)
     assert "data: OK" in res.out
 
@@ -597,26 +602,6 @@ def test_single_file_post_hook_has_no_journal(ws):
     assert info.read_text() == "UNSET"
 
 
-def test_meta_only_post_hook_has_no_journal(ws):
-    info = ws.root / "journal-path.txt"
-    copy = ws.root / "journal-copy.jsonl"
-    ws.write("data/a.txt", "a")
-    ws.config(
-        {
-            "data": {
-                "path": str(ws.root / "data"),
-                "post_hook": _journal_hook(ws, info, copy),
-            }
-        }
-    )
-    ws.run("push", "data", expect_rc=0)  # journal-driven: sets info to a path
-    info.unlink()
-
-    ws.run("push", "--meta-only", "data", expect_rc=0)
-
-    assert info.read_text() == "UNSET"
-
-
 def test_noop_push_does_not_run_post_hook(ws):
     marker = ws.root / "hook-ran"
     ws.write("data/a.txt", "a")
@@ -883,25 +868,6 @@ def test_special_file_subpath_is_rejected(ws):
     assert "regular file, directory, or symlink" in res.err
 
 
-def test_noop_subpath_data_only_push_does_not_run_post_hook(ws):
-    marker = ws.root / "hook-ran"
-    ws.write("data/sub/a.txt", "a")
-    ws.config(
-        {
-            "data": {
-                "path": str(ws.root / "data"),
-                "post_hook": _marker_hook(ws, marker),
-            }
-        }
-    )
-    ws.run("push", "data", expect_rc=0)
-    marker.unlink()
-
-    ws.run("push", "--data-only", "data/sub", expect_rc=0)
-
-    assert not marker.exists()
-
-
 def test_hook_string_is_rejected(ws):
     ws.write("data/a.txt", "x")
     ws.config({"data": {"path": str(ws.root / "data"), "pre_hook": "do-something"}})
@@ -928,36 +894,6 @@ def test_local_path_resolution_handles_an_entry_at_filesystem_root(tmp_path):
 
     assert entry == "root"
     assert sub == str(tmp_path / "child.txt").removeprefix(root).replace(os.sep, "/")
-
-
-def test_meta_only_refuses_entry_kind_change(ws):
-    # --meta-only moves no data and cannot migrate a kind change; recording
-    # the new kind would orphan the old tree (dir->file) or publish a manifest
-    # mixing both shapes (file->dir). Both directions must refuse untouched.
-    import shutil
-
-    ws.write("data/a.txt", "hello")
-    ws.config({"data": {"path": str(ws.root / "data")}})
-    ws.run("push", "data", expect_rc=0)
-    shutil.rmtree(ws.root / "data")
-    (ws.root / "data").write_text("now a file")
-
-    res = ws.run("push", "--meta-only", "data")
-    assert res.rc == 1
-    assert "disagree on kind" in res.err
-    assert "data/a.txt" in ws.keys()
-    ws.run("verify", "data", expect_rc=0)  # the old backup is intact
-
-    solo = ws.write("solo", "s")
-    ws.config({"solo": {"path": str(solo)}})
-    ws.run("push", "solo", expect_rc=0)
-    os.remove(solo)
-    ws.write("solo/inner.txt", "i")
-
-    res = ws.run("push", "--meta-only", "solo")
-    assert res.rc == 1
-    assert "disagree on kind" in res.err
-    ws.run("verify", "solo", expect_rc=0)
 
 
 def test_first_nested_subpath_push_writes_valid_manifest(ws):

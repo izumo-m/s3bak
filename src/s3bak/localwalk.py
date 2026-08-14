@@ -1,20 +1,25 @@
 # Requires Python 3.10+
 """The manifest walk, on boto3-s3's directory engine.
 
-``walk_tree`` / ``iter_subtree`` yield the ``(rel, lstat, sym_target)`` items
-``manifest.write_manifest`` records, in S3 key byte order (``foo.txt`` before
-``foo/bar``). The traversal itself is boto3-s3's ``LocalFileGenerator`` - the
-same engine (and therefore the same sort definition) the data sync walks with -
-configured for complete, no-follow entry enumeration. ``ManifestWalker`` only
-customizes exclude pruning:
+``walk_tree`` yields the ``(rel, lstat, sym_target)`` items that
+``manifest.write_manifest`` records, in S3 key byte order (``foo.txt``
+before ``foo/bar``). The traversal itself is boto3-s3's
+``LocalFileGenerator`` - the same engine (and therefore the same sort
+definition) the data sync walks with - configured for complete, no-follow
+entry enumeration. ``ManifestWalker`` only customizes the exclusion
+(docs/excludes.md):
 
 - **complete enumeration**: boto3-s3 returns directories, broken symlinks,
   special files, and unreadable entries before filtering. With symlink following
   disabled, links surface as lstat-based leaves and are never descended. An
   unreadable directory degrades to its own record with no children (reported
   through ``walk_tree``'s ``warn`` when the caller wires one);
-- **excludes as pruning**: a ``dir/*`` pattern drops the directory child before
-  the walk descends, so an excluded subtree costs nothing;
+- **excludes as a per-entry filter**: every emitted entry is judged alone
+  against the entry's ``Excludes`` (aws-cli semantics - the walked pages are
+  filtered, so dropping a directory's own record does not hide its
+  non-excluded children). Skipping a descent outright happens only for the
+  provable ``dir/*`` shape, as an optimization that cannot change what the
+  filter decides;
 - **directories in-stream**: each directory's record is yielded between the
   sibling files that sort before it and its own children, which is what keeps
   the whole stream in manifest order.
@@ -33,11 +38,12 @@ from typing import TYPE_CHECKING
 from boto3_s3 import LocalFileGenerator, LocalStorage, WalkChild
 from boto3_s3.types import FileKind
 
-from s3bak.manifest import PathMatcher, split_excludes
+from s3bak.excludes import Excludes
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
+    from boto3_s3 import LocalFileInfo
     from boto3_s3.types import LocalScanOptions
 
 # The one boto3-s3 walk warning that does NOT hide tree content: the
@@ -52,11 +58,16 @@ _INVALID_TIMESTAMP_WARNING = "File has an invalid timestamp. Passing epoch time 
 
 
 class ManifestWalker(LocalFileGenerator):
-    """Prune manifest excludes before boto3-s3 descends into directories.
+    """Apply an entry's excludes to the walk, per emitted entry.
 
-    One instance serves one walk: it carries the exclude patterns and the
-    ``rel_prefix`` that anchors them at the entry root (``"./"``, or
-    ``"./{sub}/"`` for a sub-path push).
+    One instance serves one walk: it carries the compiled ``Excludes`` and
+    the ``key_prefix`` that re-anchors a sub walk's compare keys at the
+    entry root (``""`` for an entry walk, ``"{sub}/"`` for a sub-path walk).
+    The filter runs over the emitted pages (``list_file_pages``), so every
+    entry is judged alone - an excluded directory loses its own record but
+    not its visible children. ``finalize_children`` skips a descent only for
+    the provable ``dir/*`` shape (``Excludes.prunes_subtree``), where
+    pruning cannot change what the filter decides.
 
     The walker also tracks scan completeness: a warning that hides real tree
     content (an unopenable directory, a path that vanished mid-walk) sets
@@ -72,10 +83,9 @@ class ManifestWalker(LocalFileGenerator):
     symlink racing away before its readlink).
     """
 
-    def __init__(self, prune: PathMatcher, skip: PathMatcher, rel_prefix: str) -> None:
-        self._prune = prune
-        self._skip = skip
-        self._rel_prefix = rel_prefix
+    def __init__(self, excludes: Excludes, key_prefix: str) -> None:
+        self._excludes = excludes
+        self._key_prefix = key_prefix
         self.scan_incomplete = False
 
     def _completeness_watch(self, notify: Callable[[str], None]) -> Callable[[str], None]:
@@ -106,44 +116,64 @@ class ManifestWalker(LocalFileGenerator):
         )
 
     def finalize_children(self, children: list[WalkChild]) -> list[WalkChild]:
-        # The exclude pruning: rels are entry-rooted via rel_prefix, matching
-        # what split_excludes anchored. Dropping a DIRECTORY child here is what
-        # keeps the walk out of the excluded subtree entirely.
+        # The provable prune (docs/excludes.md): a relative ``dir/*``
+        # pattern covers the directory key and every key beneath it, so the
+        # walk may skip the whole descent. No other child is dropped here -
+        # dropping a directory in this hook would also hide its children,
+        # which the per-entry semantics forbid; they are judged one by one
+        # in list_file_pages instead.
         kept: list[WalkChild] = []
         for child in children:
             assert child.info.compare_key is not None  # stamped by scan_children
-            rel = self._rel_prefix + child.info.compare_key
-            if child.info.kind == FileKind.DIRECTORY:
-                if self._prune.match(rel[:-1]):
-                    continue
-            else:
-                if self._skip.match(rel):
-                    continue
-                # A symlink named like a pruned directory is excluded too (it
-                # occupies the name the pattern targets).
-                if child.info.is_symlink and self._prune.match(rel):
-                    continue
+            if child.info.kind == FileKind.DIRECTORY and self._excludes.prunes_subtree(
+                self._key_prefix + child.info.compare_key
+            ):
+                continue
             kept.append(child)
         return self.normalize_sort(kept)
 
+    def _keep(self, info: LocalFileInfo) -> bool:
+        assert info.compare_key is not None  # stamped by scan_children
+        # Directories arrive with a trailing "/" on their compare_key - the
+        # key space the patterns are defined over. The walked root's
+        # compare_key is "", so its entry-rooted key IS the prefix: "" for
+        # an entry walk (the entry root is never matched) and "{sub}/" for a
+        # sub walk, where the named sub is an ordinary judged path.
+        # ``info.key`` is the absolute local path, the anchor absolute
+        # patterns match against.
+        return not self._excludes.excluded(self._key_prefix + info.compare_key, info.key)
+
+    def list_file_pages(
+        self, root: str, options: LocalScanOptions
+    ) -> Iterator[list[LocalFileInfo]]:
+        # The per-entry exclusion, applied to everything the walk emits -
+        # the sync's pair stream and walk_tree alike consume these pages.
+        # Dropping an entry here never affects the traversal itself: an
+        # excluded directory's record disappears while its non-excluded
+        # children still emit (only ``finalize_children``'s provable prune
+        # skips a descent).
+        for page in super().list_file_pages(root, options):
+            kept = [info for info in page if self._keep(info)]
+            if kept:
+                yield kept
+
 
 def sync_walker(excludes: list[str], sub: str | None = None) -> ManifestWalker:
-    """The push sync's local-side walk: the manifest walk's exclude pruning
-    over the complete view (``store.sync_up`` enumerates every entry into the
+    """The push sync's local-side walk: the manifest walk's exclusion over
+    the complete view (``store.sync_up`` enumerates every entry into the
     pair stream for the journal; see docs/journal.md).
 
     Sharing ``ManifestWalker`` is what makes the sync and the manifest agree
-    on what an exclude means - one predicate, one anchor. The pruning applies
+    on what an exclude means - one predicate, one anchor. The filter applies
     to the LOCAL side only (the S3 listing is never filtered), so an object
     under an excluded path - uploaded before the exclude was added - surfaces
     to the sync as an ordinary orphan and ``push --delete`` can retire it,
     instead of the exclude hiding it from every lane forever. ``sub``
-    re-roots a sub-path sync's rels at ``./{sub}/`` so the entry's patterns
-    keep their entry-rooted meaning. Always a ``ManifestWalker`` - with no
-    excludes the pruning is a no-op - because the push delete lane reads the
+    re-anchors a sub walk's keys at ``{sub}/`` so the entry's patterns keep
+    their entry-rooted meaning. Always a ``ManifestWalker`` - with no
+    excludes the filter is a no-op - because the push delete lane reads the
     walker's ``scan_incomplete`` flag."""
-    prune, skip = split_excludes(excludes)
-    return ManifestWalker(prune, skip, f"./{sub}/" if sub else "./")
+    return ManifestWalker(Excludes(excludes), f"{sub}/" if sub else "")
 
 
 def walk_tree(
@@ -158,10 +188,13 @@ def walk_tree(
     S3 key order - the items one manifest record each.
 
     rel uses the manifest convention: ``root_rel`` for the root, ``rel_prefix``
-    + path below it - for an entry push that is "." / "./sub/file"; a sub-path
-    push passes "./{sub}" / "./{sub}/" so every rel (and thus every exclude
+    + path below it - for an entry walk that is "." / "./sub/file"; a sub-path
+    walk passes "./{sub}" / "./{sub}/" so every rel (and thus every exclude
     match) stays anchored at the ENTRY root, where the configured patterns are
-    defined. A missing ``root`` raises OSError (the caller checked existence);
+    defined. The entry root itself is never matched; a SUB walk's own root is
+    an ordinary judged path and is omitted when excluded (its non-excluded
+    children still walk). A missing ``root`` raises OSError (the caller
+    checked existence);
     an unreadable directory keeps its record and loses its children, and a
     path that changes underfoot mid-walk is skipped - ``warn`` (when given)
     receives one message per such gap, so a caller can surface that it did not
@@ -170,12 +203,24 @@ def walk_tree(
     that is not). ``warn=None`` (pull's apply/--delete lanes) walks silently: a
     gap there is judged by the direct-lstat fallback or safely left un-deleted.
     """
-    prune, skip = split_excludes(excludes)
-    yield root_rel, os.lstat(root), None
+    ex = Excludes(excludes)
+    key_prefix = "" if rel_prefix == "./" else rel_prefix.removeprefix("./")
+    st = os.lstat(root)
+    # A SUB walk's own root is an ordinary judged path. Judge it exactly as
+    # the walker would judge the same path as a child: a directory key keeps
+    # the trailing "/" (key_prefix carries it) and its absolute anchor gets
+    # the trailing separator boto3-s3 stamps on directory keys; a non-dir
+    # root (the manifest said directory, the local path is now a file or
+    # symlink) is judged by the slash-less forms.
+    is_dir_root = stat_mod.S_ISDIR(st.st_mode)
+    root_key = key_prefix if is_dir_root else key_prefix.rstrip("/")
+    root_anchor = os.path.abspath(root).replace(os.sep, "/") + ("/" if is_dir_root else "")
+    if not key_prefix or not ex.excluded(root_key, root_anchor):
+        yield root_rel, st, None
 
     storage = LocalStorage(
         root,
-        walker=ManifestWalker(prune, skip, rel_prefix),
+        walker=ManifestWalker(ex, key_prefix),
         follow_symlinks=False,
         enumerate_all_entries=True,
     )
@@ -198,22 +243,3 @@ def walk_tree(
                     warn(f"Skipping file {info.key}. File changed during the walk.")
                 continue
         yield rel_prefix + info.compare_key, info.stat_result, sym
-
-
-def iter_subtree(
-    local_sub: str, sub: str, excludes: list[str], *, warn: Callable[[str], None] | None = None
-) -> Iterator[tuple[str, os.stat_result, str | None]]:
-    """Walk items for a sub-path push: ``local_sub`` as recorded under
-    ``./{sub}``. Handles the file / symlink / directory cases. The walk rels
-    are entry-rooted, so the entry's exclude patterns apply exactly as they
-    would in a full push."""
-    st = os.lstat(local_sub)
-    if stat_mod.S_ISLNK(st.st_mode):
-        yield f"./{sub}", st, os.readlink(local_sub)
-        return
-    if not os.path.isdir(local_sub):
-        yield f"./{sub}", st, None
-        return
-    yield from walk_tree(
-        local_sub, excludes, root_rel=f"./{sub}", rel_prefix=f"./{sub}/", warn=warn
-    )

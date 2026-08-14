@@ -85,11 +85,16 @@ def test_pull_rejects_manifest_descendant_below_symlink(ws):
     assert not (dest / "link").exists()  # fail closed before applying any record
 
 
-def test_pull_meta_only_does_not_apply_file_metadata_through_symlink(ws):
+def test_pull_does_not_apply_file_metadata_through_symlink(ws):
+    # A regular-file record whose object is gone downloads nothing, so the
+    # metadata apply meets whatever sits at the path - here a local symlink.
+    # It must refuse to chmod/utime through it (the link's target is outside
+    # the restore tree), not "repair" the victim the link points at.
     source = ws.write("data/a.txt", "backup")
     os.chmod(source, 0o600)
     ws.config({"data": {"path": str(ws.root / "data")}})
     ws.run("push", "data", expect_rc=0)
+    ws.s3.delete_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/a.txt")
 
     victim = ws.write("victim.txt", "do not touch")
     os.chmod(victim, 0o644)
@@ -98,9 +103,10 @@ def test_pull_meta_only_does_not_apply_file_metadata_through_symlink(ws):
     dest.mkdir()
     os.symlink(victim, dest / "a.txt")
 
-    res = ws.run("pull", "--meta-only", "data", "-o", str(dest))
+    res = ws.run("pull", "data", "-o", str(dest))
 
     assert res.rc == 1
+    assert "recorded file type" in res.err
     after = os.lstat(victim)
     assert (after.st_mode, after.st_mtime_ns) == (before.st_mode, before.st_mtime_ns)
     assert (dest / "a.txt").is_symlink()
@@ -278,8 +284,14 @@ def test_status_leaf_subpath_through_symlinked_ancestor_shows_missing(ws):
     os.rmdir(ws.root / "data" / "d")
     os.symlink(outside, ws.root / "data" / "d")
 
-    res = ws.run("status", "data/d/f.txt", expect_rc=0)
+    res = ws.run("status", "--delete", "data/d/f.txt", expect_rc=0)
     assert any(ln.startswith("D ") for ln in res.out.splitlines())  # missing, not clean
+    assert "symlinked parent" in res.err
+    # Plain status must not read through the symlink and report clean either:
+    # it stays silent and warns.
+    res = ws.run("status", "data/d/f.txt", expect_rc=0)
+    assert res.out.strip() == ""
+    assert "symlinked parent" in res.err
 
 
 def test_diff_symlink_leaf_through_symlinked_ancestor_not_clean(ws):
@@ -543,7 +555,30 @@ def test_pull_replaces_symlink_directory_root_without_writing_through_it(ws):
     assert not (victim / "a.txt").exists()
 
 
-def test_meta_only_pull_replaces_empty_directory_root_symlink_safely(ws):
+def test_pull_replaces_symlink_at_an_unrecorded_ancestor(ws):
+    # excludes ["cache/"]: the manifest records ./cache/c.txt but no ./cache
+    # (a parent record is optional). The pre-sync guard must vet the
+    # unrecorded level from its child records and replace a local symlink
+    # sitting there - otherwise the sync would write through it, outside the
+    # restore tree.
+    ws.write("data/cache/c.txt", "content")
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["cache/"]}})
+    ws.run("push", "data", expect_rc=0)
+
+    outside = ws.root / "outside"
+    outside.mkdir()
+    dest = ws.root / "out"
+    dest.mkdir()
+    os.symlink(outside, dest / "cache")
+
+    ws.run("pull", "data", "-o", str(dest), expect_rc=0)
+
+    assert not (dest / "cache").is_symlink()
+    assert (dest / "cache" / "c.txt").read_text() == "content"
+    assert not (outside / "c.txt").exists()
+
+
+def test_pull_replaces_empty_directory_root_symlink_safely(ws):
     (ws.root / "empty").mkdir()
     ws.config({"empty": {"path": str(ws.root / "empty")}})
     ws.run("push", "empty", expect_rc=0)
@@ -555,7 +590,7 @@ def test_meta_only_pull_replaces_empty_directory_root_symlink_safely(ws):
     dest = ws.root / "out"
     os.symlink(victim, dest)
 
-    ws.run("pull", "--meta-only", "empty", "-o", str(dest), expect_rc=0)
+    ws.run("pull", "empty", "-o", str(dest), expect_rc=0)
 
     assert dest.is_dir() and not dest.is_symlink()
     assert marker.read_text() == "keep"
@@ -585,7 +620,7 @@ def test_remove_extras_reports_deletion_failure(tmp_path, monkeypatch, capfd):
 
     monkeypatch.setattr(restore.os, "remove", fail_remove)
 
-    item = ("extra.txt", str(extra), False)
+    item = ("extra.txt", str(extra), False, True)
     assert restore.remove_extras(iter([item]), aliases=set()) == (1, 0)
     assert extra.exists()
     assert "delete failed" in capfd.readouterr().err
@@ -720,7 +755,7 @@ def test_remove_extras_keeps_local_extra_whose_manifest_alias_would_sort_after_i
     report.parent.mkdir()
     report.write_text("restored content")
 
-    items = [("a/report", str(report), False)]
+    items = [("a/report", str(report), False, True)]
     aliases = {("a", restore.fs_alias_key("report."))}
     errors, removed = restore.remove_extras(iter(items), aliases=aliases)
 
@@ -740,7 +775,7 @@ def test_remove_extras_keeps_local_extra_whose_manifest_alias_would_sort_before_
     b.parent.mkdir()
     b.write_text("restored content")
 
-    items = [("a/b.txt", str(b), False)]
+    items = [("a/b.txt", str(b), False, True)]
     aliases = {("a", restore.fs_alias_key("B.txt"))}
     errors, removed = restore.remove_extras(iter(items), aliases=aliases)
 
@@ -758,7 +793,7 @@ def test_remove_extras_keeps_an_aliased_extra_directory_too(tmp_path, capfd):
     d = tmp_path / "a" / "b"
     d.mkdir(parents=True)
 
-    items = [("a/b", str(d), True)]
+    items = [("a/b", str(d), True, True)]
     aliases = {("a", restore.fs_alias_key("B"))}
     errors, removed = restore.remove_extras(iter(items), aliases=aliases)
 
@@ -777,7 +812,7 @@ def test_remove_extras_still_removes_an_unaliased_extra_next_to_an_alias_entry(t
     extra.parent.mkdir()
     extra.write_text("delete me")
 
-    items = [("a/unrelated.txt", str(extra), False)]
+    items = [("a/unrelated.txt", str(extra), False, True)]
     aliases = {("a", restore.fs_alias_key("deleted-elsewhere.txt"))}
     errors, removed = restore.remove_extras(iter(items), aliases=aliases)
 
@@ -797,10 +832,10 @@ def test_remove_extras_regression_nested_post_order_still_removes_plain_extras(t
     zzz.write_text("z")
 
     items = [
-        ("extradir", str(tmp_path / "extradir"), True),
-        ("extradir/sub", str(tmp_path / "extradir" / "sub"), True),
-        ("extradir/sub/deep.txt", str(deep), False),
-        ("zzz.txt", str(zzz), False),
+        ("extradir", str(tmp_path / "extradir"), True, True),
+        ("extradir/sub", str(tmp_path / "extradir" / "sub"), True, True),
+        ("extradir/sub/deep.txt", str(deep), False, True),
+        ("zzz.txt", str(zzz), False, True),
     ]
     errors, removed = restore.remove_extras(iter(items), aliases=set())
 

@@ -15,10 +15,15 @@ def cfg_ws(ws):
     return ws
 
 
-def test_meta_only_and_data_only_are_mutually_exclusive(cfg_ws):
-    res = cfg_ws.run("push", "--meta-only", "--data-only", "data")
+def test_meta_only_and_data_only_flags_are_gone(cfg_ws):
+    # A one-sided push/pull breaks the manifest's correspondence with S3, so
+    # these spellings must be rejected as unknown, not quietly ignored.
+    res = cfg_ws.run("push", "--meta-only", "data")
     assert res.rc == 1
-    assert "mutually exclusive" in res.err.lower()
+    assert "unknown option" in res.err
+    res = cfg_ws.run("pull", "--data-only", "data")
+    assert res.rc == 1
+    assert "unknown option" in res.err
 
 
 def test_all_with_explicit_entry_errors(cfg_ws):
@@ -54,10 +59,10 @@ def test_version_is_reported_without_loading_config(monkeypatch, capfd):
     assert captured.err == ""
 
 
-def test_status_rejects_delete(cfg_ws):
-    res = cfg_ws.run("status", "--delete", "data")
+def test_status_rejects_checksum(cfg_ws):
+    res = cfg_ws.run("status", "--checksum", "data")
     assert res.rc == 1
-    assert "delete" in res.err.lower()
+    assert "only applies to" in res.err
 
 
 def test_status_rejects_dry_run(cfg_ws):
@@ -104,7 +109,7 @@ def test_root_entry_path_is_rejected(ws):
     ws.config({"data": {"path": root}})
     res = ws.run("list")
     assert res.rc == 1
-    assert "filesystem root" in res.err
+    assert "path root" in res.err
 
 
 def test_entry_with_non_list_excludes_dies_cleanly(ws):
@@ -251,14 +256,18 @@ def test_pull_rejects_destinations_differing_only_by_trailing_dot(ws):
     assert "inner" in res.err
 
 
-def test_ls_remote_rejects_data_only(cfg_ws):
-    res = cfg_ws.run("ls-remote", "--data-only")
+def test_ls_remote_rejects_checksum(cfg_ws):
+    # _validate_command_options: a known option on a command it does not
+    # apply to is rejected with the commands it does apply to.
+    res = cfg_ws.run("ls-remote", "--checksum")
     assert res.rc == 1
+    assert "only applies to" in res.err
 
 
-def test_show_rejects_meta_only(cfg_ws):
-    res = cfg_ws.run("show", "--meta-only", "data")
+def test_show_rejects_delete(cfg_ws):
+    res = cfg_ws.run("show", "--delete", "data")
     assert res.rc == 1
+    assert "only applies to" in res.err
 
 
 def test_mtime_window_flag_rejects_non_number(cfg_ws):
@@ -281,11 +290,7 @@ def test_mtime_window_flag_requires_value(cfg_ws):
 @pytest.mark.parametrize(
     "args",
     [
-        ("push", "--checksum", "--meta-only", "data"),
         ("push", "--checksum", "--mtime-window", "0", "data"),
-        ("pull", "--delete", "--meta-only", "data"),
-        ("push", "--meta-only", "--delete", "data"),
-        ("push", "--data-only", "--delete", "data"),
         ("push", "--yes", "data"),
         ("pull", "--yes", "data"),
     ],
@@ -436,6 +441,8 @@ def test_delete_command_help_explains_confirmation_behavior(capfd, command):
         ("pull", "s3bak pull [options] <entry|path>...", "--output <path>"),
         ("show", "s3bak show [options] <entry|path>", "Print a single backed-up file"),
         ("status", "s3bak status [options] <entry|path>...", "Status letters:"),
+        ("verify", "s3bak verify [options] <entry|path>...", "Checks:"),
+        ("hook", "s3bak hook <pre|post> [options] <entry>...", "S3BAK_JOURNAL is unset"),
         ("diff", "s3bak diff [options] <entry|path>", "--color[=WHEN]"),
         ("list", "s3bak list", "List locally configured entries."),
         ("ls-remote", "s3bak ls-remote [options] [entry|path]", "stored on S3"),

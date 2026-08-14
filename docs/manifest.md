@@ -3,7 +3,10 @@
 Each entry has one `<entry>-manifest.jsonl` object that records its filesystem
 tree and metadata. It provides the input for `status`, metadata restoration on
 `pull`, and the default sync comparison. See [storage.md](storage.md) for its
-place alongside directly accessible data objects.
+place alongside directly accessible data objects. This document is the
+normative format and the invariants readers and writers must hold; what a
+damaged manifest means to a user, and how to repair one, is the manual's
+[recovery chapter](manual/08-recovery-troubleshooting.md).
 
 The format lives in `src/s3bak/manifest.py`; the tree walk that produces the
 records lives in `src/s3bak/localwalk.py`, on boto3-s3's directory engine.
@@ -94,8 +97,10 @@ memory bounded by one directory level rather than the whole tree:
 - **The walk** (`localwalk.walk_tree`) uses boto3-s3's complete, no-follow local
   enumeration — the data sync's own engine, so the sort definition cannot drift
   between the two. It returns directories, lstat-based symlink leaves, special
-  files, and unreadable entries before filtering. s3bak customizes only exclude
-  subtree pruning; boto3-s3 emits each directory record in-stream just before
+  files, and unreadable entries before filtering. s3bak customizes only the
+  exclude filtering ([excludes.md](excludes.md)); skipping the descent into an
+  excluded subtree is an optimization applied only where the patterns provably
+  cover all of it. boto3-s3 emits each directory record in-stream just before
   its children. An unreadable directory keeps its own record and loses its
   children; every walk reports that gap as a warning (exit 2) — the
   manifest-writing walk and the read-only status / diff walks alike — so a
@@ -105,11 +110,9 @@ memory bounded by one directory level rather than the whole tree:
   manifest.
 - **The status / pull `--delete` diff** (`merge_join`) pairs the manifest
   stream against a fresh walk on their shared sort keys with a one-record
-  lookahead per side — a both-sides pair of the same type is compared (M), a
-  both-sides pair whose type changed reports D (it is a replacement, not a
-  metadata edit), a manifest-only record reports D, and a local-only path
-  reports A / becomes a delete candidate — so a manifest far larger than RAM
-  still diffs in one pass.
+  lookahead per side: a both-sides pair is compared, a manifest-only record
+  and a local-only path each fall out of the join as their own case. One pass,
+  one pair in memory, so a manifest far larger than RAM still diffs.
 - **The push rewrite** (`merge_journal`) applies the push journal to the old
   manifest: a 2-way streaming merge in which a key with no event copies its
   old record verbatim (preserving any unknown keys), `+` / `!` copy the event
@@ -117,11 +120,6 @@ memory bounded by one directory level rather than the whole tree:
   ordering (strictly ascending, at most one event per key) and its marker
   consistency against the old manifest are validated fail closed — see
   [journal.md](journal.md) for the format and the emitter that writes it.
-- **The `--meta-only` rewrite** (`write_merged`) merges a fresh local walk
-  into the old manifest: a walked path always wins over its old record,
-  records outside a sub-path patch's replaced range are copied verbatim, and
-  old-only records are kept (`--meta-only` moves no data, so it must not drop
-  the records of objects still on S3).
 - **Pull's update strategy** (`ManifestFilter`) reads the manifest once,
   front to back, merge-joining its records against `S3.sync`'s ascending
   compare-key pairs (`iter_compare_records` keys a directory as `name/` to match
@@ -150,24 +148,29 @@ against either side of a sync without materializing it.
   would reject.
   Treating a damaged record as absent would be unsafe: `pull --delete` could
   otherwise classify the corresponding local path as an extra and remove it.
-  A directory push reads the manifest at some stage in every mode, so a
-  damaged one blocks pushes too; to recover, remove the manifest object with
-  `aws s3 rm` and push the entry again — with no manifest on S3 the push
-  transfers every pair and writes a fresh one, like a first push.
+  Failing closed costs availability — every push reads the manifest first, so
+  a damaged one blocks the command that would rewrite it — and that trade is
+  deliberate: an unreadable manifest with an intact backup is recoverable,
+  a manifest half-believed is not.
+- A record's parent directory record is optional. An excluded directory is
+  not recorded while its visible children are ([excludes.md](excludes.md)),
+  so a missing parent record is a valid manifest, not damage; pull creates
+  the missing levels as plain directories. Validation cannot condition this
+  on the excludes in force — a manifest is read under whatever configuration
+  the reader has — so parents are optional unconditionally.
 - Unknown record keys remain accepted and are preserved by sub-tree patches,
   so additive metadata does not require a version bump.
 
 ## Versioning and migration
 
-The version bumps when the format changes incompatibly. There is no in-code
-migration and no multi-version reader: a manifest whose version is not the one
-this s3bak reads is rejected at download, exactly like a damaged one, so it
-blocks a plain `push` as well. To move to a new format, first remove the old
-manifest objects (`aws s3 rm` each `<entry>-manifest.jsonl`, or all at once with
-`aws s3 rm --recursive --exclude '*' --include '*-manifest.jsonl'`), then run
-`push --all`: with no manifest on S3 each entry transfers every pair and writes
-a fresh one, exactly as a first push does.
+The version bumps when the format changes incompatibly, and only then: unknown
+keys are ignored by readers, so additive metadata needs no bump.
 
-An old manifest object left behind after a filename change (e.g. a pre-v3
-`<entry>-ls-l.txt`) is removed manually with the aws-cli command `aws s3 rm`;
-s3bak keeps no code to clean up formats it no longer writes.
+There is no in-code migration and no multi-version reader. A manifest whose
+version is not the one this s3bak reads is rejected at download, exactly like a
+damaged one — migration is therefore the same operation as repairing a damaged
+manifest, per entry: remove the manifest object and push
+([recovery chapter](manual/08-recovery-troubleshooting.md#a-damaged-manifest)).
+Carrying a reader per historical version would mean keeping every past format's
+semantics alive in code that nothing exercises; a personal backup tool can
+afford to re-push instead.

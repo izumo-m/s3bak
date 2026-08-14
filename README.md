@@ -39,8 +39,26 @@ uv run s3bak --help
 uv run pytest        # hermetic test suite (uses moto; no AWS/Docker needed)
 ```
 
+To install the `s3bak` command from this working tree instead of GitHub (e.g.
+to try out local changes without a venv):
+
+```sh
+uv tool install .
+```
+
 To poke at s3bak against a real S3-compatible endpoint, `scripts/` brings up a
 local MinIO stack: `scripts/compose-up.sh && source scripts/minio-env.sh`.
+
+## Update
+
+```sh
+uv tool upgrade s3bak --reinstall    # installed from GitHub
+uv tool install . --reinstall        # installed from this working tree
+```
+
+The GitHub install tracks the default branch, not a pinned commit, so
+`--reinstall` is required — otherwise `uv` may treat the cached clone as
+already up to date and skip fetching new commits.
 
 ## Configuration
 
@@ -85,6 +103,7 @@ Commands:
   show        Print a backed-up file
   status      Compare local files with the backup
   verify      Verify backup integrity on S3
+  hook        Run an entry's pre_hook or post_hook on demand
   diff        Show content differences
   list        List locally configured entries
   ls-remote   List entries or files stored on S3
@@ -102,7 +121,8 @@ examples.
 ```sh
 s3bak push --all              # back up every configured entry
 s3bak push --all --dry-run    # preview without uploading
-s3bak status bin              # M/A/D summary for one entry
+s3bak status bin              # what a push would change (M/A)
+s3bak status --delete bin     # also list what push --delete would offer (D)
 s3bak pull bin home-docs      # restore selected entries in parallel
 s3bak pull bin -o /tmp/out    # restore the bin entry to /tmp/out
 s3bak pull bin --delete --dry-run  # preview a mirror restore
@@ -113,11 +133,19 @@ s3bak verify --all --checksum # also compare local content to S3 ETags
 s3bak ls-remote               # list entries stored on S3
 ```
 
-The `status` letters are push-oriented (what a push would change on the backup):
-`M` modified, `A` only local (push would add), `D` only in backup
-(`push --delete` would remove; a plain push keeps it).
+The `status` letters are push-oriented — each variant previews its push. What
+each one means, and every other command's output, is the manual's
+[command reference](docs/manual/05-command-reference.md).
 
-## Design
+## Documentation
+
+The [**user manual**](docs/manual/README.md) is the complete guide and the
+authoritative description of what s3bak does: configuration, change detection,
+every command, `--delete`, the operating routine, recovery, and platform
+notes. Start at [chapter 1](docs/manual/01-introduction.md), or
+[chapter 2](docs/manual/02-getting-started.md) to set a backup up.
+
+For how s3bak is built and why:
 
 - [`docs/overview.md`](docs/overview.md) — project goals and the design document
   index.

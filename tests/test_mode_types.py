@@ -108,6 +108,9 @@ def test_status_clean_against_manifest(ws):
 
 def test_status_reports_type_mismatch(ws):
     # Manifest records a.txt as a directory; locally it is a regular file.
+    # The two sort to different keys, so nothing pairs them: plain status
+    # shows the local file as A (a push would add it), and the old record's
+    # D surfaces under --delete alone.
     ws.write("data/a.txt", "hello")
     os.chmod(ws.root / "data", 0o755)
     ws.config({"data": {"path": str(ws.root / "data")}})
@@ -119,6 +122,11 @@ def test_status_reports_type_mismatch(ws):
     )
 
     res = ws.run("status", "data", expect_rc=0)
+    lines = res.out.splitlines()
+    assert any(ln.startswith("A") and "a.txt" in ln for ln in lines)
+    assert not any(ln.startswith("D") for ln in lines)
+
+    res = ws.run("status", "--delete", "data", expect_rc=0)
     assert any(ln.startswith("D") and "a.txt" in ln for ln in res.out.splitlines())
 
 
@@ -155,8 +163,8 @@ def test_pull_restores_recorded_mtime_ns(ws):
 
 def test_pull_unuploaded_file_is_not_restored_as_dir(ws):
     # real.txt has a data object; ghost.txt is recorded but never uploaded.
-    # The recorded type keeps it a (missing) regular file, reported as an
-    # error - not silently created as a directory.
+    # The recorded type keeps it a (missing) regular file - warned about and
+    # skipped as a stale record, never silently created as a directory.
     ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/real.txt", Body=b"real")
     _put_manifest(
         ws,
@@ -174,7 +182,8 @@ def test_pull_unuploaded_file_is_not_restored_as_dir(ws):
 
     assert (dest / "real.txt").read_text() == "real"
     assert not (dest / "ghost.txt").exists()  # never created as a directory
-    assert res.rc != 0  # the un-uploaded file is reported missing
+    assert "a push retires the stale record" in res.err  # warned, not fatal
+    assert res.rc == 0  # run() maps the warning to exit 2
 
 
 def test_pull_empty_dir_subpath_restores_directory(ws):

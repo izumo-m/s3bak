@@ -30,17 +30,18 @@ wheels = [
 
 [[package]]
 name = "boto3-s3"
-version = "0.8.0"
+version = "0.10.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "boto3" },
     { name = "botocore" },
+    { name = "python-dateutil" },
     { name = "s3transfer" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c7/80/5cdf11535dab6fe9c03f07507f48f69c3589c7bf976711786d4660142be2/boto3_s3-0.8.0.tar.gz", hash = "sha256:cfd41ed2017a8abd3042b118b2acc555719c3c1f372561b09a1cb9c2b2a39e0d", size = 217810, upload-time = "2026-07-22T23:29:12.582Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/40/20/48107573de25b0356d4f3c6cccef56811628cb938f8d98a8f4e5ed7319a7/boto3_s3-0.10.0.tar.gz", hash = "sha256:85ca13e21d0948e08defa72b88a0f88be7aeef2f3cc85c0b99a7aa807c1ac534", size = 243717, upload-time = "2026-08-13T14:52:54.664Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1f/46/5176bd5e84208bfb38ed9508e0a2132270af9b72bdaf860c9676f1546cf8/boto3_s3-0.8.0-py3-none-any.whl", hash = "sha256:ca46444534d145aee90b5e845c4056b4fe43a69697e20dea0a420588b6982daf", size = 227595, upload-time = "2026-07-22T23:29:11.275Z" },
+    { url = "https://files.pythonhosted.org/packages/e8/5b/30dbc2ff46a5da111f9b5290bbbbd220562c04808182019b5a1f533a82e7/boto3_s3-0.10.0-py3-none-any.whl", hash = "sha256:ecc1b721b8e79f7217f9d4676f87608c7035f3697b6bc9e7f60a5e836d5ae906", size = 257239, upload-time = "2026-08-13T14:52:53.367Z" },
 ]
 
 [[package]]
@@ -355,7 +356,7 @@ name = "exceptiongroup"
 version = "1.3.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
+    { name = "typing-extensions" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/50/79/66800aadf48771f6b62f7eb014e352e5d06856655206165d775e675a02c9/exceptiongroup-1.3.1.tar.gz", hash = "sha256:8b412432c6055b0b7d14c310000ae93352ed6754f70fa8f7c34141f91c4e3219", size = 30371, upload-time = "2025-11-21T23:01:54.787Z" }
 wheels = [
@@ -721,7 +722,7 @@ wheels = [
 
 [[package]]
 name = "s3bak"
-version = "0.5.0"
+version = "0.6.0"
 source = { editable = "." }
 dependencies = [
     { name = "boto3" },
@@ -741,7 +742,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "boto3", specifier = ">=1.28" },
-    { name = "boto3-s3", specifier = ">=0.8,<0.9" },
+    { name = "boto3-s3", specifier = ">=0.8,<0.11" },
 ]
 
 [package.metadata.requires-dev]
