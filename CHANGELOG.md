@@ -9,6 +9,8 @@ a fix only (Fixed).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-14
+
 ### Added
 
 - `verify` now reports excluded residue: records still sitting under the
