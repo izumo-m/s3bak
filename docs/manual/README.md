@@ -26,7 +26,8 @@ description of s3bak's observable behavior (see
    repairing a damaged manifest, and restoring onto a machine that has
    nothing.
 9. [Platform notes](09-platform-notes.md) — Windows, macOS, WSL2: mtime
-   granularity, name folding, and S3-compatible services.
+   granularity per filesystem, permissions and symlinks where they differ,
+   name folding, moving a tree between platforms, and S3-compatible services.
 
 Appendix:
 
