@@ -272,7 +272,7 @@ _COMMAND_SPECS = {
             "s3bak push [options] <entry|path>...",
             "s3bak push [options] --all",
         ),
-        arguments=(("<entry|path>...", "Entries or paths to back up"),),
+        arguments=(("<entry|path>...", "Entries, groups, or paths to back up"),),
         options=(
             "all",
             "dry_run",
@@ -298,7 +298,7 @@ _COMMAND_SPECS = {
             "s3bak pull [options] <entry|path>...",
             "s3bak pull [options] --all",
         ),
-        arguments=(("<entry|path>...", "Entries or paths to restore"),),
+        arguments=(("<entry|path>...", "Entries, groups, or paths to restore"),),
         options=(
             "all",
             "dry_run",
@@ -338,7 +338,7 @@ _COMMAND_SPECS = {
             "s3bak status [options] <entry|path>...",
             "s3bak status [options] --all",
         ),
-        arguments=(("<entry|path>...", "Entries or paths to compare"),),
+        arguments=(("<entry|path>...", "Entries, groups, or paths to compare"),),
         options=("all", "status_delete", "mtime_window", "verbose", "color", "no_color", "help"),
         sections=(
             (
@@ -366,7 +366,7 @@ _COMMAND_SPECS = {
             "s3bak verify [options] <entry|path>...",
             "s3bak verify [options] --all",
         ),
-        arguments=(("<entry|path>...", "Entries or paths to verify"),),
+        arguments=(("<entry|path>...", "Entries, groups, or paths to verify"),),
         options=("all", "checksum", "mtime_window", "verbose", "help"),
         sections=(
             (
@@ -397,7 +397,7 @@ _COMMAND_SPECS = {
         ),
         arguments=(
             ("<pre|post>", "Which hook to run"),
-            ("<entry>...", "Entries whose hook to run"),
+            ("<entry>...", "Entries or groups whose hook to run"),
         ),
         options=("all", "dry_run", "verbose", "help"),
         sections=(
@@ -409,6 +409,9 @@ _COMMAND_SPECS = {
                     "S3BAK_JOURNAL is unset (no push, hence no journal), which a hook",
                     'reads as "no per-file detail; assume anything may have changed".',
                     "An entry without the named hook fails (exit 1).",
+                    "A named group runs the members that configure the hook and",
+                    "skips the rest, failing only where no member does and no",
+                    "member was named outright.",
                 ),
             ),
         ),
@@ -431,8 +434,8 @@ _COMMAND_SPECS = {
         ),
     ),
     "list": _CommandSpec(
-        overview="List locally configured entries",
-        summary="List locally configured entries. This command does not access S3.",
+        overview="List locally configured entries and groups",
+        summary="List locally configured entries and groups. This command does not access S3.",
         usage=("s3bak list",),
         arguments=(),
         options=("help",),
@@ -516,38 +519,51 @@ def print_command_help(command: str) -> NoReturn:
 # =============================================================================
 
 
+def _split_entry_form(arg: str) -> tuple[str, str, str]:
+    """`arg` read as the entry-rooted ``<name>/<sub>``: (name, separator, sub).
+    The separator is empty where that syntax does not apply - an absolute path,
+    or a name with no separator in it at all. A native separator is read as
+    ``/``, so the syntax is spelled the same way on every platform."""
+    if os.path.isabs(arg):
+        return arg, "", ""
+    entry_form = arg
+    for sep in (os.sep, os.altsep):
+        if sep and sep != "/":
+            entry_form = entry_form.replace(sep, "/")
+    return entry_form.partition("/")
+
+
 def _resolve_one_arg(cfg: Config, arg: str) -> tuple[str, str | None]:
-    # A bare name is an entry. ``entry/sub`` is entry-rooted syntax independent
+    # A bare name is an entry (a group is expanded before this, in
+    # resolve_entry_files). ``entry/sub`` is entry-rooted syntax independent
     # of CWD; every other path is resolved locally and matched to the containing
     # configured entry (longest root wins).
-    seps = [os.sep, os.altsep] if os.altsep else [os.sep]
-    if not (any(s in arg for s in seps) or os.path.isabs(arg)):
+    name, separator, raw_sub = _split_entry_form(arg)
+    if not separator and not os.path.isabs(arg):
         if arg in cfg.entries:
             return arg, None
-        console.die(f"no such entry: {arg}")
+        console.die(f"no such entry or group: {arg}")
 
-    if not os.path.isabs(arg):
-        entry_form = arg
-        for sep in seps:
-            if sep and sep != "/":
-                entry_form = entry_form.replace(sep, "/")
-        name, separator, raw_sub = entry_form.partition("/")
-        if separator and name in cfg.entries:
-            sub = posixpath.normpath(raw_sub)
-            if sub == ".":
-                return name, None
-            # os.path.splitdrive is identity on POSIX (so a filename containing
-            # ':' is fine there) but strips a Windows drive: on Windows a
-            # drive-qualified sub like "C:/escape" makes os.path.join(entry_path,
-            # sub) discard the entry path entirely and escape the entry root.
-            if (
-                sub == ".."
-                or sub.startswith("../")
-                or sub.startswith("/")
-                or os.path.splitdrive(sub)[0]
-            ):
-                console.die(f"sub path must stay inside entry {name}: {arg}")
-            return name, sub
+    if separator and name in cfg.entries:
+        sub = posixpath.normpath(raw_sub)
+        if sub == ".":
+            return name, None
+        # os.path.splitdrive is identity on POSIX (so a filename containing
+        # ':' is fine there) but strips a Windows drive: on Windows a
+        # drive-qualified sub like "C:/escape" makes os.path.join(entry_path,
+        # sub) discard the entry path entirely and escape the entry root.
+        if (
+            sub == ".."
+            or sub.startswith("../")
+            or sub.startswith("/")
+            or os.path.splitdrive(sub)[0]
+        ):
+            console.die(f"sub path must stay inside entry {name}: {arg}")
+        return name, sub
+    if separator and name in cfg.groups:
+        # `group/` and `group/.` are the group itself and were taken as such by
+        # _group_argument, so anything reaching here is a real sub path.
+        console.die(f"a group has no single root, so a sub path does not apply: {arg}")
 
     local = normalize_local_path(arg)
     matches: list[tuple[int, str, str | None]] = []
@@ -573,9 +589,38 @@ def _resolve_one_arg(cfg: Config, arg: str) -> tuple[str, str | None]:
     return best[0]
 
 
+def _group_argument(cfg: Config, arg: str) -> str | None:
+    """The group `arg` names, or None where it names none. `group/` and
+    `group/.` name the group itself, the way `entry/` and `entry/.` name the
+    whole entry; every other `group/sub` is a sub path, and _resolve_one_arg
+    rejects it."""
+    if arg in cfg.groups:
+        return arg
+    name, separator, raw_sub = _split_entry_form(arg)
+    if separator and name in cfg.groups and posixpath.normpath(raw_sub) == ".":
+        return name
+    return None
+
+
+def _reject_group(cfg: Config, arg: str, cmd: str) -> None:
+    """A single-target command needs one thing to act on, and a group is not
+    one: it has no root of its own."""
+    if _group_argument(cfg, arg) is not None:
+        console.die(f"{cmd} takes a single entry or path, not a group: {arg}")
+
+
+def _dedupe_targets(resolved: Sequence[tuple[str, str | None]]) -> list[tuple[str, str | None]]:
+    """Drop exact repeats, keeping the first occurrence. Naming a group and one
+    of its members - or the same argument twice - asks for one thing, and after
+    expansion that reads as a repeat rather than as a conflict. A repeat with a
+    DIFFERENT sub path survives, for the per-command conflict check to reject."""
+    return list(dict.fromkeys(resolved))
+
+
 def resolve_entry_file(cfg: Config, positional: list[str], cmd: str) -> tuple[str, str | None]:
     if len(positional) != 1:
         console.die(f"{cmd} takes <entry> or <path>")
+    _reject_group(cfg, positional[0], cmd)
     return _resolve_one_arg(cfg, positional[0])
 
 
@@ -584,7 +629,69 @@ def resolve_entry_files(
 ) -> list[tuple[str, str | None]]:
     if not positional:
         console.die(f"{cmd} requires at least one entry or path")
-    return [_resolve_one_arg(cfg, arg) for arg in positional]
+    resolved: list[tuple[str, str | None]] = []
+    for arg in positional:
+        # A group name expands in place, in expansion order; every other
+        # argument denotes one target.
+        group = _group_argument(cfg, arg)
+        if group is not None:
+            resolved.extend((entry, None) for entry in cfg.groups[group])
+        else:
+            resolved.append(_resolve_one_arg(cfg, arg))
+    return _dedupe_targets(resolved)
+
+
+def _resolve_hook_entries(
+    cfg: Config, positional: list[str], kind: str, verbose: bool
+) -> list[str]:
+    """The entries `hook pre|post` runs, from its positional arguments.
+
+    Naming an entry is an instruction, so it is kept even without the hook -
+    cmd_hook reports that, which is where a `post_hok:` typo surfaces. Naming
+    a GROUP is an instruction on the group, read like --all: a member without
+    the hook is outside the operation's domain and is skipped (reported under
+    -v), and a group that contributes nothing at all is an error. An entry
+    named both ways keeps the strict reading, and that naming also answers for
+    the group it belongs to: something of the group was asked for outright, so
+    the group is not the case that asked for nothing."""
+    if not positional:
+        console.die("hook requires at least one entry or path")
+    hook = f"{kind}_hook"
+    # (group name or None, the entries the argument named).
+    lanes: list[tuple[str | None, list[str]]] = []
+    named: set[str] = set()
+    for arg in positional:
+        group = _group_argument(cfg, arg)
+        if group is not None:
+            lanes.append((group, cfg.groups[group]))
+            continue
+        entry, sub = _resolve_one_arg(cfg, arg)
+        if sub is not None:
+            console.die(f"hook runs per entry; a sub path is not allowed: {entry}/{sub}")
+        named.add(entry)
+        lanes.append((None, [entry]))
+
+    entries: list[str] = []
+    skipped: list[str] = []
+    for group, members in lanes:
+        if group is None:
+            entries.extend(members)
+            continue
+        configured = [entry for entry in members if cfg.entries[entry].get(hook)]
+        if not configured and not any(member in named for member in members):
+            # The group asked for nothing runnable and nothing of it was asked
+            # for by name either. Failing here, during resolution, stops the
+            # whole command before any other argument's hook has run.
+            console.die(f"no entry in group {group} configures a {hook}")
+        skipped.extend(entry for entry in members if entry not in configured)
+        entries.extend(configured)
+    if verbose:
+        # Once per entry for the whole invocation: a group named twice, or two
+        # groups sharing a hook-less member, still report that member once.
+        for entry in dict.fromkeys(skipped):
+            if entry not in named:
+                console.diag(f"skipped (no {hook}): {entry}\n")
+    return list(dict.fromkeys(entries))
 
 
 def _validate_pull_destinations(cfg: Config, resolved: Sequence[tuple[str, str | None]]) -> None:
@@ -828,6 +935,11 @@ def main(argv: list[str] | None = None) -> int:
             resolved = [(entry, None) for entry in sorted(cfg.entries.keys())]
         else:
             resolved = resolve_entry_files(cfg, positional, "pull")
+        # A group expanding to several entries reaches the one-destination rule
+        # only here; the same message rejects several explicit targets earlier,
+        # before the config is even read.
+        if opt_outpath is not None and len(resolved) > 1:
+            console.die("-o/--output cannot be combined with multiple pull targets")
         _validate_distinct_entries(resolved, "pull")
         _validate_pull_destinations(cfg, resolved)
         return _run_resolved_entries(
@@ -897,14 +1009,7 @@ def main(argv: list[str] | None = None) -> int:
                 for skipped in sorted(cfg.entries.keys() - set(hook_entries)):
                     console.diag(f"skipped (no {hook_kind}_hook): {skipped}\n")
         else:
-            resolved = resolve_entry_files(cfg, positional, "hook")
-            for hook_entry, hook_sub in resolved:
-                if hook_sub is not None:
-                    console.die(
-                        f"hook runs per entry; a sub path is not allowed: {hook_entry}/{hook_sub}"
-                    )
-            _validate_distinct_entries(resolved, "hook")
-            hook_entries = [e for e, _ in resolved]
+            hook_entries = _resolve_hook_entries(cfg, positional, hook_kind, opt_verbose)
 
         def _hook_one(cfg_: Config, entry_: str, opts_: Opts) -> int:
             assert hook_kind is not None
@@ -930,6 +1035,7 @@ def main(argv: list[str] | None = None) -> int:
             console.die("ls-remote takes at most one entry or path")
         if not positional:
             return cmd_ls_remote(cfg, opts, None, None)
+        _reject_group(cfg, positional[0], "ls-remote")
         entry, sub = _resolve_one_arg(cfg, positional[0])
         return cmd_ls_remote(cfg, opts, entry, sub)
 

@@ -518,11 +518,13 @@ step unnecessary next time.
 
 ```console
 $ s3bak status nosuch
-s3bak: no such entry: nosuch
+s3bak: no such entry or group: nosuch
 ```
 
-The name has to be one of the keys in `entries` — `s3bak list` prints them,
-along with the paths they point at.
+The name has to be one of the keys in `entries`, or — where the command takes
+several entries — one of the names in `groups`. `s3bak list` prints both: an
+entry beside the local path it points at, and a group beside the members the
+configuration gives it, as `nightly = demo, vault`.
 
 ```console
 $ s3bak push demo

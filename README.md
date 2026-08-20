@@ -87,6 +87,10 @@ entries = {
 Per-entry keys: `path` (required), `excludes`, `pre_hook`, `post_hook`,
 `mtime_window`.
 
+The optional top-level `groups` names sets of entries — `groups = {"nightly":
+["bin", "home-docs"]}` — and a group can be typed wherever a command takes
+several entry names. Groups may nest, and no group name reaches S3.
+
 Hooks are non-empty argument lists whose first item is the executable. s3bak
 runs them directly without a command shell, so shell parsing, expansion,
 pipelines, and redirection are unavailable. Put complex work in a standalone
@@ -105,7 +109,7 @@ Commands:
   verify      Verify backup integrity on S3
   hook        Run an entry's pre_hook or post_hook on demand
   diff        Show content differences
-  list        List locally configured entries
+  list        List locally configured entries and groups
   ls-remote   List entries or files stored on S3
 
 Global options:
@@ -121,6 +125,7 @@ examples.
 ```sh
 s3bak push --all              # back up every configured entry
 s3bak push --all --dry-run    # preview without uploading
+s3bak push nightly            # back up every entry in a configured group
 s3bak status bin              # what a push would change (M/A)
 s3bak status --delete bin     # also list what push --delete would offer (D)
 s3bak pull bin home-docs      # restore selected entries in parallel

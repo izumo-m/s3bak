@@ -2793,6 +2793,10 @@ def cmd_list(cfg: Config, opts: Opts) -> int:
     for key in sorted(cfg.entries.keys()):
         path = cfg.entries[key]["path"]
         console.out(f"{key:<20s} {path}\n")
+    # Groups print their members as configured, nested groups included: what
+    # the file says is what the reader edits.
+    for name in sorted(cfg.group_members.keys()):
+        console.out(f"{name:<20s} = {', '.join(cfg.group_members[name])}\n")
     return 0
 
 

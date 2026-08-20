@@ -56,7 +56,7 @@ s3bak tells them apart by looking for a path separator:
 
 | What you type | How it is read |
 | --- | --- |
-| `bin` | the configured entry named `bin`, and nothing else |
+| `bin` | the configured entry named `bin`, or the group of that name |
 | `bin/lib` | the path `lib` inside entry `bin`, relative to that entry's root |
 | `/home/you/bin/lib`, `./lib`, `~/bin/lib` | a local path, normalized and then matched against the configured entries |
 
@@ -99,10 +99,35 @@ failed:
 
 ```console
 $ s3bak push nope
-s3bak: no such entry: nope
+s3bak: no such entry or group: nope
 $ s3bak push /etc/hostname
 s3bak: no such entry for path: /etc/hostname
 ```
+
+### Groups
+
+A bare name is also read as a [group](03-configuration.md#groups) — a
+configured set of entry names — everywhere a command takes more than one
+entry: `push`, `pull`, `status`, `verify` and `hook`. The group is replaced by
+its entries in place, so `s3bak push nightly` is `s3bak push` of each of them,
+and the group name goes no further than that.
+
+A group has no path of its own, so `nightly/lib` is refused, and so is a group
+handed to a command that works on a single target:
+
+```console
+$ s3bak push nightly/lib
+s3bak: a group has no single root, so a sub path does not apply: nightly/lib
+$ s3bak show nightly
+s3bak: show takes a single entry or path, not a group: nightly
+```
+
+Once every argument has been expanded, exact repeats are dropped and the first
+occurrence stands: naming a group beside one of its own members, or the same
+entry twice, runs that entry once. What is still refused is one entry named
+twice with different targets — the entry itself beside a sub-path of it, or
+two different sub-paths. `pull -o` takes a single argument, and that argument
+may be a group only where the group stands for exactly one entry.
 
 ### `--all`
 
@@ -125,10 +150,10 @@ order, whichever entry happened to finish first.
 
 | Command | Arguments |
 | --- | --- |
-| `push`, `pull`, `status`, `verify` | one or more, or `--all` |
-| `hook` | `pre` or `post`, then one or more entries, or `--all` |
-| `diff`, `show` | exactly one |
-| `ls-remote` | none, or one |
+| `push`, `pull`, `status`, `verify` | one or more entries, groups or paths, or `--all` |
+| `hook` | `pre` or `post`, then one or more entries or groups, or `--all` |
+| `diff`, `show` | exactly one entry or path, never a group |
+| `ls-remote` | none, or one entry or path, never a group |
 | `list` | none |
 
 `hook` is the one command whose first argument is not an entry: it selects
@@ -140,13 +165,16 @@ Naming several targets is allowed, but not every combination is coherent:
 
 | Rejected | Message |
 | --- | --- |
-| the same entry twice in one `push`, `pull` or `hook` | `duplicate entry in push: demo (parallel push of the same entry is not supported)` |
-| two sub-paths of one entry in `status` or `verify` | `conflicting sub paths for entry demo` |
+| one entry named twice with different targets in one `push` or `pull` — the entry itself beside a sub-path of it, or two different sub-paths | `duplicate entry in push: demo (parallel push of the same entry is not supported)` |
+| the same pairing in `status` or `verify` | `conflicting sub paths for entry demo` |
 | a `pull` whose targets restore into the same tree | `pull restore destinations overlap: demo (/home/you/demo) and lib (/home/you/demo/lib)` |
 
 The last one applies to `pull --all` as well, so a configuration with a nested
 entry is caught the first time you try to restore everything, rather than
 halfway through.
+
+Naming the *same* target twice is not in that list: it is deduplicated, which
+is what makes a group and one of its own members harmless side by side.
 
 ## Options
 
@@ -185,7 +213,7 @@ rehearsal.
 | `--checksum` with `--mtime-window` (except on `verify`) | a content comparison never looks at modification times |
 | `--mtime-window` without `--checksum` on `verify` | there, the window only classifies content mismatches |
 | `pull --all -o <path>` | one destination cannot hold every entry |
-| `pull a b -o <path>` | likewise for several named targets |
+| `pull a b -o <path>` | likewise for several named targets, a group of several among them |
 | `-o ""` | an empty destination is never what was meant |
 
 Each stops the command with exit 1 and a message that says as much:
@@ -369,9 +397,11 @@ threshold — 8 MiB unless the AWS configuration says otherwise — where the
 download is split into parallel parts. `--dry-run` names the same lane.
 
 `-o` takes one target and one destination, which is why it rules out `--all`
-and several arguments at once. The destination is the path itself, not a
-directory to put the entry inside: `pull wsl.conf -o /tmp/w.conf` writes that
-file, and `pull demo -o /tmp/restore` fills that directory.
+and several arguments at once. The one argument it does take may be a group,
+provided that group stands for exactly one entry; a group standing for several
+is refused like any other pair of targets. The destination is the path itself,
+not a directory to put the entry inside: `pull wsl.conf -o /tmp/w.conf` writes
+that file, and `pull demo -o /tmp/restore` fills that directory.
 
 A pull never writes the manifest — only a push may — so a record that has gone
 stale stays stale. Where the backup no longer holds the object a record names,
@@ -574,7 +604,7 @@ unset, since there was no push and therefore no journal, which a hook reads as
 ([Operating s3bak](07-operating.md)). The command needs no S3 access at all.
 
 `pre` or `post` has to come first, and the rest of the arguments are whole
-entries:
+entries or groups:
 
 ```console
 $ s3bak hook vault
@@ -612,6 +642,31 @@ that turns out to be a no-op in full should not read as success:
 ```console
 $ s3bak hook pre --all
 s3bak: no entry configures a pre_hook
+```
+
+A group reads the same way, narrowed to its members: the ones that configure
+the hook run, and the rest are skipped. What fails is the group that turns out
+to have asked for nothing at all — no member configures the hook, and no
+member was named outright either:
+
+```console
+$ s3bak hook post nightly
+s3bak: no entry in group nightly configures a post_hook
+```
+
+That is a failure of reading the arguments rather than of running a hook, so
+it stops the whole command, the hooks of any entries named beside the group
+included.
+
+Naming a member outright still asks for that member, and that reading survives
+being in a group: the member keeps the error a skipped member would not have
+produced, and the group it came from has been asked for something after all.
+So even where the group has no such hook anywhere in it, the answer is about
+the member you named:
+
+```console
+$ s3bak hook pre nightly vault
+s3bak: vault: no pre_hook configured
 ```
 
 `--dry-run` prints the command line instead of running it:
@@ -713,15 +768,20 @@ you look at one before deciding its fate.
 s3bak list
 ```
 
-Prints the configured entries and their local paths, sorted by name. It reads
-the configuration and stops there — no S3 request, no credentials, no network:
+Prints the configured entries and their local paths, sorted by name, then the
+configured groups and their members. It reads the configuration and stops
+there — no S3 request, no credentials, no network:
 
 ```console
 $ s3bak list
 demo                 /home/you/demo
 vault                /home/you/vault
 wsl.conf             /etc/wsl.conf
+nightly              = demo, vault
 ```
+
+A group's line shows its members as the file spells them, a nested group
+included, rather than the entries it finally expands to.
 
 ## `ls-remote`
 

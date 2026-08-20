@@ -9,6 +9,36 @@ a fix only (Fixed).
 
 ## [Unreleased]
 
+### Added
+
+- `groups`: an optional top-level config setting naming sets of entries.
+  A group name can be typed wherever a command takes several entry names —
+  `push`, `pull`, `status`, `verify`, `hook` — and is expanded in place
+  during argument resolution, so nothing downstream and no S3 key ever sees
+  it. Groups may nest, an entry may belong to any number of them, and a
+  group name may not collide with an entry name; membership, cycles and
+  names are all validated when the config loads. `list` prints each group
+  with its configured members. A group has no root of its own, so s3bak
+  rejects `mygroup/sub`, and rejects a group where `diff`, `show` or
+  `ls-remote` expects a single target; `pull -o` takes one argument, and
+  that argument may be a group only where the group stands for exactly one
+  entry. `hook <kind> <group>` reads like `--all` narrowed to the group:
+  members without that hook are skipped (shown under `-v`), and the error
+  comes only where the group asks for nothing at all — no member configures
+  the hook and no member was named outright. Naming an entry outright keeps
+  failing on a missing hook.
+
+### Changed
+
+- Naming the same target twice in one `push`, `pull` or `hook` — the same
+  entry twice, or a group beside one of its own members — is now
+  deduplicated silently instead of failing as a duplicate entry; `status`
+  and `verify` already collapsed it. Naming one entry twice with different
+  targets — the entry itself beside a sub-path of it, or two different
+  sub-paths — is still refused, since that would be a parallel push or
+  pull of the same tree.
+- The unknown-name error is now `no such entry or group: <name>`.
+
 ## [0.6.1] - 2026-08-14
 
 ### Fixed

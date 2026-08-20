@@ -22,9 +22,13 @@ machine that has neither.
 
 A positional `<entry|path>` argument is resolved by shape:
 
-- A bare name resolves only as a configured entry name.
+- A bare name resolves only as a configured entry name, or as a configured
+  group name where the command accepts several entries.
 - `<entry>/<subpath>` is entry-rooted syntax. It is independent of the current
-  working directory, and the normalized subpath must stay inside the entry.
+  working directory, and the normalized subpath must stay inside the entry. A
+  leading component that names a configured entry — or a configured group — is
+  read this way rather than as a local path, so it shadows a relative path of
+  the same name.
 - Every other argument is normalized as a local path and matched against the
   configured entry roots that contain it. The longest containing root wins, so
   a nested entry is preferred over its parent.
@@ -36,12 +40,29 @@ same argument denotes the same stored object or subtree across commands — the
 property that lets a user copy an argument from one command to another without
 re-reading its rules.
 
+A group is expanded in place, before anything else looks at the result: the
+duplicate and conflict checks below, the pull destination check, and the
+commands themselves all see entries only, which keeps a group from being a
+second kind of target the rest of the CLI would have to understand. Expansion
+is also why a group is rejected wherever an argument needs a root of its own:
+in the entry-rooted syntax, whose subpath would have nothing to be relative
+to, and in the single-target commands (`diff`, `show`, `ls-remote`), which
+never expand a group at all — there a group name is not a way of naming a
+single entry, however few entries it stands for. `pull -o` is the exception
+that counts resolved targets instead, because its one argument is expanded
+like any other. Group names are validated against the entry-name namespace
+when the configuration loads, so a bare name never denotes both.
+
 ## Multiple pull targets
 
 `pull <entry|path>...` resolves every argument before starting any restore and
-runs distinct entries through the shared entry worker pool. Multiple arguments
-that resolve to the same entry are rejected, even when they select different
-subpaths, because parallel restores must not mutate the same entry tree.
+runs distinct entries through the shared entry worker pool. Arguments that
+resolve to exactly the same target are deduplicated rather than rejected —
+after group expansion, asking for one thing twice is a repetition and not a
+contradiction. Two arguments that name the same entry with *different*
+targets — the entry itself beside a subpath of it, or two different
+subpaths — remain an error, because parallel restores must not mutate the
+same entry tree.
 
 The resolved restore destinations for a multi-target pull must be disjoint.
 Equal destinations and ancestor/descendant pairs are rejected before S3 work;
@@ -53,7 +74,10 @@ the cost of being wrong is one restore deleting or overwriting another's
 files — especially under `--delete`.
 
 `-o/--output` names the exact destination for one target and is therefore
-rejected with multiple explicit targets as well as with `--all`.
+rejected with `--all`, and with more than one positional argument — that count
+is taken before the configuration is read, since it needs nothing from it. The
+single argument it does take is expanded like any other, so it may be a group,
+provided that group stands for exactly one entry.
 
 ## Explicit input handling
 
@@ -75,10 +99,11 @@ neither touches S3 state.
 push, under the same contract as a push-run hook (argument vector, no shell,
 stdin detached, the same exit-status normalization) with `S3BAK_JOURNAL`
 unset — there is no push, hence no journal. The first positional argument
-selects the hook; the rest are entry names, resolved and aggregated by the
-same machinery every other multi-entry command uses.
+selects the hook; the rest are entry or group names, resolved by the same
+rules every other multi-entry command uses and aggregated by the shared entry
+worker pool.
 
-The two ways of naming entries mean different things, which is why they behave
+The ways of naming entries mean different things, which is why they behave
 differently when an entry has no such hook:
 
 - **Naming an entry is an instruction**, so an entry without that hook fails
@@ -89,6 +114,18 @@ differently when an entry has no such hook:
   This keeps a real hook failure's exit status from being shadowed by a
   hook-less entry. The command errors only when no entry configures the hook
   at all — an instruction that turns out to be a no-op in full is not success.
+- **Naming a group is an instruction on the group**, read like `--all`
+  narrowed to its members: hook-less members are outside the domain and are
+  skipped (reported under `-v`, once per entry however many groups named it).
+  A member named explicitly as well keeps the strict reading, since the
+  instruction to run that entry was given directly. The error is left for the
+  group that is a no-op in full — no member configures the hook, and no member
+  was named outright either — and it is a resolution failure, so it stops the
+  command before any hook has run.
+
+This is the one place where group expansion is not simply a substitution of
+entry names, because the hook's domain rule has to apply to what the group
+means rather than to each name it produced.
 
 ## Concurrent entry results
 
