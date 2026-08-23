@@ -113,8 +113,7 @@ class Boto3S3Store:
         # than forwarded, so an unset max_concurrency still lands on the
         # library's own default (boto3's 10 - ~/.aws/config is never read for
         # it). Handing S3 a None instead would take its separate no-config
-        # branch, which need not resolve to these same values on every library
-        # version this package accepts.
+        # branch, which need not resolve to these same values.
         self._transfer_config = TransferConfig(max_concurrency=max_concurrency)
         # boto3_s3.session is a boto3.Session whose clients parse response
         # timestamps at C speed - the listings that drive sync and verify are

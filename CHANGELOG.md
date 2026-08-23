@@ -38,6 +38,9 @@ a fix only (Fixed).
   sub-paths — is still refused, since that would be a parallel push or
   pull of the same tree.
 - The unknown-name error is now `no such entry or group: <name>`.
+- The boto3-s3 requirement is now `>=0.11,<0.12`. The floor had been held at
+  0.8 so a project already pinned there could take s3bak alongside it; it now
+  tracks the one MINOR s3bak is built and tested against.
 
 ## [0.6.1] - 2026-08-14
 
