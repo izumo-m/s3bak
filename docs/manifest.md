@@ -130,7 +130,8 @@ memory bounded by one directory level rather than the whole tree:
   self-heals over any key it is not asked about). Because the filter holds the
   manifest file open for the whole sync, the caller `close()`s it before
   unlinking the temp manifest. (Push's compare is the journal emitter's
-  cursor — the same streaming shape, spanning all three lanes.)
+  cursor — the same streaming shape, over one `pair_filter` spanning every
+  pair shape.)
 
 Because the order matches an S3 listing, the compare merge-joins the manifest
 against either side of a sync without materializing it.

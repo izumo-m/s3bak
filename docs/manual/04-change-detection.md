@@ -50,7 +50,7 @@ requests:
 
 ```console
 $ s3bak status -v demo
-+ (boto3) get_object s3://my-bucket/backup/demo-manifest.jsonl
++ (boto3-s3) get_file s3://my-bucket/backup/demo-manifest.jsonl
 M /home/you/demo/lib	mtime
       mtime: remote=2026-08-02 13:42:56 < local=2026-08-02 13:43:07 (+11s)
 A /home/you/demo/lib/new.sh

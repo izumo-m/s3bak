@@ -226,12 +226,17 @@ pinned by a contract test in boto3-s3's suite so s3bak can depend on it:
 1. `enumerate_all_entries=True` on the sync source's `LocalStorage` flows
    into the sync scan unnarrowed (`walk_source_scan_options` documents the
    caller's duty to veto entries the transfer cannot consume — which the
-   three lane filters do by returning `False`: nothing a filter rejects
-   reaches the transfer engine).
+   pair filter does by returning `False`: nothing it rejects reaches the
+   transfer engine).
 2. The pair stream is one ascending merge-join of the two listings: the root
    leads at compare key `""`, directories are keyed with a trailing `/` (the
    manifest's own sort order), and every local entry carries its full lstat
    (`stat_result`), from which journal records are built.
-3. Lane decisions run serially, in ascending key order, whenever no filter
-   is wrapped in `ParallelFilter` — s3bak simply does not wrap its
-   `--checksum` comparison.
+3. `sync(pair_filter=...)` delivers every merged pair — new entry, both-sides
+   pair, orphan alike — to one callable, serially and in ascending compare-key
+   order on the sync's own thread. That is the emitter's whole basis: one
+   cursor over the old manifest advancing in lockstep with the stream. It is
+   also why the delete mechanism stays armed on a run without `--delete`
+   (returning `False` for every orphan is the supported observe-only mode):
+   the emitter must tell "no object at this key" from "an object this run was
+   not allowed to touch".

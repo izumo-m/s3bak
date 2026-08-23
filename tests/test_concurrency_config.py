@@ -10,12 +10,23 @@ tolerance.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 
 import pytest
 
 from s3bak import cli
+
+
+def _upload_files(pair) -> bool:
+    """Stand-in for ``PushJournal.decide`` in a bare ``sync_up``: upload the
+    local regular files and touch nothing else. The complete-view walk
+    enumerates directories and special files too (docs/journal.md), which a
+    real push vetoes through the journal, and a pair with no ``src`` is an S3
+    orphan - never deleted here."""
+    src = getattr(pair, "src", None)
+    return src is not None and os.path.isfile(src.key.replace("/", os.sep))
 
 
 def _store(ws) -> cli.Boto3S3Store:
@@ -62,7 +73,7 @@ def test_client_built_once_and_reused(ws):
         # Every S3-side location resolves to an S3Storage carrying the shared
         # client, so the library never calls S3.client() again.
         store.put_file("probe.txt", str(ws.root / "data" / "a.txt"))
-        store.sync_up(str(ws.root / "data"), "data")
+        store.sync_up(str(ws.root / "data"), "data", pair_filter=_upload_files)
         assert store.head_object("data/a.txt") is not None
     finally:
         monkey.undo()

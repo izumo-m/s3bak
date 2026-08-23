@@ -297,12 +297,12 @@ summarized.
 
 ```console
 $ s3bak push -v demo
-+ (boto3) get_object s3://my-bucket/backup/demo-manifest.jsonl
++ (boto3-s3) get_file s3://my-bucket/backup/demo-manifest.jsonl
 + (boto3-s3) sync /home/you/demo s3://my-bucket/backup/demo/
 upload: /home/you/demo/new.sh to s3://my-bucket/backup/demo/new.sh
 upload: /home/you/demo/notes.txt to s3://my-bucket/backup/demo/notes.txt
 Updating s3://my-bucket/backup/demo-manifest.jsonl
-+ (boto3) put_object s3://my-bucket/backup/demo-manifest.jsonl
++ (boto3-s3) put_file s3://my-bucket/backup/demo-manifest.jsonl
 ```
 
 ### `--mtime-window` and `--checksum`
@@ -388,7 +388,7 @@ and its line says which transfer path carried it:
 
 ```console
 $ s3bak pull wsl.conf
-download: s3://my-bucket/backup/wsl.conf to /etc/wsl.conf (boto3 get_object)
+download: s3://my-bucket/backup/wsl.conf to /etc/wsl.conf (boto3-s3 get_file)
 644 /etc/wsl.conf
 ```
 
@@ -461,7 +461,7 @@ different kinds of thing is worth comparing.
 
 ```console
 $ s3bak status -v demo
-+ (boto3) get_object s3://my-bucket/backup/demo-manifest.jsonl
++ (boto3-s3) get_file s3://my-bucket/backup/demo-manifest.jsonl
 M /home/you/demo	mtime
       mtime: remote=2026-08-14 11:19:59 < local=2026-08-14 11:20:00 (+1s)
 A /home/you/demo/new.sh

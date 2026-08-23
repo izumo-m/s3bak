@@ -19,8 +19,8 @@ classifiers = [
     "Topic :: System :: Archiving :: Backup",
     "Typing :: Typed",
 ]
-# boto3-s3 provides the in-process S3 transfer/listing API; boto3 is used
-# directly for head-object / list-objects-v2.
+# boto3-s3 provides the in-process S3 API s3bak runs on; boto3 itself is
+# reached directly only for the paginated list-objects-v2 listing.
 dependencies = [
     "boto3-s3>=0.11,<0.12",
     "boto3>=1.28",

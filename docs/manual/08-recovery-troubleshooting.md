@@ -489,7 +489,7 @@ restored to — they need not be the paths they came from — and pull:
 
 ```console
 $ s3bak pull --all
-download: s3://my-bucket/backup/wsl.conf to /home/you/etc/wsl.conf (boto3 get_object)
+download: s3://my-bucket/backup/wsl.conf to /home/you/etc/wsl.conf (boto3-s3 get_file)
 644 /home/you/etc/wsl.conf
 download: s3://my-bucket/backup/demo/late.txt to /home/you/demo/late.txt
 download: s3://my-bucket/backup/demo/lib to /home/you/demo/lib

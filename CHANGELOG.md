@@ -41,6 +41,29 @@ a fix only (Fixed).
 - The boto3-s3 requirement is now `>=0.11,<0.12`. The floor had been held at
   0.8 so a project already pinned there could take s3bak alongside it; it now
   tracks the one MINOR s3bak is built and tested against.
+- s3bak now reaches S3 entirely through boto3-s3: the single-object head, get
+  and put lanes and the batched delete moved onto the library's `S3Storage` /
+  `S3Deleter`, leaving only the paginated object listing on a direct boto3
+  call. What that changes on screen is the naming — `-v`'s request trace says
+  `+ (boto3-s3) get_file` / `put_file` / `head_object` where it said
+  `+ (boto3) get_object` / `put_object` / `head_object`, and a single-file
+  pull's download line names the `(boto3-s3 get_file)` lane where it named
+  `(boto3 get_object)`. A manifest is now read and written with one request
+  whatever its size, and the size gate below which a data object skips the
+  transfer engine is now plainly s3transfer's multipart threshold.
+- A delete that fails now names the object's `s3://` URL, the way its success
+  line does, instead of the key relative to the listing.
+
+### Fixed
+
+- `push --delete` no longer reports a deletion it cannot confirm. When a
+  `DeleteObjects` response carries an error naming no key that was submitted,
+  every key of that batch the response cannot vouch for now fails, so the
+  manifest is not rewritten to drop records whose objects may still exist.
+  The explicit sub-path deletion (`push --delete entry/sub`) already refused
+  such a batch; the main delete lane inferred each key's success from its
+  absence among the errors. The guarantee now comes from boto3-s3 0.11,
+  which this release requires, so both lanes hold it.
 
 ## [0.6.1] - 2026-08-14
 
