@@ -10,12 +10,23 @@ tolerance.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 
 import pytest
 
 from s3bak import cli
+
+
+def _upload_files(pair) -> bool:
+    """Stand-in for ``PushJournal.decide`` in a bare ``sync_up``: upload the
+    local regular files and touch nothing else. The complete-view walk
+    enumerates directories and special files too (docs/journal.md), which a
+    real push vetoes through the journal, and a pair with no ``src`` is an S3
+    orphan - never deleted here."""
+    src = getattr(pair, "src", None)
+    return src is not None and os.path.isfile(src.key.replace("/", os.sep))
 
 
 def _store(ws) -> cli.Boto3S3Store:
@@ -62,7 +73,7 @@ def test_client_built_once_and_reused(ws):
         # Every S3-side location resolves to an S3Storage carrying the shared
         # client, so the library never calls S3.client() again.
         store.put_file("probe.txt", str(ws.root / "data" / "a.txt"))
-        store.sync_up(str(ws.root / "data"), "data")
+        store.sync_up(str(ws.root / "data"), "data", pair_filter=_upload_files)
         assert store.head_object("data/a.txt") is not None
     finally:
         monkey.undo()
@@ -409,3 +420,51 @@ def test_run_entries_propagates_broken_pipe():
 
     with pytest.raises(BrokenPipeError):
         run_entries(fn, cfg, ["one", "two"], Opts())
+
+
+def test_client_config_leaves_room_for_the_listing_and_delete_workers(ws):
+    # The transfer pool is not the only user of this store's one client: a
+    # push's S3 listing runs on boto3-s3's scan prefetch worker and its
+    # confirmed deletions on S3Deleter's batch worker, both on the same client.
+    # botocore's default pool (10) sits exactly at the transfer concurrency, so
+    # those two would overflow it and pay a fresh handshake per request.
+    ws.write("data/a.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+
+    store = _store(ws)
+    cfg = store._client_config
+    assert cfg.max_pool_connections == 10 + 4  # library default + headroom
+    assert store._client.meta.config.max_pool_connections == 10 + 4
+    # A stalled request must be bounded and noticed: an unreachable endpoint
+    # gives up long before botocore's 60 s connect default, a dropped
+    # connection is discovered by keepalive rather than by the read timeout,
+    # and the retry policy is pinned so the worst case is a known quantity.
+    assert cfg.connect_timeout == 10
+    assert cfg.read_timeout == 60
+    assert cfg.tcp_keepalive is True
+    # total_max_attempts is the whole ceiling, the first request included -
+    # botocore reads a `max_attempts` here as retries and adds one.
+    assert store._client.meta.config.retries == {"mode": "standard", "total_max_attempts": 5}
+    # Ctrl-C is process-fatal for a CLI, which is what lets a scan teardown
+    # abandon its page worker instead of waiting out a stuck listing request.
+    assert store._s3.reusable_after_interrupt is False
+
+
+def test_client_pool_follows_max_concurrency(ws):
+    ws.write("data/a.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}}, max_concurrency=6)
+
+    store = _store(ws)
+    assert store._client_config.max_pool_connections == 6 + 4
+    assert store._client.meta.config.max_pool_connections == 6 + 4
+
+
+def test_a_cloned_store_carries_the_same_connection_settings(ws):
+    # Multi-entry runs clone the store per worker (run_entries); a clone that
+    # lost the pool sizing would put the extra workers back on the default 10.
+    ws.write("data/a.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}}, max_concurrency=6)
+
+    clone = _store(ws).clone()
+    assert clone._client_config.max_pool_connections == 6 + 4
+    assert clone._s3.reusable_after_interrupt is False

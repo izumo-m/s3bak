@@ -16,6 +16,15 @@ Two cases behave very differently:
   `finally`. The backup itself stays consistent, but a few residues are left
   for the operator to resolve.
 
+A *second* `Ctrl-C` moves a run from the first case to the second on purpose.
+The first one unwinds normally, but that unwind joins s3transfer's transfer
+threads, so a request stuck in a socket read can hold it for a full request
+timeout ([cli.md](cli.md#exit-codes)); the second leaves through `os._exit`,
+which runs no `finally` and is a hard kill in every way that matters here.
+The fail-old rule below is what makes that safe to offer: the state it leaves
+is still an arbitrary subset of completed work described by the previous
+manifest.
+
 ## The rule: fail old
 
 Every S3 mutation completes before the manifest describing it is published,
@@ -127,14 +136,15 @@ siblings.
 
 When a pull must replace the restore root itself, it downloads into
 `<root>.s3bak-stage-<random>/new` and swaps in two renames, moving the old root
-to `<stage>/replaced` first. An ordinary failure or `Ctrl-C` preserves that
-directory **and prints where it is**; a hard kill prints nothing, so the
-configured path can be missing while the old tree sits in the stage.
+to `<stage>/replaced` first. An ordinary failure or a first `Ctrl-C`
+preserves that directory **and prints where it is**; a hard kill prints
+nothing, so the configured path can be missing while the old tree sits in the
+stage.
 
 ### Abandoned multipart uploads
 
-A large upload is a multipart upload. An ordinary failure — including
-`Ctrl-C` — aborts it, but a hard kill cannot, and s3bak neither lists nor
+A large upload is a multipart upload. An ordinary failure — including a
+first `Ctrl-C` — aborts it, but a hard kill cannot, and s3bak neither lists nor
 aborts leftover parts. They hold no valid object, are invisible to `verify`,
 and are billed as storage. The bucket's own
 `AbortIncompleteMultipartUpload` lifecycle rule is the standard S3 answer, so

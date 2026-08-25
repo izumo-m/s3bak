@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 import os
 import tokenize
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from s3bak.console import console, expand_home
@@ -36,6 +36,13 @@ class Config:
     bucket: str
     path_prefix: str
     entries: dict[str, dict[str, Any]]
+    # Group name -> the entry names it stands for, already expanded (nested
+    # groups resolved, first occurrence kept). A command line never sees a
+    # group beyond argument resolution, and S3 never sees one at all.
+    groups: dict[str, list[str]] = field(default_factory=dict)
+    # Group name -> its members exactly as configured, nested groups included.
+    # `list` prints these: what the file says is what the reader edits.
+    group_members: dict[str, list[str]] = field(default_factory=dict)
     # Max entries processed at once by a multi-entry command (None = the
     # built-in default cap, cli._DEFAULT_ENTRY_CONCURRENCY; a set value
     # replaces that default rather than further narrowing it). Consumed by
@@ -136,6 +143,95 @@ def _validate_entry_name(name: Any, config_path: str) -> str:
             f"entry name must not contain control characters in {config_path} (got {name!r})"
         )
     return name
+
+
+def _validate_group_name(name: Any, config_path: str) -> str:
+    if not isinstance(name, str) or not name:
+        console.die(f"group names must be non-empty strings in {config_path} (got {name!r})")
+    # A group is typed where an entry is, and the CLI reads a separator as
+    # entry-rooted or local-path syntax, so a name carrying one is untypeable.
+    # The -manifest.jsonl reservation does not apply: no group reaches S3.
+    if name in (".", "..") or "/" in name or "\\" in name:
+        console.die(f"group name must be one path component in {config_path} (got {name!r})")
+    if any(ord(char) < 32 or ord(char) == 127 for char in name):
+        console.die(
+            f"group name must not contain control characters in {config_path} (got {name!r})"
+        )
+    return name
+
+
+def _expand_groups(members: dict[str, list[str]], config_path: str) -> dict[str, list[str]]:
+    """The entry names every group stands for: a depth-first walk in configured
+    member order, keeping each entry's first occurrence. Every member is
+    already known to be an entry or a group; a cycle dies here.
+
+    A finished walk is memoized, so a group reached along many paths - or named
+    twice by one parent - is walked once instead of once per path to it, which
+    is what keeps a deep nesting from costing exponential work. Memoizing
+    cannot hide a cycle: a group is only recorded once its walk has returned,
+    and a group still on the stack has not."""
+    expanded: dict[str, list[str]] = {}
+
+    def walk(group: str, stack: tuple[str, ...]) -> list[str]:
+        if group in stack:
+            cycle = " -> ".join((*stack[stack.index(group) :], group))
+            console.die(f"groups[{group!r}] contains itself in {config_path} ({cycle})")
+        done = expanded.get(group)
+        if done is not None:
+            return done
+        entries: list[str] = []
+        seen: set[str] = set()
+        for member in members[group]:
+            names = walk(member, (*stack, group)) if member in members else [member]
+            for name in names:
+                if name not in seen:
+                    seen.add(name)
+                    entries.append(name)
+        expanded[group] = entries
+        return entries
+
+    return {group: walk(group, ()) for group in members}
+
+
+def _load_groups(
+    ns: dict[str, Any], entries: dict[str, Any], config_path: str
+) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """Validate the optional `groups` setting and expand every group.
+
+    Returns (members as configured, members expanded to entry names)."""
+    raw = ns.get("groups")
+    if raw is None:
+        return {}, {}
+    if not isinstance(raw, dict):
+        console.die(f"groups must be a dict in {config_path} (got {raw!r})")
+
+    members: dict[str, list[str]] = {}
+    for raw_name, raw_members in raw.items():
+        name = _validate_group_name(raw_name, config_path)
+        # A command-line name must denote one thing, so entry and group names
+        # share a namespace.
+        if name in entries:
+            console.die(f"groups[{name!r}] collides with the entry of that name in {config_path}")
+        if (
+            not isinstance(raw_members, list)
+            or not raw_members
+            or not all(isinstance(member, str) for member in raw_members)
+        ):
+            console.die(
+                f"groups[{name!r}] must be a non-empty list of strings in {config_path} "
+                f"(got {raw_members!r})"
+            )
+        members[name] = list(raw_members)
+
+    for name, group_members in members.items():
+        for member in group_members:
+            if member not in entries and member not in members:
+                console.die(
+                    f"groups[{name!r}] names {member!r}, which is neither an entry nor a group, "
+                    f"in {config_path}"
+                )
+
+    return members, _expand_groups(members, config_path)
 
 
 def load_config(*, create_store: bool = True) -> Config:
@@ -252,12 +348,19 @@ def load_config(*, create_store: bool = True) -> Config:
             entry_cfg.get("mtime_window"), config_path, label=f"entries[{name!r}].mtime_window"
         )
 
+    # Optional named sets of entry names, usable wherever a multi-entry command
+    # takes entry names. Purely a config/CLI concept: expanded during argument
+    # resolution, so no group name reaches a manifest or an S3 key.
+    group_members, groups = _load_groups(ns, entries, config_path)
+
     cfg = Config(
         profile=profile,
         prefix=prefix,
         bucket=bucket,
         path_prefix=path_prefix,
         entries=entries,
+        groups=groups,
+        group_members=group_members,
         entry_concurrency=entry_concurrency,
         mtime_window=DEFAULT_MTIME_WINDOW if mtime_window is None else mtime_window,
     )

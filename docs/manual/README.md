@@ -22,9 +22,9 @@ description of s3bak's observable behavior (see
    runs, hooks and `S3BAK_JOURNAL`, storage classes and bucket versioning, and
    keeping the backup private.
 8. [Recovery and troubleshooting](08-recovery-troubleshooting.md) —
-   interrupted runs, hard-kill residue, what to do about each verify finding,
-   repairing a damaged manifest, and restoring onto a machine that has
-   nothing.
+   interrupted runs, a run that has gone quiet, hard-kill residue, what to do
+   about each verify finding, repairing a damaged manifest, and restoring onto
+   a machine that has nothing.
 9. [Platform notes](09-platform-notes.md) — Windows, macOS, WSL2: mtime
    granularity per filesystem, permissions and symlinks where they differ,
    name folding, moving a tree between platforms, and S3-compatible services.

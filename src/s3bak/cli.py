@@ -53,7 +53,7 @@ from s3bak.commands import (
 from s3bak.compare import _resolve_use_color
 from s3bak.config import Config, Opts, load_config
 from s3bak.confirm import AnswerMode, is_aborted, reset_confirmations, resolve_answer_mode
-from s3bak.console import console, expand_home, normalize_local_path
+from s3bak.console import PROG, console, expand_home, normalize_local_path
 from s3bak.restore import canonical_restore_comparison_path, resolve_pull_destination
 from s3bak.store import Boto3S3Store
 from s3bak.syncops import download_from_s3
@@ -158,10 +158,12 @@ def run_entries(
                 console.err(f"{entries[index]}: {exc}")
                 statuses[index] = 1
     finally:
-        # SIGINT lands in this (main) thread as SystemExit: cancel the entries
-        # that have not started, but let the running ones finish - killing an
-        # entry mid-push would leave its manifest and data inconsistent. The
-        # normal path has nothing pending, so this is then a plain shutdown.
+        # SIGINT lands in this (main) thread as KeyboardInterrupt: cancel the
+        # entries that have not started, but let the running ones finish -
+        # killing an entry mid-push would leave its manifest and data
+        # inconsistent. A second Ctrl-C is the way out when that wait is too
+        # long (see _on_sigint). The normal path has nothing pending, so this
+        # is then a plain shutdown.
         executor.shutdown(wait=True, cancel_futures=True)
     # Completion order varies with scheduling. Preserve the first configured
     # entry's failure so --all has a deterministic exit code (including a
@@ -272,7 +274,7 @@ _COMMAND_SPECS = {
             "s3bak push [options] <entry|path>...",
             "s3bak push [options] --all",
         ),
-        arguments=(("<entry|path>...", "Entries or paths to back up"),),
+        arguments=(("<entry|path>...", "Entries, groups, or paths to back up"),),
         options=(
             "all",
             "dry_run",
@@ -298,7 +300,7 @@ _COMMAND_SPECS = {
             "s3bak pull [options] <entry|path>...",
             "s3bak pull [options] --all",
         ),
-        arguments=(("<entry|path>...", "Entries or paths to restore"),),
+        arguments=(("<entry|path>...", "Entries, groups, or paths to restore"),),
         options=(
             "all",
             "dry_run",
@@ -338,7 +340,7 @@ _COMMAND_SPECS = {
             "s3bak status [options] <entry|path>...",
             "s3bak status [options] --all",
         ),
-        arguments=(("<entry|path>...", "Entries or paths to compare"),),
+        arguments=(("<entry|path>...", "Entries, groups, or paths to compare"),),
         options=("all", "status_delete", "mtime_window", "verbose", "color", "no_color", "help"),
         sections=(
             (
@@ -366,7 +368,7 @@ _COMMAND_SPECS = {
             "s3bak verify [options] <entry|path>...",
             "s3bak verify [options] --all",
         ),
-        arguments=(("<entry|path>...", "Entries or paths to verify"),),
+        arguments=(("<entry|path>...", "Entries, groups, or paths to verify"),),
         options=("all", "checksum", "mtime_window", "verbose", "help"),
         sections=(
             (
@@ -397,7 +399,7 @@ _COMMAND_SPECS = {
         ),
         arguments=(
             ("<pre|post>", "Which hook to run"),
-            ("<entry>...", "Entries whose hook to run"),
+            ("<entry>...", "Entries or groups whose hook to run"),
         ),
         options=("all", "dry_run", "verbose", "help"),
         sections=(
@@ -409,6 +411,9 @@ _COMMAND_SPECS = {
                     "S3BAK_JOURNAL is unset (no push, hence no journal), which a hook",
                     'reads as "no per-file detail; assume anything may have changed".',
                     "An entry without the named hook fails (exit 1).",
+                    "A named group runs the members that configure the hook and",
+                    "skips the rest, failing only where no member does and no",
+                    "member was named outright.",
                 ),
             ),
         ),
@@ -431,8 +436,8 @@ _COMMAND_SPECS = {
         ),
     ),
     "list": _CommandSpec(
-        overview="List locally configured entries",
-        summary="List locally configured entries. This command does not access S3.",
+        overview="List locally configured entries and groups",
+        summary="List locally configured entries and groups. This command does not access S3.",
         usage=("s3bak list",),
         arguments=(),
         options=("help",),
@@ -516,38 +521,51 @@ def print_command_help(command: str) -> NoReturn:
 # =============================================================================
 
 
+def _split_entry_form(arg: str) -> tuple[str, str, str]:
+    """`arg` read as the entry-rooted ``<name>/<sub>``: (name, separator, sub).
+    The separator is empty where that syntax does not apply - an absolute path,
+    or a name with no separator in it at all. A native separator is read as
+    ``/``, so the syntax is spelled the same way on every platform."""
+    if os.path.isabs(arg):
+        return arg, "", ""
+    entry_form = arg
+    for sep in (os.sep, os.altsep):
+        if sep and sep != "/":
+            entry_form = entry_form.replace(sep, "/")
+    return entry_form.partition("/")
+
+
 def _resolve_one_arg(cfg: Config, arg: str) -> tuple[str, str | None]:
-    # A bare name is an entry. ``entry/sub`` is entry-rooted syntax independent
+    # A bare name is an entry (a group is expanded before this, in
+    # resolve_entry_files). ``entry/sub`` is entry-rooted syntax independent
     # of CWD; every other path is resolved locally and matched to the containing
     # configured entry (longest root wins).
-    seps = [os.sep, os.altsep] if os.altsep else [os.sep]
-    if not (any(s in arg for s in seps) or os.path.isabs(arg)):
+    name, separator, raw_sub = _split_entry_form(arg)
+    if not separator and not os.path.isabs(arg):
         if arg in cfg.entries:
             return arg, None
-        console.die(f"no such entry: {arg}")
+        console.die(f"no such entry or group: {arg}")
 
-    if not os.path.isabs(arg):
-        entry_form = arg
-        for sep in seps:
-            if sep and sep != "/":
-                entry_form = entry_form.replace(sep, "/")
-        name, separator, raw_sub = entry_form.partition("/")
-        if separator and name in cfg.entries:
-            sub = posixpath.normpath(raw_sub)
-            if sub == ".":
-                return name, None
-            # os.path.splitdrive is identity on POSIX (so a filename containing
-            # ':' is fine there) but strips a Windows drive: on Windows a
-            # drive-qualified sub like "C:/escape" makes os.path.join(entry_path,
-            # sub) discard the entry path entirely and escape the entry root.
-            if (
-                sub == ".."
-                or sub.startswith("../")
-                or sub.startswith("/")
-                or os.path.splitdrive(sub)[0]
-            ):
-                console.die(f"sub path must stay inside entry {name}: {arg}")
-            return name, sub
+    if separator and name in cfg.entries:
+        sub = posixpath.normpath(raw_sub)
+        if sub == ".":
+            return name, None
+        # os.path.splitdrive is identity on POSIX (so a filename containing
+        # ':' is fine there) but strips a Windows drive: on Windows a
+        # drive-qualified sub like "C:/escape" makes os.path.join(entry_path,
+        # sub) discard the entry path entirely and escape the entry root.
+        if (
+            sub == ".."
+            or sub.startswith("../")
+            or sub.startswith("/")
+            or os.path.splitdrive(sub)[0]
+        ):
+            console.die(f"sub path must stay inside entry {name}: {arg}")
+        return name, sub
+    if separator and name in cfg.groups:
+        # `group/` and `group/.` are the group itself and were taken as such by
+        # _group_argument, so anything reaching here is a real sub path.
+        console.die(f"a group has no single root, so a sub path does not apply: {arg}")
 
     local = normalize_local_path(arg)
     matches: list[tuple[int, str, str | None]] = []
@@ -573,9 +591,38 @@ def _resolve_one_arg(cfg: Config, arg: str) -> tuple[str, str | None]:
     return best[0]
 
 
+def _group_argument(cfg: Config, arg: str) -> str | None:
+    """The group `arg` names, or None where it names none. `group/` and
+    `group/.` name the group itself, the way `entry/` and `entry/.` name the
+    whole entry; every other `group/sub` is a sub path, and _resolve_one_arg
+    rejects it."""
+    if arg in cfg.groups:
+        return arg
+    name, separator, raw_sub = _split_entry_form(arg)
+    if separator and name in cfg.groups and posixpath.normpath(raw_sub) == ".":
+        return name
+    return None
+
+
+def _reject_group(cfg: Config, arg: str, cmd: str) -> None:
+    """A single-target command needs one thing to act on, and a group is not
+    one: it has no root of its own."""
+    if _group_argument(cfg, arg) is not None:
+        console.die(f"{cmd} takes a single entry or path, not a group: {arg}")
+
+
+def _dedupe_targets(resolved: Sequence[tuple[str, str | None]]) -> list[tuple[str, str | None]]:
+    """Drop exact repeats, keeping the first occurrence. Naming a group and one
+    of its members - or the same argument twice - asks for one thing, and after
+    expansion that reads as a repeat rather than as a conflict. A repeat with a
+    DIFFERENT sub path survives, for the per-command conflict check to reject."""
+    return list(dict.fromkeys(resolved))
+
+
 def resolve_entry_file(cfg: Config, positional: list[str], cmd: str) -> tuple[str, str | None]:
     if len(positional) != 1:
         console.die(f"{cmd} takes <entry> or <path>")
+    _reject_group(cfg, positional[0], cmd)
     return _resolve_one_arg(cfg, positional[0])
 
 
@@ -584,7 +631,69 @@ def resolve_entry_files(
 ) -> list[tuple[str, str | None]]:
     if not positional:
         console.die(f"{cmd} requires at least one entry or path")
-    return [_resolve_one_arg(cfg, arg) for arg in positional]
+    resolved: list[tuple[str, str | None]] = []
+    for arg in positional:
+        # A group name expands in place, in expansion order; every other
+        # argument denotes one target.
+        group = _group_argument(cfg, arg)
+        if group is not None:
+            resolved.extend((entry, None) for entry in cfg.groups[group])
+        else:
+            resolved.append(_resolve_one_arg(cfg, arg))
+    return _dedupe_targets(resolved)
+
+
+def _resolve_hook_entries(
+    cfg: Config, positional: list[str], kind: str, verbose: bool
+) -> list[str]:
+    """The entries `hook pre|post` runs, from its positional arguments.
+
+    Naming an entry is an instruction, so it is kept even without the hook -
+    cmd_hook reports that, which is where a `post_hok:` typo surfaces. Naming
+    a GROUP is an instruction on the group, read like --all: a member without
+    the hook is outside the operation's domain and is skipped (reported under
+    -v), and a group that contributes nothing at all is an error. An entry
+    named both ways keeps the strict reading, and that naming also answers for
+    the group it belongs to: something of the group was asked for outright, so
+    the group is not the case that asked for nothing."""
+    if not positional:
+        console.die("hook requires at least one entry or path")
+    hook = f"{kind}_hook"
+    # (group name or None, the entries the argument named).
+    lanes: list[tuple[str | None, list[str]]] = []
+    named: set[str] = set()
+    for arg in positional:
+        group = _group_argument(cfg, arg)
+        if group is not None:
+            lanes.append((group, cfg.groups[group]))
+            continue
+        entry, sub = _resolve_one_arg(cfg, arg)
+        if sub is not None:
+            console.die(f"hook runs per entry; a sub path is not allowed: {entry}/{sub}")
+        named.add(entry)
+        lanes.append((None, [entry]))
+
+    entries: list[str] = []
+    skipped: list[str] = []
+    for group, members in lanes:
+        if group is None:
+            entries.extend(members)
+            continue
+        configured = [entry for entry in members if cfg.entries[entry].get(hook)]
+        if not configured and not any(member in named for member in members):
+            # The group asked for nothing runnable and nothing of it was asked
+            # for by name either. Failing here, during resolution, stops the
+            # whole command before any other argument's hook has run.
+            console.die(f"no entry in group {group} configures a {hook}")
+        skipped.extend(entry for entry in members if entry not in configured)
+        entries.extend(configured)
+    if verbose:
+        # Once per entry for the whole invocation: a group named twice, or two
+        # groups sharing a hook-less member, still report that member once.
+        for entry in dict.fromkeys(skipped):
+            if entry not in named:
+                console.diag(f"skipped (no {hook}): {entry}\n")
+    return list(dict.fromkeys(entries))
 
 
 def _validate_pull_destinations(cfg: Config, resolved: Sequence[tuple[str, str | None]]) -> None:
@@ -828,6 +937,11 @@ def main(argv: list[str] | None = None) -> int:
             resolved = [(entry, None) for entry in sorted(cfg.entries.keys())]
         else:
             resolved = resolve_entry_files(cfg, positional, "pull")
+        # A group expanding to several entries reaches the one-destination rule
+        # only here; the same message rejects several explicit targets earlier,
+        # before the config is even read.
+        if opt_outpath is not None and len(resolved) > 1:
+            console.die("-o/--output cannot be combined with multiple pull targets")
         _validate_distinct_entries(resolved, "pull")
         _validate_pull_destinations(cfg, resolved)
         return _run_resolved_entries(
@@ -897,14 +1011,7 @@ def main(argv: list[str] | None = None) -> int:
                 for skipped in sorted(cfg.entries.keys() - set(hook_entries)):
                     console.diag(f"skipped (no {hook_kind}_hook): {skipped}\n")
         else:
-            resolved = resolve_entry_files(cfg, positional, "hook")
-            for hook_entry, hook_sub in resolved:
-                if hook_sub is not None:
-                    console.die(
-                        f"hook runs per entry; a sub path is not allowed: {hook_entry}/{hook_sub}"
-                    )
-            _validate_distinct_entries(resolved, "hook")
-            hook_entries = [e for e, _ in resolved]
+            hook_entries = _resolve_hook_entries(cfg, positional, hook_kind, opt_verbose)
 
         def _hook_one(cfg_: Config, entry_: str, opts_: Opts) -> int:
             assert hook_kind is not None
@@ -930,6 +1037,7 @@ def main(argv: list[str] | None = None) -> int:
             console.die("ls-remote takes at most one entry or path")
         if not positional:
             return cmd_ls_remote(cfg, opts, None, None)
+        _reject_group(cfg, positional[0], "ls-remote")
         entry, sub = _resolve_one_arg(cfg, positional[0])
         return cmd_ls_remote(cfg, opts, entry, sub)
 
@@ -950,13 +1058,79 @@ def _sdk_errors() -> tuple[type[BaseException], ...]:
     return (Boto3S3Error, BotoCoreError, ClientError)
 
 
+# --- Ctrl-C ------------------------------------------------------------------
+#
+# The first interrupt asks for an orderly stop. It surfaces as the
+# KeyboardInterrupt every layer below recognizes: boto3-s3 abandons a scan's
+# page worker rather than waiting out one more listing (Boto3S3Store builds its
+# S3 with reusable_after_interrupt=False), run_entries lets the entries already
+# running finish, and run() maps it to exit 130.
+#
+# That orderly stop is not always quick. s3transfer joins its transfer threads
+# on the way out, so a request stuck in a socket read holds the exit until it
+# times out - up to a read timeout per attempt (store._client_config). The
+# second interrupt is the escape hatch: it gives up on the orderly stop and
+# leaves at once. What that leaves behind is what any hard kill leaves - S3
+# changes with no manifest describing them - and the next plain push of the
+# entry settles it (docs/recovery.md).
+_interrupted = False
+
+_FIRST_INTERRUPT = (
+    f"\n{PROG}: interrupted; finishing the S3 requests already in flight"
+    " (Ctrl-C again to exit now)\n"
+)
+_SECOND_INTERRUPT = (
+    f"\n{PROG}: interrupted again; exiting now - the manifest was not rewritten,"
+    " so push this entry again to settle it\n"
+)
+
+
+def _write_stderr(text: str) -> None:
+    """Write to fd 2 without going through the console.
+
+    A signal handler runs on the main thread, which may already be inside
+    ``Console._write`` holding the console lock - and ``threading.Lock`` is not
+    reentrant, so ``console.err`` here would deadlock the run it is trying to
+    explain. A closed stderr is not this function's problem: the interrupt still
+    has to do its job.
+    """
+    try:
+        os.write(2, text.encode("utf-8", "replace"))
+    except OSError:
+        pass
+
+
+def _on_sigint(_signum: int, _frame: object) -> NoReturn:
+    global _interrupted
+    if _interrupted:
+        _write_stderr(_SECOND_INTERRUPT)
+        # Not sys.exit(): that unwinds through the very joins this is escaping
+        # (and the interpreter's own wait for non-daemon threads after them).
+        os._exit(130)
+    _interrupted = True
+    _write_stderr(_FIRST_INTERRUPT)
+    raise KeyboardInterrupt
+
+
+def reset_interrupt_state() -> None:
+    """Forget an earlier interrupt (in-process test runs; run() is one-shot)."""
+    global _interrupted
+    _interrupted = False
+
+
 def run() -> int:
     """Console entry point: install signal handling and translate exceptions
     into exit codes. This is what the ``s3bak`` command invokes."""
     console.reset_warnings()
-    signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
+    reset_interrupt_state()
+    signal.signal(signal.SIGINT, _on_sigint)
     try:
         rc = main() or 0
+    except KeyboardInterrupt:
+        # The first Ctrl-C, having unwound the run. The handler already said
+        # what happened, and there is nothing to settle here: an interrupted
+        # push deliberately leaves its manifest unwritten (docs/recovery.md).
+        return 130
     except subprocess.CalledProcessError as e:
         cmd_str = shlex.join(e.cmd) if isinstance(e.cmd, list) else str(e.cmd)
         console.err(f"command failed: {cmd_str}")

@@ -85,6 +85,21 @@ entries = {
     },
 }
 
+# Named sets of entry names (optional). A group can be typed wherever a
+# command takes several entries - push, pull, status, verify, hook - and is
+# replaced by its entries before the command runs, so no group name ever
+# reaches S3. (hook is the exception: a named group runs only the members
+# that configure the hook it was asked for.) A group may name another group,
+# and one entry may belong to several groups. A group name must not be an
+# entry name, and a group has no path of its own: s3bak rejects
+# "dotfiles/bin", and rejects a group where diff, show or ls-remote expects
+# a single target.
+#
+# groups = {
+#     "dotfiles": [".ssh", "bin", ".emacs.d"],
+#     "nightly": ["dotfiles", "vault"],
+# }
+
 # config.py is plain Python, so entries can be added conditionally, e.g. per
 # host or platform:
 #

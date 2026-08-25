@@ -47,7 +47,7 @@ digits rather than two identical-looking timestamps.
 
 ```console
 $ s3bak status -v demo
-+ (boto3) get_object s3://my-bucket/backup/demo-manifest.jsonl
++ (boto3-s3) get_file s3://my-bucket/backup/demo-manifest.jsonl
 M /home/you/demo/notes.txt	mtime
       mtime: remote=2026-08-14 13:56:25.944048102 < local=2026-08-14 13:56:26.244048102 (+0.3s)
 ```
@@ -56,7 +56,7 @@ A drift of a second or more prints whole seconds instead:
 
 ```console
 $ s3bak status -v demo
-+ (boto3) get_object s3://my-bucket/backup/demo-manifest.jsonl
++ (boto3-s3) get_file s3://my-bucket/backup/demo-manifest.jsonl
 M /home/you/demo/notes.txt	mtime
       mtime: remote=2026-08-14 13:56:25 < local=2026-08-14 13:56:28 (+3s)
 ```

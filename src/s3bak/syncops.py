@@ -18,7 +18,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import IO, TYPE_CHECKING
 
-from boto3_s3 import LocalFileInfo
+from boto3_s3 import LocalFileInfo, SrcOnlyPair, SyncPair
 
 from s3bak import localwalk, manifest
 from s3bak.compare import SYMLINK_MTIME_SUPPORTED, mode_differs
@@ -27,7 +27,7 @@ from s3bak.console import console
 from s3bak.manifest import ManifestEntry
 
 if TYPE_CHECKING:
-    from boto3_s3 import FileFilter, FileInfo, PairFilter, SyncPair
+    from boto3_s3 import FileFilter, FileInfo, MergedPair, PairFilter
 
 
 def _walk_warning(body: str) -> None:
@@ -134,15 +134,15 @@ class PushJournal:
     """The single-scan push's compare, journal emitter, and keep/drop policy.
 
     One instance observes one push sync (docs/journal.md): wired as the
-    sync's three lane filters, it advances a cursor over the old manifest in
-    lockstep with the ascending pair stream - the sync's complete-view local
-    walk union the S3 listing - decides each lane's action, and records every
-    manifest change as one journal line: ``+`` / ``!`` carry the new record
-    built from the walked lstat (the stats the compare judged), ``-`` the
-    dropped old record verbatim. Every policy decision is made here, so
-    ``manifest.merge_journal`` is a pure apply; a journal with no real event
-    (``has_events`` False - no-change placeholder lines do not count) IS the
-    no-op decision - nothing to rewrite.
+    sync's one pair filter (``decide``), it advances a cursor over the old
+    manifest in lockstep with the ascending pair stream - the sync's
+    complete-view local walk union the S3 listing - decides what happens to
+    each pair, and records every manifest change as one journal line: ``+`` /
+    ``!`` carry the new record built from the walked lstat (the stats the
+    compare judged), ``-`` the dropped old record verbatim. Every policy
+    decision is made here, so ``manifest.merge_journal`` is a pure apply; a
+    journal with no real event (``has_events`` False - no-change placeholder
+    lines do not count) IS the no-op decision - nothing to rewrite.
 
     The cursor sees every local item (update and create cover the whole walk)
     and, on a ``--delete`` run, every S3 orphan, so a record it skips over has
@@ -153,7 +153,7 @@ class PushJournal:
     becomes an ancestor-stack frame - the same post-order pull ``--delete``
     uses for local extras - asked only once the stream proves everything
     beneath it resolved deleted, and kept silently (no question) when any
-    record beneath survived. Lane decisions are serial and ascending (the
+    record beneath survived. Pair decisions are serial and ascending (the
     boto3-s3 contract the design relies on), which is also why
     ``--checksum``'s content comparison runs inline here rather than on a
     pool.
@@ -174,6 +174,7 @@ class PushJournal:
         content: PairFilter | None = None,
         dest_listed: bool = False,
         delete_mode: bool = False,
+        object_delete: FileFilter | None = None,
         record_delete: Callable[[str, ManifestEntry], bool] | None = None,
     ) -> None:
         # Binary, because a confirmed directory-record drop seeks back and
@@ -202,6 +203,16 @@ class PushJournal:
         # record's object is gone (see _skip_over).
         self._dest_listed = dest_listed
         self._delete_mode = delete_mode
+        # The per-orphan decision for an S3 object with no local counterpart
+        # (the --delete confirmation, or the --yes / dry-run gate). None is a
+        # run without --delete: every orphan is still observed - the cursor
+        # needs it - and kept. Assert rather than fall back: a delete_mode run
+        # that arrived here with no decision would keep every orphan silently,
+        # turning an unattended --yes push into a no-op instead of failing.
+        assert not (delete_mode and object_delete is None), (
+            "a --delete run must carry a per-orphan decision"
+        )
+        self._object_delete = object_delete
         self._record_delete = record_delete
         # Open directory-record delete candidates, innermost last - the same
         # ancestor-stack post-order pull --delete uses for local extras, so
@@ -275,9 +286,9 @@ class PushJournal:
         Retiring it is repair, not deletion - there is no backup at the key
         to protect - and it is the self-heal for a push interrupted (or
         aborted by q) after some of its deletions had already run. This is
-        why the delete lane is observed even without ``--delete``
-        (commands._journal_delete_lane): a record whose object is still there
-        must reach the journal through that lane instead of arriving here.
+        why an S3 orphan is observed even without ``--delete``
+        (``_decide_orphan``): a record whose object is still there must reach
+        the journal through that pair instead of arriving here.
         Where the run lists no objects at all (``dest_listed`` false - a
         single-file or symlink sub-path push), nothing is provably stale and
         the record is kept.
@@ -428,9 +439,26 @@ class PushJournal:
             spool.close()
             self._pending_object_deletes_spool = None
 
-    # --- lane filters -------------------------------------------------------
-    def update_filter(self, pair: SyncPair) -> bool:
-        """The update lane: a both-sides pair (local item x S3 object)."""
+    # --- the pair filter ----------------------------------------------------
+    def decide(self, pair: MergedPair) -> bool:
+        """The sync's one decision (``S3.sync``'s ``pair_filter``): every
+        merged pair, whatever its shape, serially and in ascending compare-key
+        order on the sync's own thread. ``True`` takes that pair's default
+        action - upload a new or changed file, delete an orphan.
+
+        One entry point for all three shapes is what keeps the cursor in
+        lockstep with the stream: a record the stream never keys is provably
+        stale (``_skip_over``), which only holds if every key on either side
+        passes through here - including the S3 orphans of a run with no
+        ``--delete``, whose decision is then a flat no."""
+        if isinstance(pair, SyncPair):
+            return self._decide_update(pair)
+        if isinstance(pair, SrcOnlyPair):
+            return self._decide_create(pair.src)
+        return self._decide_orphan(pair.dest)
+
+    def _decide_update(self, pair: SyncPair) -> bool:
+        """A both-sides pair: a local item x the S3 object at its key."""
         assert pair.transfer_type.value == "upload"
         src = pair.src
         assert isinstance(src, LocalFileInfo)  # the pair's local side carries the lstat
@@ -496,11 +524,11 @@ class PushJournal:
             )
         return False
 
-    def create_filter(self, info: FileInfo) -> bool:
-        """The create lane: a local-only item - a new file, or any directory /
-        symlink / special file (objectless, so never paired), the root
-        included (compare key ``""``, the stream's first item)."""
-        assert isinstance(info, LocalFileInfo)  # the create lane's side is the local walk
+    def _decide_create(self, info: FileInfo) -> bool:
+        """A local-only item - a new file, or any directory / symlink / special
+        file (objectless, so never paired), the root included (compare key
+        ``""``, the stream's first item)."""
+        assert isinstance(info, LocalFileInfo)  # a source-only pair is the local walk
         st = info.stat_result
         assert st is not None and info.compare_key is not None
         is_dir = stat_mod.S_ISDIR(st.st_mode)
@@ -522,29 +550,27 @@ class PushJournal:
         )
         return True
 
-    def observe_delete(self, inner: FileFilter) -> FileFilter:
-        """Wrap the delete lane's decision (the --delete confirmation, or the
-        --yes/dry-run gate): a confirmed deletion drops the owning file
-        record with its object - the two travel together. A non-file record
-        at the key (objectless by definition) is never dropped by a
-        confirmation, and an unrecorded object has nothing to drop. Any
-        record that survives here - an object answered n, or a non-file
-        record shadowed by an object at its key - pins every open ancestor
-        frame (an unrecorded object does not: only records constrain the
-        manifest's directory-parent rule)."""
+    def _decide_orphan(self, info: FileInfo) -> bool:
+        """An S3-only key - the delete candidate, put to ``object_delete``
+        (the --delete confirmation, or the --yes/dry-run gate; a run without
+        --delete has none and keeps every orphan).
 
-        def decide(info: FileInfo) -> bool:
-            assert info.compare_key is not None
-            old = self._advance(self._full_key(info.compare_key, is_dir=False))
-            doomed = inner(info)
-            if old is not None:
-                if doomed and old[0].is_file:
-                    self._emit(manifest.JOURNAL_DROP, old[1])
-                else:
-                    self._mark_record_kept()
-            return doomed
-
-        return decide
+        A confirmed deletion drops the owning file record with its object -
+        the two travel together. A non-file record at the key (objectless by
+        definition) is never dropped by a confirmation, and an unrecorded
+        object has nothing to drop. Any record that survives here - an object
+        answered n, or a non-file record shadowed by an object at its key -
+        pins every open ancestor frame (an unrecorded object does not: only
+        records constrain the manifest's directory-parent rule)."""
+        assert info.compare_key is not None
+        old = self._advance(self._full_key(info.compare_key, is_dir=False))
+        doomed = self._object_delete is not None and self._object_delete(info)
+        if old is not None:
+            if doomed and old[0].is_file:
+                self._emit(manifest.JOURNAL_DROP, old[1])
+            else:
+                self._mark_record_kept()
+        return doomed
 
     def _journal_nonfile(
         self,
@@ -767,7 +793,7 @@ def download_from_s3(
     # The lane is named on the transfer line: a directory sync's lines come
     # from boto3-s3, which reports its own transfers, but nothing else would
     # say how this one object travelled.
-    lane = "boto3-s3 cp" if cfg.store.multipart_download(size) else "boto3 get_object"
+    lane = "boto3-s3 cp" if cfg.store.multipart_download(size) else "boto3-s3 get_file"
     if dryrun:
         # The download writes the local file, so it is a mutation and stays
         # skipped. No substitute probe either: a HeadObject can succeed or

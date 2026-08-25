@@ -88,6 +88,7 @@ At the top level of the file:
 | `profile` | non-empty string | *required* | the AWS profile to authenticate with; [Appendix A](appendix-a-aws-setup.md) creates one |
 | `prefix` | non-empty string | *required* | the bucket and optional path everything is stored under; must start with `s3://` and name a bucket, and a trailing slash is accepted and ignored |
 | `entries` | non-empty dict | *required* | what to back up, keyed by entry name; a name must be a non-empty, control-character-free single path component that does not end in `-manifest.jsonl` |
+| `groups` | dict | no groups | named sets of entries, keyed by group name; each value is a non-empty list of entry or group names, and a group name follows the entry-name rules except the `-manifest.jsonl` one and may not be an entry's name |
 | `max_concurrency` | integer >= 1 | 10 | transfers running at once within one entry; also sizes the pool `verify --checksum` hashes with |
 | `entry_concurrency` | integer >= 1 | 4 | entries processed at once by one command |
 | `mtime_window` | number of seconds >= 0 | 0.01 | how far two modification times may differ and still count as equal; `0` demands an exact nanosecond match |
@@ -185,6 +186,68 @@ effects does not fire on a backup that changed nothing.
 [Operating s3bak](07-operating.md) covers using hooks in a routine, including
 the journal a post_hook can read to learn what the push actually did.
 
+## Groups
+
+A group is a name for a set of entries, and nothing more:
+
+```python
+entries = {
+    "bin": {"path": f"{HOME}/bin"},
+    ".ssh": {"path": f"{HOME}/.ssh"},
+    "vault": {"path": "/mnt/data/vault"},
+}
+
+groups = {
+    "dotfiles": ["bin", ".ssh"],
+    "nightly": ["dotfiles", "vault"],
+}
+```
+
+`s3bak push nightly` then means `s3bak push bin .ssh vault`. A group name is
+accepted wherever a command takes entry names — `push`, `pull`, `status`,
+`verify` and `hook` — and is replaced by the entries it stands for before the
+command does anything, so nothing further along ever sees the name. It never
+reaches S3 either: the backup is laid out by entry, and a group is only a way
+of naming several of them at once. `--all` is untouched by all of this; it
+still means every configured entry.
+
+`hook` is the one command that reads a group as more than that substitution: a
+named group runs the members that configure the hook it was asked for and
+skips the rest, which the [Command reference](05-command-reference.md#hook)
+sets out in full.
+
+What a group is not is an entry. It has no path of its own, so there is no
+sub-path to name under it, and nothing for a command that works on a single
+target — `diff`, `show`, `ls-remote` — to act on:
+
+```console
+$ s3bak push nightly/lib
+s3bak: a group has no single root, so a sub path does not apply: nightly/lib
+$ s3bak diff nightly
+s3bak: diff takes a single entry or path, not a group: nightly
+```
+
+A group may name another group, as `nightly` does above, and one entry may
+belong to as many groups as you like. Expansion follows the configured order,
+depth first, and keeps each entry's first appearance. Exact repeats within one
+command line — a group named beside one of its own members, or the same entry
+twice — collapse into a single run of that entry. What does not collapse is
+one entry named twice with different targets: the entry itself beside a
+sub-path of it, or two different sub-paths. That is a conflict, and it is
+refused.
+
+Group names share the namespace of entry names, because the command line
+cannot tell the two apart, so a group may not take an entry's name. The rest
+of the naming rules are the entry ones: a non-empty single path component,
+free of control characters, and neither `.` nor `..`. The `-manifest.jsonl`
+ending is the exception and is allowed here, since that reservation exists for
+names that become S3 objects.
+
+All of it is checked when the file is read — that a group lists at least one
+member, that each member names an entry or another group, and that no group
+reaches itself through its members — so a mistake stops the next command you
+run rather than the next backup of that group.
+
 ## Tuning
 
 The optional top-level settings default to values that suit most machines, and
@@ -260,6 +323,11 @@ entries = {
         "mtime_window": 1,
         "post_hook": ["rclone", "copy", "/mnt/data/vault", "remote:vault"],
     },
+}
+
+groups = {
+    "dotfiles": [".ssh", "bin", ".emacs.d"],
+    "nightly": ["dotfiles", "vault"],
 }
 ```
 

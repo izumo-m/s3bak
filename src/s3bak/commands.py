@@ -163,7 +163,11 @@ class _PushDeletePlan:
     manifest is the journal emitter's business (a confirmed deletion journals
     its record's drop at the decision point)."""
 
-    lane: bool | FileFilter  # the per-orphan decision, or False for "no --delete"
+    # The per-orphan decision. None ONLY where --delete was not given: every
+    # --delete plan below resolves it to a callable before returning, and the
+    # journal reads a None as "keep every orphan" - which would silently turn
+    # an unattended --yes run into a no-op.
+    lane: FileFilter | None
     confirmer: DeleteConfirmer | None  # --delete without --yes (asked or auto-n)
     walker: localwalk.ManifestWalker | None = None  # the sync's local walker (--delete only)
     old_manifest: str | None = None  # set by the caller once downloaded
@@ -214,43 +218,16 @@ def _record_candidate_kind(e: ManifestEntry) -> str:
     return "special-file record"
 
 
-def _keep_orphan(_info: FileInfo) -> bool:
-    """The delete lane's decision without ``--delete``: keep every S3 orphan.
-
-    Passed to the sync as a filter rather than as a flat False so the journal
-    still observes the key (see ``_journal_delete_lane``)."""
-    return False
-
-
-def _journal_delete_lane(journal: PushJournal, plan: _PushDeletePlan) -> FileFilter:
-    """The delete lane the sync runs, wrapped so the journal sees every S3-only
-    key - with or without ``--delete``.
-
-    The journal has to tell "no object at this key" from "an object the run
-    was not allowed to touch": a record the pair stream never keys is stale
-    and any push retires it (PushJournal._skip_over), so an object that IS
-    there must reach the journal rather than be skipped over. Without
-    ``--delete`` the wrapped decision is a flat no, so the lane observes and
-    deletes nothing."""
-    lane = _keep_orphan if plan.lane is False else plan.lane
-    # A --delete plan always resolves its lane to a callable (_plan_push_deletes
-    # replaces the placeholder True before returning). Assert rather than fall
-    # back: silently reading a True lane as "keep" would turn an unattended
-    # --yes run into a no-op instead of failing.
-    assert not isinstance(lane, bool), "a --delete lane must be a callable decision"
-    return journal.observe_delete(lane)
-
-
 def _plan_push_deletes(
     cfg: Config, entry: str, sub: str | None, opts: Opts, walker: localwalk.ManifestWalker
 ) -> _PushDeletePlan:
     if not opts.delete:
-        return _PushDeletePlan(lane=False, confirmer=None)
+        return _PushDeletePlan(lane=None, confirmer=None)
     if opts.dryrun or resolve_answer_mode(yes=opts.yes) is AnswerMode.ALL_YES:
         # Report (dry run) or delete (--yes) every candidate the completeness
         # gate admits. The gate callable never prompts, so it is safe under
         # dryrun too (the library invokes a callable there as well).
-        plan = _PushDeletePlan(lane=True, confirmer=None, walker=walker)
+        plan = _PushDeletePlan(lane=None, confirmer=None, walker=walker)
         plan.lane = lambda info: plan.allow()
 
         def report_record(rel: str, e: ManifestEntry) -> bool:
@@ -557,6 +534,7 @@ def _push_sub(
                 content=cfg.store.content_compare() if opts.checksum else None,
                 dest_listed=is_dir_sub,
                 delete_mode=opts.delete and is_dir_sub,
+                object_delete=plan.lane if is_dir_sub else None,
                 record_delete=plan.record_delete,
             )
             # False until the journal's stream truly completed: a sync that
@@ -593,9 +571,7 @@ def _push_sub(
                         local_sub,
                         sub_rel,
                         walker=walker,
-                        compare=journal.update_filter,
-                        create=journal.create_filter,
-                        delete=_journal_delete_lane(journal, plan),
+                        pair_filter=journal.decide,
                         dryrun=opts.dryrun,
                         verbose=opts.verbose,
                     )
@@ -852,6 +828,7 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                     content=cfg.store.content_compare() if opts.checksum else None,
                     dest_listed=True,
                     delete_mode=opts.delete,
+                    object_delete=plan.lane,
                     record_delete=plan.record_delete,
                 )
                 sync_ok = False
@@ -860,9 +837,7 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                         target,
                         entry,
                         walker=walker,
-                        compare=journal.update_filter,
-                        create=journal.create_filter,
-                        delete=_journal_delete_lane(journal, plan),
+                        pair_filter=journal.decide,
                         dryrun=opts.dryrun,
                         verbose=opts.verbose,
                     )
@@ -2321,7 +2296,7 @@ class _ContentChecker:
         self._pool: ThreadPoolExecutor | None = None
         self._queue: deque[tuple[Future[bool | None], ManifestEntry, os.stat_result, str]] = deque()
 
-    def check(self, rel_key: str, local_path: str, record: ManifestEntry, obj: ObjectMeta) -> None:
+    def check(self, local_path: str, record: ManifestEntry, obj: ObjectMeta) -> None:
         try:
             st = os.lstat(local_path)
         except FileNotFoundError:
@@ -2336,7 +2311,7 @@ class _ContentChecker:
 
         def hash_one() -> bool | None:
             try:
-                return self._differs(rel_key, local_path, obj.size, obj.etag)
+                return self._differs(local_path, obj.size, obj.etag)
             except self._read_errors:
                 return None  # unreadable/vanished mid-check: reported as a warning below
 
@@ -2543,7 +2518,7 @@ def _verify_dir(
                             )
                         elif reason is None:
                             local_path = os.path.join(local_base, *key.split("/"))
-                            checker.check(f"{rel_base}/{key}", local_path, record, obj)
+                            checker.check(local_path, record, obj)
                         # reason == "structural": a symlinked/non-directory ancestor
                         # redirects to a file the record does not describe (a local
                         # type change, not a backup defect): skip, like a type change.
@@ -2613,7 +2588,7 @@ def _verify_file_record(
     if opts.checksum and content_reachable:
         checker = _ContentChecker(cfg, entry, report)
         try:
-            checker.check(rel_key, local_path, record, head)
+            checker.check(local_path, record, head)
         finally:
             checker.close()
 
@@ -2793,6 +2768,10 @@ def cmd_list(cfg: Config, opts: Opts) -> int:
     for key in sorted(cfg.entries.keys()):
         path = cfg.entries[key]["path"]
         console.out(f"{key:<20s} {path}\n")
+    # Groups print their members as configured, nested groups included: what
+    # the file says is what the reader edits.
+    for name in sorted(cfg.group_members.keys()):
+        console.out(f"{name:<20s} = {', '.join(cfg.group_members[name])}\n")
     return 0
 
 

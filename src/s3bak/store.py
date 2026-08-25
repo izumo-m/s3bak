@@ -1,23 +1,23 @@
 # Requires Python 3.10+
 """The S3 backend: a thin wrapper over the boto3-s3 library.
 
-Transfers (cp / sync) and listing go through boto3-s3's ``S3`` API in-process;
-head-object uses the underlying boto3 client. One ``S3`` orchestrator and one
-boto3 client are built up front (client construction is not thread-safe) and
-every S3-side location is handed to the library as an ``S3Storage`` bound to
-that shared client - see ``_s3_loc``.
+Everything reaches S3 through boto3-s3 in-process: the ``S3`` orchestrator
+drives cp / sync / ls, and every S3-side location is handed to the library as
+an ``S3Storage`` bound to one shared boto3 client (see ``_s3_loc``), which is
+also what the single-key head / get / put and the batched delete are
+addressed through. That client is used directly only by ``iter_objects``,
+whose paginated listing carries the ordering check verify's merge-join needs.
+The orchestrator and the client are built up front, client construction not
+being thread-safe.
 """
 
 from __future__ import annotations
 
 import os
 import shutil
-import stat as stat_mod
 import sys
-import tempfile
 import threading
 from collections.abc import Callable, Iterable, Iterator
-from contextlib import closing
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -28,20 +28,96 @@ if TYPE_CHECKING:
         FileFilter,
         FileInfo,
         LocalFileGenerator,
+        MergedPairFilter,
+        NotFoundError,
         OpResult,
         PairFilter,
         ResultCallback,
         S3Storage,
     )
     from boto3_s3.etagcompare import EtagComparison
+    from botocore.config import Config as BotocoreConfig
+
+
+# --- connection settings for the one shared client --------------------------
+#
+# botocore's defaults are written for a single-threaded caller, and this store
+# is not one, so the client is built from an explicit config instead
+# (_client_config):
+#
+# - `max_pool_connections` defaults to 10, exactly the transfer pool's own
+#   size - while the SAME client also carries a push's S3 listing (boto3-s3
+#   fetches its pages on a scan prefetch worker) and S3Deleter's batch worker,
+#   two more requests that can be in flight at once. urllib3 does not block on
+#   an exhausted pool; it opens a throwaway connection and closes it again on
+#   release, so every overflow request pays a fresh TCP + TLS handshake.
+# - `tcp_keepalive` defaults to off, so a connection a NAT, a VPN, or a WSL2
+#   host has silently dropped is discovered only when the read timeout expires.
+# - `connect_timeout` defaults to 60 s, far longer than a reachable endpoint
+#   ever needs, and the run says nothing at all while it elapses.
+#
+# The retry policy is pinned rather than left to the environment so the worst
+# case for one stuck request is a known quantity - _READ_TIMEOUT x
+# _TOTAL_ATTEMPTS plus standard mode's capped backoff, a few minutes rather
+# than an open-ended wait. The cost of pinning it is that AWS_RETRY_MODE /
+# AWS_MAX_ATTEMPTS (and their ~/.aws/config spellings) no longer reach this
+# client; nothing else about the profile is overridden.
+_POOL_HEADROOM = 4  # the listing prefetch worker, the deleter worker, slack
+_CONNECT_TIMEOUT = 10
+_READ_TIMEOUT = 60
+# ``total_max_attempts``, not ``max_attempts``: botocore counts the latter as
+# retries AFTER the first request and rewrites it to this key plus one, so
+# spelling the total out is the only way to say what the ceiling actually is.
+_TOTAL_ATTEMPTS = 5
+
+
+def _client_config(max_concurrency: int) -> BotocoreConfig:
+    """The botocore config every client of this store is built with.
+
+    A fresh instance per call: building a client rewrites the ``retries`` dict
+    in place (botocore normalizes the attempt count onto it), so the config
+    must not be shared with another store.
+    """
+    from botocore.config import Config
+
+    return Config(
+        max_pool_connections=max_concurrency + _POOL_HEADROOM,
+        connect_timeout=_CONNECT_TIMEOUT,
+        read_timeout=_READ_TIMEOUT,
+        tcp_keepalive=True,
+        retries={"mode": "standard", "total_max_attempts": _TOTAL_ATTEMPTS},
+    )
+
+
+# The S3 error codes that mean "there is no object at this key". boto3-s3 maps
+# a missing BUCKET onto the same NotFoundError as a missing key, so a lane that
+# reads every NotFoundError as "not present" answers a bucket typo - or a
+# profile pointing at the wrong account - with "entry not found on S3" instead
+# of saying the place does not exist. The code is recovered from the ClientError
+# the library chains as __cause__.
+_MISSING_KEY_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
+
+
+def _missing_object(exc: NotFoundError) -> bool:
+    """Whether this ``NotFoundError`` really means "no object at that key".
+
+    False for everything else the category also covers - the bucket itself
+    being absent, and a LOCAL not-found (a destination directory that raced
+    away mid-write, which the library files under the same type with no
+    ``bucket``). Those must propagate to ``run()``: "could not tell" and
+    "you are looking in the wrong place" must never read as "not there".
+    """
     from botocore.exceptions import ClientError
 
-# s3transfer's default multipart threshold, and boto3's default part size. Below
-# this an object is a single PutObject / GetObject in both the transfer path and
-# EtagComparison's reconstruction, so a direct client call is byte-identical to
-# S3.cp (same plain-MD5 ETag) - and skips s3transfer's machinery (a thread pool,
-# and for downloads a pre-transfer HeadObject probe).
-_DEFAULT_MULTIPART = 8 * 1024 * 1024
+    if exc.bucket is None:
+        return False  # a local failure: the object side said nothing at all
+    cause = exc.__cause__
+    if isinstance(cause, ClientError):
+        code = cause.response.get("Error", {}).get("Code", "")
+        return code in _MISSING_KEY_CODES
+    # Nothing to read a code off (the library raised it on its own): keep its
+    # classification rather than turning an absence into a hard failure.
+    return True
 
 
 @dataclass
@@ -108,23 +184,31 @@ class Boto3S3Store:
         from boto3_s3 import S3, TransferConfig, session
 
         # One TransferConfig always, set max_concurrency or not: it is the
-        # default for every cp / sync, and _resolve_small_limit reads
-        # multipart_threshold back off it. A None argument is dropped rather
+        # default for every cp / sync, and _multipart reads multipart_threshold
+        # back off it. A None argument is dropped rather
         # than forwarded, so an unset max_concurrency still lands on the
         # library's own default (boto3's 10 - ~/.aws/config is never read for
         # it). Handing S3 a None instead would take its separate no-config
-        # branch, which need not resolve to these same values on every library
-        # version this package accepts.
+        # branch, which need not resolve to these same values.
         self._transfer_config = TransferConfig(max_concurrency=max_concurrency)
+        # Sized off the resolved transfer concurrency, not the argument: an
+        # unset max_concurrency still has to size the pool the library's own
+        # default will fill (see _client_config).
+        self._client_config = _client_config(self._transfer_config.max_request_concurrency)
         # boto3_s3.session is a boto3.Session whose clients parse response
         # timestamps at C speed - the listings that drive sync and verify are
         # severalfold faster on large trees.
         self._s3 = S3(
             session=session(profile_name=profile),
+            config=self._client_config,
             transfer_config=self._transfer_config,
+            # Ctrl-C is process-fatal here (cli.run raises one KeyboardInterrupt
+            # and hard-exits on a second), which is the posture that lets a scan
+            # teardown abandon its page worker instead of waiting out a listing
+            # request that may be stuck for a full timeout.
+            reusable_after_interrupt=False,
         )
         self._client = self._s3.client()
-        self._small_limit = self._resolve_small_limit()
 
     def clone(self) -> Boto3S3Store:
         """A fresh store - its own boto3-s3 orchestrator and client - with this
@@ -139,20 +223,6 @@ class Boto3S3Store:
             self.path_prefix,
             max_concurrency=self.max_concurrency,
         )
-
-    def _resolve_small_limit(self) -> int:
-        """Objects strictly smaller than this go through a direct client call
-        instead of S3.cp.
-
-        The bound is ``min(multipart_threshold, part_size)`` so a small object
-        is single-part under both the transfer path (s3transfer uses multipart
-        at ``multipart_threshold``, default 8 MiB) and ``EtagComparison`` (which
-        reconstructs a composite ETag above ``part_size`` = ``s3.multipart_chunksize``).
-        Below the min, both agree the ETag is a plain MD5, so a direct
-        PutObject/GetObject cannot diverge from what S3.cp would store.
-        """
-        part_size = self._s3.aws_config().get_size("s3.multipart_chunksize", _DEFAULT_MULTIPART)
-        return min(self._transfer_config.multipart_threshold, part_size or _DEFAULT_MULTIPART)
 
     # --- internal ----------------------------------------------------------
     def _s3_loc(self, rel_key: str = "", *, is_dir: bool = False) -> S3Storage:
@@ -201,6 +271,17 @@ class Boto3S3Store:
 
     def _s3_url(self, rel_key: str = "") -> str:
         return f"{self.prefix}/{rel_key}" if rel_key else self.prefix
+
+    def _multipart(self, size: int) -> bool:
+        """Whether an object of ``size`` takes S3.cp's multipart engine rather
+        than the single-request lane (``S3Storage.get_file`` / ``put_file``).
+
+        s3transfer's own ``multipart_threshold``, and nothing but a
+        performance split: the single-request lane is one correct GetObject /
+        PutObject at any size, so where the line falls decides only whether
+        the transfer is parallelized.
+        """
+        return size >= self._transfer_config.multipart_threshold
 
     def _transfer(
         self, verbose: bool, label: str, op: Callable[[ResultCallback], None]
@@ -261,7 +342,11 @@ class Boto3S3Store:
                         results += 1
                     console.out(f"{line}\n")
                 elif r.outcome is OpOutcome.FAILED:
-                    console.diag(f"{r.compare_key}: {r.error}\n")
+                    # A delete names the display endpoint its success line
+                    # would have named; every other transfer type names the
+                    # relative compare key, as the sync's own lines do.
+                    where = r.src if r.transfer_type is TransferType.DELETE else r.compare_key
+                    console.diag(f"{where}: {r.error}\n")
                 elif r.outcome is OpOutcome.WARNED:
                     console.warn(
                         f"warning: {r.error}" if r.error else f"warning: skipped {r.compare_key}"
@@ -288,57 +373,35 @@ class Boto3S3Store:
 
     # --- Public API --------------------------------------------------------
     def head_object(self, rel_key: str, *, verbose: bool = False) -> ObjectMeta | None:
-        from botocore.exceptions import ClientError
-
-        key = self._api_key(rel_key)
+        """HeadObject one key, or None when it is definitively absent (404).
+        Any other failure - a denied head, a transport error - propagates:
+        "could not tell" must never read as "not there"."""
         if verbose:
-            console.diag(f"+ (boto3) head_object s3://{self.bucket}/{key}\n")
-        try:
-            data = self._client.head_object(Bucket=self.bucket, Key=key)
-        except ClientError as e:
-            if self._is_not_found(e):
-                return None
-            raise
+            console.diag(f"+ (boto3-s3) head_object {self._s3_url(rel_key)}\n")
+        info = self._s3_loc(rel_key).get_fileinfo()
+        if info is None:
+            return None
         return ObjectMeta(
             key=rel_key,
-            size=int(data.get("ContentLength", 0)),
-            etag=(data.get("ETag") or "").strip('"') or None,
-            storage_class=data.get("StorageClass"),
+            size=info.size or 0,
+            etag=info.etag,
+            storage_class=info.storage_class,
         )
 
-    def etag_checker(self) -> Callable[[str, str, int, str | None], bool]:
-        """A thread-safe ``(rel_key, local_path, s3_size, s3_etag) -> differs``
-        content check against an S3 ETag the caller already holds (a listing
-        or head result), so it costs no S3 call. One shared EtagComparison
+    def etag_checker(self) -> Callable[[str, int, str | None], bool]:
+        """A thread-safe ``(local_path, s3_size, s3_etag) -> differs`` content
+        check against an S3 ETag the caller already holds (a listing or head
+        result), so it costs no S3 call. One shared EtagComparison
         (thread-safe by contract) serves every call; part_size comes from the
         same profile the uploads use, so multipart ETags reconstruct to a
         matching value. A missing ETag reports "differs" - verification must
         fail loudly rather than silently pass."""
-        from boto3_s3 import LocalFileInfo, LocalStorage, S3FileInfo, SyncPair, TransferType
         from boto3_s3.etagcompare import EtagComparison
 
         comparison = EtagComparison(self._s3)
 
-        def differs(rel_key: str, local_path: str, s3_size: int, s3_etag: str | None) -> bool:
-            if not s3_etag:
-                return True
-            # Since 0.5 EtagComparison reads the readable side through its
-            # ``storage.open(compare_key)``, not a bare path: root a
-            # LocalStorage at the file's parent and key it by basename, so the
-            # open resolves back to local_path.
-            local_store = LocalStorage(os.path.dirname(local_path) or ".")
-            pair = SyncPair(
-                compare_key=rel_key,
-                transfer_type=TransferType.UPLOAD,
-                src=LocalFileInfo(
-                    key=local_path,
-                    size=os.path.getsize(local_path),
-                    compare_key=os.path.basename(local_path),
-                    storage=local_store,
-                ),
-                dest=S3FileInfo(key=rel_key, size=s3_size, etag=s3_etag),
-            )
-            return comparison(pair)
+        def differs(local_path: str, s3_size: int, s3_etag: str | None) -> bool:
+            return comparison.content_differs(local_path, etag=s3_etag, s3_size=s3_size)
 
         return differs
 
@@ -353,9 +416,9 @@ class Boto3S3Store:
         check, not this.
         """
         head = self.head_object(rel_key, verbose=verbose)
-        if head is None or not head.etag:
+        if head is None:
             return True
-        return self.etag_checker()(rel_key, local_path, head.size, head.etag)
+        return self.etag_checker()(local_path, head.size, head.etag)
 
     def iter_objects(self, rel_prefix: str, *, verbose: bool = False) -> Iterator[ObjectMeta]:
         """Stream the objects below ``rel_prefix/`` in listing (key byte) order,
@@ -414,15 +477,11 @@ class Boto3S3Store:
         self._s3.ls(self._s3_loc(is_dir=True), recursive=False, on_entry=collect)
         return objects, prefixes
 
-    def _is_not_found(self, e: ClientError) -> bool:
-        code = e.response.get("Error", {}).get("Code", "")
-        return code in ("404", "NoSuchKey", "NotFound")
-
     def multipart_download(self, size: int | None) -> bool:
         """Which lane ``get_object`` takes for an object of ``size``: True for
         S3.cp's parallel multipart download, False for a single GetObject.
         Callers report the lane a single-object transfer used."""
-        return size is not None and size >= self._small_limit
+        return size is not None and self._multipart(size)
 
     def get_object(
         self,
@@ -433,72 +492,41 @@ class Boto3S3Store:
         verbose: bool = False,
     ) -> bool:
         """Download to dest_path; False if the object is absent (other errors
-        propagate to run()). A large object (``size`` >= the small-object
-        limit) goes through S3.cp for parallel multipart download; everything
-        else - and any object of unknown size - is a single streamed
-        GetObject, avoiding s3transfer's pre-transfer HeadObject probe."""
-        if self.multipart_download(size):
-            from boto3_s3 import NotFoundError
+        propagate to run()). A large object (``size`` >= the multipart
+        threshold) goes through S3.cp for a parallel multipart download;
+        everything else - and any object of unknown size - is one streamed
+        GetObject through ``S3Storage.get_file``, which skips s3transfer's
+        machinery (a thread pool, and a pre-transfer HeadObject probe) and
+        still lands the bytes atomically: a sibling temp file replaced into
+        place, an existing destination's mode carried over, and the previous
+        content left whole if the read fails."""
+        from boto3_s3 import NotFoundError
 
-            if verbose:
-                console.diag(f"+ (boto3-s3) cp {self._s3_url(rel_key)} {dest_path}\n")
-            try:
+        loc = self._s3_loc(rel_key)
+        try:
+            if self.multipart_download(size):
+                if verbose:
+                    console.diag(f"+ (boto3-s3) cp {self._s3_url(rel_key)} {dest_path}\n")
                 # force_glacier_transfer: without it cp WARN-skips a GLACIER /
                 # DEEP_ARCHIVE source and returns as if it succeeded, so pull would
                 # apply the record's metadata over stale (or absent) local content
                 # and exit 0. Forcing the transfer makes an archived-not-restored
                 # object fail loudly (InvalidObjectState) - matching the small
                 # object path's direct GetObject - and lets a restored one through.
-                self._s3.cp(self._s3_loc(rel_key), dest_path, force_glacier_transfer=True)
-                return True
-            except NotFoundError:
-                return False
-
-        from botocore.exceptions import ClientError
-
-        if verbose:
-            console.diag(f"+ (boto3) get_object s3://{self.bucket}/{self._api_key(rel_key)}\n")
-        try:
-            resp = self._client.get_object(Bucket=self.bucket, Key=self._api_key(rel_key))
-        except ClientError as e:
-            if self._is_not_found(e):
-                # A genuinely-absent object is "not present"; other errors
-                # (access denied, transport, config) propagate to run().
-                return False
-            raise
-        with closing(resp["Body"]) as body:
-            parent = os.path.dirname(dest_path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            temp_dir = parent or os.curdir
-            fd, temp_path = tempfile.mkstemp(prefix=".s3bak-download-", dir=temp_dir)
-            try:
-                try:
-                    existing_mode = os.lstat(dest_path).st_mode
-                except OSError:
-                    existing_mode = None
-                if existing_mode is not None and stat_mod.S_ISREG(existing_mode):
-                    # Atomic replacement uses a new inode. Preserve the mode of
-                    # an existing regular destination so the replacement does not
-                    # turn it into tempfile's 0600 merely as a side effect.
-                    os.chmod(temp_path, stat_mod.S_IMODE(existing_mode))
-                # Match s3transfer's safety property: finish into a sibling temp
-                # file and replace atomically. A failed/truncated read leaves the
-                # previous destination intact, and a final-component symlink is
-                # replaced instead of followed into an unrelated target.
-                with os.fdopen(fd, "wb") as f:
-                    shutil.copyfileobj(body, f)
-                os.replace(temp_path, dest_path)
-            except BaseException:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-                try:
-                    os.unlink(temp_path)
-                except FileNotFoundError:
-                    pass
+                self._s3.cp(loc, dest_path, force_glacier_transfer=True)
+            else:
+                if verbose:
+                    console.diag(f"+ (boto3-s3) get_file {self._s3_url(rel_key)}\n")
+                loc.get_file(dest_path)
+        except NotFoundError as e:
+            if not _missing_object(e):
+                # A LOCAL not-found (the destination's directory raced away
+                # mid-write) or a missing bucket: neither is "no such object",
+                # so let it propagate to run() like any other failure.
                 raise
+            # A genuinely-absent object is "not present"; other errors
+            # (access denied, transport, config) propagate to run().
+            return False
         return True
 
     def delete_objects(
@@ -506,79 +534,44 @@ class Boto3S3Store:
     ) -> TransferResult:
         """Delete the objects at ``rel_keys`` (entry-relative), streaming.
 
-        DeleteObjects batches stay within S3's 1,000-key limit; a batch's
-        ``delete:`` lines print (and its per-key failures, if any) as soon as
-        it flushes - single-threaded (no worker callback here), so no lock is
-        needed around the running tallies. ``dryrun`` reports the would-be
-        deletions without calling S3.
+        boto3-s3's ``S3Deleter`` batches within S3's 1,000-key limit and
+        dispatches each batch on its own worker thread, so a generator of keys
+        keeps producing - ``delete_subtree`` streams a listing straight in -
+        while the previous batch deletes; every key's ``delete:`` line, or its
+        failure, prints as its batch completes. That worker deletes through
+        this store's one client while the caller lists on it, which is the
+        shape boto3-s3's own ``rm`` runs (the one-client-per-thread contract
+        is about transfers, which a batched delete is not). ``dryrun`` reports
+        the would-be deletions inline, without sending anything.
+
+        A non-zero result is what stops the caller from publishing a manifest
+        that has already dropped the records (docs/recovery.md), so it must
+        cover every key the response cannot vouch for: the deleter fails a key
+        whose batch carried an error naming no submitted key, rather than
+        inferring its success from the key's absence among the errors.
+
+        Not to be called from inside a console prompt session: a dispatch
+        waits for the previous batch (the deleter's backpressure point) while
+        that batch's worker prints through the console the prompt holds.
         """
-        results = 0
-        had_error = False
-        batch: list[str] = []  # entry-relative rels queued for the current request
+        from boto3_s3 import FileInfo, S3Deleter
 
-        def flush() -> None:
-            nonlocal results, had_error
-            if not batch:
-                return
-            if dryrun:
-                for rel in batch:
-                    console.out(f"(dry-run) delete: {self._s3_url(rel)}\n")
-                    results += 1
-                batch.clear()
-                return
-            if verbose:
-                console.diag(
-                    f"+ (boto3) delete_objects s3://{self.bucket}/ ({len(batch)} key(s))\n"
-                )
-            response = self._client.delete_objects(
-                Bucket=self.bucket,
-                Delete={"Objects": [{"Key": self._api_key(rel)} for rel in batch], "Quiet": True},
-            )
-            # Per-key failures (Object Lock, a per-object policy): with Quiet=True
-            # only failures come back, so a key absent from Errors was deleted -
-            # print its delete: line only then, never eagerly (that would claim a
-            # failed key was deleted while stderr says it failed).
-            requested = {self._api_key(rel) for rel in batch}
-            error_items = response.get("Errors", [])
-            unattributable = [item for item in error_items if item.get("Key") not in requested]
-            if unattributable:
-                # An error with a missing or unknown Key cannot be tied to a
-                # requested key, so we cannot prove ANY key in this batch was
-                # deleted. Fail the whole batch rather than report a phantom
-                # success: a false success would drop the manifest record (the
-                # caller stops before publishing on a non-zero result) while the
-                # object survives on S3 as an unrecorded orphan.
-                detail = "; ".join(
-                    str(item.get("Message") or item.get("Code") or "delete failed")
-                    for item in unattributable
-                )
-                for rel in batch:
-                    console.diag(f"{self._s3_url(rel)}: delete failed ({detail})\n")
-                had_error = True
-                batch.clear()
-                return
-            # Every remaining error is attributable (its Key is a requested key).
-            failed = {
-                key: item.get("Code", "delete failed")
-                for item in error_items
-                if (key := item.get("Key")) is not None
-            }
-            for rel in batch:
-                code = failed.get(self._api_key(rel))
-                if code is None:
-                    console.out(f"delete: {self._s3_url(rel)}\n")
-                    results += 1
-                else:
-                    console.diag(f"{self._s3_url(rel)}: {code}\n")
-                    had_error = True
-            batch.clear()
+        failed = 0
 
-        for rel in rel_keys:
-            batch.append(rel)
-            if len(batch) == 1000:
-                flush()
-        flush()
-        return TransferResult(returncode=1 if had_error else 0, results=results)
+        def op(on_result: ResultCallback) -> None:
+            nonlocal failed
+            with S3Deleter(self._s3_loc(), on_result=on_result, dryrun=dryrun) as deleter:
+                for rel in rel_keys:
+                    deleter.submit(FileInfo(key=self._api_key(rel)))
+            failed = deleter.failed
+
+        # `verbose and not dryrun`: the + trace echoes the requests a run makes,
+        # and a dryrun deleter sends none - it reports each submission inline.
+        label = f"delete objects under {self.prefix}/ (batched)"
+        result = self._transfer(verbose and not dryrun, label, op)
+        if failed:
+            return TransferResult(returncode=1, results=result.results)
+        return result
 
     def delete_subtree(
         self, rel_key: str, *, dryrun: bool = False, verbose: bool = False
@@ -592,7 +585,9 @@ class Boto3S3Store:
         ``docs.txt``.
         """
         if verbose:
-            console.diag(f"+ (boto3) delete subtree s3://{self.bucket}/{self._api_key(rel_key)}\n")
+            console.diag(
+                f"+ (boto3-s3) delete subtree s3://{self.bucket}/{self._api_key(rel_key)}\n"
+            )
 
         def doomed_keys() -> Iterator[str]:
             if self.head_object(rel_key, verbose=verbose) is not None:
@@ -605,17 +600,17 @@ class Boto3S3Store:
     def stream_object_to_stdout(self, rel_key: str, *, verbose: bool = False) -> bool:
         """Write the object to stdout; False if it is absent, so the caller can
         say why in its own words (other errors propagate to run())."""
-        from botocore.exceptions import ClientError
+        from boto3_s3 import NotFoundError
 
         if verbose:
-            console.diag(f"+ (boto3) get_object s3://{self.bucket}/{self._api_key(rel_key)}\n")
+            console.diag(f"+ (boto3-s3) open {self._s3_url(rel_key)}\n")
         try:
-            resp = self._client.get_object(Bucket=self.bucket, Key=self._api_key(rel_key))
-        except ClientError as e:
-            if self._is_not_found(e):
-                return False
-            raise
-        with closing(resp["Body"]) as body:
+            body = self._s3_loc().open(self._api_key(rel_key), "rb")
+        except NotFoundError as e:
+            if not _missing_object(e):
+                raise
+            return False
+        with body:
             shutil.copyfileobj(body, sys.stdout.buffer)
         sys.stdout.buffer.flush()
         return True
@@ -663,23 +658,18 @@ class Boto3S3Store:
         )
 
     def put_file(self, rel_key: str, src_path: str, *, verbose: bool = False) -> None:
-        """Upload a local file without result-line collection (manifests). A
-        small file is a single PutObject; a large one keeps S3.cp for multipart.
-        Errors (ClientError / Boto3S3Error) surface to run()."""
-        if os.path.getsize(src_path) >= self._small_limit:
-            if verbose:
-                console.diag(f"+ (boto3-s3) cp {src_path} {self._s3_url(rel_key)}\n")
-            self._s3.cp(src_path, self._s3_loc(rel_key))
-            return
+        """Upload a local file without result-line collection (manifests): one
+        PutObject, whatever the size - a manifest is read and rewritten on
+        nearly every command, and the single-request lane costs it no transfer
+        engine. Errors (Boto3S3Error) surface to run()."""
         if verbose:
-            console.diag(f"+ (boto3) put_object s3://{self.bucket}/{self._api_key(rel_key)}\n")
-        with open(src_path, "rb") as f:
-            self._client.put_object(Bucket=self.bucket, Key=self._api_key(rel_key), Body=f)
+            console.diag(f"+ (boto3-s3) put_file {self._s3_url(rel_key)}\n")
+        self._s3_loc(rel_key).put_file(src_path)
 
     def put_object(self, rel_key: str, src_path: str, *, verbose: bool = False) -> TransferResult:
         dst = self._s3_url(rel_key)
-        if os.path.getsize(src_path) >= self._small_limit:
-            loc = self._s3_loc(rel_key)
+        loc = self._s3_loc(rel_key)
+        if self._multipart(os.path.getsize(src_path)):
             return self._transfer(
                 verbose,
                 f"cp {src_path} {dst}",
@@ -687,14 +677,13 @@ class Boto3S3Store:
             )
         # Small file: a single PutObject, and print the result line the
         # s3transfer callback would have printed (see _transfer.on_result).
-        from botocore.exceptions import ClientError
+        from boto3_s3 import Boto3S3Error
 
         if verbose:
-            console.diag(f"+ (boto3) put_object s3://{self.bucket}/{self._api_key(rel_key)}\n")
+            console.diag(f"+ (boto3-s3) put_file {dst}\n")
         try:
-            with open(src_path, "rb") as f:
-                self._client.put_object(Bucket=self.bucket, Key=self._api_key(rel_key), Body=f)
-        except ClientError as e:
+            loc.put_file(src_path)
+        except Boto3S3Error as e:
             console.diag(f"{e}\n")
             return TransferResult(returncode=1, results=0)
         console.out(f"upload: {src_path} to {dst}\n")
@@ -705,10 +694,8 @@ class Boto3S3Store:
         src_dir: str,
         rel_prefix: str,
         *,
+        pair_filter: MergedPairFilter,
         walker: LocalFileGenerator | None = None,
-        compare: PairFilter | None = None,
-        create: bool | FileFilter = True,
-        delete: bool | FileFilter = False,
         dryrun: bool = False,
         verbose: bool = False,
     ) -> TransferResult:
@@ -726,11 +713,11 @@ class Boto3S3Store:
         cannot consume - push's PushJournal observes these entries for its
         journal and never lets them reach the transfer engine.
 
-        `delete` is the delete-lane value: False keeps every S3 orphan (the
-        default), True prunes them all, and a callable decides per orphan
-        (the --delete confirmation; called serially in ascending key order).
-        `create` is the create-lane value with the same shapes and the same
-        serial ascending-order guarantee for a callable."""
+        `pair_filter` decides every merged pair - a new local item, a
+        both-sides pair, an S3 orphan - through one callable (push's
+        PushJournal.decide), called serially in ascending compare-key order
+        on this thread. True takes the pair's default action: upload the new
+        or changed file, delete the orphan."""
         from boto3_s3 import LocalStorage
 
         # follow_symlinks moved onto the Storage in 0.5: symlinks are not
@@ -743,15 +730,11 @@ class Boto3S3Store:
         return self._transfer(
             verbose,
             f"sync {src_dir} {dst}",
-            # New local files take the caller's create lane, both-sides pairs
-            # the update_filter, orphans the delete lane above.
             lambda cb: self._s3.sync(
                 src,
                 dst,
-                create_filter=create,
-                delete_filter=delete,
+                pair_filter=pair_filter,
                 dryrun=dryrun,
-                update_filter=compare,
                 on_result=cb,
             ),
         )

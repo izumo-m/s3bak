@@ -9,6 +9,92 @@ a fix only (Fixed).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-25
+
+### Added
+
+- `groups`: an optional top-level config setting naming sets of entries.
+  A group name can be typed wherever a command takes several entry names —
+  `push`, `pull`, `status`, `verify`, `hook` — and is expanded in place
+  during argument resolution, so nothing downstream and no S3 key ever sees
+  it. Groups may nest, an entry may belong to any number of them, and a
+  group name may not collide with an entry name; membership, cycles and
+  names are all validated when the config loads. `list` prints each group
+  with its configured members. A group has no root of its own, so s3bak
+  rejects `mygroup/sub`, and rejects a group where `diff`, `show` or
+  `ls-remote` expects a single target; `pull -o` takes one argument, and
+  that argument may be a group only where the group stands for exactly one
+  entry. `hook <kind> <group>` reads like `--all` narrowed to the group:
+  members without that hook are skipped (shown under `-v`), and the error
+  comes only where the group asks for nothing at all — no member configures
+  the hook and no member was named outright. Naming an entry outright keeps
+  failing on a missing hook.
+
+### Changed
+
+- The S3 client is now built from an explicit botocore config instead of
+  botocore's defaults. The connection pool is sized to the transfer
+  concurrency plus room for the two workers that share the same client — a
+  push's S3 listing (boto3-s3's scan prefetch worker) and `S3Deleter`'s batch
+  worker — where the default pool of 10 sat exactly at the transfer
+  concurrency and made every overflow request pay a fresh TCP + TLS
+  handshake. TCP keepalives are on, the connect timeout drops from 60 s to
+  10 s, and the retry policy is pinned to standard mode with 5 total attempts
+  so one stalled request costs a bounded number of timeouts rather than an
+  open-ended wait. Pinning the retry policy means `AWS_RETRY_MODE` /
+  `AWS_MAX_ATTEMPTS` (and their `~/.aws/config` spellings) no longer reach
+  this client; nothing else about the profile is overridden.
+- `Ctrl-C` now has two stages. The first raises a `KeyboardInterrupt` where it
+  used to raise `SystemExit`, which is the shape the layers below recognize:
+  boto3-s3 abandons a scan's page worker instead of waiting one more listing
+  out, and a multi-entry run still lets the entries already in flight finish.
+  Because that orderly stop joins s3transfer's transfer threads, a request
+  stuck in a socket read can hold the exit for a full timeout — so a second
+  `Ctrl-C` now abandons it and exits immediately. Both exit 130, both say what
+  they are doing, and what the hard exit leaves behind is what any kill leaves:
+  S3 changes with no manifest describing them, settled by the next plain push.
+- Naming the same target twice in one `push`, `pull` or `hook` — the same
+  entry twice, or a group beside one of its own members — is now
+  deduplicated silently instead of failing as a duplicate entry; `status`
+  and `verify` already collapsed it. Naming one entry twice with different
+  targets — the entry itself beside a sub-path of it, or two different
+  sub-paths — is still refused, since that would be a parallel push or
+  pull of the same tree.
+- The unknown-name error is now `no such entry or group: <name>`.
+- The boto3-s3 requirement is now `>=0.11,<0.12`. The floor had been held at
+  0.8 so a project already pinned there could take s3bak alongside it; it now
+  tracks the one MINOR s3bak is built and tested against.
+- s3bak now reaches S3 entirely through boto3-s3: the single-object head, get
+  and put lanes and the batched delete moved onto the library's `S3Storage` /
+  `S3Deleter`, leaving only the paginated object listing on a direct boto3
+  call. What that changes on screen is the naming — `-v`'s request trace says
+  `+ (boto3-s3) get_file` / `put_file` / `head_object` where it said
+  `+ (boto3) get_object` / `put_object` / `head_object`, and a single-file
+  pull's download line names the `(boto3-s3 get_file)` lane where it named
+  `(boto3 get_object)`. A manifest is now read and written with one request
+  whatever its size, and the size gate below which a data object skips the
+  transfer engine is now plainly s3transfer's multipart threshold.
+- A delete that fails now names the object's `s3://` URL, the way its success
+  line does, instead of the key relative to the listing.
+
+### Fixed
+
+- `push --delete` no longer reports a deletion it cannot confirm. When a
+  `DeleteObjects` response carries an error naming no key that was submitted,
+  every key of that batch the response cannot vouch for now fails, so the
+  manifest is not rewritten to drop records whose objects may still exist.
+  The explicit sub-path deletion (`push --delete entry/sub`) already refused
+  such a batch; the main delete lane inferred each key's success from its
+  absence among the errors. The guarantee now comes from boto3-s3 0.11,
+  which this release requires, so both lanes hold it.
+- A bucket that does not exist is reported as such again, instead of as a
+  missing backup. boto3-s3 files `NoSuchBucket` under the same not-found
+  category as `NoSuchKey`, so the move onto its single-request get lanes had
+  `pull`, `status`, `show` and `ls-remote` answer a typo in the config's
+  `prefix` — or a profile resolving to the wrong account — with
+  `entry not found on S3`. Only a genuinely absent key now reads as "not
+  present"; everything else propagates and names the bucket.
+
 ## [0.6.1] - 2026-08-14
 
 ### Fixed

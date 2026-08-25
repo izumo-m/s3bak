@@ -304,12 +304,12 @@ how to write them; this section is what they behave like in a running system.
 $ s3bak push -v demo
 + pre_hook: ['/home/you/bin/dump-db']
 dumped /home/you/demo/db.sql
-+ (boto3) get_object s3://my-bucket/backup/demo-manifest.jsonl
++ (boto3-s3) get_file s3://my-bucket/backup/demo-manifest.jsonl
 + (boto3-s3) sync /home/you/demo s3://my-bucket/backup/demo/
 upload: /home/you/demo/db.sql to s3://my-bucket/backup/demo/db.sql
 upload: /home/you/demo/notes.txt to s3://my-bucket/backup/demo/notes.txt
 Updating s3://my-bucket/backup/demo-manifest.jsonl
-+ (boto3) put_object s3://my-bucket/backup/demo-manifest.jsonl
++ (boto3-s3) put_file s3://my-bucket/backup/demo-manifest.jsonl
 + post_hook: ['/home/you/bin/offsite']
 offsite: 2 changed file(s)
 ```

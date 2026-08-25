@@ -11,18 +11,24 @@ behind them.
 
 ## The compare decision
 
-Every sync needs an **update-lane** strategy (`S3.sync`'s `update_filter`):
-given a pair present on *both* sides (a local side and its S3 side for one key),
-does it need re-copying? New entries and orphans are separate lanes —
-`create_filter` copies every new local/S3 file, `delete_filter`
-prunes orphans (off by default; `push --delete` turns it into the per-orphan
-confirmation, `--yes` into an unconditional prune; pull prunes local extras
-itself, see below) — so the strategy below only judges the
-intersection. s3bak has two judgments; where each lives differs by direction:
-pull wires `ManifestFilter` (or the `--checksum` comparison) as its update
-filter directly, while push folds the same judgment into its journal emitter
-(`PushJournal`), which spans all three lanes to record manifest changes as it
-decides — see [journal.md](journal.md).
+Every sync judges each merged pair: does this key need copying, and is an
+orphan on the destination side to be deleted? The judgment that carries the
+weight is the one for a pair present on *both* sides (a local side and its S3
+side for one key) — does it need re-copying? s3bak has two answers for that,
+and where each is wired differs by direction.
+
+**Pull** takes boto3-s3's three lane filters: `ManifestFilter` (or the
+`--checksum` comparison) as the `update_filter` that judges the both-sides
+pairs, the default `create_filter` copying every S3-only key, and no delete
+lane at all (pull prunes local extras itself, see below).
+
+**Push** takes the single `pair_filter` instead, which replaces all three: its
+journal emitter (`PushJournal`) sees every pair whatever its shape — new local
+item, both-sides pair, S3 orphan — folds the same both-sides judgment in, and
+records every manifest change as it decides. An orphan is kept unless
+`--delete` was given (which turns the decision into the per-orphan
+confirmation, `--yes` into an unconditional prune). See
+[journal.md](journal.md).
 
 ### Default: the size+mtime check
 
@@ -97,7 +103,7 @@ stale record whose object is already gone are all invisible to it. The exact
 rehearsal, with the real listing, is `push --delete --dry-run`; the passive
 discovery channel for what status cannot see is `verify`.
 
-## The transfer path: direct client call vs. `S3.cp`
+## The transfer path: the single-request lane vs. `S3.cp`
 
 boto3-s3's `S3.cp` always routes through s3transfer (a thread pool, and on
 downloads a pre-transfer HeadObject probe). That machinery pays off for large,
@@ -106,28 +112,28 @@ on nearly every command, are small.
 
 So the store routes by size:
 
-- **Below `min(multipart_threshold, s3.multipart_chunksize)`** (default 8 MiB):
-  a direct `client.put_object` / `client.get_object`. One round trip; downloads
-  skip the HeadObject probe (`status` and `ls-remote` drop from 2 S3 calls to
-  1). A direct download streams into a sibling temporary file and atomically
-  replaces the destination only after success, preserving an existing file if
-  the response is interrupted and never following a final-path symlink.
+- **Below `multipart_threshold`** (s3transfer's own, default 8 MiB):
+  `S3Storage.get_file` / `put_file` — one GetObject / PutObject with no
+  transfer engine underneath. Downloads skip the HeadObject probe (`status`
+  and `ls-remote` drop from 2 S3 calls to 1) and still land atomically: the
+  body streams into a sibling temporary file that replaces the destination
+  only after success, so an interrupted response leaves the previous file
+  whole, an existing destination's permission bits carry onto the
+  replacement, and a final-path symlink is replaced rather than followed.
 - **At or above the threshold:** `S3.cp`, for parallel multipart transfer and
   the composite multipart ETag.
 
-**Why the min is a correctness gate, not just a tuning knob.** Below the
-multipart threshold, s3transfer itself does a single-part upload, so a direct
-`put_object` stores the *identical* plain-MD5 ETag `S3.cp` would. Above the part
-size, `EtagComparison` reconstructs a *composite* ETag; a large file uploaded as
-a single object would store a plain MD5 and break `--checksum`. Gating strictly
-below the min of both means a small object is single-part under *both* the
-transfer path and the ETag reconstruction, so a direct call can never diverge
-from what `S3.cp` would store.
+The split is a performance choice and nothing more: either lane stores the
+same bytes, and `EtagComparison` reconstructs from the ETag it is given (a
+`-N` suffix means multipart, anything else a whole-object MD5), so
+`--checksum` cannot see where the line falls.
 
 Downloads know a single-file entry's size from its manifest record and route
-accordingly; a manifest download (small, size unknown) always takes the direct
-path. Directory syncs (`sync_up` / `sync_down`) always use `S3.cp` — moving many
-files is exactly what its machinery is for.
+accordingly; a manifest download (small, size unknown) always takes the
+single-request lane, and a manifest upload always does — a file read and
+rewritten on nearly every command has no use for a transfer engine. Directory
+syncs (`sync_up` / `sync_down`) always use `S3.cp` — moving many files is
+exactly what its machinery is for.
 
 A single-object transfer therefore reports its own result line, naming the
 lane: a sync's lines come from boto3-s3's result callback, which knows nothing
@@ -154,6 +160,10 @@ concurrently transferring threads). See
 thread-safety boundary. `SIGINT` during a multi-entry run cancels the entries
 that have not started; entries already running finish (killing one mid-push
 would leave its manifest and data inconsistent) before the process exits 130.
+That wait is bounded by the request timeouts the client carries, not by
+anything s3bak can shorten once a transfer thread is inside a socket read, so
+a second `SIGINT` abandons it and exits at once
+([cli.md](cli.md#exit-codes)).
 
 ## The push pipeline
 
@@ -191,11 +201,12 @@ is [cli.md](cli.md#hook-invocation-hook-prepost).
    confirmed deletion removes the old backup (the exact key and everything
    under `entry/`), then the push records the new kind from scratch.
    **Directory entry:** one `sync_up` over the complete local view, with the
-   journal emitter (`PushJournal`, [journal.md](journal.md)) wired as all
-   three lane filters — the single scan that both decides the transfers and
-   records every manifest change. A locally deleted file keeps its S3 object
-   AND its manifest record — **push never deletes a backup unless `--delete`
-   was given and the deletion confirmed** (see "Deleting backups" below).
+   journal emitter (`PushJournal`, [journal.md](journal.md)) wired as the
+   sync's single `pair_filter` — the single scan that both decides the
+   transfers and records every manifest change. A locally deleted file keeps
+   its S3 object AND its manifest record — **push never deletes a backup
+   unless `--delete` was given and the deletion confirmed** (see "Deleting
+   backups" below).
    `--checksum` ignores manifest file stats for its content decision (the
    download above still validates and feeds the kind check and the journal's
    cursor, which still journals mode and structure drift). Excludes filter the
@@ -386,7 +397,7 @@ rehearsal must fail or warn exactly where the real command would. With
    pull returns immediately. This gate is skipped under `--checksum`, since it
    is the very stat check whose blind spot `--checksum` exists to cover.
 3. **Download** (a symlink sub-path, having no data object, skips this
-   step): `sync_down` for a directory, a single `get_object` for a file
+   step): `sync_down` for a directory, a single-request `get_file` for a file
    (multipart via `S3.cp` if the recorded size is large). Excluded paths are
    not downloaded ([excludes.md](excludes.md)). A restore root of
    the wrong type (a directory where a file entry restores, a file or symlink

@@ -7,11 +7,12 @@ through ``store.delete_objects`` directly via ``delete_subtree``).
 
 A plain local deletion is the positive control. Against it, a per-key
 (attributable) DeleteObjects error must fail the push and leave the manifest
-untouched; on the sub-path lane, an error that cannot be tied to any
-requested key (unattributable - ``store.delete_objects``'s own failsafe, see
-its "unattributable" branch around line 535) must fail the whole batch and
-leave the manifest untouched even when the object was in fact removed from
-S3 underneath.
+untouched; and an error that cannot be tied to any requested key
+(unattributable) must fail every key of its batch that the response cannot
+vouch for - leaving the manifest untouched even when the object was in fact
+removed from S3 underneath. Both deletions run through boto3-s3's
+``S3Deleter``, whose fail-closed synthesis is what s3bak's "publish only
+after the deletion landed" rule rests on.
 
 Failures are injected by wrapping ``botocore.client.BaseClient._make_api_call``
 so only the ``DeleteObjects`` call is intercepted; every other S3 call (the
@@ -59,8 +60,8 @@ def test_push_delete_removes_key_and_drops_manifest_record(ws):
 
 
 def test_push_delete_attributable_failure_keeps_stale_manifest(ws, monkeypatch):
-    # The main directory delete lane (sync_up's delete_filter, dispatched
-    # through boto3-s3's S3Deleter) reports a per-key DeleteObjects error tied
+    # The main directory delete lane (an orphan taken by sync_up's pair filter,
+    # dispatched through boto3-s3's S3Deleter) reports a DeleteObjects error tied
     # to the requested key: the push must fail, the object must survive, and -
     # the point of this test - the manifest must not be rewritten to drop the
     # record the (refused) deletion would have removed.
@@ -107,10 +108,9 @@ def test_push_delete_subpath_unattributable_failure_keeps_stale_manifest_despite
     # first (so the object is actually removed from S3) and only then splices
     # in an unattributable error, to pin the strongest form of the guarantee:
     # even when S3 truly deleted the object, an unattributable error in the
-    # response still blocks the manifest rewrite that would drop its record -
-    # the safe side of the trade, matching store.delete_objects's own comment
-    # (the alternative, a false success, would orphan the object with no
-    # record and no way to notice).
+    # response still blocks the manifest rewrite that would drop its record.
+    # That is the safe side of the trade - the alternative, a false success,
+    # would orphan the object with no record and no way to notice.
     ws.write("data/keep.txt", "keep")
     ws.write("data/removed.txt", "target")
     ws.config({"data": {"path": str(ws.root / "data")}})
@@ -134,7 +134,8 @@ def test_push_delete_subpath_unattributable_failure_keeps_stale_manifest_despite
     res = ws.run("push", "--delete", "--yes", "data/removed.txt")
 
     assert res.rc != 0
-    assert "delete failed" in res.err
+    assert "cannot be confirmed" in res.err
+    assert "data/removed.txt" in res.err
     assert "data/removed.txt" not in ws.keys()  # the real delete_objects call did happen
     assert _manifest_body(ws, "data") == before_body  # the stale record survives
     assert _manifest_etag(ws, "data") == before_etag

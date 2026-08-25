@@ -444,7 +444,7 @@ def test_delete_command_help_explains_confirmation_behavior(capfd, command):
         ("verify", "s3bak verify [options] <entry|path>...", "Checks:"),
         ("hook", "s3bak hook <pre|post> [options] <entry>...", "S3BAK_JOURNAL is unset"),
         ("diff", "s3bak diff [options] <entry|path>", "--color[=WHEN]"),
-        ("list", "s3bak list", "List locally configured entries."),
+        ("list", "s3bak list", "List locally configured entries and groups."),
         ("ls-remote", "s3bak ls-remote [options] [entry|path]", "stored on S3"),
     ],
 )
