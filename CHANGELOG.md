@@ -9,6 +9,8 @@ a fix only (Fixed).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-25
+
 ### Added
 
 - `groups`: an optional top-level config setting naming sets of entries.
