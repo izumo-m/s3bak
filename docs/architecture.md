@@ -82,3 +82,13 @@ a client with another. Within one entry, s3transfer's own worker threads
 operate under that entry's client, which the library manages. The local-only
 `list` command does not construct a store. Runtime concurrency and its
 configuration are described in [sync.md](sync.md#concurrency).
+
+That one client is built from an explicit botocore config rather than
+botocore's defaults, because more than the transfer pool rides on it: a push's
+S3 listing runs on boto3-s3's scan prefetch worker and its confirmed deletions
+on `S3Deleter`'s batch worker, so the connection pool is sized to the transfer
+concurrency plus headroom for those two. The same config turns on TCP
+keepalives and shortens the connect timeout, so a connection the network
+dropped silently is discovered rather than waited out, and pins the retry
+policy so the worst case for one stuck request is a bounded number of
+timeouts. `store._client_config` carries the values and the reasoning.

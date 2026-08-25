@@ -35,6 +35,57 @@ if TYPE_CHECKING:
         S3Storage,
     )
     from boto3_s3.etagcompare import EtagComparison
+    from botocore.config import Config as BotocoreConfig
+
+
+# --- connection settings for the one shared client --------------------------
+#
+# botocore's defaults are written for a single-threaded caller, and this store
+# is not one, so the client is built from an explicit config instead
+# (_client_config):
+#
+# - `max_pool_connections` defaults to 10, exactly the transfer pool's own
+#   size - while the SAME client also carries a push's S3 listing (boto3-s3
+#   fetches its pages on a scan prefetch worker) and S3Deleter's batch worker,
+#   two more requests that can be in flight at once. urllib3 does not block on
+#   an exhausted pool; it opens a throwaway connection and closes it again on
+#   release, so every overflow request pays a fresh TCP + TLS handshake.
+# - `tcp_keepalive` defaults to off, so a connection a NAT, a VPN, or a WSL2
+#   host has silently dropped is discovered only when the read timeout expires.
+# - `connect_timeout` defaults to 60 s, far longer than a reachable endpoint
+#   ever needs, and the run says nothing at all while it elapses.
+#
+# The retry policy is pinned rather than left to the environment so the worst
+# case for one stuck request is a known quantity - _READ_TIMEOUT x
+# _TOTAL_ATTEMPTS plus standard mode's capped backoff, a few minutes rather
+# than an open-ended wait. The cost of pinning it is that AWS_RETRY_MODE /
+# AWS_MAX_ATTEMPTS (and their ~/.aws/config spellings) no longer reach this
+# client; nothing else about the profile is overridden.
+_POOL_HEADROOM = 4  # the listing prefetch worker, the deleter worker, slack
+_CONNECT_TIMEOUT = 10
+_READ_TIMEOUT = 60
+# ``total_max_attempts``, not ``max_attempts``: botocore counts the latter as
+# retries AFTER the first request and rewrites it to this key plus one, so
+# spelling the total out is the only way to say what the ceiling actually is.
+_TOTAL_ATTEMPTS = 5
+
+
+def _client_config(max_concurrency: int) -> BotocoreConfig:
+    """The botocore config every client of this store is built with.
+
+    A fresh instance per call: building a client rewrites the ``retries`` dict
+    in place (botocore normalizes the attempt count onto it), so the config
+    must not be shared with another store.
+    """
+    from botocore.config import Config
+
+    return Config(
+        max_pool_connections=max_concurrency + _POOL_HEADROOM,
+        connect_timeout=_CONNECT_TIMEOUT,
+        read_timeout=_READ_TIMEOUT,
+        tcp_keepalive=True,
+        retries={"mode": "standard", "total_max_attempts": _TOTAL_ATTEMPTS},
+    )
 
 
 @dataclass
@@ -108,12 +159,22 @@ class Boto3S3Store:
         # it). Handing S3 a None instead would take its separate no-config
         # branch, which need not resolve to these same values.
         self._transfer_config = TransferConfig(max_concurrency=max_concurrency)
+        # Sized off the resolved transfer concurrency, not the argument: an
+        # unset max_concurrency still has to size the pool the library's own
+        # default will fill (see _client_config).
+        self._client_config = _client_config(self._transfer_config.max_request_concurrency)
         # boto3_s3.session is a boto3.Session whose clients parse response
         # timestamps at C speed - the listings that drive sync and verify are
         # severalfold faster on large trees.
         self._s3 = S3(
             session=session(profile_name=profile),
+            config=self._client_config,
             transfer_config=self._transfer_config,
+            # Ctrl-C is process-fatal here (cli.run raises one KeyboardInterrupt
+            # and hard-exits on a second), which is the posture that lets a scan
+            # teardown abandon its page worker instead of waiting out a listing
+            # request that may be stuck for a full timeout.
+            reusable_after_interrupt=False,
         )
         self._client = self._s3.client()
 

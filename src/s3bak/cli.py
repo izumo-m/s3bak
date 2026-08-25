@@ -53,7 +53,7 @@ from s3bak.commands import (
 from s3bak.compare import _resolve_use_color
 from s3bak.config import Config, Opts, load_config
 from s3bak.confirm import AnswerMode, is_aborted, reset_confirmations, resolve_answer_mode
-from s3bak.console import console, expand_home, normalize_local_path
+from s3bak.console import PROG, console, expand_home, normalize_local_path
 from s3bak.restore import canonical_restore_comparison_path, resolve_pull_destination
 from s3bak.store import Boto3S3Store
 from s3bak.syncops import download_from_s3
@@ -158,10 +158,12 @@ def run_entries(
                 console.err(f"{entries[index]}: {exc}")
                 statuses[index] = 1
     finally:
-        # SIGINT lands in this (main) thread as SystemExit: cancel the entries
-        # that have not started, but let the running ones finish - killing an
-        # entry mid-push would leave its manifest and data inconsistent. The
-        # normal path has nothing pending, so this is then a plain shutdown.
+        # SIGINT lands in this (main) thread as KeyboardInterrupt: cancel the
+        # entries that have not started, but let the running ones finish -
+        # killing an entry mid-push would leave its manifest and data
+        # inconsistent. A second Ctrl-C is the way out when that wait is too
+        # long (see _on_sigint). The normal path has nothing pending, so this
+        # is then a plain shutdown.
         executor.shutdown(wait=True, cancel_futures=True)
     # Completion order varies with scheduling. Preserve the first configured
     # entry's failure so --all has a deterministic exit code (including a
@@ -1056,13 +1058,79 @@ def _sdk_errors() -> tuple[type[BaseException], ...]:
     return (Boto3S3Error, BotoCoreError, ClientError)
 
 
+# --- Ctrl-C ------------------------------------------------------------------
+#
+# The first interrupt asks for an orderly stop. It surfaces as the
+# KeyboardInterrupt every layer below recognizes: boto3-s3 abandons a scan's
+# page worker rather than waiting out one more listing (Boto3S3Store builds its
+# S3 with reusable_after_interrupt=False), run_entries lets the entries already
+# running finish, and run() maps it to exit 130.
+#
+# That orderly stop is not always quick. s3transfer joins its transfer threads
+# on the way out, so a request stuck in a socket read holds the exit until it
+# times out - up to a read timeout per attempt (store._client_config). The
+# second interrupt is the escape hatch: it gives up on the orderly stop and
+# leaves at once. What that leaves behind is what any hard kill leaves - S3
+# changes with no manifest describing them - and the next plain push of the
+# entry settles it (docs/recovery.md).
+_interrupted = False
+
+_FIRST_INTERRUPT = (
+    f"\n{PROG}: interrupted; finishing the S3 requests already in flight"
+    " (Ctrl-C again to exit now)\n"
+)
+_SECOND_INTERRUPT = (
+    f"\n{PROG}: interrupted again; exiting now - the manifest was not rewritten,"
+    " so push this entry again to settle it\n"
+)
+
+
+def _write_stderr(text: str) -> None:
+    """Write to fd 2 without going through the console.
+
+    A signal handler runs on the main thread, which may already be inside
+    ``Console._write`` holding the console lock - and ``threading.Lock`` is not
+    reentrant, so ``console.err`` here would deadlock the run it is trying to
+    explain. A closed stderr is not this function's problem: the interrupt still
+    has to do its job.
+    """
+    try:
+        os.write(2, text.encode("utf-8", "replace"))
+    except OSError:
+        pass
+
+
+def _on_sigint(_signum: int, _frame: object) -> NoReturn:
+    global _interrupted
+    if _interrupted:
+        _write_stderr(_SECOND_INTERRUPT)
+        # Not sys.exit(): that unwinds through the very joins this is escaping
+        # (and the interpreter's own wait for non-daemon threads after them).
+        os._exit(130)
+    _interrupted = True
+    _write_stderr(_FIRST_INTERRUPT)
+    raise KeyboardInterrupt
+
+
+def reset_interrupt_state() -> None:
+    """Forget an earlier interrupt (in-process test runs; run() is one-shot)."""
+    global _interrupted
+    _interrupted = False
+
+
 def run() -> int:
     """Console entry point: install signal handling and translate exceptions
     into exit codes. This is what the ``s3bak`` command invokes."""
     console.reset_warnings()
-    signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
+    reset_interrupt_state()
+    signal.signal(signal.SIGINT, _on_sigint)
     try:
         rc = main() or 0
+    except KeyboardInterrupt:
+        # The first Ctrl-C, having unwound the run. The handler already said
+        # what happened, and there is nothing to settle here: an interrupted
+        # push deliberately leaves its manifest unwritten (docs/recovery.md).
+        return 130
     except subprocess.CalledProcessError as e:
         cmd_str = shlex.join(e.cmd) if isinstance(e.cmd, list) else str(e.cmd)
         console.err(f"command failed: {cmd_str}")

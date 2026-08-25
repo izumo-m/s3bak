@@ -160,6 +160,43 @@ loss as `content differs but size+mtime match` — from outside, a file whose
 contents were lost looks exactly like one edited behind the size and
 modification time.
 
+## A run that has gone quiet
+
+A push prints one line per transfer *as it completes*, so a run that has
+stopped printing is not a run that has stopped working — it is a run waiting
+on requests already in flight. One S3 request that hangs is enough to make
+the whole command look dead, because the lines behind it have nothing to
+report until it resolves.
+
+The usual cause is a connection the network dropped without telling either
+end: a NAT table that expired it, a VPN that moved, a laptop that suspended.
+s3bak bounds how long that can go unnoticed — TCP keepalives on every
+connection, ten seconds to connect, sixty seconds per read, and at most five
+attempts for one request — so the worst case is minutes, not an open-ended
+wait. `-v` will not shorten it: it echoes the calls s3bak makes, not the
+progress of the request inside one.
+
+`Ctrl-C` twice is the way out:
+
+| Press | What happens |
+| --- | --- |
+| once | the clean stop: no new work is started and what is in flight finishes |
+| twice | s3bak leaves at once, abandoning the stuck request |
+
+The first press has to wait for that stuck request — up to the read timeout —
+because the transfer threads are joined before the process can leave, which is
+why it says so and offers you the second press:
+
+```console
+^Cs3bak: interrupted; finishing the S3 requests already in flight (Ctrl-C again to exit now)
+^Cs3bak: interrupted again; exiting now - the manifest was not rewritten, so push this entry again to settle it
+```
+
+Either way the exit status is 130, and either way the residue is the one an
+interrupted push always leaves: objects on S3 that the manifest does not
+mention yet. [An interrupted push](#an-interrupted-push) above is how to
+settle it — a plain `push` of the entry, no `--delete` needed.
+
 ## Leftovers a hard kill can leave
 
 None of these damages the backup. They are files nobody removed because the

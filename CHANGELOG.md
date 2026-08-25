@@ -30,6 +30,27 @@ a fix only (Fixed).
 
 ### Changed
 
+- The S3 client is now built from an explicit botocore config instead of
+  botocore's defaults. The connection pool is sized to the transfer
+  concurrency plus room for the two workers that share the same client — a
+  push's S3 listing (boto3-s3's scan prefetch worker) and `S3Deleter`'s batch
+  worker — where the default pool of 10 sat exactly at the transfer
+  concurrency and made every overflow request pay a fresh TCP + TLS
+  handshake. TCP keepalives are on, the connect timeout drops from 60 s to
+  10 s, and the retry policy is pinned to standard mode with 5 total attempts
+  so one stalled request costs a bounded number of timeouts rather than an
+  open-ended wait. Pinning the retry policy means `AWS_RETRY_MODE` /
+  `AWS_MAX_ATTEMPTS` (and their `~/.aws/config` spellings) no longer reach
+  this client; nothing else about the profile is overridden.
+- `Ctrl-C` now has two stages. The first raises a `KeyboardInterrupt` where it
+  used to raise `SystemExit`, which is the shape the layers below recognize:
+  boto3-s3 abandons a scan's page worker instead of waiting one more listing
+  out, and a multi-entry run still lets the entries already in flight finish.
+  Because that orderly stop joins s3transfer's transfer threads, a request
+  stuck in a socket read can hold the exit for a full timeout — so a second
+  `Ctrl-C` now abandons it and exits immediately. Both exit 130, both say what
+  they are doing, and what the hard exit leaves behind is what any kill leaves:
+  S3 changes with no manifest describing them, settled by the next plain push.
 - Naming the same target twice in one `push`, `pull` or `hook` — the same
   entry twice, or a group beside one of its own members — is now
   deduplicated silently instead of failing as a duplicate entry; `status`

@@ -161,6 +161,17 @@ behind that mapping:
   Aborting with `q` is a failure, and so is declining the explicit
   backup-subtree deletion — in both cases the command did not do what it was
   asked ([sync.md](sync.md#deleting-backups---delete---yes)).
+- **`Ctrl-C` has two stages, and both exit 130.** The first SIGINT raises
+  `KeyboardInterrupt` — the shape the layers below recognize, so boto3-s3
+  abandons a scan's page worker rather than waiting one more listing out and
+  a multi-entry run lets the entries already in flight finish. That orderly
+  stop still joins s3transfer's transfer threads, so a request stuck in a
+  socket read holds the exit until it times out; the second SIGINT is the
+  escape hatch and leaves through `os._exit`. Neither writes through the
+  console: a handler runs on the main thread, which may already hold the
+  non-reentrant console lock. What the hard exit leaves is what any kill
+  leaves — S3 changes with no manifest describing them, settled by the next
+  plain push ([recovery.md](recovery.md)).
 - **Operational exceptions do not reach the user as tracebacks.** `run()`
   catches the SDK, OS, and manifest error families and reports what the layer
   below said, because a backup tool's failures are ordinary operational

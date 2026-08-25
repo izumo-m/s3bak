@@ -831,7 +831,7 @@ it as a stale manifest.
 | 1 | a usage, configuration, local I/O, S3, or manifest error |
 | 2 | the work finished, but something warned |
 | 3 and up | a hook's own exit status, passed through |
-| 130 | interrupted (`Ctrl-C`) |
+| 130 | interrupted (`Ctrl-C`, once for an orderly stop or twice to leave at once) |
 | 141 | the output pipe was closed |
 
 Exit 2 is the one worth wiring into a scheduled run. It means s3bak did what

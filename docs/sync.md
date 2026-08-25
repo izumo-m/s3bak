@@ -160,6 +160,10 @@ concurrently transferring threads). See
 thread-safety boundary. `SIGINT` during a multi-entry run cancels the entries
 that have not started; entries already running finish (killing one mid-push
 would leave its manifest and data inconsistent) before the process exits 130.
+That wait is bounded by the request timeouts the client carries, not by
+anything s3bak can shorten once a transfer thread is inside a socket read, so
+a second `SIGINT` abandons it and exits at once
+([cli.md](cli.md#exit-codes)).
 
 ## The push pipeline
 
