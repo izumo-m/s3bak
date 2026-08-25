@@ -29,6 +29,7 @@ if TYPE_CHECKING:
         FileInfo,
         LocalFileGenerator,
         MergedPairFilter,
+        NotFoundError,
         OpResult,
         PairFilter,
         ResultCallback,
@@ -86,6 +87,37 @@ def _client_config(max_concurrency: int) -> BotocoreConfig:
         tcp_keepalive=True,
         retries={"mode": "standard", "total_max_attempts": _TOTAL_ATTEMPTS},
     )
+
+
+# The S3 error codes that mean "there is no object at this key". boto3-s3 maps
+# a missing BUCKET onto the same NotFoundError as a missing key, so a lane that
+# reads every NotFoundError as "not present" answers a bucket typo - or a
+# profile pointing at the wrong account - with "entry not found on S3" instead
+# of saying the place does not exist. The code is recovered from the ClientError
+# the library chains as __cause__.
+_MISSING_KEY_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
+
+
+def _missing_object(exc: NotFoundError) -> bool:
+    """Whether this ``NotFoundError`` really means "no object at that key".
+
+    False for everything else the category also covers - the bucket itself
+    being absent, and a LOCAL not-found (a destination directory that raced
+    away mid-write, which the library files under the same type with no
+    ``bucket``). Those must propagate to ``run()``: "could not tell" and
+    "you are looking in the wrong place" must never read as "not there".
+    """
+    from botocore.exceptions import ClientError
+
+    if exc.bucket is None:
+        return False  # a local failure: the object side said nothing at all
+    cause = exc.__cause__
+    if isinstance(cause, ClientError):
+        code = cause.response.get("Error", {}).get("Code", "")
+        return code in _MISSING_KEY_CODES
+    # Nothing to read a code off (the library raised it on its own): keep its
+    # classification rather than turning an absence into a hard failure.
+    return True
 
 
 @dataclass
@@ -487,11 +519,10 @@ class Boto3S3Store:
                     console.diag(f"+ (boto3-s3) get_file {self._s3_url(rel_key)}\n")
                 loc.get_file(dest_path)
         except NotFoundError as e:
-            if e.bucket is None:
+            if not _missing_object(e):
                 # A LOCAL not-found (the destination's directory raced away
-                # mid-write): the object side said nothing, so this is not
-                # "no such object" - let it propagate to run() like any other
-                # local I/O failure.
+                # mid-write) or a missing bucket: neither is "no such object",
+                # so let it propagate to run() like any other failure.
                 raise
             # A genuinely-absent object is "not present"; other errors
             # (access denied, transport, config) propagate to run().
@@ -554,7 +585,9 @@ class Boto3S3Store:
         ``docs.txt``.
         """
         if verbose:
-            console.diag(f"+ (boto3) delete subtree s3://{self.bucket}/{self._api_key(rel_key)}\n")
+            console.diag(
+                f"+ (boto3-s3) delete subtree s3://{self.bucket}/{self._api_key(rel_key)}\n"
+            )
 
         def doomed_keys() -> Iterator[str]:
             if self.head_object(rel_key, verbose=verbose) is not None:
@@ -573,7 +606,9 @@ class Boto3S3Store:
             console.diag(f"+ (boto3-s3) open {self._s3_url(rel_key)}\n")
         try:
             body = self._s3_loc().open(self._api_key(rel_key), "rb")
-        except NotFoundError:
+        except NotFoundError as e:
+            if not _missing_object(e):
+                raise
             return False
         with body:
             shutil.copyfileobj(body, sys.stdout.buffer)

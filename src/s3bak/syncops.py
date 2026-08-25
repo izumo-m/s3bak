@@ -206,7 +206,12 @@ class PushJournal:
         # The per-orphan decision for an S3 object with no local counterpart
         # (the --delete confirmation, or the --yes / dry-run gate). None is a
         # run without --delete: every orphan is still observed - the cursor
-        # needs it - and kept.
+        # needs it - and kept. Assert rather than fall back: a delete_mode run
+        # that arrived here with no decision would keep every orphan silently,
+        # turning an unattended --yes push into a no-op instead of failing.
+        assert not (delete_mode and object_delete is None), (
+            "a --delete run must carry a per-orphan decision"
+        )
         self._object_delete = object_delete
         self._record_delete = record_delete
         # Open directory-record delete candidates, innermost last - the same

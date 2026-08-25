@@ -85,6 +85,13 @@ a fix only (Fixed).
   such a batch; the main delete lane inferred each key's success from its
   absence among the errors. The guarantee now comes from boto3-s3 0.11,
   which this release requires, so both lanes hold it.
+- A bucket that does not exist is reported as such again, instead of as a
+  missing backup. boto3-s3 files `NoSuchBucket` under the same not-found
+  category as `NoSuchKey`, so the move onto its single-request get lanes had
+  `pull`, `status`, `show` and `ls-remote` answer a typo in the config's
+  `prefix` — or a profile resolving to the wrong account — with
+  `entry not found on S3`. Only a genuinely absent key now reads as "not
+  present"; everything else propagates and names the bucket.
 
 ## [0.6.1] - 2026-08-14
 

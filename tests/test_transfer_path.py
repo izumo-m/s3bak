@@ -374,6 +374,53 @@ def test_local_not_found_is_not_reported_as_a_missing_object(ws, monkeypatch):
         store.get_object("obj", str(ws.root / "gone" / "out.bin"))
 
 
+def _wrong_bucket_store(ws) -> cli.Boto3S3Store:
+    """A store pointed at a bucket that does not exist - the shape of a typo in
+    the config's `prefix`, or a profile resolving to the wrong account."""
+    bucket = "s3bak-no-such-bucket"
+    return cli.Boto3S3Store(_store(ws).profile, f"s3://{bucket}/p", bucket, "p")
+
+
+def test_a_missing_bucket_is_not_reported_as_a_missing_object(ws):
+    # boto3-s3 files NoSuchBucket under the same NotFoundError as NoSuchKey.
+    # Reading that as "not present" would answer a bucket typo with "entry not
+    # found on S3" - a backup tool must never say the backup is absent when it
+    # was looking in a place that does not exist.
+    from boto3_s3 import NotFoundError
+
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    store = _wrong_bucket_store(ws)
+    out = str(ws.root / "out.bin")
+
+    with pytest.raises(NotFoundError):
+        store.get_object("obj", out)
+    with pytest.raises(NotFoundError):
+        store.get_object("obj", out, size=store._transfer_config.multipart_threshold)
+    with pytest.raises(NotFoundError):
+        store.stream_object_to_stdout("obj")
+
+
+def test_a_missing_bucket_stops_the_commands_that_read_a_manifest(ws):
+    # The manifest download is the first S3 read of pull / status / show, so it
+    # is where a wrong bucket has to surface: run() turns the SDK error into
+    # exit 1 with the bucket named, instead of "entry not found on S3".
+    ws.write("data/a.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws._config.write_text(
+        ws._config.read_text().replace(
+            f'prefix = "s3://{ws.bucket}/', 'prefix = "s3://s3bak-no-such-bucket/'
+        )
+    )
+
+    from boto3_s3 import NotFoundError
+
+    for args in (("pull", "data"), ("status", "data"), ("show", "data/a.txt")):
+        # ws.run stops at cli.main; run() is what maps an SDK error to exit 1.
+        with pytest.raises(NotFoundError, match="NoSuchBucket"):
+            ws.run(*args)
+
+
 # --- the single-file pull names the lane it took ---------------------------
 #
 # A directory pull's lines come from boto3-s3, which reports each transfer it
