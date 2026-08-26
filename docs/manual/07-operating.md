@@ -108,7 +108,7 @@ it:
 
 ```console
 $ s3bak status --delete --all
-M /home/you/demo	mtime
+M /home/you/demo	mtime+
 D /home/you/demo/todo.txt
 ```
 

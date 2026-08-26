@@ -430,9 +430,9 @@ lists the bucket.
 
 ```console
 $ s3bak status demo
-M /home/you/demo	mtime
+M /home/you/demo	mtime+
 A /home/you/demo/new.sh
-M /home/you/demo/notes.txt	size, mtime
+M /home/you/demo/notes.txt	size+, mtime+
 M /home/you/demo/run.sh	mode
 ```
 
@@ -447,25 +447,27 @@ that differed:
 
 | Tag | What differs |
 | --- | --- |
-| `size` | the size of a regular file |
+| `size+` / `size-` | the size of a regular file — local is larger / smaller |
 | `mode` | the permission bits |
-| `mtime` | the modification time, beyond the tolerance |
+| `mtime+` / `mtime-` | the modification time, beyond the tolerance — local is newer / older |
 | `link` | where a symlink points |
 | `type` | the kind of thing at that path |
 
-A regular file prints its tags as `size, mode, mtime` and a symlink as
-`link, mtime`. A `type` difference stands alone, since nothing else about two
-different kinds of thing is worth comparing.
+The sign on `size` and `mtime` is the direction of the drift, local relative
+to the backup; `mode`, `link` and `type` have no order, so they carry none.
+A regular file prints its tags in the order `size, mode, mtime` and a symlink
+in `link, mtime`. A `type` difference stands alone, since nothing else about
+two different kinds of thing is worth comparing.
 
 `-v` prints the values under each line, indented, and adds the request trace:
 
 ```console
 $ s3bak status -v demo
 + (boto3-s3) get_file s3://my-bucket/backup/demo-manifest.jsonl
-M /home/you/demo	mtime
+M /home/you/demo	mtime+
       mtime: remote=2026-08-14 11:19:59 < local=2026-08-14 11:20:00 (+1s)
 A /home/you/demo/new.sh
-M /home/you/demo/notes.txt	size, mtime
+M /home/you/demo/notes.txt	size+, mtime+
       size: remote=34 < local=35 (+1 bytes)
       mtime: remote=2026-08-14 11:19:59 < local=2026-08-14 11:20:00 (+1s)
 M /home/you/demo/run.sh	mode
@@ -474,7 +476,7 @@ M /home/you/demo/run.sh	mode
 
 `remote` is what the manifest recorded and `local` is what is there now; the
 `<` and `>` point at the larger or later of the two, and colour marks the same
-side green. A `type` line names the two kinds — `type: remote=symlink
+side green — the same direction the tag's sign already gave. A `type` line names the two kinds — `type: remote=symlink
 local=regular file`. Larger differences also print a readable form of
 themselves: `(+3145728 bytes (+3.00 MB))` for a size, `(+2d 3h)` for a time,
 and fractional seconds when the drift is under a second.

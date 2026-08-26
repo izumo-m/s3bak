@@ -237,6 +237,31 @@ def test_status_verbose_reports_mtime_change(ws):
     assert "a.txt" in res.out
 
 
+def test_status_tags_carry_drift_direction(ws):
+    # The plain tag line points the drift without -v: size+/mtime+ = the local
+    # side is larger/newer, size-/mtime- = smaller/older - the sign of the
+    # local-minus-remote difference the -v detail prints.
+    grow = ws.write("data/grow.txt", "abc")
+    shrink = ws.write("data/shrink.txt", "long content here")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    grow.write_text("abcdef")  # larger...
+    ahead = os.lstat(grow).st_mtime_ns + 3_600_000_000_000
+    os.utime(grow, ns=(ahead, ahead))  # ...and newer
+    shrink.write_text("x")  # smaller...
+    os.utime(shrink, (1_600_000_000, 1_600_000_000))  # ...and older
+
+    res = ws.run("status", "data", expect_rc=0)
+    tags = {}
+    for line in res.out.splitlines():
+        if line.startswith("M") and "\t" in line:
+            path, _, tag_part = line.partition("\t")
+            tags[os.path.basename(path.split(" ", 1)[1])] = tag_part
+    assert tags["grow.txt"] == "size+, mtime+"
+    assert tags["shrink.txt"] == "size-, mtime-"
+
+
 def test_diff_shows_content_changes(ws):
     ws.write("data/a.txt", "one\n")
     ws.config({"data": {"path": str(ws.root / "data")}})

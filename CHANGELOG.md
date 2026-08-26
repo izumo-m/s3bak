@@ -9,6 +9,14 @@ a fix only (Fixed).
 
 ## [Unreleased]
 
+### Changed
+
+- `status` prints its `size` and `mtime` tags with a direction suffix —
+  `size+` / `mtime+` when the local side is larger / newer, `size-` /
+  `mtime-` when it is smaller / older — so the direction of a drift is
+  visible without `-v`. The sign matches the signed difference the `-v`
+  detail line shows (local minus remote).
+
 ## [0.7.0] - 2026-08-25
 
 ### Added

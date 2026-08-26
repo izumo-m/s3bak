@@ -120,9 +120,10 @@ def _fmt_mtime(mtime_ns: int, *, subsecond: bool = False) -> str:
 
 
 def _mtime_mismatch(entry_mtime_ns: int, loc_mtime_ns: int, use_color: bool) -> tuple[str, str]:
-    """Build the ("mtime", detail-line) pair for a manifest/local mtime
+    """Build the (tag, detail-line) pair for a manifest/local mtime
     mismatch, shared by the regular-file and symlink mtime checks so both
-    render identically."""
+    render identically. The tag carries the direction — ``mtime+`` = local
+    is newer — so the plain tag line agrees with the detail's signed diff."""
     diff_ns = loc_mtime_ns - entry_mtime_ns
     # A sub-second drift (e.g. WSL2 drvfs truncates a restored mtime to whole
     # seconds) renders as two identical second-precision timestamps, so show
@@ -131,10 +132,12 @@ def _mtime_mismatch(entry_mtime_ns: int, loc_mtime_ns: int, use_color: bool) -> 
     fmt_local = _fmt_mtime(loc_mtime_ns, subsecond=subsecond)
     fmt_remote = _fmt_mtime(entry_mtime_ns, subsecond=subsecond)
     if entry_mtime_ns < loc_mtime_ns:
+        tag = "mtime+"
         cmp = "<"
         remote_disp = fmt_remote
         local_disp = _color_wrap(fmt_local, use_color)
     else:
+        tag = "mtime-"
         cmp = ">"
         remote_disp = _color_wrap(fmt_remote, use_color)
         local_disp = fmt_local
@@ -146,7 +149,7 @@ def _mtime_mismatch(entry_mtime_ns: int, loc_mtime_ns: int, use_color: bool) -> 
         diff_str = _humanize_duration(
             loc_mtime_ns // 1_000_000_000 - entry_mtime_ns // 1_000_000_000
         )
-    return "mtime", f"mtime: remote={remote_disp} {cmp} local={local_disp} ({diff_str})"
+    return tag, f"mtime: remote={remote_disp} {cmp} local={local_disp} ({diff_str})"
 
 
 def mode_differs(entry: ManifestEntry, st: os.stat_result) -> bool:
@@ -169,7 +172,9 @@ def mode_differs(entry: ManifestEntry, st: os.stat_result) -> bool:
 @dataclass
 class EntryDiff:
     status: str | None  # None=match, "M"=modified (a type change included), "D"=nothing local
-    tags: list[str]  # ["mode", "mtime", "size", "link"]
+    # ["mode", "mtime+", "size-", "link", "type"]; size and mtime carry the
+    # direction of the drift as a +/- suffix (the sign of local - remote).
+    tags: list[str]
     details: list[str]  # human-readable per-field detail lines
 
     @property
@@ -274,12 +279,13 @@ def compare_to_stat(
         loc_size = st.st_size
         if entry.size is not None and loc_size != entry.size:
             diff.status = "M"
-            diff.tags.append("size")
             if entry.size < loc_size:
+                diff.tags.append("size+")
                 cmp = "<"
                 remote_disp = str(entry.size)
                 local_disp = _color_wrap(str(loc_size), use_color)
             else:
+                diff.tags.append("size-")
                 cmp = ">"
                 remote_disp = _color_wrap(str(entry.size), use_color)
                 local_disp = str(loc_size)
