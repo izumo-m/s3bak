@@ -23,6 +23,9 @@ from typing import TYPE_CHECKING
 
 from s3bak import localwalk, manifest
 from s3bak.compare import (
+    CONFLICT_CONTENT,
+    CONFLICT_OBJECT,
+    CONFLICT_SIZE,
     _diff_color_flag,
     _fmt_mtime,
     _resolve_use_color,
@@ -30,6 +33,9 @@ from s3bak.compare import (
     compare_to_stat,
     format_diff_block,
     mode_differs,
+    ordered_side,
+    tie_conflict,
+    warn_conflict,
 )
 from s3bak.config import Config, Opts
 from s3bak.confirm import (
@@ -43,6 +49,7 @@ from s3bak.console import IS_WINDOWS, console, is_junction, normalize_local_path
 from s3bak.excludes import Excludes
 from s3bak.manifest import ManifestEntry
 from s3bak.restore import (
+    _lstat_readlink,
     apply_manifest,
     fs_alias_key,
     local_keyed,
@@ -57,6 +64,7 @@ from s3bak.restore import (
 from s3bak.store import ObjectMeta
 from s3bak.syncops import (
     PushJournal,
+    UpdateFilter,
     download_from_s3,
     download_manifest,
     drop_subtree_records,
@@ -536,6 +544,8 @@ def _push_sub(
                 delete_mode=opts.delete and is_dir_sub,
                 object_delete=plan.lane if is_dir_sub else None,
                 record_delete=plan.record_delete,
+                update=opts.update,
+                verbose=opts.verbose,
             )
             # False until the journal's stream truly completed: a sync that
             # errored or an exception mid-push parks the cursor mid-manifest,
@@ -560,7 +570,7 @@ def _push_sub(
                     rel_acc = part if rel_acc is None else f"{rel_acc}/{part}"
                     if ex.excluded(f"{rel_acc}/", os.path.abspath(acc).replace(os.sep, "/") + "/"):
                         continue
-                    journal.record_ancestor(rel_acc, os.lstat(acc))
+                    journal.record_ancestor(rel_acc, os.lstat(acc), acc)
 
                 if is_link:
                     # symlink: upload nothing; the manifest record IS the backup.
@@ -623,6 +633,17 @@ def _push_sub(
         os.unlink(manifest_path)
 
 
+def _single_file_record(manifest_path: str, target: str) -> ManifestEntry | None:
+    """The regular-file record for this single-file entry's configured
+    basename in its already-downloaded (file-shaped) manifest, or None when
+    the manifest names an older basename or records a symlink."""
+    basename = os.path.basename(target)
+    for m in manifest.iter_manifest(manifest_path):
+        if m.path == basename and m.sym_target is None and m.is_file:
+            return m
+    return None
+
+
 def _single_file_compare(
     cfg: Config, entry: str, target: str, opts: Opts, manifest_path: str | None
 ) -> tuple[bool, bool]:
@@ -630,7 +651,8 @@ def _single_file_compare(
     the entry's one-record manifest (or EtagComparison under --checksum).
     ``manifest_path`` is the caller's already-downloaded manifest (file-shaped -
     the kind guard ran), or None when the entry has none on S3.
-    Returns ``(needs_upload, mode_drifted)``.
+    Returns ``(needs_upload, refresh_manifest)``: whether to upload, and -
+    when not - whether the one record is stale and wants rewriting anyway.
 
     Upload unless the manifest holds a regular-file record for exactly this
     basename, the local stat matches it, AND the S3 object exists at the
@@ -639,44 +661,80 @@ def _single_file_compare(
     one at the wrong size; only this head-object probe can see either (a dir
     entry self-heals via the sync listing; a single file has no listing).
 
-    ``mode_drifted`` reports a permission-only drift against that record when
-    no upload is needed, so the caller refreshes just the manifest - the same
-    record is already in hand, costing no extra S3 call. The --checksum path
-    never sets it (its ETag decision reads no manifest here);
-    _single_file_manifest_matches covers mode there."""
+    ``refresh_manifest`` covers a permission-only drift against the record
+    (the same record is already in hand, costing no extra S3 call) and, under
+    --checksum, everything its ETag decision cannot see: a missing manifest,
+    an older configured basename, or a stale mode / size+mtime on a
+    content-equal file - the self-healing the default push gets from its
+    re-transfer.
+
+    Under -u (``_single_file_compare_update``) the record's mtime orders the
+    two sides (docs/sync.md)."""
     assert cfg.store is not None
-    if opts.checksum:
-        return cfg.store.needs_upload(entry, target, verbose=opts.verbose), False
-    if manifest_path is None:
+    window_ns = cfg.window_ns_for(entry)
+    record = _single_file_record(manifest_path, target) if manifest_path is not None else None
+    if record is None:
+        if opts.checksum:
+            return cfg.store.needs_upload(entry, target, verbose=opts.verbose), True
         return True, False
     st = os.lstat(target)
-    basename = os.path.basename(target)
-    for m in manifest.iter_manifest(manifest_path):
-        if m.path == basename and m.sym_target is None and m.is_file:
-            if not m.matches_stat(st, cfg.window_ns_for(entry)):
-                return True, False
-            head = cfg.store.head_object(entry, verbose=opts.verbose)
-            if head is None or head.size != m.size:
-                return True, False
-            return False, mode_differs(m, st)
-    return True, False
+    if opts.update:
+        return _single_file_compare_update(cfg, entry, target, opts, record, st, window_ns)
+    if opts.checksum:
+        needs_upload = cfg.store.needs_upload(entry, target, verbose=opts.verbose)
+        return needs_upload, mode_differs(record, st) or not record.matches_stat(st, window_ns)
+    if not record.matches_stat(st, window_ns):
+        return True, False
+    head = cfg.store.head_object(entry, verbose=opts.verbose)
+    if head is None or head.size != record.size:
+        return True, False
+    return False, mode_differs(record, st)
 
 
-def _single_file_manifest_matches(manifest_path: str, target: str, window_ns: int) -> bool:
-    """Whether the already-downloaded manifest describes this single-file
-    entry's current state: the record names the configured basename, its
-    permission bits match, AND its size+mtime match (within ``window_ns``).
-
-    The size+mtime part keeps --checksum's manifest self-healing on par with the
-    default push: a content-equal file whose mtime drifted out of the window
-    still refreshes the record, so status settles and pull restores the current
-    mtime, instead of the manifest staying stale forever (--checksum never
-    re-transfers a content-equal file)."""
-    record = next(manifest.iter_manifest(manifest_path))
-    if record.path != os.path.basename(target):
-        return False
-    st = os.lstat(target)
-    return not mode_differs(record, st) and record.matches_stat(st, window_ns)
+def _single_file_compare_update(
+    cfg: Config,
+    entry: str,
+    target: str,
+    opts: Opts,
+    record: ManifestEntry,
+    st: os.stat_result,
+    window_ns: int,
+) -> tuple[bool, bool]:
+    """``_single_file_compare`` under -u, the single-file shape of
+    ``PushJournal``'s rule: a newer local side uploads (or, content-equal
+    under --checksum, just re-records); a newer record is kept as it is; a
+    tie is a conflict when the size (content under --checksum) or the mode
+    differs. The stored object is probed before the two sides are ordered,
+    as the directory lane's listing is: a missing object re-uploads (the
+    self-heal the create lane gives a recorded file), one at another size
+    than its record is a conflict - the record describes neither side."""
+    assert cfg.store is not None
+    head = cfg.store.head_object(entry, verbose=opts.verbose)
+    if head is None:
+        return True, opts.checksum
+    if head.size != record.size:
+        warn_conflict(CONFLICT_OBJECT, target)
+        return False, False
+    side = ordered_side(record, st, window_ns)
+    if side == "local" and not opts.checksum:
+        return True, False
+    if side == "record":
+        if opts.verbose:
+            console.diag(f"skip (backup is newer): {target}\n")
+        return False, False
+    differs: str | None = None
+    if opts.checksum:
+        content_differs = cfg.store.etag_checker()(target, head.size, head.etag)
+        if side == "local":
+            return content_differs, True
+        if content_differs:
+            differs = CONFLICT_CONTENT
+    elif st.st_size != record.size:
+        differs = CONFLICT_SIZE
+    reason = tie_conflict(record, st, None, differs=differs)
+    if reason is not None:
+        warn_conflict(reason, target)
+    return False, False
 
 
 def _migrate_entry_kind(cfg: Config, entry: str, to_dir: bool, opts: Opts) -> int:
@@ -830,6 +888,8 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                     delete_mode=opts.delete,
                     object_delete=plan.lane,
                     record_delete=plan.record_delete,
+                    update=opts.update,
+                    verbose=opts.verbose,
                 )
                 sync_ok = False
                 try:
@@ -899,7 +959,7 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             finally:
                 os.unlink(journal_path)
         else:
-            needs_upload, mode_drifted = _single_file_compare(
+            needs_upload, refresh_manifest = _single_file_compare(
                 cfg, entry, target, opts, manifest_path if have_manifest else None
             )
             if needs_upload:
@@ -915,16 +975,6 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                         return result.returncode
                     results = result.results
                 refresh_manifest = results > 0
-            else:
-                if opts.checksum:
-                    # ETag equality can skip an already-present data object even
-                    # when its manifest was deleted, still names an older
-                    # configured basename, or records a stale mode / mtime.
-                    refresh_manifest = not have_manifest or not _single_file_manifest_matches(
-                        manifest_path, target, cfg.window_ns_for(entry)
-                    )
-                else:
-                    refresh_manifest = mode_drifted
             if opts.delete:
                 # A single-file entry has no sync listing, so its --delete lane
                 # is this explicit sweep of entry/ (see _delete_file_entry_strays).
@@ -1000,6 +1050,9 @@ def _manifest_matches_local(
     """True iff every manifest record the pull would touch matches the local
     filesystem. Excluded records are outside the comparison - the pull skips
     them in full (docs/excludes.md) - so they cannot hold the gate open.
+    Under -u a newer local side is a difference like any other: the lanes
+    decide it (and report the skip under -v, or a drifted object), never
+    this gate.
 
     Returning True means 'boto3-s3 sync' would copy nothing AND apply_manifest
     would change nothing - so both can be skipped.
@@ -1019,21 +1072,28 @@ def _manifest_matches_local(
             anchor = os.path.abspath(target).replace(os.sep, "/") + ("/" if entry.is_dir else "")
             if ex.excluded(key, anchor):
                 continue
-        if not compare_to_local(entry, target, window_ns=window_ns).is_match:
+        st, local_sym = _lstat_readlink(target)
+        if not compare_to_stat(entry, st, local_sym, window_ns=window_ns).is_match:
             return False
     return True
 
 
 def _pull_exclude_lanes(
-    ex: Excludes, sub: str | None, outpath: str, compare: PairFilter
+    ex: Excludes,
+    sub: str | None,
+    outpath: str,
+    compare: PairFilter,
+    create_inner: FileFilter | None = None,
 ) -> tuple[FileFilter, PairFilter]:
     """Veto excluded keys in pull's download lanes (docs/excludes.md): a
     create-lane key under an excluded path is never downloaded, and an
     excluded both-sides pair is left untouched without consulting the
     stat/content compare (whose streaming cursor self-heals over keys it is
-    not asked about). Keys are re-anchored at the entry root, where the
-    patterns are defined; anchored (absolute) patterns match the restore
-    destination's absolute path - aws-cli's join-onto-root semantics."""
+    not asked about; ``create_inner``, -u's create-lane decision, shares
+    that cursor and is skipped the same way). Keys are re-anchored at the
+    entry root, where the patterns are defined; anchored (absolute) patterns
+    match the restore destination's absolute path - aws-cli's join-onto-root
+    semantics."""
 
     def excluded_key(compare_key: str) -> bool:
         key = f"{sub}/{compare_key}" if sub else compare_key
@@ -1042,7 +1102,9 @@ def _pull_exclude_lanes(
 
     def create(info: FileInfo) -> bool:
         assert info.compare_key is not None  # the sync stamps every listed entry
-        return not excluded_key(info.compare_key)
+        if excluded_key(info.compare_key):
+            return False
+        return create_inner is None or create_inner(info)
 
     def update(pair: SyncPair) -> bool:
         if excluded_key(pair.compare_key):
@@ -1144,6 +1206,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             is_dir = kind == "dir"
             has_data = kind in ("file", "dir")
         else:
+            kind = "dir" if entry_is_dir else "file"
             is_dir = entry_is_dir
             has_data = True
 
@@ -1196,6 +1259,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                     opts=opts,
                     entry=entry,
                     window_ns=window_ns,
+                    update=opts.update,
                 )
             return 0
 
@@ -1220,12 +1284,14 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         # ordinary part of the repair) - so the outer finally's restore below
         # is skipped there and only fires on a path that never got that far.
         prep_repaired = False
+        update_spool: str | None = None  # -u's per-key decisions, sync -> apply
+        root_conflict = False  # the restore root is of another kind than its record
         if has_data and os.path.lexists(outpath):
             if is_dir:
-                conflict = os.path.islink(outpath) or not os.path.isdir(outpath)
+                root_conflict = os.path.islink(outpath) or not os.path.isdir(outpath)
             else:
-                conflict = not stat_mod.S_ISREG(os.lstat(outpath).st_mode)
-            if conflict:
+                root_conflict = not stat_mod.S_ISREG(os.lstat(outpath).st_mode)
+            if root_conflict:
                 if opts.dryrun:
                     console.out(f"(dry-run) would replace {outpath} (conflicting type)\n")
                 else:
@@ -1255,23 +1321,76 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             # symlinked restore root and chmod a file outside the destination. A
             # staged pull downloads into a fresh stage, where nothing needs prep
             # (and the conflicting root itself must not be walked into).
+            # -u orders each pair against the tree at outpath. A staged pull has
+            # no such tree: the download lands in an empty stage, so nothing
+            # there can be "newer" - the conflicting root is replaced whole,
+            # as without -u (docs/sync.md). Judged by the conflict, not the
+            # stage: a dry run stages nothing, and must preview the same run.
+            # A single-file entry has no sync lanes to decide in; its one
+            # verdict is taken here, before the Windows writable prep below
+            # changes the very mode it judges.
+            use_update = opts.update and not root_conflict
+            single_verdict = "download"
+            if use_update and has_data and not is_dir:
+                single_verdict = _single_file_pull_verdict(
+                    cfg, entry, manifest_path, outpath, sub, window_ns, opts
+                )
+                if single_verdict == "keep":
+                    return 0
+
+            prep_modes: dict[str, int] | None = None
             if IS_WINDOWS and not opts.dryrun and stage_dir is None:
                 prep = windows_collect_writable_prep(outpath, is_dir, manifest_path, sub)
+                if use_update:
+                    # -u judges a file's permission bits and then leaves kept
+                    # files to themselves - which the apply never re-chmods -
+                    # so both get the modes from before the prep.
+                    prep_modes = {os.path.abspath(path): mode for path, mode in prep}
 
             changed = False
-            if has_data:
+            if has_data and single_verdict == "apply":
+                # --checksum found the single file's content equal and only
+                # its recorded mtime or mode newer: nothing to download, but
+                # the metadata apply below has work.
+                changed = True
+            elif has_data:
                 # The compare only matters for the dir sync; a single-file transfer
                 # always happens (we only reach it on a manifest mismatch). Its
                 # size (from the manifest) routes a large file through multipart.
                 dest = os.path.join(stage_dir, "new") if stage_dir is not None else outpath
-                compare = sync_compare(cfg, opts, entry, manifest_path, sub=sub) if is_dir else None
+                compare: PairFilter | None = None
+                update_filter: UpdateFilter | None = None
                 create: bool | FileFilter = True
+                if is_dir:
+                    if use_update:
+                        assert cfg.store is not None
+                        spool_fd, update_spool = tempfile.mkstemp(suffix=".decisions")
+                        os.close(spool_fd)
+                        update_filter = UpdateFilter(
+                            manifest.iter_compare_records(manifest_path, sub=sub),
+                            window_ns=window_ns,
+                            spool_path=update_spool,
+                            outpath=outpath,
+                            verbose=opts.verbose,
+                            content=cfg.store.content_compare() if opts.checksum else None,
+                            prep_modes=prep_modes,
+                        )
+                        compare = update_filter
+                        create = update_filter.create
+                    else:
+                        compare = sync_compare(cfg, opts, entry, manifest_path, sub=sub)
                 pair_filter = compare
                 if is_dir and excludes and compare is not None:
                     # Anchored at OUTPATH, the final destination - on a staged
                     # pull the sync writes into the stage, but absolute
                     # patterns are defined against where the tree ends up.
-                    create, pair_filter = _pull_exclude_lanes(ex, sub, outpath, compare)
+                    create, pair_filter = _pull_exclude_lanes(
+                        ex,
+                        sub,
+                        outpath,
+                        compare,
+                        update_filter.create if update_filter is not None else None,
+                    )
                 file_size = None if is_dir else _single_file_size(manifest_path)
                 try:
                     rc, changed = download_from_s3(
@@ -1351,6 +1470,18 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                     console.out(f"(dry-run) would apply manifest metadata: {outpath}\n")
                 st = 0
             else:
+                # A single file's -u verdict was taken above, so its apply
+                # settles the download it decided on, like any download; a
+                # symlink or special-file sub-path has no download and takes
+                # the apply's own -u rule - against a local path of its
+                # recorded kind only: it is its own restore root, and a root
+                # of another kind takes the plain apply - a symlink record
+                # replaces it, a special-file record refuses it (pull never
+                # creates one) - as staging replaces a conflicting data root.
+                apply_update = use_update and is_dir
+                if use_update and not has_data:
+                    root_st, _root_sym = _lstat_readlink(outpath)
+                    apply_update = root_st is not None and _is_kind(root_st, kind)
                 st = apply_manifest(
                     outpath,
                     is_dir,
@@ -1358,6 +1489,9 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                     sub=sub,
                     window_ns=window_ns,
                     excludes=excludes,
+                    update=apply_update,
+                    decisions=update_spool,
+                    prep_modes=prep_modes,
                 )
                 if st == 0:
                     # A clean apply already re-chmod'd every prepped path to its
@@ -1387,6 +1521,8 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                         opts=opts,
                         entry=entry,
                         window_ns=window_ns,
+                        update=use_update,
+                        decisions=update_spool,
                     )
 
             # Any non-zero exit after a staged swap - the metadata apply OR the
@@ -1428,6 +1564,8 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             # never double up with another restore.
             if IS_WINDOWS and not prep_repaired:
                 windows_restore_modes(prep)
+            if update_spool is not None:
+                os.unlink(update_spool)
             if stage_dir is not None:
                 # Preserve the stage ONLY while it actually holds the stranded old
                 # root (the swap did not cleanly retire or roll it back); on
@@ -1445,6 +1583,81 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         return 1
     finally:
         os.unlink(manifest_path)
+
+
+def _is_kind(st: os.stat_result, kind: str) -> bool:
+    """Whether a local lstat is of the manifest kind ``_sub_kind_from_manifest``
+    names: file, dir, symlink, or special (anything else)."""
+    if kind == "symlink":
+        return stat_mod.S_ISLNK(st.st_mode)
+    if kind == "dir":
+        return stat_mod.S_ISDIR(st.st_mode)
+    if kind == "file":
+        return stat_mod.S_ISREG(st.st_mode)
+    return not (
+        stat_mod.S_ISLNK(st.st_mode) or stat_mod.S_ISDIR(st.st_mode) or stat_mod.S_ISREG(st.st_mode)
+    )
+
+
+def _single_file_pull_verdict(
+    cfg: Config,
+    entry: str,
+    manifest_path: str,
+    outpath: str,
+    sub: str | None,
+    window_ns: int,
+    opts: Opts,
+) -> str:
+    """pull -u's one verdict for a single-file entry or a file sub-path,
+    reached only past the no-op gate (so something differs), the single-file
+    shape of ``UpdateFilter``'s rule: ``"download"`` when the record is the
+    newer side or nothing is local; ``"keep"`` for a newer local file (a
+    skip line under -v) and for a conflict, warned - a tie with a size
+    (content under --checksum) or mode difference, or a stored object that
+    no longer matches its record; ``"apply"`` when --checksum finds the
+    content equal under a newer record, so only the metadata is behind. The
+    root's kind already agrees (a conflicting root bypasses -u and is
+    replaced whole, staged on a real run)."""
+    assert cfg.store is not None
+    record: ManifestEntry | None = None
+    for m in manifest.iter_manifest(manifest_path):
+        if sub is None or m.path == f"./{sub}":
+            record = m
+            break
+    if record is None or not record.is_file:
+        return "download"
+    try:
+        st = os.lstat(outpath)
+    except OSError:
+        return "download"
+    # The stored object is probed before the two sides are ordered, as the
+    # directory lane's listing is: one that no longer matches its record is
+    # a conflict whichever side is newer.
+    head = cfg.store.head_object(f"{entry}/{sub}" if sub else entry, verbose=opts.verbose)
+    if head is None:
+        return "download"  # the lane reports the missing object
+    if head.size != record.size:
+        warn_conflict(CONFLICT_OBJECT, outpath)
+        return "keep"
+    side = ordered_side(record, st, window_ns)
+    if side == "local":
+        if opts.verbose:
+            console.diag(f"skip (local is newer): {outpath}\n")
+        return "keep"
+    differs: str | None = None
+    if opts.checksum:
+        if cfg.store.etag_checker()(outpath, head.size, head.etag):
+            differs = CONFLICT_CONTENT
+        elif side == "record":
+            return "apply"
+    elif record.size is not None and st.st_size != record.size:
+        differs = CONFLICT_SIZE
+    if side == "record":
+        return "download"
+    reason = tie_conflict(record, st, None, differs=differs)
+    if reason is not None:
+        warn_conflict(reason, outpath)
+    return "keep"
 
 
 def _single_file_size(manifest_path: str) -> int | None:
@@ -1570,16 +1783,22 @@ def _mirror_extras(
     opts: Opts,
     entry: str,
     window_ns: int,
+    update: bool = False,
+    decisions: str | None = None,
 ) -> int:
     """pull ``--delete``'s extras removal, followed by a directory-metadata
     re-settle: every removal bumps its parent directory's mtime, so when
     anything was actually removed the manifest metadata is applied once more -
     the gated apply touches exactly the directories the removals dirtied.
-    Skipped under --dry-run, which never applies metadata."""
+    Under -u the sync's ``decisions`` spool reaches this pass too, so a file
+    the sync kept stays kept; every directory counts as dirtied here
+    (``settle_all_dirs``): which ones the removals touched is not tracked,
+    and a directory mtime settled to its record costs nothing. Skipped under
+    --dry-run, which never applies metadata."""
     status, removed = _delete_extras(manifest_path, outpath, sub, excludes, opts=opts, entry=entry)
     if removed and not opts.dryrun:
-        # warn_stale=False: the pull's first apply already warned about any
-        # stale records; the re-settle must not repeat those warnings.
+        # report=False: the pull's first apply already warned about any
+        # stale records or conflicts; the re-settle must not repeat them.
         settle = apply_manifest(
             outpath,
             True,
@@ -1587,7 +1806,10 @@ def _mirror_extras(
             sub=sub,
             window_ns=window_ns,
             excludes=excludes,
-            warn_stale=False,
+            report=False,
+            update=update,
+            decisions=decisions,
+            settle_all_dirs=True,
         )
         status = status or settle
     return status

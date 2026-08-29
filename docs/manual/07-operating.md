@@ -143,6 +143,83 @@ open the files, run the program, load the database dump. A quarterly drill is
 enough; run one whenever entries, excludes, or the bucket policy change, since
 those are the changes that quietly alter what is in the backup.
 
+## Sharing an entry between machines
+
+An entry that lives on more than one machine — `~/bin` on a laptop and on a
+desktop, say — gets edited on both, and a plain `push` or `pull` is the wrong
+tool for bringing the two together: each is a mirror, and mirrors overwrite.
+A push from the machine that did not edit `prog1` replaces the other
+machine's newer `prog1`; a pull onto the machine that edited `prog2`
+replaces its `prog2` with the older backup.
+
+`-u` (`--update`) makes both commands take only the newer side of each
+path, judged by its modification time against the one the manifest recorded
+([Command reference](05-command-reference.md)). Run both directions on each
+machine, in either order:
+
+```sh
+s3bak pull -u bin; s3bak push -u bin
+```
+
+`;` rather than `&&`: a conflict makes the first command exit 2, and the
+second should still run. On the laptop, the pull brings down the desktop's
+newer files and the push sends up the laptop's; the same two commands on the
+desktop finish the exchange, and a third round on either machine is silent.
+Per path, the newest edit wins, whichever machine made it.
+
+What the rule does, path by path:
+
+| Path | `push -u` | `pull -u` |
+| --- | --- | --- |
+| a regular file | uploads when the local copy is newer; a newer record is kept as it is | restores when the record is newer; a newer local file is left alone in full |
+| a symlink | the same, by the link's own modification time where the platform keeps one; on Windows a changed target is always a conflict | the same |
+| a directory | re-records its permission bits and modification time when the local ones are newer | applies them when the record is newer; a directory the pull wrote into is settled to the record either way |
+| present on one side only | uploaded, as always | restored, as always |
+| the same modification time, something else different | a conflict: warned, left alone on both sides, exit 2 | the same |
+
+### Conflicts
+
+A conflict is a difference the rule cannot order: the two sides carry the
+same modification time (within `mtime_window`) yet differ in size, in
+content under `--checksum`, in permission bits (`chmod` does not change a
+modification time), or in a symlink's target. Nothing is transferred and
+nothing is recorded; the warning names the path:
+
+```console
+$ s3bak push -u bin
+warning: conflict - same mtime, size differs; skipped (touch the copy to keep): /home/you/bin/prog1
+```
+
+Resolve it by making the copy that should win the newer one — `touch` it on
+that machine and run the two commands again — or by naming the path in a
+plain command, which mirrors it: `s3bak push bin/prog1` sends this machine's
+copy up, `s3bak pull bin/prog1` brings the backup's down.
+
+### What `-u` does not do
+
+- **Deletions do not travel.** A file deleted on one machine is still in the
+  backup, so the next `pull -u` there brings it back. To delete for good, run
+  `push --delete` on one machine, then `pull --delete` on every other machine
+  *before* its next `push -u` — otherwise that machine uploads its copy again.
+  [Deleting safely](06-deleting-safely.md) has the prompts.
+- **A stale tree resurrects its leftovers.** A machine whose copy of the
+  entry is old — scripts deleted elsewhere long ago, still present here —
+  uploads them on its first `push -u`. Bring such a machine in line with a
+  plain `pull --delete` once, then switch to `-u`.
+- **Clocks decide.** The rule is only as good as the machines' clocks. Keep
+  them synchronized; WSL2 in particular can fall behind the host after a
+  sleep, and an edit made on a slow clock loses to an older one.
+- **A mirror push still mirrors.** A plain `push` from a machine that has not
+  pulled sends its older copies over the newer ones. A later `pull -u;
+  push -u` on the other machine sets that right, and bucket versioning keeps
+  the overwritten objects, but the window is real: keep shared entries out
+  of a scheduled mirror push. A [group](05-command-reference.md#groups) of
+  the shared entries under `-u` and another of the rest under a plain push
+  keeps the two apart.
+- **One command at a time.** Two machines running s3bak against the same
+  entry at once is the concurrent run the [scope](01-introduction.md) rules
+  out; stagger the schedules, or keep the exchange manual.
+
 ## Running unattended
 
 ### cron

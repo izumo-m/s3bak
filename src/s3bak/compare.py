@@ -17,8 +17,9 @@ import stat as stat_mod
 import subprocess
 import sys
 from dataclasses import dataclass
+from typing import Literal
 
-from s3bak.console import IS_WINDOWS
+from s3bak.console import IS_WINDOWS, console
 from s3bak.manifest import ManifestEntry
 
 _ANSI_GREEN = "\033[1;32m"
@@ -152,21 +153,105 @@ def _mtime_mismatch(entry_mtime_ns: int, loc_mtime_ns: int, use_color: bool) -> 
     return tag, f"mtime: remote={remote_disp} {cmp} local={local_disp} ({diff_str})"
 
 
-def mode_differs(entry: ManifestEntry, st: os.stat_result) -> bool:
+def mode_differs(
+    entry: ManifestEntry, st: os.stat_result, *, local_mode: int | None = None
+) -> bool:
     """Whether the record's permission bits differ from the local stat's.
 
     The shared mode predicate: ``status``'s mode report and push's
     manifest-refresh check both use it, so a push settles exactly the mode
     differences ``status`` shows. Callers skip symlink records (their
-    permission bits are compared nowhere)."""
-    if stat_mod.S_IMODE(st.st_mode) == entry.perm_bits:
+    permission bits are compared nowhere). ``local_mode`` stands in for
+    ``st.st_mode`` where the caller knows the file's mode before a Windows
+    pull's writable prep changed it (restore.py)."""
+    mode = st.st_mode if local_mode is None else local_mode
+    if stat_mod.S_IMODE(mode) == entry.perm_bits:
         return False
     if IS_WINDOWS:
         # Windows-native Python (incl. msys2 UCRT64) reports synthetic modes
         # via os.stat: 0o666 for writable files, 0o444 for read-only - not
         # the Unix permission bits. Only the owner-write bit is meaningful.
-        return (entry.perm_bits & 0o200) != (st.st_mode & 0o200)
+        return (entry.perm_bits & 0o200) != (mode & 0o200)
     return True
+
+
+# --- the -u rule: the newer side wins (docs/sync.md) -------------------------
+
+Side = Literal["local", "record", "tie"]
+
+
+def newer_side(entry_mtime_ns: int | None, local_mtime_ns: int, window_ns: int) -> Side:
+    """Which side a ``-u`` decision favours: ``"local"`` when the local mtime
+    is newer than the record's by more than ``window_ns``, ``"record"`` when
+    the record's is newer, ``"tie"`` inside the window - and for a record
+    with no mtime, since nothing can be ordered against it. A tie with a
+    difference is a conflict, never a silent pick.
+
+    The tie clause is the same ``abs(...) <= window_ns`` that ``matches_stat``
+    and ``compare_to_stat`` apply, so ``status``'s ``mtime+`` / ``mtime-``
+    tags and the -u decisions never disagree on which side is newer."""
+    if entry_mtime_ns is None or abs(local_mtime_ns - entry_mtime_ns) <= window_ns:
+        return "tie"
+    return "local" if local_mtime_ns > entry_mtime_ns else "record"
+
+
+# The reasons a -u conflict is reported with. Each names the difference the
+# rule saw on a tie (or the reason it could not judge the direction at all).
+CONFLICT_SIZE = "same mtime, size differs"
+CONFLICT_CONTENT = "same mtime, content differs"
+CONFLICT_MODE = "same mtime, mode differs"
+CONFLICT_TYPE = "same mtime, type differs"
+CONFLICT_LINK = "same mtime, link target differs"
+CONFLICT_LINK_NO_MTIME = "link target differs (link mtimes are not compared on this platform)"
+CONFLICT_UNRECORDED = "not recorded in the manifest"
+CONFLICT_OBJECT = "stored object does not match the record"
+
+
+def warn_conflict(reason: str, path: str) -> None:
+    """Report a -u conflict: a pair the newer-side rule cannot order, with a
+    difference it must not pick a side for. The pair is left as it is on
+    both sides; the warning is counted, so the run exits 2. ``touch`` the
+    copy that should win and run again, or name the path in a plain
+    ``push`` / ``pull``, which mirrors it."""
+    console.warn(f"warning: conflict - {reason}; skipped (touch the copy to keep): {path}")
+
+
+def ordered_side(entry: ManifestEntry, st: os.stat_result, window_ns: int) -> Side:
+    """``newer_side`` for a whole record: which side of a pair the -u rule
+    favours. A local symlink on a platform that cannot set link mtimes
+    (Windows) is always a tie - its mtime is a creation time, not a fact
+    about the link - and anything else is ordered by its mtime."""
+    if stat_mod.S_ISLNK(st.st_mode) and not SYMLINK_MTIME_SUPPORTED:
+        return "tie"
+    return newer_side(entry.mtime_ns, st.st_mtime_ns, window_ns)
+
+
+def tie_conflict(
+    entry: ManifestEntry,
+    st: os.stat_result,
+    local_sym: str | None,
+    *,
+    differs: str | None = None,
+    local_mode: int | None = None,
+) -> str | None:
+    """On a tie, the first difference the -u rule cannot order - the conflict
+    reason to report - or None when the two sides agree. The order is fixed
+    here for every caller, so one state reports one reason wherever it is
+    met: the recorded kind, then a symlink's target, then whatever the
+    caller compared on its own (``differs`` names it: ``CONFLICT_SIZE``, or
+    ``CONFLICT_CONTENT`` under --checksum), then the permission bits - never
+    a symlink's, which are compared nowhere."""
+    if stat_mod.S_IFMT(entry.mode) != stat_mod.S_IFMT(st.st_mode):
+        return CONFLICT_TYPE
+    if stat_mod.S_ISLNK(st.st_mode):
+        if (local_sym or "") != entry.sym_target:
+            return CONFLICT_LINK if SYMLINK_MTIME_SUPPORTED else CONFLICT_LINK_NO_MTIME
+        return None
+    if differs is not None:
+        return differs
+    if mode_differs(entry, st, local_mode=local_mode):
+        return CONFLICT_MODE
+    return None
 
 
 @dataclass
@@ -222,12 +307,14 @@ def compare_to_stat(
     *,
     window_ns: int,
     use_color: bool = False,
+    local_mode: int | None = None,
 ) -> EntryDiff:
     """Manifest record vs the local side's already-taken ``lstat``.
 
     ``st`` is the local lstat (None = missing) and ``local_sym`` the readlink
     target when ``st`` is a symlink - both come for free from the manifest
-    walk, so the status merge-join adds no syscalls here.
+    walk, so the status merge-join adds no syscalls here. ``local_mode`` is
+    ``mode_differs``'s: the mode to judge instead of ``st.st_mode``.
     The size + mtime part is the same check the sync's ManifestFilter
     applies (mtime within ``window_ns``), so `status` and push/pull agree on
     what counts as changed; mode is additionally compared here for the
@@ -292,8 +379,8 @@ def compare_to_stat(
             diff_str = _humanize_size_diff(loc_size - entry.size)
             diff.details.append(f"size: remote={remote_disp} {cmp} local={local_disp} ({diff_str})")
 
-    if mode_differs(entry, st):
-        loc_mode = format(stat_mod.S_IMODE(st.st_mode), "o")
+    if mode_differs(entry, st, local_mode=local_mode):
+        loc_mode = format(stat_mod.S_IMODE(st.st_mode if local_mode is None else local_mode), "o")
         diff.status = "M"
         diff.tags.append("mode")
         diff.details.append(f"mode: remote={entry.perm_str} local={loc_mode}")

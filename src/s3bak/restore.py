@@ -11,6 +11,7 @@ manifest; it does not touch S3.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import stat as stat_mod
@@ -20,7 +21,13 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
 from s3bak import localwalk, manifest
-from s3bak.compare import SYMLINK_MTIME_SUPPORTED, compare_to_stat
+from s3bak.compare import (
+    SYMLINK_MTIME_SUPPORTED,
+    compare_to_stat,
+    ordered_side,
+    tie_conflict,
+    warn_conflict,
+)
 from s3bak.confirm import DeleteConfirmer
 from s3bak.console import IS_WINDOWS, console, is_junction
 from s3bak.excludes import Excludes
@@ -496,21 +503,47 @@ class _DirFrame:
     # settling now would just be re-dirtied, so the pop below routes this
     # frame to post_symlink_dirs instead of settling it in place.
     resettle: bool = False
+    # -u only: the pull itself wrote beneath this directory (a download, a
+    # created directory, a placed symlink, a removed extra), so its mtime is
+    # this run's side effect, not a local change - settle it to the record
+    # whatever the newer-side rule would say (docs/sync.md).
+    dirty: bool = False
 
 
-def _settle_dir(target: str, m_entry: ManifestEntry, window_ns: int) -> int:
+def _settle_dir(
+    target: str,
+    m_entry: ManifestEntry,
+    window_ns: int,
+    *,
+    ordered: bool = False,
+    report: bool = True,
+) -> int:
     """Re-check one directory's mode/mtime against a fresh lstat and apply it
     if it drifted. Shared by the ancestor stack's pop-time settle (the common
     case) and the small resettle list a deferred symlink placement dirties
     again afterwards. The stream-time stat is stale by the time a directory
     is settled - its children's mutations ran after it was observed - so this
-    always re-lstats rather than trusting an earlier one."""
+    always re-lstats rather than trusting an earlier one.
+
+    ``ordered`` is -u's rule for a directory the pull did not write into: it
+    is ordered by its own mtime - a newer record is applied, a newer local
+    side is kept, and a tie with a mode difference is a conflict (reported
+    when ``report``)."""
     st, _sym = _lstat_readlink(target)
     if st is None or not stat_mod.S_ISDIR(st.st_mode):
         console.err(f"expected {m_entry.path} to be a directory: {target}")
         return 1
     if compare_to_stat(m_entry, st, None, window_ns=window_ns).is_match:
         return 0
+    if ordered:
+        side = ordered_side(m_entry, st, window_ns)
+        if side == "local":
+            return 0
+        if side == "tie":
+            reason = tie_conflict(m_entry, st, None)
+            if report and reason is not None:
+                warn_conflict(reason, target)
+            return 0
     console.out(f"{m_entry.perm_str} {target}\n")
     return 0 if _apply_meta(target, m_entry.perm_bits, m_entry.mtime_ns) else 1
 
@@ -520,6 +553,9 @@ def _pop_dir_frames(
     rel: str | None,
     post_symlink_dirs: list[tuple[str, ManifestEntry]],
     window_ns: int,
+    *,
+    update: bool = False,
+    report: bool = True,
 ) -> int:
     """Pop and settle every frame the stream has now left: everything on
     ``stack`` that is not ``rel`` itself or one of its ancestors (``rel=None``
@@ -532,20 +568,29 @@ def _pop_dir_frames(
         if frame.resettle:
             post_symlink_dirs.append((frame.target, frame.m_entry))
             continue
-        errors += _settle_dir(frame.target, frame.m_entry, window_ns)
+        errors += _settle_dir(
+            frame.target,
+            frame.m_entry,
+            window_ns,
+            ordered=update and not frame.dirty,
+            report=report,
+        )
     return errors
 
 
 @dataclass
 class _ApplyOutcome:
     """What ``apply_manifest`` must do after ``_apply_record`` handled one
-    record, beyond the error count: push a new directory frame, or flag the
+    record, beyond the error count: push a new directory frame, flag the
     record's open parent frame (the ancestor stack's top) for a
-    post-placement re-settle."""
+    post-placement re-settle, or (``mutated``) note that the record's
+    parent directory was written into - an entry created, removed, or
+    replaced - which under -u marks that frame dirtied."""
 
     errors: int
     push_dir: bool = False
     defer_symlink: bool = False
+    mutated: bool = False
 
 
 def _apply_record(
@@ -557,11 +602,26 @@ def _apply_record(
     window_ns: int,
     is_dir_entry: bool,
     deferred_symlinks: list[tuple[str, ManifestEntry]],
-    warn_stale: bool,
+    report: bool,
+    update: bool = False,
+    decision: str | None = None,
+    prep_modes: dict[str, int] | None = None,
 ) -> _ApplyOutcome:
     """Repair one manifest record against its local lstat; a record whose
     local state already matches (the shared ``compare_to_stat`` predicate) is
-    left untouched. Directory records are only structurally fixed here
+    left untouched. ``report`` False is the pull --delete re-settle, which
+    repeats no warning its first pass already gave (a stale record, a -u
+    conflict).
+
+    Under -u (``update``) the sync's spooled ``decision`` for this key comes
+    first: a kept key (``K``) is left alone in full, a downloaded key
+    (``D``) is settled to its record like any other. A key the sync did not
+    decide - it judged the pair a match, or the record has no object at all
+    (a symlink, a special file, stale residue) - is ordered by the record's
+    mtime here: a newer local side is left alone, a tie with a difference
+    is a conflict, and only a newer record is applied.
+
+    Directory records are only structurally fixed here
     (conflicting-type removal, ``makedirs``); their mode/mtime is settled by
     ``apply_manifest``'s ancestor stack after every child mutation - signaled
     back as ``push_dir=True`` so the caller pushes the frame. A symlink
@@ -572,10 +632,42 @@ def _apply_record(
     post-placement re-settle, since that deferred placement dirties the
     parent's mtime again after the stack has already settled it. On Windows, a
     symlink whose own recorded target does not exist locally yet is deferred
-    the same way - see the placement branch below."""
+    the same way - see the placement branch below.
+
+    ``prep_modes`` (Windows, -u) maps absolute paths to the modes the
+    writable prep found: the rule judges a file by that mode, and a file it
+    then leaves alone gets it back - the apply is what re-chmods prepped
+    files, and a kept file is one it would otherwise never reach."""
+    local_mode: int | None = None
+    if update and prep_modes and decision != manifest.PULL_DOWNLOADED:
+        local_mode = prep_modes.get(os.path.abspath(target))
+
+    def kept() -> _ApplyOutcome:
+        if local_mode is not None:
+            try:
+                os.chmod(target, local_mode)
+            except OSError:
+                pass  # a mode the record never asked for; nothing to report
+        return _ApplyOutcome(0)
+
+    if update and decision == manifest.PULL_KEPT:
+        return kept()
     if m_entry.sym_target is not None:
         if compare_to_stat(m_entry, st, local_sym, window_ns=window_ns).is_match:
             return _ApplyOutcome(0)
+        if update and decision is None and st is not None:
+            # No object behind a link record, so the sync never saw this key:
+            # order the two sides here, by the link's own mtime where the
+            # platform keeps one (a local file or directory at the key is
+            # the type change the same rule covers).
+            side = ordered_side(m_entry, st, window_ns)
+            if side == "local":
+                return kept()
+            if side == "tie":
+                reason = tie_conflict(m_entry, st, local_sym)
+                if report and reason is not None:
+                    warn_conflict(reason, target)
+                return kept()
         if st is not None and stat_mod.S_ISDIR(st.st_mode):
             deferred_symlinks.append((target, m_entry))
             return _ApplyOutcome(0, defer_symlink=True)
@@ -598,7 +690,8 @@ def _apply_record(
             deferred_symlinks.append((target, m_entry))
             return _ApplyOutcome(0, defer_symlink=True)
         return _ApplyOutcome(
-            0 if _place_symlink(target, st, m_entry.sym_target, m_entry.mtime_ns) else 1
+            0 if _place_symlink(target, st, m_entry.sym_target, m_entry.mtime_ns) else 1,
+            mutated=True,
         )
 
     # Symlinks are handled above; the recorded type distinguishes a
@@ -608,25 +701,47 @@ def _apply_record(
         # A file or symlink where a directory belongs is a stale conflicting
         # type; clear it so the recorded directory is what ends up there
         # (the symlink branch above clears conflicting types the same way).
+        mutated = False
         if st is not None and not stat_mod.S_ISDIR(st.st_mode):
             os.remove(target)
             st = None
+            mutated = True
         if st is None:
             os.makedirs(target, exist_ok=True)
-        return _ApplyOutcome(0, push_dir=True)
+            mutated = True
+        return _ApplyOutcome(0, push_dir=True, mutated=mutated)
 
-    if compare_to_stat(m_entry, st, local_sym, window_ns=window_ns).is_match:
-        return _ApplyOutcome(0)
+    if compare_to_stat(m_entry, st, local_sym, window_ns=window_ns, local_mode=local_mode).is_match:
+        return kept()
+    if (
+        update
+        and decision is None
+        and st is not None
+        and stat_mod.S_IFMT(st.st_mode) == stat_mod.S_IFMT(m_entry.mode)
+    ):
+        # The sync judged this pair a match (or never saw the key: a special
+        # file, or a file record whose object is gone), yet something differs:
+        # a newer local side is kept, and a tie is a conflict when the mode
+        # differs - the size check below stays a hard error, as it is one
+        # (the stored object does not match its record).
+        side = ordered_side(m_entry, st, window_ns)
+        if side == "local":
+            return kept()
+        if side == "tie" and (m_entry.size is None or st.st_size == m_entry.size):
+            reason = tie_conflict(m_entry, st, local_sym, local_mode=local_mode)
+            if report and reason is not None:
+                warn_conflict(reason, target)
+            return kept()
     if st is None:
         if m_entry.is_file:
             # Nothing local and nothing downloaded: the record's object is
             # gone (an interrupted deletion, an out-of-band delete). Stale
             # residue must not abort a restore - warn, skip the record, and
             # keep restoring; the next push retires the record
-            # (docs/sync.md, the pull pipeline). ``warn_stale`` False is the
+            # (docs/sync.md, the pull pipeline). ``report`` False is the
             # pull --delete re-settle, which already warned on its first
             # pass over the same records.
-            if warn_stale:
+            if report:
                 console.warn(
                     f"warning: no data object behind this record - skipped"
                     f" (a push retires the stale record): {target}"
@@ -667,12 +782,30 @@ def apply_manifest(
     *,
     window_ns: int,
     excludes: list[str] | None = None,
-    warn_stale: bool = True,
+    report: bool = True,
+    update: bool = False,
+    decisions: str | None = None,
+    settle_all_dirs: bool = False,
+    prep_modes: dict[str, int] | None = None,
 ) -> int:
     """Repair local state to match the manifest, touching (and reporting)
     only records whose local state differs - the shared size+mtime predicate
     plus mode, symlink target, and directory mtime. An mtime drift inside
-    ``window_ns`` is a match and stays as it is.
+    ``window_ns`` is a match and stays as it is. ``report`` False (the pull
+    --delete re-settle) repeats no warning the first pass already gave.
+
+    ``update`` is pull -u (docs/sync.md, "the newer side wins"): the sync's
+    spooled per-key decisions (``decisions``, an ``UpdateFilter`` spool in
+    stream order, merge-joined here through a one-record cursor) say which
+    files it downloaded and which it kept; every other record is ordered by
+    its own mtime here. A directory the pull wrote into - a spooled
+    download, a created directory, a placed symlink - is marked dirtied on
+    the frame stack and settled to its record like today; one it did not is
+    left alone when its local mtime is the newer one. ``settle_all_dirs``
+    treats every directory as dirtied (the --delete re-settle, whose
+    removals dirtied an untracked set of them). ``prep_modes`` is the
+    Windows writable prep's record of the modes it changed, for the rule to
+    judge by and for kept files to get back (see ``_apply_record``).
 
     A directory entry consumes one merge-join of the manifest against a fresh
     local walk. The walk filters ``excludes`` and serves purely as a stat
@@ -707,6 +840,7 @@ def apply_manifest(
     dir_stack: list[_DirFrame] = []
     post_symlink_dirs: list[tuple[str, ManifestEntry]] = []
     errors = 0
+    decided = _DecisionCursor(decisions if update else None)
     # A manifest is downloaded from S3 and may be corrupt or hostile. Only a
     # directory entry joins record-controlled paths onto outpath, so only it can
     # escape (a single-file entry always writes at outpath). Reject any record
@@ -740,84 +874,111 @@ def apply_manifest(
         anchor = os.path.abspath(target).replace(os.sep, "/") + ("/" if is_dir_rec else "")
         return ex.excluded(key, anchor)
 
-    if is_dir:
-        for _key, m, loc in manifest.merge_join(
-            manifest_keyed(manifest_path, sub), local_keyed(outpath, excludes or [], sub)
-        ):
-            # Pop (and settle) every directory frame the stream has now left,
-            # BEFORE this item is processed: the item's own rel (the manifest
-            # side when present, the local-only side otherwise) is the
-            # stream's forward progress, and proves the stack's non-ancestor
-            # suffix is done even when this particular item is not one apply
-            # touches (a local-only extra is pull --delete's lane, below).
-            if m is not None:
-                item_rel: str | None = m[0]
-            elif loc is not None:
-                item_rel = loc[0]
-            else:
-                item_rel = None
-            if item_rel is not None:
-                errors += _pop_dir_frames(dir_stack, item_rel, post_symlink_dirs, window_ns)
-            if m is None:
-                continue  # local-only: pull --delete's lane, not apply's
-            rel, m_entry = m
-            target = outpath if rel == "." else os.path.join(outpath, rel)
-            if excluded_record(rel, m_entry.is_dir, target):
-                continue  # pull never touches an excluded path
-            if loc is not None:
-                _lrel, st, local_sym = loc
-            else:
-                # The walk filters excludes, so "not walked" may mean
-                # hidden rather than missing: judge from a direct lstat.
-                if rel != "." and not within_root(root_real, target):
-                    console.err(f"manifest path escapes restore root, skipped: {m_entry.path}")
-                    errors += 1
+    try:
+        if is_dir:
+            for key, m, loc in manifest.merge_join(
+                manifest_keyed(manifest_path, sub), local_keyed(outpath, excludes or [], sub)
+            ):
+                # Pop (and settle) every directory frame the stream has now left,
+                # BEFORE this item is processed: the item's own rel (the manifest
+                # side when present, the local-only side otherwise) is the
+                # stream's forward progress, and proves the stack's non-ancestor
+                # suffix is done even when this particular item is not one apply
+                # touches (a local-only extra is pull --delete's lane, below).
+                if m is not None:
+                    item_rel: str | None = m[0]
+                elif loc is not None:
+                    item_rel = loc[0]
+                else:
+                    item_rel = None
+                if item_rel is not None:
+                    errors += _pop_dir_frames(
+                        dir_stack,
+                        item_rel,
+                        post_symlink_dirs,
+                        window_ns,
+                        update=update,
+                        report=report,
+                    )
+                if m is None:
+                    continue  # local-only: pull --delete's lane, not apply's
+                decision = decided.lookup(key)
+                rel, m_entry = m
+                target = outpath if rel == "." else os.path.join(outpath, rel)
+                if excluded_record(rel, m_entry.is_dir, target):
+                    continue  # pull never touches an excluded path
+                if loc is not None:
+                    _lrel, st, local_sym = loc
+                else:
+                    # The walk filters excludes, so "not walked" may mean
+                    # hidden rather than missing: judge from a direct lstat.
+                    if rel != "." and not within_root(root_real, target):
+                        console.err(f"manifest path escapes restore root, skipped: {m_entry.path}")
+                        errors += 1
+                        continue
+                    st, local_sym = _lstat_readlink(target)
+                outcome = _apply_record(
+                    m_entry,
+                    target,
+                    st,
+                    local_sym,
+                    window_ns=window_ns,
+                    is_dir_entry=True,
+                    deferred_symlinks=deferred_symlinks,
+                    report=report,
+                    update=update,
+                    decision=decision,
+                    prep_modes=prep_modes,
+                )
+                errors += outcome.errors
+                if (
+                    update
+                    and dir_stack
+                    and (decision == manifest.PULL_DOWNLOADED or outcome.mutated)
+                ):
+                    # The stack top is this record's nearest recorded ancestor,
+                    # the directory this write landed in (an unrecorded, excluded
+                    # directory in between is not settled at all).
+                    dir_stack[-1].dirty = True
+                if outcome.defer_symlink and dir_stack:
+                    # The current stack top is this record's nearest RECORDED
+                    # ancestor (a parent record is optional - an excluded
+                    # directory is unrecorded); the pop above already closed
+                    # everything that is not an ancestor of it. Flag it so its
+                    # pop-time settle is skipped in favor of the post-placement
+                    # re-settle below.
+                    dir_stack[-1].resettle = True
+                if outcome.push_dir:
+                    dir_stack.append(_DirFrame(rel, target, m_entry, dirty=settle_all_dirs))
+            errors += _pop_dir_frames(
+                dir_stack, None, post_symlink_dirs, window_ns, update=update, report=report
+            )
+        else:
+            for m_entry in manifest.iter_manifest(manifest_path):
+                res = manifest_target(m_entry, outpath, is_dir, sub)
+                if res is None:
                     continue
+                target, rel = res
+                # A single-file entry's one record IS the entry root (sub None):
+                # excludes never apply to it. A file/symlink SUB is judged.
+                if sub is not None and excluded_record(rel, m_entry.is_dir, target):
+                    continue  # pull never touches an excluded path
                 st, local_sym = _lstat_readlink(target)
-            outcome = _apply_record(
-                m_entry,
-                target,
-                st,
-                local_sym,
-                window_ns=window_ns,
-                is_dir_entry=True,
-                deferred_symlinks=deferred_symlinks,
-                warn_stale=warn_stale,
-            )
-            errors += outcome.errors
-            if outcome.defer_symlink and dir_stack:
-                # The current stack top is this record's nearest RECORDED
-                # ancestor (a parent record is optional - an excluded
-                # directory is unrecorded); the pop above already closed
-                # everything that is not an ancestor of it. Flag it so its
-                # pop-time settle is skipped in favor of the post-placement
-                # re-settle below.
-                dir_stack[-1].resettle = True
-            if outcome.push_dir:
-                dir_stack.append(_DirFrame(rel, target, m_entry))
-        errors += _pop_dir_frames(dir_stack, None, post_symlink_dirs, window_ns)
-    else:
-        for m_entry in manifest.iter_manifest(manifest_path):
-            res = manifest_target(m_entry, outpath, is_dir, sub)
-            if res is None:
-                continue
-            target, rel = res
-            # A single-file entry's one record IS the entry root (sub None):
-            # excludes never apply to it. A file/symlink SUB is judged.
-            if sub is not None and excluded_record(rel, m_entry.is_dir, target):
-                continue  # pull never touches an excluded path
-            st, local_sym = _lstat_readlink(target)
-            outcome = _apply_record(
-                m_entry,
-                target,
-                st,
-                local_sym,
-                window_ns=window_ns,
-                is_dir_entry=False,
-                deferred_symlinks=deferred_symlinks,
-                warn_stale=warn_stale,
-            )
-            errors += outcome.errors
+                outcome = _apply_record(
+                    m_entry,
+                    target,
+                    st,
+                    local_sym,
+                    window_ns=window_ns,
+                    is_dir_entry=False,
+                    deferred_symlinks=deferred_symlinks,
+                    report=report,
+                    update=update,
+                    prep_modes=prep_modes,
+                )
+                errors += outcome.errors
+    finally:
+        decided.close()
 
     # Symlink-over-directory replacements ran into nothing above (the lazy
     # walk may still have needed the subtree); the stream is exhausted now, so
@@ -838,9 +999,46 @@ def apply_manifest(
     # deepest-first.
     post_symlink_dirs.sort(key=lambda x: x[0], reverse=True)
     for target, m_entry in post_symlink_dirs:
-        errors += _settle_dir(target, m_entry, window_ns)
+        errors += _settle_dir(target, m_entry, window_ns, report=report)
 
     return 1 if errors else 0
+
+
+class _DecisionCursor:
+    """A one-record lookahead over pull -u's decision spool (see
+    ``syncops.UpdateFilter``): ``(marker, compare_key)`` JSON lines in the
+    sync's ascending compare-key order, which is the apply merge-join's own
+    order, so each key is asked about at most once and the cursor only ever
+    moves forward. ``None`` is the no-spool case (not a -u pull, or a
+    single-file apply) and answers nothing."""
+
+    def __init__(self, path: str | None):
+        self._lines = open(path, encoding="utf-8") if path is not None else None
+        self._head = self._next()
+
+    def _next(self) -> tuple[str, str] | None:
+        if self._lines is None:
+            return None
+        line = self._lines.readline()
+        if not line:
+            return None
+        marker, key = json.loads(line)
+        return key, marker
+
+    def lookup(self, key: str) -> str | None:
+        while self._head is not None and self._head[0] < key:
+            self._head = self._next()
+        if self._head is not None and self._head[0] == key:
+            marker = self._head[1]
+            self._head = self._next()
+            return marker
+        return None
+
+    def close(self) -> None:
+        if self._lines is not None:
+            self._lines.close()
+            self._lines = None
+        self._head = None
 
 
 # =============================================================================

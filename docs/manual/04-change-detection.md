@@ -281,6 +281,17 @@ One thing hides this. A pull whose records all match the local tree already
 returns immediately, without transferring anything at all, so a stale record
 can sit unnoticed until some other difference gives that pull work to do.
 
+### The newer side wins (`-u`)
+
+`push -u` and `pull -u` add a direction to the rule: a pair that differs is
+transferred only when the source is the newer side, by the same modification
+times the rule already compares — the record's against the local file's,
+with the tolerance counting as equal. An equal modification time with any
+other difference is a conflict, reported and left alone, because nothing
+orders it. [Command reference](05-command-reference.md) has the option;
+[Sharing an entry between machines](07-operating.md#sharing-an-entry-between-machines)
+is what it is for.
+
 ## Excludes
 
 An entry's `excludes` are glob patterns for paths to leave out. They work

@@ -21,7 +21,18 @@ from typing import IO, TYPE_CHECKING
 from boto3_s3 import LocalFileInfo, SrcOnlyPair, SyncPair
 
 from s3bak import localwalk, manifest
-from s3bak.compare import SYMLINK_MTIME_SUPPORTED, mode_differs
+from s3bak.compare import (
+    CONFLICT_CONTENT,
+    CONFLICT_OBJECT,
+    CONFLICT_SIZE,
+    CONFLICT_TYPE,
+    CONFLICT_UNRECORDED,
+    SYMLINK_MTIME_SUPPORTED,
+    mode_differs,
+    ordered_side,
+    tie_conflict,
+    warn_conflict,
+)
 from s3bak.config import Config, Opts
 from s3bak.console import console
 from s3bak.manifest import ManifestEntry
@@ -99,7 +110,8 @@ def sync_compare(
     --checksum. `manifest_path=None` (nothing on S3 yet) yields an empty
     filter, so every both-sides pair transfers. The size+mtime-check window is
     resolved for `entry`. (Push builds a `PushJournal` instead, which folds
-    the same judgment into its journal emission.)
+    the same judgment into its journal emission; pull -u builds an
+    ``UpdateFilter`` itself, which also takes the create lane - see cmd_pull.)
 
     The ManifestFilter streams the manifest file, so the caller must `close()`
     it before unlinking the temp manifest (see cmd_pull)."""
@@ -110,6 +122,166 @@ def sync_compare(
     if manifest_path is not None:
         records = manifest.iter_compare_records(manifest_path, sub=sub)
     return manifest.ManifestFilter(records, window_ns=cfg.window_ns_for(entry))
+
+
+PULL_DOWNLOADED = manifest.PULL_DOWNLOADED
+PULL_KEPT = manifest.PULL_KEPT
+
+
+class UpdateFilter(manifest.ManifestFilter):
+    """pull -u's lanes (docs/sync.md, "the newer side wins"): the
+    ``ManifestFilter`` judgment with the record's mtime ordering the two
+    sides, for both the update lane (a local regular file x its object) and
+    the create lane (an object with nothing the sync could see locally -
+    nothing at all, or a symlink or directory, which pull's destination
+    listing omits). boto3-s3 decides both lanes serially, in one ascending
+    compare-key stream, so the inherited one-record cursor serves both.
+
+    A pair downloads only when the record is the newer side; a newer local
+    side is kept in full; a tie with a difference - size (content under
+    --checksum), mode, kind, or link target - is a conflict, warned here and
+    kept. An unrecorded object over a local path, or an object that no
+    longer matches its record, cannot be ordered at all and is a conflict
+    too: -u's promise is that it never overwrites newer local work, and
+    "unknown" is not "older".
+
+    Every decision the metadata apply must honour is spooled, one JSON line
+    per key in stream order: ``D`` for a download (the apply settles the
+    file to its record whatever its stamped mtime says, and marks its parent
+    directory dirtied), ``K`` for a kept key (the apply leaves it alone -
+    a conflict was already reported here). A key the filter judged an
+    ordinary match is not spooled; the apply applies the same rule itself
+    to whatever it meets unspooled. The spool is a temp file the caller owns
+    (created before the sync, unlinked after the apply); ``close()`` flushes
+    it along with the manifest handle."""
+
+    def __init__(
+        self,
+        records: Iterator[tuple[str, ManifestEntry]],
+        *,
+        window_ns: int,
+        spool_path: str,
+        outpath: str,
+        verbose: bool,
+        content: PairFilter | None = None,
+        prep_modes: dict[str, int] | None = None,
+    ):
+        super().__init__(records, window_ns=window_ns)
+        self._spool = open(spool_path, "w", encoding="utf-8")
+        self._outpath = outpath
+        self._verbose = verbose
+        self._content = content
+        # A Windows pull adds the write bit to every read-only local file
+        # before the sync (restore.windows_collect_writable_prep); the mode
+        # the rule judges is the one from before that, keyed by absolute path.
+        self._prep_modes = prep_modes or {}
+
+    def close(self) -> None:
+        super().close()
+        self._spool.close()
+
+    def _local_mode(self, local_path: str) -> int | None:
+        return self._prep_modes.get(os.path.abspath(local_path))
+
+    def _decide(self, marker: str, compare_key: str) -> None:
+        # A key can contain a newline, so a line needs an encoding.
+        self._spool.write(json.dumps([marker, compare_key]) + "\n")
+
+    def _keep_newer(self, compare_key: str, local_path: str) -> bool:
+        self._decide(PULL_KEPT, compare_key)
+        if self._verbose:
+            console.diag(f"skip (local is newer): {local_path}\n")
+        return False
+
+    def _conflict(self, reason: str, compare_key: str, local_path: str) -> bool:
+        warn_conflict(reason, local_path)
+        self._decide(PULL_KEPT, compare_key)
+        return False
+
+    def __call__(self, pair: SyncPair) -> bool:
+        if pair.transfer_type.value != "download":
+            raise ValueError(f"UpdateFilter judges download pairs only: {pair.compare_key!r}")
+        local, remote = pair.dest, pair.src
+        key = pair.compare_key
+        local_path = local.key.replace("/", os.sep)
+        m = self._lookup(key)
+        if m is None:
+            return self._conflict(CONFLICT_UNRECORDED, key, local_path)
+        if not m.is_file:
+            # A recorded directory or symlink shadowed by an object at its key:
+            # the record is what pull restores, and the apply does that.
+            return False
+        if remote.size != m.size:
+            return self._conflict(CONFLICT_OBJECT, key, local_path)
+        st = local.stat_result if isinstance(local, LocalFileInfo) else None
+        if st is None:
+            try:
+                st = os.lstat(local_path)
+            except OSError:
+                self._decide(PULL_DOWNLOADED, key)
+                return True  # vanished between listing and compare; let sync warn
+        side = ordered_side(m, st, self.window_ns)
+        if side == "local":
+            return self._keep_newer(key, local_path)
+        differs = (
+            self._content(pair)
+            if self._content is not None
+            else not m.matches_stat(st, self.window_ns)
+        )
+        if side == "record":
+            if not differs:
+                # --checksum, content-equal: nothing to download; the apply
+                # gives the file its recorded (newer) mtime and mode.
+                return False
+            self._decide(PULL_DOWNLOADED, key)
+            return True
+        reason = tie_conflict(
+            m,
+            st,
+            None,
+            differs=(CONFLICT_CONTENT if self._content is not None else CONFLICT_SIZE)
+            if differs
+            else None,
+            local_mode=self._local_mode(local_path),
+        )
+        if reason is not None:
+            return self._conflict(reason, key, local_path)
+        return False
+
+    def create(self, info: FileInfo) -> bool:
+        """The create lane: an object the destination listing paired with
+        nothing. Nothing local downloads; a local symlink where a file is
+        recorded is the type change the rule orders by the link's own mtime
+        (a tie where link mtimes cannot be compared); a local directory is
+        never ordered against a file (the two are not a pair, docs/sync.md)
+        and takes the ordinary lane."""
+        key = info.compare_key
+        assert key is not None  # the sync stamps every listed entry
+        m = self._lookup(key)
+        local_path = os.path.join(self._outpath, key.replace("/", os.sep))
+        try:
+            st: os.stat_result | None = os.lstat(local_path)
+        except OSError:
+            st = None
+        if st is None:
+            if m is not None and not m.is_file:
+                return False  # residue at a recorded dir/link key: the apply restores the record
+            self._decide(PULL_DOWNLOADED, key)
+            return True
+        if m is None:
+            return self._conflict(CONFLICT_UNRECORDED, key, local_path)
+        if not m.is_file:
+            return False
+        if not stat_mod.S_ISLNK(st.st_mode):
+            self._decide(PULL_DOWNLOADED, key)
+            return True
+        side = ordered_side(m, st, self.window_ns)
+        if side == "local":
+            return self._keep_newer(key, local_path)
+        if side == "record":
+            self._decide(PULL_DOWNLOADED, key)
+            return True
+        return self._conflict(tie_conflict(m, st, None) or CONFLICT_TYPE, key, local_path)
 
 
 @dataclass
@@ -176,6 +348,8 @@ class PushJournal:
         delete_mode: bool = False,
         object_delete: FileFilter | None = None,
         record_delete: Callable[[str, ManifestEntry], bool] | None = None,
+        update: bool = False,
+        verbose: bool = False,
     ) -> None:
         # Binary, because a confirmed directory-record drop seeks back and
         # overwrites its placeholder's one-byte marker in place (see
@@ -196,6 +370,12 @@ class PushJournal:
         self._walker = walker
         self._sub = sub
         self._content = content
+        # -u: the newer side wins (docs/sync.md). A recorded pair copies only
+        # when the local side is the newer one; a newer record keeps its line
+        # untouched, and a tie with a difference is a conflict, warned and
+        # left alone. Skips print under -v only.
+        self._update = update
+        self._verbose = verbose
         # Whether this run's pair stream covers every S3 object in the
         # journal's range - true when the push runs a directory sync, false
         # for a single-file or symlink sub-path push, which lists nothing.
@@ -471,11 +651,16 @@ class PushJournal:
             # Kind conflict: the local non-file shields the object from the
             # delete lane (it pairs instead of orphaning), so record the local
             # side as usual and offer the object out-of-lane under --delete.
-            self._journal_nonfile(key, st, src, old)
-            if self._delete_mode:
+            # Under -u the record may win instead (a newer record, or a tie);
+            # the object then stays what the kept record does not describe,
+            # and is not offered - nothing local replaced it.
+            recorded = self._journal_nonfile(key, st, src, old)
+            if self._delete_mode and (recorded or not self._update):
                 self._record_pending_object_delete(key, old is not None and old[0].is_file)
             return False
         e = old[0] if old is not None else None
+        if self._update and e is not None:
+            return self._decide_update_newer(pair, src, st, key, e)
         if self._content is not None:
             # The content compare reads the file, and an unreadable one would
             # abort the sync with AccessDenied from inside the hash - probe
@@ -524,6 +709,61 @@ class PushJournal:
             )
         return False
 
+    def _skip_newer(self, info: FileInfo) -> None:
+        """-u left a pair alone because the backup is the newer side: not an
+        event (nothing happened), so it prints under -v only, like a request
+        trace - a quiet push still means "nothing to do"."""
+        if self._verbose:
+            console.diag(f"skip (backup is newer): {info.key}\n")
+
+    def _decide_update_newer(
+        self,
+        pair: SyncPair,
+        src: LocalFileInfo,
+        st: os.stat_result,
+        key: str,
+        e: ManifestEntry,
+    ) -> bool:
+        """The -u verdict for a local regular file whose key holds both an S3
+        object and a record (docs/sync.md, "the newer side wins"): copy and
+        re-record only when the local side is the newer one; a newer record
+        keeps its line untouched, whatever the local file looks like; a tie
+        is a conflict when anything differs - size (content under
+        --checksum), mode, or the recorded kind - and a no-op otherwise. An
+        object that no longer matches its record cannot be ordered at all
+        (the record describes neither side), so it is a conflict too."""
+        if e.is_file and pair.dest.size != e.size:
+            warn_conflict(CONFLICT_OBJECT, src.key)
+            return False
+        side = ordered_side(e, st, self._window_ns)
+        if side == "record":
+            self._skip_newer(src)
+            return False
+        if side == "local":
+            if not self._probe_readable(src):
+                return False
+            copy = self._content is None or self._content(pair)
+            # A newer local side re-records either way: under --checksum a
+            # content-equal file still carries the newer mtime and mode, the
+            # same refresh the default push's re-transfer gives it.
+            self._emit_new(manifest.JOURNAL_REPLACE, self._record_path(key, is_dir=False), st, None)
+            return copy
+        # A tie: the rule has no side to pick, so any difference is a conflict.
+        differs: str | None = None
+        if not e.is_file:
+            pass  # the kind differs: tie_conflict reports that first
+        elif self._content is not None:
+            if not self._probe_readable(src):
+                return False
+            if self._content(pair):
+                differs = CONFLICT_CONTENT
+        elif not e.matches_stat(st, self._window_ns):
+            differs = CONFLICT_SIZE
+        reason = tie_conflict(e, st, None, differs=differs)
+        if reason is not None:
+            warn_conflict(reason, src.key)
+        return False
+
     def _decide_create(self, info: FileInfo) -> bool:
         """A local-only item - a new file, or any directory / symlink / special
         file (objectless, so never paired), the root included (compare key
@@ -537,6 +777,18 @@ class PushJournal:
         if is_dir or not stat_mod.S_ISREG(st.st_mode):
             self._journal_nonfile(key, st, info, old)
             return False
+        if self._update and old is not None and not old[0].is_file:
+            # A regular file where a symlink or special file is recorded (a
+            # directory sorts to another key and never pairs): the kind
+            # change follows the rule like its mirror image in
+            # _journal_nonfile_newer - a newer record keeps, a tie conflicts.
+            side = ordered_side(old[0], st, self._window_ns)
+            if side == "record":
+                self._skip_newer(info)
+                return False
+            if side == "tie":
+                warn_conflict(tie_conflict(old[0], st, None) or CONFLICT_TYPE, info.key)
+                return False
         # A local regular file with no S3 object: upload it - the create lane
         # copies every new file, including a recorded file whose object went
         # missing (the self-heal).
@@ -578,13 +830,19 @@ class PushJournal:
         st: os.stat_result,
         info: FileInfo,
         old: tuple[ManifestEntry, str] | None,
-    ) -> None:
+    ) -> bool:
         """Journal a directory / symlink / special-file item: an event only
         when the record would change - a new path, a changed symlink target
         or (where ``SYMLINK_MTIME_SUPPORTED``) an out-of-window symlink mtime
         drift, an out-of-window directory or special-file mtime drift, a mode
         drift (directories and specials; symlink permission bits are compared
-        nowhere), or a type change."""
+        nowhere), or a type change. Returns whether an event was journaled.
+
+        Under -u the item's own mtime orders the two sides instead: a newer
+        local side re-records, a newer record is kept, and a tie is a
+        conflict when the target, kind, or mode differs. A symlink on a
+        platform that cannot set link mtimes (Windows) has no mtime to order
+        by, so a changed target there is always a conflict."""
         is_dir = stat_mod.S_ISDIR(st.st_mode)
         path = self._record_path(key, is_dir=is_dir)
         sym: str | None = None
@@ -595,11 +853,13 @@ class PushJournal:
                 # Raced away between the scan and here: no record can be
                 # built, so the walk did not see the whole tree.
                 self._gap(f"Skipping file {info.key}. File changed during the walk.")
-                return
+                return False
         if old is None:
             self._emit_new(manifest.JOURNAL_ADD, path, st, sym)
-            return
+            return True
         e = old[0]
+        if self._update:
+            return self._journal_nonfile_newer(path, st, info, sym, e)
         if stat_mod.S_ISLNK(st.st_mode):
             changed = e.sym_target != sym or (
                 SYMLINK_MTIME_SUPPORTED
@@ -626,6 +886,28 @@ class PushJournal:
             )
         if changed:
             self._emit_new(manifest.JOURNAL_REPLACE, path, st, sym)
+        return changed
+
+    def _journal_nonfile_newer(
+        self,
+        path: str,
+        st: os.stat_result,
+        info: FileInfo,
+        sym: str | None,
+        e: ManifestEntry,
+    ) -> bool:
+        """The -u half of ``_journal_nonfile`` for a recorded item."""
+        side = ordered_side(e, st, self._window_ns)
+        if side == "local":
+            self._emit_new(manifest.JOURNAL_REPLACE, path, st, sym)
+            return True
+        if side == "record":
+            self._skip_newer(info)
+            return False
+        reason = tie_conflict(e, st, sym)
+        if reason is not None:
+            warn_conflict(reason, info.key)
+        return False
 
     # --- explicit events (sub-path pushes) ----------------------------------
     def record_root(self, st: os.stat_result) -> None:
@@ -633,7 +915,7 @@ class PushJournal:
         sub-path push (no old manifest, so the cursor is empty)."""
         self._emit_new(manifest.JOURNAL_ADD, ".", st, None)
 
-    def record_ancestor(self, rel: str, st: os.stat_result) -> None:
+    def record_ancestor(self, rel: str, st: os.stat_result, local_path: str) -> None:
         """A sub-path push's parent directory: journal only a drift (a missing
         record, or a mode/mtime change) - the ancestors' metadata should
         restore on pull, but re-recording an unchanged ancestor was the old
@@ -646,6 +928,17 @@ class PushJournal:
         old = self._advance(rel + "/")
         if old is None:
             self._emit_new(manifest.JOURNAL_ADD, f"./{rel}", st, None)
+        elif self._update:
+            # The newer side wins here too; a kept (newer) ancestor record is
+            # not worth a skip line - the ancestors are incidental to the
+            # sub-path named on the command line.
+            side = ordered_side(old[0], st, self._window_ns)
+            if side == "local":
+                self._emit_new(manifest.JOURNAL_REPLACE, f"./{rel}", st, None)
+            elif side == "tie":
+                reason = tie_conflict(old[0], st, None)
+                if reason is not None:
+                    warn_conflict(reason, local_path)
         elif (
             mode_differs(old[0], st)
             or old[0].mtime_ns is None

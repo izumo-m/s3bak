@@ -76,6 +76,61 @@ change *is* transferred, and an mtime-only drift is not. It reads and hashes
 every candidate file, which is why it is opt-in. `part_size` comes from the same
 profile the uploads use, so multipart ETags reconstruct to a matching value.
 
+### Opt-in: the newer side wins (`-u`)
+
+`-u` keeps the size+mtime judgment and adds a direction to it.
+`compare.newer_side` orders a pair by the record's mtime against the local
+lstat's: `local` or `record` beyond `mtime_window`, `tie` inside it — and for
+a record with no mtime, which nothing can be ordered against. Every caller
+goes through its two record-level forms, `ordered_side` (the same, with a
+local symlink on a platform without link mtimes always a tie) and
+`tie_conflict` (the fixed order in which a tie's differences are examined -
+kind, link target, the caller's size or content comparison, mode - and the
+reason each reports), so one state reports one reason wherever it is met. A
+pair copies only when the source is the newer side. A newer destination is
+kept in full:
+push journals nothing for it (the record must keep describing the object),
+pull leaves the file's content *and* metadata alone. A tie with a difference
+— size (content under `--checksum`), mode, kind, a link's target, or a link's
+target on a platform without link mtimes — is a conflict: warned
+(`compare.warn_conflict`, exit 2), transferred nowhere, recorded nowhere. So
+is a pair the rule cannot order at all: an object whose size no longer
+matches its record, and on pull an object the manifest does not record
+(push takes the local side there — the only copy the operator holds, while
+bucket versioning keeps the object). rsync's `-u` copies on an equal mtime
+when the sizes differ; s3bak deliberately does not — that pick is
+order-dependent (`pull -u; push -u` picks the record, the reverse order the
+local file), and a mode-only change has no mtime to order by at all, so a
+silent pick would flip-flop between machines.
+
+Directories follow the same rule with one carve-out. A directory the pull
+itself wrote into — a download, a created directory, a placed symlink, a
+removed extra — has a fresh mtime that is the pull's side effect, not a local
+change, so it is settled to its record as always; only a directory the pull
+did not touch keeps a newer local mtime. Push re-records a directory only
+when the local mtime is newer.
+
+Push decides all of this inside `PushJournal`, the one place its pairs pass
+through. Pull decides in `syncops.UpdateFilter`, which extends
+`ManifestFilter` with the rule and also takes the create lane (an object with
+nothing the destination listing could see: nothing local, or a symlink or
+directory, which the listing omits) — one cursor serves both lanes, since
+boto3-s3 decides them serially in one ascending stream. Its decisions are
+spooled for the metadata apply (see the pull pipeline): the apply cannot
+otherwise tell a downloaded file, stamped with the object's upload time and
+therefore "newer", from a genuinely newer local edit. A staged pull (a
+conflicting restore root) has no local tree to order against and runs
+without the per-file rule; a symlink or special-file sub-path - its own
+restore root, with no stage - is ordered only against a local path of its
+recorded kind, and a root of another kind takes the plain apply: replaced
+whole for a symlink record, refused for a special-file record (pull never
+creates one), exactly as without -u.
+A single-file entry or file sub-path has no lanes, so `cmd_pull` takes its
+one verdict up front, probing the stored object first as the lanes do. The
+no-op gate is unchanged under -u: a newer local side is a difference the
+lanes decide (and report under `-v`), so it runs the pipeline like any
+other. A named file sub-path push stays unconditional.
+
 ### One predicate, shared
 
 `status` and both compare directions share one size/mtime predicate
@@ -209,7 +264,9 @@ is [cli.md](cli.md#hook-invocation-hook-prepost).
    backups" below).
    `--checksum` ignores manifest file stats for its content decision (the
    download above still validates and feeds the kind check and the journal's
-   cursor, which still journals mode and structure drift). Excludes filter the
+   cursor, which still journals mode and structure drift). `-u` adds the
+   newer-side rule to every decision the journal makes (see "the newer side
+   wins" above): a pair whose record is newer journals nothing. Excludes filter the
    sync's **local side only**, per path, with aws-cli semantics
    ([excludes.md](excludes.md)) — through the same walker the manifest walk
    uses (`localwalk.sync_walker`), so the data sync and the manifest can never
@@ -399,7 +456,11 @@ rehearsal must fail or warn exactly where the real command would. With
 3. **Download** (a symlink sub-path, having no data object, skips this
    step): `sync_down` for a directory, a single-request `get_file` for a file
    (multipart via `S3.cp` if the recorded size is large). Excluded paths are
-   not downloaded ([excludes.md](excludes.md)). A restore root of
+   not downloaded ([excludes.md](excludes.md)). Under `-u` the lanes are
+   `UpdateFilter`'s, and each decision is spooled to a temp file in stream
+   order — `D` for a download, `K` for a key kept as it is — for step 4; a
+   single-file entry has no lanes, so `cmd_pull` takes its one verdict
+   before the transfer. A restore root of
    the wrong type (a directory where a file entry restores, a file or symlink
    where a tree does) is never destroyed up front: the download lands in a
    unique stage directory beside it first, and the root is swapped in two
@@ -426,6 +487,19 @@ rehearsal must fail or warn exactly where the real command would. With
    single-file lane leaves the write time - and gets its recorded mtime
    applied; a stamp that already lands inside the window is a match and stays,
    the same bounded tolerance every match gets.
+
+   Under `-u` the apply merge-joins the sync's decision spool through a
+   one-record cursor (the spool is in the sync's compare-key order, which is
+   the join's own): a kept key is skipped in full, a downloaded key is
+   settled to its record whatever its stamped mtime says, and every other
+   record — a match the sync judged, a symlink or special file it never saw,
+   a file record whose object is gone — is ordered by its own mtime here: a
+   newer local side is left alone, a tie with a mode difference is a
+   conflict, only a newer record is applied. A directory frame is marked
+   dirtied when a spooled download or an apply mutation (a created
+   directory, a placed symlink) lands beneath it; only an undirtied frame
+   follows the rule at pop time, and the `--delete` re-settle treats every
+   frame as dirtied, since which ones the removals touched is not tracked.
 
    Directory mode/mtime settles through an ancestor stack kept over the
    ascending merge-join: a directory pushes a frame when its own record is

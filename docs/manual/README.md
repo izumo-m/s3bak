@@ -18,9 +18,10 @@ description of s3bak's observable behavior (see
    entry and path resolution, output format, exit codes.
 6. [Deleting safely](06-deleting-safely.md) — `push --delete` and
    `pull --delete`: confirmation prompts, `--yes`, and what can be lost.
-7. [Operating s3bak](07-operating.md) — the recommended routine, unattended
-   runs, hooks and `S3BAK_JOURNAL`, storage classes and bucket versioning, and
-   keeping the backup private.
+7. [Operating s3bak](07-operating.md) — the recommended routine, sharing an
+   entry between machines with `-u`, unattended runs, hooks and
+   `S3BAK_JOURNAL`, storage classes and bucket versioning, and keeping the
+   backup private.
 8. [Recovery and troubleshooting](08-recovery-troubleshooting.md) —
    interrupted runs, a run that has gone quiet, hard-kill residue, what to do
    about each verify finding, repairing a damaged manifest, and restoring onto
