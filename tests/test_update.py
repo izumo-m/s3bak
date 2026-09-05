@@ -7,6 +7,7 @@ entry are simulated by pointing the same entry name at two local trees."""
 from __future__ import annotations
 
 import os
+import shutil
 import stat
 
 import pytest
@@ -358,6 +359,63 @@ def test_pull_update_applies_a_newer_directory_record(ws):
     ws.run("pull", "-u", "data", expect_rc=0)
 
     assert _mtime_ns(sub) == recorded
+
+
+def test_pull_update_settles_the_directories_it_created(ws):
+    # A pull into an empty destination creates every level itself, so none of
+    # them has a local side that could be newer: the fresh mtime and the
+    # umask's mode are this run's own, and the record is what they settle to -
+    # including a level no file record sits directly inside.
+    ws.write("data/a/b/deep.txt", "beta")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    root = ws.root / "data"
+    dirs = [root, root / "a", root / "a" / "b"]
+    for d in reversed(dirs):
+        os.chmod(d, 0o750)
+        os.utime(d, (OLD, OLD))
+    ws.run("push", "data", expect_rc=0)
+    recorded = {d: _mtime_ns(d) for d in dirs}
+    shutil.rmtree(root)
+
+    ws.run("pull", "-u", "data", expect_rc=0)
+
+    for d in dirs:
+        assert _mtime_ns(d) == recorded[d], d
+        assert _mode(d) == 0o750, d
+
+
+def test_pull_update_settles_the_parent_a_new_directory_landed_in(ws):
+    # The sync's mkdir gives the parent a new entry, and with it a fresh
+    # mtime - the pull's own side effect, not a local change to keep.
+    _pushed_tree(ws)
+    root = ws.root / "data"
+    recorded = _mtime_ns(root)
+    shutil.rmtree(root / "sub")
+    os.utime(root, ns=(recorded, recorded))
+
+    ws.run("pull", "-u", "data", expect_rc=0)
+
+    assert (root / "sub" / "b.txt").read_text() == "beta"
+    assert _mtime_ns(root) == recorded
+
+
+def test_pull_update_settles_an_empty_directory_it_recreated(ws):
+    # An empty directory has no object behind it, so the metadata apply's own
+    # makedirs is what creates it - and what must settle it afterwards.
+    ws.write("data/a.txt", "alpha")
+    empty = ws.root / "data" / "empty"
+    empty.mkdir()
+    os.chmod(empty, 0o700)
+    os.utime(empty, (OLD, OLD))
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    recorded = _mtime_ns(empty)
+    empty.rmdir()
+
+    ws.run("pull", "-u", "data", expect_rc=0)
+
+    assert _mtime_ns(empty) == recorded
+    assert _mode(empty) == 0o700
 
 
 def test_pull_update_single_file_entry(ws):

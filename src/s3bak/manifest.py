@@ -672,7 +672,10 @@ def merge_join(
 # pull -u's spooled decisions (syncops.UpdateFilter writes them, the metadata
 # apply in restore.py reads them): one JSON ``[marker, compare_key]`` line per
 # decided key, in the sync's ascending compare-key order.
-PULL_DOWNLOADED = "D"  # the key downloads: its parent directory is dirtied
+# ``D`` on a file key means the sync downloads it, on a directory key that the
+# sync has to create that level for a download below; either dirties the
+# directory the write lands in.
+PULL_DOWNLOADED = "D"
 PULL_KEPT = "K"  # the key is left exactly as it is, metadata included
 
 

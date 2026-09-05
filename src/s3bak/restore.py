@@ -503,10 +503,11 @@ class _DirFrame:
     # settling now would just be re-dirtied, so the pop below routes this
     # frame to post_symlink_dirs instead of settling it in place.
     resettle: bool = False
-    # -u only: the pull itself wrote beneath this directory (a download, a
-    # created directory, a placed symlink, a removed extra), so its mtime is
-    # this run's side effect, not a local change - settle it to the record
-    # whatever the newer-side rule would say (docs/sync.md).
+    # -u only: the pull itself wrote into this directory (a download, a
+    # created entry, a placed symlink, a removed extra) or created it
+    # outright, so its mtime is this run's side effect, not a local change -
+    # settle it to the record whatever the newer-side rule would say
+    # (docs/sync.md).
     dirty: bool = False
 
 
@@ -797,11 +798,13 @@ def apply_manifest(
     ``update`` is pull -u (docs/sync.md, "the newer side wins"): the sync's
     spooled per-key decisions (``decisions``, an ``UpdateFilter`` spool in
     stream order, merge-joined here through a one-record cursor) say which
-    files it downloaded and which it kept; every other record is ordered by
-    its own mtime here. A directory the pull wrote into - a spooled
-    download, a created directory, a placed symlink - is marked dirtied on
-    the frame stack and settled to its record like today; one it did not is
-    left alone when its local mtime is the newer one. ``settle_all_dirs``
+    files it downloaded, which it kept, and which directories it had to
+    create for them; every other record is ordered by its own mtime here. A
+    directory the pull wrote into or created - a spooled download or
+    directory key, a makedirs of this apply's own, a placed symlink - is
+    marked dirtied on the frame stack and settled to its record like today;
+    one it did not touch is left alone when its local mtime is the newer
+    one. ``settle_all_dirs``
     treats every directory as dirtied (the --delete re-settle, whose
     removals dirtied an untracked set of them). ``prep_modes`` is the
     Windows writable prep's record of the modes it changed, for the rule to
@@ -938,7 +941,9 @@ def apply_manifest(
                 ):
                     # The stack top is this record's nearest recorded ancestor,
                     # the directory this write landed in (an unrecorded, excluded
-                    # directory in between is not settled at all).
+                    # directory in between is not settled at all) - a spooled
+                    # directory key among them, whose mkdir gave its parent a
+                    # new entry and so a new mtime.
                     dir_stack[-1].dirty = True
                 if outcome.defer_symlink and dir_stack:
                     # The current stack top is this record's nearest RECORDED
@@ -949,7 +954,20 @@ def apply_manifest(
                     # re-settle below.
                     dir_stack[-1].resettle = True
                 if outcome.push_dir:
-                    dir_stack.append(_DirFrame(rel, target, m_entry, dirty=settle_all_dirs))
+                    # A directory this pull created has no local side to be
+                    # newer: its mtime is the mkdir's, its mode the umask's.
+                    # The apply's own makedirs reports itself (``mutated``);
+                    # the sync's are the directory keys in the decision spool.
+                    dir_stack.append(
+                        _DirFrame(
+                            rel,
+                            target,
+                            m_entry,
+                            dirty=settle_all_dirs
+                            or outcome.mutated
+                            or decision == manifest.PULL_DOWNLOADED,
+                        )
+                    )
             errors += _pop_dir_frames(
                 dir_stack, None, post_symlink_dirs, window_ns, update=update, report=report
             )

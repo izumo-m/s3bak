@@ -427,14 +427,14 @@ that file, and `pull demo -o /tmp/restore` fills that directory.
 local copy, and leaves a newer local file alone in full — content,
 permission bits and modification time. The tie rule is `push -u`'s: a
 same-time difference is a conflict, warned and left as it is, exit 2. A
-directory the pull wrote into is settled to its record as always; one it did
-not touch keeps a newer local modification time. Where the record gives
-nothing to judge by — an object the manifest does not know, or one whose
-size no longer matches its record — the pull keeps the local side and warns,
-since unknown is not older. A restore root of the wrong type is replaced
-whole, as without `-u`: an empty stage holds nothing newer (a special-file
-sub-path of the wrong type is refused instead, as without `-u`: a pull never
-creates one). One more
+directory the pull wrote into, or created for what it restored, is settled to
+its record as always; one it did not touch keeps a newer local modification
+time. Where the record gives nothing to judge by — an object the manifest
+does not know, or one whose size no longer matches its record — the pull
+keeps the local side and warns, since unknown is not older. A restore root
+of the wrong type is replaced whole, as without `-u`: an empty stage holds
+nothing newer (a special-file sub-path of the wrong type is refused instead,
+as without `-u`: a pull never creates one). One more
 directory rule under `--delete`: once anything was removed, every directory
 is settled to its record, since which ones the removals touched is not
 tracked — a newer local modification time on a directory does not survive a

@@ -149,11 +149,13 @@ class UpdateFilter(manifest.ManifestFilter):
     per key in stream order: ``D`` for a download (the apply settles the
     file to its record whatever its stamped mtime says, and marks its parent
     directory dirtied), ``K`` for a kept key (the apply leaves it alone -
-    a conflict was already reported here). A key the filter judged an
-    ordinary match is not spooled; the apply applies the same rule itself
-    to whatever it meets unspooled. The spool is a temp file the caller owns
-    (created before the sync, unlinked after the apply); ``close()`` flushes
-    it along with the manifest handle."""
+    a conflict was already reported here). A directory key carries ``D``
+    too, for a level the transfer has to create (``_download``): the mkdir
+    is the sync's, so the apply cannot see it any other way. A key the
+    filter judged an ordinary match is not spooled; the apply applies the
+    same rule itself to whatever it meets unspooled. The spool is a temp
+    file the caller owns (created before the sync, unlinked after the
+    apply); ``close()`` flushes it along with the manifest handle."""
 
     def __init__(
         self,
@@ -175,6 +177,10 @@ class UpdateFilter(manifest.ManifestFilter):
         # before the sync (restore.windows_collect_writable_prep); the mode
         # the rule judges is the one from before that, keyed by absolute path.
         self._prep_modes = prep_modes or {}
+        # The directory key _download last walked. Decisions ascend, so a
+        # directory is done with once the stream has moved past it, and one
+        # walk per directory answers every download inside it.
+        self._walked_parent: str | None = None
 
     def close(self) -> None:
         super().close()
@@ -186,6 +192,50 @@ class UpdateFilter(manifest.ManifestFilter):
     def _decide(self, marker: str, compare_key: str) -> None:
         # A key can contain a newline, so a line needs an encoding.
         self._spool.write(json.dumps([marker, compare_key]) + "\n")
+
+    @staticmethod
+    def _dir_key(compare_key: str) -> str:
+        """The compare key of the directory ``compare_key`` sits in - the
+        manifest's own key for that directory record, ``""`` at the sync
+        root (``entry_sort_key``'s key for the tree root)."""
+        head = compare_key.rpartition("/")[0]
+        return f"{head}/" if head else ""
+
+    def _local_dir(self, dir_key: str) -> str:
+        return (
+            os.path.join(self._outpath, dir_key[:-1].replace("/", os.sep))
+            if dir_key
+            else self._outpath
+        )
+
+    def _download(self, compare_key: str) -> bool:
+        """Spool a create-lane download, preceded by every directory level
+        the transfer has to create to hold it.
+
+        A directory the sync creates has this pull's own mtime, and a mode
+        from the umask rather than the record - not a local change the
+        newer-side rule may keep (docs/sync.md). The apply cannot see those
+        mkdirs on its own: it meets the directory already there, and would
+        read the fresh mtime as a newer local side. The walk stops at the
+        first level that already exists, which the apply dirties itself from
+        the created level's decision - so what is spooled here is exactly
+        what the sync creates. A missing directory holds nothing the other
+        lane could have decided first, so its chain always precedes every
+        key under it in the spool, and one chain per directory suffices."""
+        parent = self._dir_key(compare_key)
+        if parent != self._walked_parent:
+            self._walked_parent = parent
+            missing: list[str] = []
+            key = parent
+            while not os.path.isdir(self._local_dir(key)):
+                missing.append(key)
+                if not key:
+                    break  # the sync root itself: the sync creates it too
+                key = self._dir_key(key[:-1])
+            for dir_key in reversed(missing):  # shallowest first, so keys ascend
+                self._decide(PULL_DOWNLOADED, dir_key)
+        self._decide(PULL_DOWNLOADED, compare_key)
+        return True
 
     def _keep_newer(self, compare_key: str, local_path: str) -> bool:
         self._decide(PULL_KEPT, compare_key)
@@ -266,21 +316,18 @@ class UpdateFilter(manifest.ManifestFilter):
         if st is None:
             if m is not None and not m.is_file:
                 return False  # residue at a recorded dir/link key: the apply restores the record
-            self._decide(PULL_DOWNLOADED, key)
-            return True
+            return self._download(key)
         if m is None:
             return self._conflict(CONFLICT_UNRECORDED, key, local_path)
         if not m.is_file:
             return False
         if not stat_mod.S_ISLNK(st.st_mode):
-            self._decide(PULL_DOWNLOADED, key)
-            return True
+            return self._download(key)
         side = ordered_side(m, st, self.window_ns)
         if side == "local":
             return self._keep_newer(key, local_path)
         if side == "record":
-            self._decide(PULL_DOWNLOADED, key)
-            return True
+            return self._download(key)
         return self._conflict(tie_conflict(m, st, None) or CONFLICT_TYPE, key, local_path)
 
 

@@ -21,13 +21,13 @@ a fix only (Fixed).
   under `--checksum`, mode, kind, or symlink target; an object the manifest
   does not record (`pull`); an object whose size no longer matches its
   record — is a conflict: warned, left alone on both sides, exit 2. A
-  directory the pull wrote into is settled to its record as before; one it
-  did not touch keeps a newer local modification time (except after a
-  `--delete` removal, which settles every directory). Running
-  `pull -u; push -u` on each of several machines that share an entry
-  converges them on the newest copy of every file; the manual's operating
-  chapter has the routine and what it does not cover (deletions, clocks).
-  `-v` lists the paths a newer other side kept.
+  directory the pull wrote into, or created for what it restored, is settled
+  to its record as before; one it did not touch keeps a newer local
+  modification time (except after a `--delete` removal, which settles every
+  directory). Running `pull -u; push -u` on each of several machines that
+  share an entry converges them on the newest copy of every file; the
+  manual's operating chapter has the routine and what it does not cover
+  (deletions, clocks). `-v` lists the paths a newer other side kept.
 
 ### Changed
 

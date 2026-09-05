@@ -105,7 +105,8 @@ silent pick would flip-flop between machines.
 
 Directories follow the same rule with one carve-out. A directory the pull
 itself wrote into — a download, a created directory, a placed symlink, a
-removed extra — has a fresh mtime that is the pull's side effect, not a local
+removed extra — or created outright carries this run's own mtime, and a
+created one the umask's mode: the pull's side effect rather than a local
 change, so it is settled to its record as always; only a directory the pull
 did not touch keeps a newer local mtime. Push re-records a directory only
 when the local mtime is newer.
@@ -497,9 +498,13 @@ rehearsal must fail or warn exactly where the real command would. With
    newer local side is left alone, a tie with a mode difference is a
    conflict, only a newer record is applied. A directory frame is marked
    dirtied when a spooled download or an apply mutation (a created
-   directory, a placed symlink) lands beneath it; only an undirtied frame
-   follows the rule at pop time, and the `--delete` re-settle treats every
-   frame as dirtied, since which ones the removals touched is not tracked.
+   directory, a placed symlink) lands beneath it, and when the directory is
+   one the pull created: the apply's own `makedirs` reports itself, while
+   the sync's are the directory keys the create lane spools — every level it
+   has to make for a download, which the apply would otherwise meet already
+   in place and read as a newer local side. Only an undirtied frame follows
+   the rule at pop time, and the `--delete` re-settle treats every frame as
+   dirtied, since which ones the removals touched is not tracked.
 
    Directory mode/mtime settles through an ancestor stack kept over the
    ascending merge-join: a directory pushes a frame when its own record is

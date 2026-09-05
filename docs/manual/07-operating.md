@@ -173,7 +173,7 @@ What the rule does, path by path:
 | --- | --- | --- |
 | a regular file | uploads when the local copy is newer; a newer record is kept as it is | restores when the record is newer; a newer local file is left alone in full |
 | a symlink | the same, by the link's own modification time where the platform keeps one; on Windows a changed target is always a conflict | the same |
-| a directory | re-records its permission bits and modification time when the local ones are newer | applies them when the record is newer; a directory the pull wrote into is settled to the record either way |
+| a directory | re-records its permission bits and modification time when the local ones are newer | applies them when the record is newer; a directory the pull wrote into or created is settled to the record either way |
 | present on one side only | uploaded, as always | restored, as always |
 | the same modification time, something else different | a conflict: warned, left alone on both sides, exit 2 | the same |
 
