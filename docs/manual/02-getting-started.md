@@ -146,8 +146,8 @@ again:
 
 ```console
 $ s3bak status bin
-M /home/you/bin/backup-photos	size, mtime
-M /home/you/bin/lib	mtime
+M /home/you/bin/backup-photos	size+, mtime+
+M /home/you/bin/lib	mtime+
 A /home/you/bin/lib/extra.sh
 ```
 
@@ -155,7 +155,8 @@ The letters describe what a push would change in the backup: `M` the stored
 copy differs, `A` this exists only locally. (A third letter, `D` — this
 exists only in the backup — appears under `status --delete` alone; it
 previews the opt-in `push --delete`.) The tags after `M` name the properties
-that differ. `lib` is listed
+that differ, and the sign points the drift — `size+` says the local file is
+the larger one, `mtime-` would say it is older. `lib` is listed
 because adding a file to a directory changes that directory's modification
 time, and s3bak records and restores directory times like any other.
 
@@ -179,7 +180,7 @@ Move a file out of the tree to stand in for losing it:
 ```console
 $ mv ~/bin/sync-notes /tmp/
 $ s3bak status bin
-M /home/you/bin	mtime
+M /home/you/bin	mtime+
 ```
 
 The missing file itself is not listed. The letters are push-oriented, an

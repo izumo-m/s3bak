@@ -35,13 +35,15 @@ Permission bits are compared but never move data. A `chmod` alone makes the
 next push rewrite the manifest record and upload nothing.
 
 Here is a tree with a few unrelated changes — a longer file, a new file, and
-a `chmod`. Each `M` line names the properties that differed:
+a `chmod`. Each `M` line names the properties that differed, and the sign on
+`size` and `mtime` points the drift: `+` means the local side is the larger
+or newer one, `-` the smaller or older:
 
 ```console
 $ s3bak status demo
-M /home/you/demo/lib	mtime
+M /home/you/demo/lib	mtime+
 A /home/you/demo/lib/new.sh
-M /home/you/demo/notes.txt	size, mtime
+M /home/you/demo/notes.txt	size+, mtime+
 M /home/you/demo/run.sh	mode
 ```
 
@@ -51,10 +53,10 @@ requests:
 ```console
 $ s3bak status -v demo
 + (boto3-s3) get_file s3://my-bucket/backup/demo-manifest.jsonl
-M /home/you/demo/lib	mtime
+M /home/you/demo/lib	mtime+
       mtime: remote=2026-08-02 13:42:56 < local=2026-08-02 13:43:07 (+11s)
 A /home/you/demo/lib/new.sh
-M /home/you/demo/notes.txt	size, mtime
+M /home/you/demo/notes.txt	size+, mtime+
       size: remote=23 < local=34 (+11 bytes)
       mtime: remote=2026-08-02 13:42:56 < local=2026-08-02 13:43:07 (+11s)
 M /home/you/demo/run.sh	mode
@@ -80,7 +82,7 @@ remove:
 ```console
 $ mv /home/you/demo/old-notes.txt /tmp/
 $ s3bak status --delete demo
-M /home/you/demo	mtime
+M /home/you/demo	mtime+
 D /home/you/demo/old-notes.txt
 ```
 
@@ -97,7 +99,7 @@ by a symlink stays one line, because the two occupy the same key:
 
 ```console
 $ s3bak status demo
-M /home/you/demo/lib	mtime
+M /home/you/demo/lib	mtime+
 M /home/you/demo/lib/util.sh	type
 ```
 
@@ -108,7 +110,7 @@ record — kept by an ordinary push — surfaces as `D` only under
 
 ```console
 $ s3bak status --delete demo
-M /home/you/demo	mtime
+M /home/you/demo	mtime+
 D /home/you/demo/run.sh
 A /home/you/demo/run.sh
 ```
@@ -278,6 +280,17 @@ of what a push saw, so only a push may change it.
 One thing hides this. A pull whose records all match the local tree already
 returns immediately, without transferring anything at all, so a stale record
 can sit unnoticed until some other difference gives that pull work to do.
+
+### The newer side wins (`-u`)
+
+`push -u` and `pull -u` add a direction to the rule: a pair that differs is
+transferred only when the source is the newer side, by the same modification
+times the rule already compares — the record's against the local file's,
+with the tolerance counting as equal. An equal modification time with any
+other difference is a conflict, reported and left alone, because nothing
+orders it. [Command reference](05-command-reference.md) has the option;
+[Sharing an entry between machines](07-operating.md#sharing-an-entry-between-machines)
+is what it is for.
 
 ## Excludes
 

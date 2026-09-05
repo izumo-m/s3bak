@@ -141,6 +141,13 @@ self or its new self**. s3bak writes every download into a temporary sibling
 and renames it into place, so an interrupted transfer never leaves a
 half-written file under the real name.
 
+`pull -u` re-runs the same way, with one difference worth knowing. A file the
+interrupted run downloaded but had not yet stamped carries the object's
+upload time, which is newer than its record, so the re-run keeps it as a
+newer local file. Nothing is lost — the content is the backup's — and the
+next `push -u` uploads it once, needlessly, after which every machine agrees
+again.
+
 ### After a power loss, pull again with `--checksum`
 
 That rename is atomic against a process that dies, but s3bak does not `fsync`

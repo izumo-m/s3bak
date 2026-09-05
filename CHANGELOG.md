@@ -9,6 +9,36 @@ a fix only (Fixed).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-05
+
+### Added
+
+- `-u` / `--update` on `push` and `pull`: the newer side wins. A pair that
+  differs is transferred only when the source's modification time is newer
+  than the other side's — `push -u` uploads what is newer locally and keeps
+  the record of what is newer in the backup, `pull -u` restores what is newer
+  in the backup and leaves a newer local file alone, its permission bits and
+  modification time included. A pair the rule cannot order — the same
+  modification time (within `mtime_window`) with a different size, content
+  under `--checksum`, mode, kind, or symlink target; an object the manifest
+  does not record (`pull`); an object whose size no longer matches its
+  record — is a conflict: warned, left alone on both sides, exit 2. A
+  directory the pull wrote into, or created for what it restored, is settled
+  to its record as before; one it did not touch keeps a newer local
+  modification time (except after a `--delete` removal, which settles every
+  directory). Running `pull -u; push -u` on each of several machines that
+  share an entry converges them on the newest copy of every file; the
+  manual's operating chapter has the routine and what it does not cover
+  (deletions, clocks). `-v` lists the paths a newer other side kept.
+
+### Changed
+
+- `status` prints its `size` and `mtime` tags with a direction suffix —
+  `size+` / `mtime+` when the local side is larger / newer, `size-` /
+  `mtime-` when it is smaller / older — so the direction of a drift is
+  visible without `-v`. The sign matches the signed difference the `-v`
+  detail line shows (local minus remote).
+
 ## [0.7.0] - 2026-08-25
 
 ### Added

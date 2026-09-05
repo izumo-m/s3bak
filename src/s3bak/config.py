@@ -78,6 +78,7 @@ class Opts:
     yes: bool = False
     verbose: bool = False
     checksum: bool = False
+    update: bool = False  # -u: the newer side wins (docs/sync.md)
     outpath: str | None = None
     color: str = "auto"
 

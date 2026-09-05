@@ -38,7 +38,7 @@ transferring on every run, and as a `status` line that never goes away:
 
 ```console
 $ s3bak status demo
-M /home/you/demo/notes.txt	mtime
+M /home/you/demo/notes.txt	mtime+
 ```
 
 `-v` prints the two timestamps, and this is where the sub-second cases become
@@ -48,7 +48,7 @@ digits rather than two identical-looking timestamps.
 ```console
 $ s3bak status -v demo
 + (boto3-s3) get_file s3://my-bucket/backup/demo-manifest.jsonl
-M /home/you/demo/notes.txt	mtime
+M /home/you/demo/notes.txt	mtime+
       mtime: remote=2026-08-14 13:56:25.944048102 < local=2026-08-14 13:56:26.244048102 (+0.3s)
 ```
 
@@ -57,7 +57,7 @@ A drift of a second or more prints whole seconds instead:
 ```console
 $ s3bak status -v demo
 + (boto3-s3) get_file s3://my-bucket/backup/demo-manifest.jsonl
-M /home/you/demo/notes.txt	mtime
+M /home/you/demo/notes.txt	mtime+
       mtime: remote=2026-08-14 13:56:25 < local=2026-08-14 13:56:28 (+3s)
 ```
 

@@ -243,6 +243,11 @@ _OPTION_SPECS = {
     "checksum": _OptionSpec(
         "--checksum", "Compare file contents instead of size and mtime", "--checksum"
     ),
+    "update": _OptionSpec(
+        "-u, --update",
+        "Transfer only where the source is newer; a tie with a difference is a conflict",
+        "-u/--update",
+    ),
     "mtime_window": _OptionSpec(
         "--mtime-window <seconds>", "Override the mtime tolerance", "--mtime-window"
     ),
@@ -281,6 +286,7 @@ _COMMAND_SPECS = {
             "delete",
             "yes",
             "checksum",
+            "update",
             "mtime_window",
             "verbose",
             "help",
@@ -291,6 +297,7 @@ _COMMAND_SPECS = {
             "s3bak push bin/subdir",
             "s3bak push --all --dry-run",
             "s3bak push bin --delete",
+            "s3bak push -u bin",
         ),
     ),
     "pull": _CommandSpec(
@@ -307,6 +314,7 @@ _COMMAND_SPECS = {
             "delete",
             "yes",
             "checksum",
+            "update",
             "mtime_window",
             "output",
             "verbose",
@@ -318,6 +326,7 @@ _COMMAND_SPECS = {
             "s3bak pull bin home-docs",
             "s3bak pull bin -o /tmp/restore",
             "s3bak pull bin --delete --dry-run",
+            "s3bak pull -u bin",
         ),
     ),
     "show": _CommandSpec(
@@ -769,6 +778,7 @@ def main(argv: list[str] | None = None) -> int:
     opt_yes = False
     opt_verbose = False
     opt_checksum = False
+    opt_update = False
     opt_mtime_window: float | None = None
     opt_outpath: str | None = None
     opt_color: str = "auto"
@@ -807,6 +817,9 @@ def main(argv: list[str] | None = None) -> int:
         elif a == "--checksum":
             opt_checksum = True
             used_options.append("checksum")
+        elif a in ("-u", "--update"):
+            opt_update = True
+            used_options.append("update")
         elif a == "--mtime-window" or a.startswith("--mtime-window="):
             used_options.append("mtime_window")
             val, i = take_value(a, i)
@@ -873,6 +886,7 @@ def main(argv: list[str] | None = None) -> int:
         yes=opt_yes,
         verbose=opt_verbose,
         checksum=opt_checksum,
+        update=opt_update,
         outpath=opt_outpath,
         color=opt_color,
     )

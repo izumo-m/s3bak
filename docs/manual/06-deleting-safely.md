@@ -170,7 +170,7 @@ nothing:
 
 ```console
 $ s3bak status --delete demo
-M /home/you/demo	mtime
+M /home/you/demo	mtime+
 D /home/you/demo/cache
 D /home/you/demo/cache/a.bin
 D /home/you/demo/cache/b.bin

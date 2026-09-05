@@ -88,6 +88,12 @@ A pull that meets another run's residue — a record whose object an interrupted
 deletion already removed — warns and skips it (exit 2) and restores everything
 else; the record itself is retired by the next push, never by the pull.
 
+`pull -u` adds one case. The sync stamps the object's upload time on a
+downloaded file and the apply settles it to the record afterwards, so a file
+caught between the two looks newer than its record to the re-run, which
+keeps it (docs/sync.md, the newer-side rule). The content is the backup's;
+the next `push -u` re-uploads it once and the record catches up.
+
 ## What a hard kill does not guarantee
 
 These need a manual step. None of them corrupts the backup on S3.

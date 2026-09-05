@@ -132,6 +132,7 @@ s3bak pull bin -o /tmp/out    # restore the bin entry to /tmp/out
 s3bak pull bin --delete --dry-run  # preview a mirror restore
 s3bak push --all --delete --yes    # unattended mirror (e.g. cron)
 s3bak push bin/subdir         # entry-rooted syntax; independent of CWD
+s3bak pull -u bin; s3bak push -u bin  # exchange newer files with another machine
 s3bak verify --all            # check manifests against stored objects
 s3bak verify --all --checksum # also compare local content to S3 ETags
 s3bak ls-remote               # list entries stored on S3

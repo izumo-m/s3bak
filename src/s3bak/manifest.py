@@ -669,6 +669,15 @@ def merge_join(
 # ManifestFilter (the pull compare)
 # =============================================================================
 
+# pull -u's spooled decisions (syncops.UpdateFilter writes them, the metadata
+# apply in restore.py reads them): one JSON ``[marker, compare_key]`` line per
+# decided key, in the sync's ascending compare-key order.
+# ``D`` on a file key means the sync downloads it, on a directory key that the
+# sync has to create that level for a download below; either dirties the
+# directory the write lands in.
+PULL_DOWNLOADED = "D"
+PULL_KEPT = "K"  # the key is left exactly as it is, metadata included
+
 
 class ManifestFilter:
     """Pull's update-lane strategy: an rsync-style size+mtime check against
