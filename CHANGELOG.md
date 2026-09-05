@@ -9,6 +9,8 @@ a fix only (Fixed).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-05
+
 ### Added
 
 - `-u` / `--update` on `push` and `pull`: the newer side wins. A pair that
