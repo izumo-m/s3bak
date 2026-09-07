@@ -22,8 +22,10 @@ from dataclasses import dataclass
 
 from s3bak import localwalk, manifest
 from s3bak.compare import (
+    CONFLICT_DIR_AT_FILE,
     SYMLINK_MTIME_SUPPORTED,
     compare_to_stat,
+    dir_at_file_record,
     ordered_side,
     tie_conflict,
     warn_conflict,
@@ -714,19 +716,28 @@ def _apply_record(
 
     if compare_to_stat(m_entry, st, local_sym, window_ns=window_ns, local_mode=local_mode).is_match:
         return kept()
+    dir_at_file = st is not None and m_entry.is_file and stat_mod.S_ISDIR(st.st_mode)
     if (
         update
         and decision is None
         and st is not None
-        and stat_mod.S_IFMT(st.st_mode) == stat_mod.S_IFMT(m_entry.mode)
+        and (dir_at_file or stat_mod.S_IFMT(st.st_mode) == stat_mod.S_IFMT(m_entry.mode))
     ):
         # The sync judged this pair a match (or never saw the key: a special
         # file, or a file record whose object is gone), yet something differs:
         # a newer local side is kept, and a tie is a conflict when the mode
         # differs - the size check below stays a hard error, as it is one
-        # (the stored object does not match its record).
+        # (the stored object does not match its record). A directory where a
+        # file is recorded takes the lane's rule (syncops.UpdateFilter.create)
+        # when the record's object is gone and the lane never saw the key:
+        # kept when newer, the conflict otherwise - never replaced.
         side = ordered_side(m_entry, st, window_ns)
         if side == "local":
+            return kept()
+        if dir_at_file:
+            reason = tie_conflict(m_entry, st, None) if side == "tie" else CONFLICT_DIR_AT_FILE
+            if report and reason is not None:
+                warn_conflict(reason, target)
             return kept()
         if side == "tie" and (m_entry.size is None or st.st_size == m_entry.size):
             reason = tie_conflict(m_entry, st, local_sym, local_mode=local_mode)
@@ -751,6 +762,13 @@ def _apply_record(
         # A special file is never created by pull (storage.md#restore-fidelity):
         # a missing one is a hard error, not residue.
         console.err(f"expected special file missing (pull does not create it): {target}")
+        return _ApplyOutcome(1)
+    if dir_at_file:
+        # Never replaced - it may hold data the backup does not - so the
+        # record cannot be restored here. The sync's create lane refused the
+        # download for the same reason (syncops.RestoreFilter); this is the
+        # one report of it on a real run.
+        console.err(dir_at_file_record(target))
         return _ApplyOutcome(1)
     if stat_mod.S_IFMT(st.st_mode) != stat_mod.S_IFMT(m_entry.mode):
         # In particular, never chmod/utime through a local symlink where a

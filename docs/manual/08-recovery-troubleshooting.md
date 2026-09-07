@@ -340,6 +340,32 @@ s3bak: demo: type conflict: s3://my-bucket/backup/demo/draft.txt (manifest recor
 ([Deleting safely](06-deleting-safely.md)). Until then the object is harmless
 except that it collides with a restore of that path.
 
+### A directory where the backup records a file
+
+`verify` never reads the local tree, so this one is the pull's to report: a
+path that was a file when it was last pushed has since become a directory —
+often deliberately, with its contents excluded — and the record still says
+file. The pull restores everything else and refuses that one record, since a
+directory is never replaced (the restore root itself is the exception:
+`pull demo/lib` asks for `lib` back, and gets it):
+
+```console
+$ s3bak pull demo
+s3bak: type conflict: a directory sits where the backup records a regular file (push --delete retires the stale record; move the directory away to restore the file): /home/you/demo/lib
+```
+
+`pull -u` keeps the directory instead — as the newer side, or as a conflict
+(exit 2) — and `pull --delete` in either form never offers what is inside it.
+Retire the record with `push --delete`, run wherever the local tree is the
+one you want: the old object is offered as an orphan, and its record goes
+with it. Note that `lib/*` in `excludes` covers the directory itself, so the
+backup then records nothing at that path; `lib/?*` excludes the contents only
+and records the directory. If the contents were pushed rather than excluded,
+the manifest holds the file and the directory both — the
+[`unrestorable`](#unrestorable-a-file-and-a-directory-at-one-path) case
+above, which the same `push --delete` settles. If the backup's file is what
+you want, move the directory away and pull again.
+
 ### `folder object`
 
 Some tools — the S3 console among them — represent a folder with a

@@ -423,6 +423,32 @@ is refused like any other pair of targets. The destination is the path itself,
 not a directory to put the entry inside: `pull wsl.conf -o /tmp/w.conf` writes
 that file, and `pull demo -o /tmp/restore` fills that directory.
 
+A directory sitting where the backup records a regular file is never
+replaced — it may hold data the backup does not — so that one record cannot
+be restored. The pull restores everything else, reports the path, and exits
+1; `--dry-run` reports the same line (except for a record whose object is
+also gone, which only the metadata pass finds, and a dry run does not run
+it):
+
+```console
+$ s3bak pull demo
+download: s3://my-bucket/backup/demo/notes.txt to /home/you/demo/notes.txt
+644 /home/you/demo/notes.txt
+s3bak: type conflict: a directory sits where the backup records a regular file (push --delete retires the stale record; move the directory away to restore the file): /home/you/demo/lib
+```
+
+Such a record is usually stale — the path became a directory after its last
+push — and `push --delete` retires it, run wherever the local tree is the one
+you want (the old object is offered as an orphan). To have the file back
+instead, move the directory away and pull again. An object with no file
+record at its key — one the manifest does not know, or one left where the
+manifest now records a directory — sitting over such a directory is residue
+the pull cannot place: warned about (exit 2) and skipped. The restore root
+is the exception: naming the path itself — `pull demo/lib`, wherever `-o`
+sends it — asks for that one thing back, and a root of the wrong type is
+replaced whole once its download has landed, as any restore root of the
+wrong type is.
+
 `-u` (`--update`) restores only the files whose record is newer than the
 local copy, and leaves a newer local file alone in full — content,
 permission bits and modification time. The tie rule is `push -u`'s: a
@@ -431,7 +457,10 @@ directory the pull wrote into, or created for what it restored, is settled to
 its record as always; one it did not touch keeps a newer local modification
 time. Where the record gives nothing to judge by — an object the manifest
 does not know, or one whose size no longer matches its record — the pull
-keeps the local side and warns, since unknown is not older. A restore root
+keeps the local side and warns, since unknown is not older. A directory where
+the record is a file is ordered like any other type change, by its own
+modification time: newer, it is left alone; otherwise it is a conflict, since
+a directory is never replaced (see above). A restore root
 of the wrong type is replaced whole, as without `-u`: an empty stage holds
 nothing newer (a special-file sub-path of the wrong type is refused instead,
 as without `-u`: a pull never creates one). One more

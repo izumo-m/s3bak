@@ -64,12 +64,12 @@ from s3bak.restore import (
 from s3bak.store import ObjectMeta
 from s3bak.syncops import (
     PushJournal,
+    RestoreFilter,
     UpdateFilter,
     download_from_s3,
     download_manifest,
     drop_subtree_records,
     publish_journal_manifest,
-    sync_compare,
     write_manifest_to_aws,
 )
 
@@ -1083,17 +1083,17 @@ def _pull_exclude_lanes(
     sub: str | None,
     outpath: str,
     compare: PairFilter,
-    create_inner: FileFilter | None = None,
+    create_inner: FileFilter,
 ) -> tuple[FileFilter, PairFilter]:
     """Veto excluded keys in pull's download lanes (docs/excludes.md): a
     create-lane key under an excluded path is never downloaded, and an
     excluded both-sides pair is left untouched without consulting the
     stat/content compare (whose streaming cursor self-heals over keys it is
-    not asked about; ``create_inner``, -u's create-lane decision, shares
-    that cursor and is skipped the same way). Keys are re-anchored at the
-    entry root, where the patterns are defined; anchored (absolute) patterns
-    match the restore destination's absolute path - aws-cli's join-onto-root
-    semantics."""
+    not asked about; ``create_inner``, the filter's own create-lane decision,
+    shares that cursor and is skipped the same way). Keys are re-anchored at
+    the entry root, where the patterns are defined; anchored (absolute)
+    patterns match the restore destination's absolute path - aws-cli's
+    join-onto-root semantics."""
 
     def excluded_key(compare_key: str) -> bool:
         key = f"{sub}/{compare_key}" if sub else compare_key
@@ -1104,7 +1104,7 @@ def _pull_exclude_lanes(
         assert info.compare_key is not None  # the sync stamps every listed entry
         if excluded_key(info.compare_key):
             return False
-        return create_inner is None or create_inner(info)
+        return create_inner(info)
 
     def update(pair: SyncPair) -> bool:
         if excluded_key(pair.compare_key):
@@ -1285,6 +1285,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         # is skipped there and only fires on a path that never got that far.
         prep_repaired = False
         update_spool: str | None = None  # -u's per-key decisions, sync -> apply
+        restore_filter: RestoreFilter | None = None  # a plain directory pull's lanes
         root_conflict = False  # the restore root is of another kind than its record
         if has_data and os.path.lexists(outpath):
             if is_dir:
@@ -1358,16 +1359,26 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 # always happens (we only reach it on a manifest mismatch). Its
                 # size (from the manifest) routes a large file through multipart.
                 dest = os.path.join(stage_dir, "new") if stage_dir is not None else outpath
+                # A directory sync's lanes: the update lane judges the
+                # both-sides pairs, the create lane every S3-only key. Both
+                # come from one streaming filter over the manifest - -u's
+                # UpdateFilter, or the plain RestoreFilter, which never
+                # downloads onto a local directory; under --checksum the
+                # plain update lane is the content comparison instead. A
+                # single-file transfer has no lanes.
                 compare: PairFilter | None = None
-                update_filter: UpdateFilter | None = None
                 create: bool | FileFilter = True
+                lanes: manifest.ManifestFilter | None = None  # holds the temp manifest open
                 if is_dir:
+                    assert cfg.store is not None
+                    records = manifest.iter_compare_records(manifest_path, sub=sub)
+                    dir_compare: PairFilter
+                    dir_create: FileFilter
                     if use_update:
-                        assert cfg.store is not None
                         spool_fd, update_spool = tempfile.mkstemp(suffix=".decisions")
                         os.close(spool_fd)
                         update_filter = UpdateFilter(
-                            manifest.iter_compare_records(manifest_path, sub=sub),
+                            records,
                             window_ns=window_ns,
                             spool_path=update_spool,
                             outpath=outpath,
@@ -1375,22 +1386,34 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                             content=cfg.store.content_compare() if opts.checksum else None,
                             prep_modes=prep_modes,
                         )
-                        compare = update_filter
-                        create = update_filter.create
+                        lanes = dir_compare = update_filter
+                        dir_create = update_filter.create
                     else:
-                        compare = sync_compare(cfg, opts, entry, manifest_path, sub=sub)
-                pair_filter = compare
-                if is_dir and excludes and compare is not None:
-                    # Anchored at OUTPATH, the final destination - on a staged
-                    # pull the sync writes into the stage, but absolute
-                    # patterns are defined against where the tree ends up.
-                    create, pair_filter = _pull_exclude_lanes(
-                        ex,
-                        sub,
-                        outpath,
-                        compare,
-                        update_filter.create if update_filter is not None else None,
-                    )
+                        restore_filter = RestoreFilter(
+                            records,
+                            window_ns=window_ns,
+                            outpath=outpath,
+                            dryrun=opts.dryrun,
+                            # Only an existing tree of the recorded kind can
+                            # hold a directory in a download's way: a staged
+                            # pull (and its dry run, against the uncorrected
+                            # root) and a destination still to be created
+                            # are not judged (see RestoreFilter).
+                            check_local=not root_conflict and os.path.isdir(outpath),
+                        )
+                        lanes = restore_filter
+                        dir_compare = (
+                            cfg.store.content_compare() if opts.checksum else restore_filter
+                        )
+                        dir_create = restore_filter.create
+                    if excludes:
+                        # Anchored at OUTPATH, the final destination - on a staged
+                        # pull the sync writes into the stage, but absolute
+                        # patterns are defined against where the tree ends up.
+                        dir_create, dir_compare = _pull_exclude_lanes(
+                            ex, sub, outpath, dir_compare, dir_create
+                        )
+                    compare, create = dir_compare, dir_create
                 file_size = None if is_dir else _single_file_size(manifest_path)
                 try:
                     rc, changed = download_from_s3(
@@ -1400,18 +1423,17 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                         is_dir,
                         opts.verbose,
                         sub=sub,
-                        compare=pair_filter,
+                        compare=compare,
                         create=create,
                         size=file_size,
                         dryrun=opts.dryrun,
                     )
                 finally:
-                    # The streaming ManifestFilter holds the temp manifest open; close
-                    # it before the outer finally unlinks it (Windows cannot remove an
-                    # open file). `compare` is the raw filter - the lane
-                    # wrapper (pair_filter) must not defeat this check.
-                    if isinstance(compare, manifest.ManifestFilter):
-                        compare.close()
+                    # The streaming filter holds the temp manifest open; close
+                    # it before the outer finally unlinks it (Windows cannot
+                    # remove an open file).
+                    if lanes is not None:
+                        lanes.close()
                 if rc != 0:
                     # The Windows writable prep is restored by the outer
                     # finally below, whichever way this function now returns.
@@ -1468,7 +1490,10 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 # something: a stat-gate difference, or a planned transfer.
                 if not manifest_matches or changed:
                     console.out(f"(dry-run) would apply manifest metadata: {outpath}\n")
-                st = 0
+                # A directory sitting where a regular file is recorded fails
+                # the real run's apply; the lane reported it here instead (a
+                # dry run applies nothing), so rehearse the failure too.
+                st = 1 if restore_filter is not None and restore_filter.conflicts else 0
             else:
                 # A single file's -u verdict was taken above, so its apply
                 # settles the download it decided on, like any download; a
@@ -1755,20 +1780,56 @@ def _delete_extras(
 
     aliases = _collect_extra_aliases(manifest_path, outpath, sub, excludes)
 
+    # A local directory left standing where the manifest records a file,
+    # symlink, or special file - under -u the kept or conflicting side; a
+    # plain pull either replaced it before this pass (a symlink record's
+    # deferred placement) or failed its apply, which skips --delete - holds
+    # what the manifest cannot vouch for (docs/sync.md): nothing at or
+    # beneath it is a candidate. The record's key has no trailing slash and
+    # the directory's does, so the two never pair - the record arrives
+    # manifest-only, and the directory and its contents follow as local-only
+    # items inside the record's descendant range. Judged from the manifest
+    # alone, like the alias set (an excluded record included): keeping is
+    # the safe side, and the stale record is push --delete's to retire. A
+    # blocker is dropped once the ascending stream leaves its range, and the
+    # ones open at once form a chain of prefixes - a record can only join
+    # while an earlier one's range is still ahead, i.e. its name extends
+    # that one's by characters below "/" ("x", "x-", "x-old") - so their
+    # number is bounded by the longest name, never by the tree.
+    blockers: list[str] = []  # rels of non-directory records whose descendant range lies ahead
+
+    def prune(rel: str) -> None:
+        # Memory only: drop every blocker whose range the ascending stream
+        # has left (rel sorts past "b/" without being under it). covered()
+        # never depends on this having run.
+        blockers[:] = [b for b in blockers if rel < b + "/" or rel.startswith(b + "/")]
+
+    def covered(rel: str) -> bool:
+        return any(rel == b or rel.startswith(b + "/") for b in blockers)
+
     def items() -> Iterator[tuple[str, str, bool, bool]]:
         # Every LOCAL item flows: the local-only lane (m is None) are the
-        # removal candidates, and a recorded local item pins the extra
-        # directories still open above it (see remove_extras) - a parent
-        # record is optional, so an unrecorded directory can hold recorded
-        # children whose rmdir must never be offered.
+        # removal candidates, and a recorded local item - or one a blocker
+        # covers - pins the extra directories still open above it (see
+        # remove_extras) - a parent record is optional, so an unrecorded
+        # directory can hold recorded children whose rmdir must never be
+        # offered.
         for _key, m, loc in manifest.merge_join(
             manifest_keyed(manifest_path, sub), local_keyed(outpath, excludes, sub)
         ):
             if loc is None:
+                assert m is not None  # the join yields at least one side
+                rel, m_entry = m
+                prune(rel)
+                if rel != "." and not m_entry.is_dir:
+                    blockers.append(rel)
                 continue
             rel, st, _sym = loc
-            if rel != ".":
-                yield rel, os.path.join(outpath, rel), stat_mod.S_ISDIR(st.st_mode), m is None
+            if rel == ".":
+                continue
+            prune(rel)
+            extra = m is None and not covered(rel)
+            yield rel, os.path.join(outpath, rel), stat_mod.S_ISDIR(st.st_mode), extra
 
     errors, removed = remove_extras(items(), aliases=aliases, dryrun=opts.dryrun, confirm=confirmer)
     return (1 if errors else 0), removed

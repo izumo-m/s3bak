@@ -10,6 +10,7 @@ import pytest
 
 from s3bak import cli
 from s3bak.compare import SYMLINK_MTIME_SUPPORTED
+from s3bak.console import console
 
 _NO_SYMLINK_MTIME_REASON = "platform cannot set a symlink's own mtime without following it"
 _DRIFTED_LINK_MTIME_NS = 1_700_000_000_000_000_000
@@ -970,6 +971,184 @@ def test_pull_delete_skipped_when_metadata_apply_fails(ws):
     assert res.rc == 1
     assert "skipping --delete" in res.err
     assert extra.exists()
+
+
+# --- a local directory where the backup records a regular file ---------------
+
+_DIR_AT_FILE = "type conflict: a directory sits where the backup records a regular file"
+
+
+def _directory_at_file_record(ws, excludes=None):
+    """Push d/x as a regular file, then replace it locally with a directory
+    holding data the backup does not; d/other is edited so the pull's no-op
+    gate opens. Returns the directory."""
+    ws.write("data/d/x", "old")
+    ws.write("data/d/other", "o")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    if excludes:  # added after the push, so d/x is recorded whatever they cover
+        ws.config({"data": {"path": str(ws.root / "data"), "excludes": excludes}})
+    x = ws.root / "data" / "d" / "x"
+    x.unlink()
+    x.mkdir()
+    (x / "inner").write_text("unrecorded")
+    (ws.root / "data" / "d" / "other").write_text("changed")
+    return x
+
+
+def test_pull_reports_directory_at_file_record_and_keeps_it(ws):
+    # The download lane never lands an object on a local directory (the
+    # os.replace that commits a download would fail with EISDIR after the
+    # bytes were fetched): the pull restores everything else, reports the
+    # one record it cannot restore, and fails; the directory is untouched.
+    x = _directory_at_file_record(ws)
+    other = ws.root / "data" / "d" / "other"
+
+    res = ws.run("pull", "data")
+
+    assert res.rc == 1
+    assert _DIR_AT_FILE in res.err and "push --delete" in res.err
+    assert "Is a directory" not in res.err
+    assert (x / "inner").read_text() == "unrecorded"
+    assert other.read_text() == "o"  # the rest of the tree is restored...
+    assert f"644 {other}" in res.out  # ...and settled
+    assert f"{ws.prefix}/data/d/x to" not in res.out
+
+
+def test_pull_dry_run_reports_directory_at_file_record(ws):
+    # A dry run applies no metadata, so the lane reports what the apply
+    # would, and the rehearsal fails the way the real run does.
+    x = _directory_at_file_record(ws)
+
+    res = ws.run("pull", "--dry-run", "data")
+
+    assert res.rc == 1
+    assert _DIR_AT_FILE in res.err
+    assert f"{ws.prefix}/data/d/x to" not in res.out
+    assert (x / "inner").read_text() == "unrecorded"
+    assert (ws.root / "data" / "d" / "other").read_text() == "changed"
+
+
+def test_pull_delete_is_skipped_after_directory_at_file_record(ws):
+    # The directory's contents excluded (`d/x/*` covers the directory key too,
+    # docs/excludes.md), the file record is not: its key carries no slash.
+    # The record is reported, and --delete does not run over a tree that is
+    # not in its recorded state.
+    x = _directory_at_file_record(ws, excludes=["d/x/*"])
+
+    res = ws.run("pull", "--delete", "--yes", "data")
+
+    assert res.rc == 1
+    assert _DIR_AT_FILE in res.err
+    assert "skipping --delete" in res.err
+    assert (x / "inner").read_text() == "unrecorded"
+
+
+def test_pull_reports_directory_at_file_record_whose_object_is_gone(ws):
+    # The record's object gone, the download lane never sees the key: the
+    # metadata pass meets the directory and reports the same conflict (a
+    # dry run, which applies nothing, cannot see this one).
+    x = _directory_at_file_record(ws)
+    ws.s3.delete_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/d/x")
+
+    res = ws.run("pull", "--dry-run", "data", expect_rc=0)
+    assert _DIR_AT_FILE not in res.err  # the accepted gap (manual 05)
+
+    res = ws.run("pull", "data")
+
+    assert res.rc == 1
+    assert _DIR_AT_FILE in res.err
+    assert (x / "inner").read_text() == "unrecorded"
+
+
+def test_pull_checksum_reports_directory_at_file_record(ws):
+    # Under --checksum the update lane is the content comparison; the create
+    # lane is still the filter's.
+    x = _directory_at_file_record(ws)
+
+    res = ws.run("pull", "--checksum", "data")
+
+    assert res.rc == 1
+    assert _DIR_AT_FILE in res.err
+    assert (x / "inner").read_text() == "unrecorded"
+
+
+def test_pull_replaces_a_symlinked_root_without_judging_the_old_tree(ws):
+    # A restore root of the wrong type is replaced whole from a stage: the
+    # download lands in an empty stage, so nothing there can be in the way,
+    # and the old tree behind the symlink - the directory at d/x included -
+    # must not be judged in its place. The dry run, which runs against the
+    # uncorrected root, must not report a conflict the real run never meets.
+    x = _directory_at_file_record(ws)
+    link = ws.root / "link"
+    os.symlink(ws.root / "data", link)
+    ws.config({"data": {"path": str(link)}})
+
+    res = ws.run("pull", "--dry-run", "data", expect_rc=0)
+    assert "(conflicting type)" in res.out and "type conflict" not in res.err
+
+    res = ws.run("pull", "data", expect_rc=0)
+
+    assert not link.is_symlink() and (link / "d" / "x").read_text() == "old"
+    assert (x / "inner").read_text() == "unrecorded"  # the old tree, untouched
+    assert "type conflict" not in res.err and "no data object" not in res.err
+
+
+def test_pull_ignores_an_excluded_file_record_over_a_local_directory(ws):
+    # The record's own key excluded (`d/x`, no slash), the pull touches
+    # neither the record nor the directory: no download, no report - and
+    # --delete never offers the directory or its contents, which the stale
+    # record still shadows.
+    x = _directory_at_file_record(ws, excludes=["d/x"])
+
+    res = ws.run("pull", "--delete", "--yes", "data", expect_rc=0)
+
+    assert res.err == "" and "delete:" not in res.out
+    assert f"{ws.prefix}/data/d/x to" not in res.out
+    assert (x / "inner").read_text() == "unrecorded"
+
+
+def test_pull_delete_shields_only_the_directory_at_the_stale_record(ws):
+    # The stale record's descendant range covers d/x and what is under it,
+    # not the siblings whose names sort around that range: "x-old" and
+    # "x.bak" before it ("-" and "." sort below "/"), "x0new" after it. All
+    # three are ordinary extras and go; d/x/inner stays.
+    x = _directory_at_file_record(ws, excludes=["d/x"])
+    ws.write("data/d/x-old/junk", "j")
+    ws.write("data/d/x.bak", "b")
+    ws.write("data/d/x0new", "n")
+
+    res = ws.run("pull", "--delete", "--yes", "data", expect_rc=0)
+
+    assert res.err == ""
+    assert not (ws.root / "data" / "d" / "x-old").exists()
+    assert not (ws.root / "data" / "d" / "x.bak").exists()
+    assert not (ws.root / "data" / "d" / "x0new").exists()
+    assert (x / "inner").read_text() == "unrecorded"
+
+
+@pytest.mark.parametrize("excludes", [[], ["d/x/*"]], ids=["recorded-dir", "unrecorded-dir"])
+def test_pull_warns_for_a_stale_object_over_a_local_directory(ws, excludes):
+    # An object with no file record at its key, where a local directory sits:
+    # verify's `type conflict` (a directory record shadowed by the object) or
+    # an unrecorded object over an excluded directory. Either is residue the
+    # pull cannot place - warned about (exit 2), never downloaded; everything
+    # else restores.
+    ws.write("data/d/other", "o")
+    ws.write("data/d/x/inner", "i")
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": excludes}})
+    ws.run("push", "data", expect_rc=0)
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/d/x", Body=b"stale")
+    (ws.root / "data" / "d" / "other").write_text("changed")
+    warned = console.warning_count()
+
+    res = ws.run("pull", "data", expect_rc=0)
+
+    assert "warning: stale object not restored - a directory sits at its path" in res.err
+    assert console.warning_count() == warned + 1  # what cli.run turns into exit 2
+    assert f"{ws.prefix}/data/d/x to" not in res.out
+    assert (ws.root / "data" / "d" / "x" / "inner").read_text() == "i"
+    assert (ws.root / "data" / "d" / "other").read_text() == "o"
 
 
 def test_pull_delete_resettles_directory_mtime(ws):

@@ -324,6 +324,95 @@ def test_pull_update_unrecorded_object_over_a_local_file_is_a_conflict(ws):
     assert b.read_text() == "beta"
 
 
+def _directory_at_file_record(ws):
+    """Replace the pushed a.txt with a directory holding data the backup does
+    not: the type change no download can undo (docs/sync.md)."""
+    a, _b = _pushed_tree(ws)
+    a.unlink()
+    a.mkdir()
+    (a / "inner").write_text("unrecorded")
+    return a
+
+
+def test_pull_update_keeps_a_newer_directory_where_a_file_is_recorded(ws):
+    a = _directory_at_file_record(ws)
+    os.utime(a, (NEW, NEW))
+
+    res = ws.run("pull", "-u", "-v", "data", expect_rc=0)
+
+    assert f"skip (local is newer): {a}" in res.err
+    assert "conflict" not in res.err and "download:" not in res.out
+    assert (a / "inner").read_text() == "unrecorded"
+
+
+def test_pull_update_older_directory_where_a_file_is_recorded_is_a_conflict(ws):
+    # A newer record would replace a symlink at its key, but never a
+    # directory: that pair is the conflict, and the directory stays.
+    a = _directory_at_file_record(ws)
+    os.utime(a, (OLD, OLD))
+    warned = console.warning_count()
+
+    res = ws.run("pull", "-u", "data", expect_rc=0)
+
+    assert (
+        f"{CONFLICT}newer in the backup, but a directory sits at its path;"
+        f" skipped (touch the copy to keep): {a}"
+    ) in res.err
+    assert console.warning_count() == warned + 1
+    assert "download:" not in res.out
+    assert (a / "inner").read_text() == "unrecorded"
+
+
+def test_pull_update_directory_tie_where_a_file_is_recorded_is_a_conflict(ws):
+    a, _b = _pushed_tree(ws)
+    recorded = _mtime_ns(a)
+    a.unlink()
+    a.mkdir()
+    os.utime(a, ns=(recorded, recorded))
+
+    res = ws.run("pull", "-u", "data", expect_rc=0)
+
+    assert f"{CONFLICT}same mtime, type differs" in res.err
+    assert a.is_dir()
+
+
+def test_pull_update_delete_never_offers_the_contents_of_a_kept_directory(ws):
+    # The directory kept at a file record's key holds what the manifest
+    # cannot vouch for: neither it nor its contents are extras, whichever
+    # side the rule picked.
+    a = _directory_at_file_record(ws)
+    for mtime, quiet in ((NEW, True), (OLD, False)):
+        os.utime(a, (mtime, mtime))
+
+        res = ws.run("pull", "-u", "--delete", "--yes", "data", expect_rc=0)
+
+        assert "delete:" not in res.out
+        # Kept by the rule, not by the name-folding alias guard, which the
+        # stale record's own spelling used to trip.
+        assert "not removed (a local name" not in res.err
+        assert (res.err == "") is quiet  # the older directory is the conflict
+        assert (a / "inner").read_text() == "unrecorded"
+
+
+def test_pull_update_orders_a_directory_where_a_gone_object_is_recorded(ws):
+    # The record's object gone, no lane ever sees the key: the metadata apply
+    # applies the same rule to the directory it meets there.
+    a = _directory_at_file_record(ws)
+    ws.s3.delete_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/a.txt")
+    os.utime(a, (NEW, NEW))
+
+    res = ws.run("pull", "-u", "data", expect_rc=0)
+
+    assert res.err == ""
+    assert (a / "inner").read_text() == "unrecorded"
+
+    os.utime(a, (OLD, OLD))
+    res = ws.run("pull", "-u", "data", expect_rc=0)
+
+    assert f"{CONFLICT}newer in the backup, but a directory sits at its path" in res.err
+    assert (a / "inner").read_text() == "unrecorded"
+
+
 def test_pull_update_settles_a_directory_it_downloaded_into(ws):
     _a, b = _pushed_tree(ws)
     sub = ws.root / "data" / "sub"

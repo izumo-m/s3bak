@@ -9,6 +9,19 @@ a fix only (Fixed).
 
 ## [Unreleased]
 
+### Fixed
+
+- `pull` no longer fails with a raw `[Errno 21] Is a directory` from the
+  download when a local directory sits where the backup records a regular
+  file. The object is never downloaded onto the directory: the pull restores
+  everything else, reports the record it cannot restore as a `type conflict`
+  (naming what retires the record and what restores the file), and exits 1;
+  `--dry-run` reports it too. `pull -u` orders the directory by its own
+  modification time like any other type change: a newer directory is kept,
+  an older one is a conflict (exit 2). `pull --delete` never offers such a
+  directory or its contents as extras. An object with no file record at its
+  key, over such a directory, is warned about and skipped.
+
 ## [0.8.0] - 2026-09-05
 
 ### Added

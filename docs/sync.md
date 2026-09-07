@@ -116,7 +116,12 @@ through. Pull decides in `syncops.UpdateFilter`, which extends
 `ManifestFilter` with the rule and also takes the create lane (an object with
 nothing the destination listing could see: nothing local, or a symlink or
 directory, which the listing omits) — one cursor serves both lanes, since
-boto3-s3 decides them serially in one ascending stream. Its decisions are
+boto3-s3 decides them serially in one ascending stream, as in the plain
+pull's `RestoreFilter`. A local symlink or directory at a file record's key
+is the type change the rule orders by the local side's own mtime: newer, it
+is kept; a newer record replaces a symlink but never a directory, which is
+then the conflict — and the apply applies the same rule to a directory at a
+file record whose object is gone, a key no lane ever sees. Its decisions are
 spooled for the metadata apply (see the pull pipeline): the apply cannot
 otherwise tell a downloaded file, stamped with the object's upload time and
 therefore "newer", from a genuinely newer local edit. A staged pull (a
@@ -457,11 +462,33 @@ rehearsal must fail or warn exactly where the real command would. With
 3. **Download** (a symlink sub-path, having no data object, skips this
    step): `sync_down` for a directory, a single-request `get_file` for a file
    (multipart via `S3.cp` if the recorded size is large). Excluded paths are
-   not downloaded ([excludes.md](excludes.md)). Under `-u` the lanes are
-   `UpdateFilter`'s, and each decision is spooled to a temp file in stream
-   order — `D` for a download, `K` for a key kept as it is — for step 4; a
-   single-file entry has no lanes, so `cmd_pull` takes its one verdict
-   before the transfer. A restore root of
+   not downloaded ([excludes.md](excludes.md)). A directory sync's two lanes
+   come from one streaming filter over the manifest: `ManifestFilter`'s
+   size+mtime check for the both-sides pairs (the content comparison under
+   `--checksum`), and the create lane for every S3-only key — which is also
+   where a local symlink or directory at an object's key lands, since the
+   destination listing omits both. The create lane never downloads onto a
+   local directory (`syncops.RestoreFilter`): a download commits through an
+   `os.replace` that replaces a file or symlink atomically but can never
+   replace a directory, so the transfer would fetch the bytes only to fail
+   on the rename. The record decides what the directory means. A
+   regular-file record there is a type conflict: the directory is never
+   replaced (it may hold data the backup does not), so the record cannot be
+   restored at that path — the metadata apply reports it (exit 1) on a real
+   run, the lane itself on a dry run, which applies nothing. No file record
+   at the key means the object is residue the pull cannot place — unrecorded,
+   or shadowing a directory record (verify's type conflict; a directory
+   record's key carries a trailing slash, so the object's key finds no
+   record) — warned about (exit 2). A symlink or special-file record at the
+   key is left to the apply, which restores the record. The check is
+   skipped where nothing can be in the way: a staged pull (a conflicting
+   restore root, below) writes into an empty stage — and its dry run runs
+   against the uncorrected root, which must not be judged either — and a
+   destination that does not exist yet holds nothing. Under `-u` the lanes
+   are `UpdateFilter`'s, and each decision is spooled to a temp file in
+   stream order — `D` for a download, `K` for a key kept as it is — for
+   step 4; a single-file entry has no lanes, so `cmd_pull` takes its one
+   verdict before the transfer. A restore root of
    the wrong type (a directory where a file entry restores, a file or symlink
    where a tree does) is never destroyed up front: the download lands in a
    unique stage directory beside it first, and the root is swapped in two
@@ -531,8 +558,11 @@ rehearsal must fail or warn exactly where the real command would. With
    (`os.utime(..., follow_symlinks=False)`) — their own recorded mtime, and
    mode/mtime are set on entries whose local type matches the record.
    Directory and symlink conflicts are recreated from the manifest; a
-   regular-file conflict is reported instead of following a hostile local
-   symlink. A regular-file
+   regular-file conflict is reported: never through a hostile local symlink,
+   and never over a local directory, which is not replaced (step 3 refused
+   its download for the same reason; a record whose object is gone never
+   reached that lane, so a directory at its path is found here alone, which
+   a dry run, applying nothing, does not rehearse). A regular-file
    record whose object is gone — the residue of a deletion that outran its
    manifest rewrite, or an object removed out-of-band — is warned about and
    skipped in full (exit 2); the pull restores everything else rather than
@@ -571,6 +601,23 @@ the extras diff and is never offered ([excludes.md](excludes.md)).
   over the same merge-join, before the removal stream starts, so a leaf and a
   directory extra alike check it the instant each is judged; a hit warns
   (exit 2) instead of removing.
+- **A directory where a non-directory is recorded is not an extra.** A local
+  directory left standing where the manifest records a file, symlink, or
+  special file — under `-u` the kept or conflicting side; a plain pull
+  either replaced it before this pass (a symlink record's deferred
+  placement) or failed its apply, which skips `--delete` — holds what the
+  manifest cannot vouch for. The record's key has no trailing slash and the
+  directory's does, so they never pair: the record arrives manifest-only,
+  and the directory and everything beneath it follow as local-only items in
+  its descendant range. They flow as recorded content — never offered, and
+  pinning the extra directories open above them. Judged from the manifest
+  alone, like the alias set (an excluded record included): keeping is the
+  safe side, and `push --delete` retires the stale record. A blocker is
+  dropped once the ascending stream leaves its range, and the ones open at
+  once form a chain of prefixes — a record can only join while an earlier
+  one's range is still ahead, i.e. its name extends that one's by
+  characters below `/` (`x`, `x-`, `x-old`) — so their number is bounded by
+  the longest name, never by the tree.
 - **Ordering against the metadata apply.** The extras pass runs after the
   apply and is skipped when the apply failed — extras diffed against a tree
   that is not in its recorded state are not trustworthy deletion candidates.

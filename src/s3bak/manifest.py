@@ -684,8 +684,10 @@ class ManifestFilter:
     the manifest (True = copy). Wired as ``S3.sync``'s ``update_filter`` on
     ``sync_down``, so it is handed only the both-sides download pairs; new
     entries (``create_filter``) and local extras are decided by those lanes,
-    never here. (Push's compare lives in ``syncops.PushJournal``, which folds
-    the same size+mtime judgment into its journal emission.)
+    never here - the subclasses that wire it (``syncops.RestoreFilter`` for
+    a plain pull, ``syncops.UpdateFilter`` under -u) take the create lane on
+    this same cursor. (Push's compare lives in ``syncops.PushJournal``, which
+    folds the same size+mtime judgment into its journal emission.)
 
     Streaming: it reads the manifest once, front to back, merge-joining its
     records against ``S3.sync``'s ascending compare-key pairs - the whole
