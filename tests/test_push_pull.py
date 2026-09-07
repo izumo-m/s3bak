@@ -1011,7 +1011,7 @@ def test_pull_reports_directory_at_file_record_and_keeps_it(ws):
     assert "Is a directory" not in res.err
     assert (x / "inner").read_text() == "unrecorded"
     assert other.read_text() == "o"  # the rest of the tree is restored...
-    assert f"644 {other}" in res.out  # ...and settled
+    assert f"M {other}" not in ws.run("status", "data").out  # ...and settled
     assert f"{ws.prefix}/data/d/x to" not in res.out
 
 
@@ -1092,6 +1092,25 @@ def test_pull_replaces_a_symlinked_root_without_judging_the_old_tree(ws):
     assert not link.is_symlink() and (link / "d" / "x").read_text() == "old"
     assert (x / "inner").read_text() == "unrecorded"  # the old tree, untouched
     assert "type conflict" not in res.err and "no data object" not in res.err
+
+
+def test_pull_replaces_a_symlink_to_a_directory_at_a_file_record(ws):
+    # Only a directory (or a junction, which lstats as one) blocks a
+    # download: a symlink at the key - even one pointing at a directory - is
+    # a type change the download undoes, replacing the link and never
+    # following it. (On Windows s3transfer removes the link before the
+    # rename; verified there by hand, since the suite runs on POSIX.)
+    x = _directory_at_file_record(ws)
+    shutil.rmtree(x)
+    elsewhere = ws.root / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "inner").write_text("i")
+    os.symlink(elsewhere, x, target_is_directory=True)
+
+    ws.run("pull", "data", expect_rc=0)
+
+    assert not x.is_symlink() and x.read_text() == "old"
+    assert (elsewhere / "inner").read_text() == "i"
 
 
 def test_pull_ignores_an_excluded_file_record_over_a_local_directory(ws):

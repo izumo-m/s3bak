@@ -111,10 +111,11 @@ class RestoreFilter(manifest.ManifestFilter):
 
     The create lane is handed every object the destination listing paired
     with nothing: nothing local, or a symlink or directory, which pull's
-    listing omits. A download lands through a sibling temp file and an
-    ``os.replace``, which replaces a file or symlink atomically but can never
-    replace a directory - the transfer would fetch the bytes and then fail
-    on the rename. So a local directory at the key is checked first, and
+    listing omits. A download lands through a sibling temp file and a
+    rename that replaces a file or symlink (a symlink to a directory
+    included - on Windows s3transfer removes the link first) but never a
+    directory or junction - the transfer would fetch the bytes and then
+    fail on the rename. So a local directory at the key is checked first, and
     the record at that key says what it means. A regular-file record there
     is a type conflict: the directory is never replaced (it may hold data the
     backup does not), so the record cannot be restored here - reported by
@@ -167,7 +168,7 @@ class RestoreFilter(manifest.ManifestFilter):
         except OSError:
             return True  # nothing local (or unreadable: the transfer reports it)
         if not stat_mod.S_ISDIR(st.st_mode):
-            return True  # a file or symlink: the download replaces it atomically
+            return True  # a file or symlink: the download replaces it
         m = self._lookup(key)
         if m is None:
             console.warn(
