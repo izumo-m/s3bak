@@ -294,8 +294,9 @@ is what it is for.
 
 ## Excludes
 
-An entry's `excludes` are glob patterns for paths to leave out. They work
-exactly like `aws s3 sync --exclude` — the same pattern engine does the
+An entry's `excludes` are glob patterns for paths to leave out and, with a
+`!` prefix, for paths to take back. They work exactly like
+`aws s3 sync --exclude` and `--include` — the same pattern engine does the
 matching — and the matching is deliberately literal:
 
 - a relative pattern is compared against the **whole path relative to the
@@ -317,9 +318,13 @@ and not the top itself. Covering both takes both patterns.
 
 Three more properties are worth knowing before you write a list of them:
 
-- **Order does not matter.** s3bak has no include patterns to play against
-  excludes, so the list means "excluded if any pattern matches" — unlike
-  `.gitignore`, where a later rule can take a path back.
+- **Order matters once a `!` appears.** A pattern that starts with `!` takes
+  matching paths *back*, like `aws s3 sync --include`, and the last pattern
+  that matches a path decides — so `["cache/*", "!cache/keep/*"]` backs up
+  `cache/keep` and nothing else under `cache`, while the reverse order backs
+  up nothing under `cache` at all. Without any `!` the list simply means
+  "excluded if any pattern matches". See
+  [Taking paths back](#taking-paths-back).
 - **A symbolic link is matched by its own name only.** Whatever it points at,
   a link named `cache` has no trailing slash in the comparison, so neither
   `cache/` nor `cache/*` excludes it; `cache` does.
@@ -330,9 +335,56 @@ Three more properties are worth knowing before you write a list of them:
 
 Naming an excluded path on the command line does not override the exclude,
 either: `s3bak push demo/cache` where `cache/*` is excluded pushes nothing and
-exits 0, since ignoring the path is the rule rather than an error. (Compare a
-sub-path that simply does not exist locally, which is an error unless
-`--delete` says to retire its backup.)
+exits 0, since ignoring the path is the rule rather than an error. A path
+that does not exist locally is judged by what the backup records under it:
+when every record there is excluded — or, with nothing recorded, when the
+name is excluded in either spelling, as a file or as a directory — the push
+is the same silent exit 0. Otherwise a missing sub-path is an error, unless
+`--delete` says to retire its backup. A `pull` of a name the backup does not
+record follows the same rule: excluded in either spelling, it is ignored;
+otherwise it is the `not found on S3` error.
+
+### Taking paths back
+
+The `!` prefix is what turns `excludes` into a list of what to keep. Start
+with `*`, then name what comes back:
+
+```python
+"home": {
+    "path": HOME,
+    "excludes": [
+        "*",                     # nothing, unless taken back below
+        "!.bashrc", "!.gitconfig",
+        "!.config/*",            # .config and everything under it...
+        ".config/Code/Cache/*",  # ...except this cache
+        "!.ssh/*", ".ssh/agent/*",
+    ],
+},
+```
+
+Every path is still judged on its own, in both directions. Taking back
+`*.md` takes back no directory: under a catch-all `*`, the directories the
+files sit in stay excluded and unrecorded, so a pull creates them as plain
+directories with default permissions (see below). If their metadata matters,
+take the directories back too — `!*/` matches every directory and nothing
+else, the rsync idiom:
+
+```python
+"excludes": ["*", "!*/", "!*.md"]
+```
+
+The config loader rejects a `!` with nothing after it, and a list that
+*opens* with a `!` pattern: everything is included until an exclude matches,
+so a leading include takes nothing back — the same trap as a lone
+`--include` in aws-cli. An empty pattern is rejected too. A name that begins
+with a literal `!` is written as a character class, `[\!]name`; taking such
+a name back is `!!name`, which reads as it works.
+
+A `!` pattern also shapes what s3bak reads from disk. With `*` first, every
+local walk — a push, `status`, `pull --delete` — descends only into
+directories a later `!` pattern could reach, so a `HOME` entry that takes
+back `.config/nvim/*` never opens `Downloads`. A pattern that can reach
+anywhere, `!*.md` or the `!*/` idiom, gives that up: the whole tree is read.
 
 ### What excluded means
 

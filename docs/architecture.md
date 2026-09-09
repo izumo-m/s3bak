@@ -32,7 +32,7 @@ are foundational modules used from several layers.
   its streaming merge, sorted-stream joins, and the stat-based manifest
   comparison pull uses.
 - **excludes** owns the exclusion predicate (`Excludes`), delegated to
-  boto3-s3's `globsieve` - aws-cli's `--exclude` engine - per
+  boto3-s3's `globsieve` - aws-cli's `--exclude` / `--include` engine - per
   [excludes.md](excludes.md). It imports no other s3bak module, so every
   layer that must agree on what an exclude means shares the one predicate.
 - **localwalk** enumerates local trees in the same key order as the data sync

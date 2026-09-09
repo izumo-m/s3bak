@@ -98,7 +98,7 @@ Each entry is a dictionary of these keys:
 | Key | Type | Default | What it sets |
 | --- | --- | --- | --- |
 | `path` | non-empty, NUL-free string | *required* | the absolute local path to back up: a directory or a regular file, never a path root (`/`, or `C:\` or `\\server\share` on Windows), a symlink, or a special file; `~` is not expanded |
-| `excludes` | list of NUL-free strings | nothing excluded | aws-cli-style glob patterns to leave out of the backup: a relative pattern matches the path relative to the entry root, an absolute pattern the absolute path |
+| `excludes` | list of NUL-free strings | nothing excluded | aws-cli-style glob patterns to leave out of the backup, applied in order; a `!` prefix takes matching paths back; a relative pattern matches the path relative to the entry root, an absolute pattern the absolute path |
 | `pre_hook` | non-empty list of NUL-free strings | no hook | argument vector run before every push attempt, without a shell; a failure stops the push |
 | `post_hook` | non-empty list of NUL-free strings | no hook | argument vector run after a push that did work, without a shell; never runs after a push that changed nothing |
 | `mtime_window` | number of seconds >= 0 | the top-level value | the same tolerance, for this entry alone |
@@ -158,6 +158,18 @@ filesystem root (`/home/you/...`, or a drive letter on Windows) is matched
 against the absolute path instead. Excluding a directory together with its
 contents is spelled `elpa/*`; a bare `elpa` matches only a *file* named
 `elpa`, exactly as it would in aws-cli.
+
+A pattern that starts with `!` takes matching paths back, the way
+`aws s3 sync --include` does. Patterns apply in the order written, and the
+last one that matches a path decides:
+
+```python
+"excludes": ["*", "!*.md", "!*/"]
+```
+
+backs up the `.md` files at every depth (and, through `!*/`, the directories
+they sit in) and nothing else. A list that opens with a `!` pattern is
+rejected, since it would take nothing back.
 [How s3bak detects changes](04-change-detection.md) covers the language and
 its consequences properly.
 

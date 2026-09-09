@@ -23,11 +23,13 @@ from boto3_s3 import LocalFileInfo, SrcOnlyPair, SyncPair
 from s3bak import localwalk, manifest
 from s3bak.compare import (
     CONFLICT_CONTENT,
+    CONFLICT_DIR_AT_FILE,
     CONFLICT_OBJECT,
     CONFLICT_SIZE,
     CONFLICT_TYPE,
     CONFLICT_UNRECORDED,
     SYMLINK_MTIME_SUPPORTED,
+    dir_at_file_record,
     mode_differs,
     ordered_side,
     tie_conflict,
@@ -102,26 +104,82 @@ def download_manifest(cfg: Config, entry: str, dest: str, verbose: bool = False)
     return found
 
 
-def sync_compare(
-    cfg: Config, opts: Opts, entry: str, manifest_path: str | None, sub: str | None = None
-) -> PairFilter:
-    """Build pull's update-lane strategy (`S3.sync`'s `update_filter`): the
-    stat-only streaming ManifestFilter by default, EtagComparison under
-    --checksum. `manifest_path=None` (nothing on S3 yet) yields an empty
-    filter, so every both-sides pair transfers. The size+mtime-check window is
-    resolved for `entry`. (Push builds a `PushJournal` instead, which folds
-    the same judgment into its journal emission; pull -u builds an
-    ``UpdateFilter`` itself, which also takes the create lane - see cmd_pull.)
+class RestoreFilter(manifest.ManifestFilter):
+    """The plain pull's lanes: ``ManifestFilter``'s size+mtime judgment for
+    the update lane, plus a create lane that never downloads onto a local
+    directory.
 
-    The ManifestFilter streams the manifest file, so the caller must `close()`
-    it before unlinking the temp manifest (see cmd_pull)."""
-    assert cfg.store is not None
-    if opts.checksum:
-        return cfg.store.content_compare()
-    records: Iterator[tuple[str, ManifestEntry]] = iter(())
-    if manifest_path is not None:
-        records = manifest.iter_compare_records(manifest_path, sub=sub)
-    return manifest.ManifestFilter(records, window_ns=cfg.window_ns_for(entry))
+    The create lane is handed every object the destination listing paired
+    with nothing: nothing local, or a symlink or directory, which pull's
+    listing omits. A download lands through a sibling temp file and a
+    rename that replaces a file or symlink (a symlink to a directory
+    included - on Windows s3transfer removes the link first) but never a
+    directory or junction - the transfer would fetch the bytes and then
+    fail on the rename. So a local directory at the key is checked first, and
+    the record at that key says what it means. A regular-file record there
+    is a type conflict: the directory is never replaced (it may hold data the
+    backup does not), so the record cannot be restored here - reported by
+    the metadata apply on a real run (``restore._apply_record``, exit 1) and
+    here on a dry run, which runs no apply. No file record there means the
+    object is residue the pull cannot place - unrecorded, or shadowing a
+    directory record (verify's type conflict; a directory record's key
+    carries a trailing slash, so the object's key finds no record at all) -
+    warned about (exit 2). A symlink or special-file record at the key is
+    left to the apply, which restores the record.
+
+    One cursor serves both lanes, as in ``UpdateFilter``: boto3-s3 decides
+    them serially in one ascending compare-key stream. Under --checksum the
+    update lane is the content comparison instead, and this filter serves
+    the create lane alone. Streams the manifest file, so the caller closes
+    it before unlinking the temp manifest (see cmd_pull).
+
+    ``check_local`` False skips the lstat: a staged pull writes into an
+    empty stage, where nothing can be in the way - and ``outpath`` is then
+    the conflicting root itself, a symlink there would lead the check into
+    the old tree - as does its dry run, which runs against that uncorrected
+    root; a destination that does not exist yet holds nothing either."""
+
+    def __init__(
+        self,
+        records: Iterator[tuple[str, ManifestEntry]],
+        *,
+        window_ns: int,
+        outpath: str,
+        dryrun: bool,
+        check_local: bool = True,
+    ):
+        super().__init__(records, window_ns=window_ns)
+        self._outpath = outpath
+        self._dryrun = dryrun
+        self._check_local = check_local
+        #: Regular-file records a local directory blocked. A dry run fails
+        #: on them (exit 1) the way the real run's apply does.
+        self.conflicts = 0
+
+    def create(self, info: FileInfo) -> bool:
+        """The create lane (``S3.sync``'s ``create_filter``): True downloads."""
+        if not self._check_local:
+            return True
+        key = info.compare_key
+        assert key is not None  # the sync stamps every listed entry
+        local_path = os.path.join(self._outpath, key.replace("/", os.sep))
+        try:
+            st = os.lstat(local_path)
+        except OSError:
+            return True  # nothing local (or unreadable: the transfer reports it)
+        if not stat_mod.S_ISDIR(st.st_mode):
+            return True  # a file or symlink: the download replaces it
+        m = self._lookup(key)
+        if m is None:
+            console.warn(
+                "warning: stale object not restored - a directory sits at its path"
+                f" and no file is recorded there (push --delete retires it): {local_path}"
+            )
+        elif m.is_file:
+            self.conflicts += 1
+            if self._dryrun:
+                console.err(dir_at_file_record(local_path))
+        return False
 
 
 PULL_DOWNLOADED = manifest.PULL_DOWNLOADED
@@ -300,11 +358,12 @@ class UpdateFilter(manifest.ManifestFilter):
 
     def create(self, info: FileInfo) -> bool:
         """The create lane: an object the destination listing paired with
-        nothing. Nothing local downloads; a local symlink where a file is
-        recorded is the type change the rule orders by the link's own mtime
-        (a tie where link mtimes cannot be compared); a local directory is
-        never ordered against a file (the two are not a pair, docs/sync.md)
-        and takes the ordinary lane."""
+        nothing. Nothing local downloads; a local symlink or directory where
+        a file is recorded is the type change the rule orders by the local
+        side's own mtime (a tie where link mtimes cannot be compared). A
+        newer local side is kept either way; a newer record replaces a
+        symlink but never a directory (``RestoreFilter``), which is then the
+        conflict."""
         key = info.compare_key
         assert key is not None  # the sync stamps every listed entry
         m = self._lookup(key)
@@ -321,12 +380,15 @@ class UpdateFilter(manifest.ManifestFilter):
             return self._conflict(CONFLICT_UNRECORDED, key, local_path)
         if not m.is_file:
             return False
-        if not stat_mod.S_ISLNK(st.st_mode):
+        is_dir = stat_mod.S_ISDIR(st.st_mode)
+        if not is_dir and not stat_mod.S_ISLNK(st.st_mode):
             return self._download(key)
         side = ordered_side(m, st, self.window_ns)
         if side == "local":
             return self._keep_newer(key, local_path)
         if side == "record":
+            if is_dir:
+                return self._conflict(CONFLICT_DIR_AT_FILE, key, local_path)
             return self._download(key)
         return self._conflict(tie_conflict(m, st, None) or CONFLICT_TYPE, key, local_path)
 

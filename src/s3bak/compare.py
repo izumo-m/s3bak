@@ -205,6 +205,7 @@ CONFLICT_LINK = "same mtime, link target differs"
 CONFLICT_LINK_NO_MTIME = "link target differs (link mtimes are not compared on this platform)"
 CONFLICT_UNRECORDED = "not recorded in the manifest"
 CONFLICT_OBJECT = "stored object does not match the record"
+CONFLICT_DIR_AT_FILE = "newer in the backup, but a directory sits at its path"
 
 
 def warn_conflict(reason: str, path: str) -> None:
@@ -214,6 +215,21 @@ def warn_conflict(reason: str, path: str) -> None:
     copy that should win and run again, or name the path in a plain
     ``push`` / ``pull``, which mirrors it."""
     console.warn(f"warning: conflict - {reason}; skipped (touch the copy to keep): {path}")
+
+
+def dir_at_file_record(path: str) -> str:
+    """The plain pull's report for a local directory sitting where the backup
+    records a regular file. The directory is never replaced - it may hold
+    data the backup does not - so the record cannot be restored at ``path``;
+    the message says what retires the record and what restores the file.
+    One text for its two reporters: the metadata apply on a real run
+    (``restore._apply_record``) and the create lane on a dry run, which runs
+    no apply (``syncops.RestoreFilter``)."""
+    return (
+        "type conflict: a directory sits where the backup records a regular file"
+        " (push --delete retires the stale record; move the directory away to"
+        f" restore the file): {path}"
+    )
 
 
 def ordered_side(entry: ManifestEntry, st: os.stat_result, window_ns: int) -> Side:

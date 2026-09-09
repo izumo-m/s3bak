@@ -287,7 +287,10 @@ The metadata line appears twice because every removal changes its parent
 directory's modification time; s3bak re-applies the recorded metadata to
 exactly the directories the removals disturbed.
 
-An excluded local path is invisible to this diff and is never offered. Neither
+An excluded local path is invisible to this diff and is never offered. Nor is
+a directory left standing where the backup records a file, symlink, or
+special file — under `-u`, the newer or conflicting side — or anything inside
+it: what it holds is not the pull's to remove. Neither
 is a name your filesystem might fold onto a recorded one — a case difference on
 Windows or macOS, a Unicode spelling difference, a trailing dot Windows trims.
 Such a name might *be* the file the pull just restored under its recorded

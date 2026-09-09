@@ -526,3 +526,26 @@ def test_non_string_required_config_values_are_rejected(ws, field):
 
     assert res.rc == 1
     assert "profile and prefix" in res.err.lower()
+
+
+def test_entry_with_a_bare_bang_exclude_dies_cleanly(ws):
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["*", "!"]}})
+    res = ws.run("list")
+    assert res.rc == 1
+    assert "excludes" in res.err and "bare '!'" in res.err
+
+
+def test_entry_with_a_leading_include_dies_cleanly(ws):
+    # A leading "!" takes nothing back (everything is included until an
+    # exclude matches): the operator meant the other order.
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["!keep/*", "*"]}})
+    res = ws.run("list")
+    assert res.rc == 1
+    assert "must not start with an include" in res.err
+
+
+def test_entry_with_an_empty_exclude_pattern_dies_cleanly(ws):
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["*", ""]}})
+    res = ws.run("list")
+    assert res.rc == 1
+    assert "excludes has an empty pattern" in res.err
