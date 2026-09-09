@@ -408,6 +408,32 @@ def _reject_symlinked_sub_ancestors(base: str, sub: str) -> str | None:
     return None
 
 
+def _backup_invisible(ex: Excludes, manifest_path: str | None, sub: str, anchor: str) -> bool:
+    """Whether the excludes hide everything the backup records at or under
+    ``sub`` - the "nothing visible" judgment for a sub-path absent locally,
+    where the manifest is the only side with a kind to judge by. Each record
+    is judged alone, by its recorded kind (docs/excludes.md): under
+    ``["*", "!x/*"]`` an absent ``x`` with ``x/`` recorded is missing, not
+    ignored - its backup is what the config keeps. With no record at all
+    there is no kind to consult, so either spelling matching means the
+    operator's config excludes the name. ``anchor`` is the sub's absolute
+    local path (``/``-separated); a record's anchor extends it."""
+    recorded = False
+    if manifest_path is not None:
+        for entry in manifest.iter_manifest(manifest_path):
+            rel = entry.path.removeprefix("./")
+            if rel != sub and not rel.startswith(sub + "/"):
+                continue
+            recorded = True
+            below = rel[len(sub) :]  # "" for the sub itself, "/x/y" beneath it
+            slash = "/" if entry.is_dir else ""
+            if not ex.excluded(rel + slash, anchor + below + slash):
+                return False
+    if recorded:
+        return True
+    return ex.excluded(sub, anchor) or ex.excluded(f"{sub}/", anchor + "/")
+
+
 def _push_sub(
     cfg: Config,
     entry: str,
@@ -469,9 +495,9 @@ def _push_sub(
         # target is judged by its actual kind - a directory counts as
         # invisible only when the filtered walk yields NOTHING (its own
         # record included), so a partially excluded directory still pushes
-        # normally below. An absent target has no kind to consult, so either
-        # spelling matching means the operator's config excludes the name,
-        # and exclusion wins over "missing".
+        # normally below. An absent target has no local kind to consult, so
+        # what the backup records under the name is judged instead
+        # (_backup_invisible), and exclusion wins over "missing".
         ex = Excludes(excludes)
         sub_anchor = os.path.abspath(local_sub).replace(os.sep, "/")
         if sub_st is not None and stat_mod.S_ISDIR(sub_st.st_mode):
@@ -488,9 +514,7 @@ def _push_sub(
         elif sub_st is not None:
             nothing_visible = ex.excluded(sub, sub_anchor)
         else:
-            nothing_visible = ex.excluded(sub, sub_anchor) or ex.excluded(
-                f"{sub}/", sub_anchor + "/"
-            )
+            nothing_visible = _backup_invisible(ex, old_manifest, sub, sub_anchor)
 
         if sub_st is None or nothing_visible:
             if not opts.delete:

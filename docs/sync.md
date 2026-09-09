@@ -345,12 +345,12 @@ nothing to confirm: records under a same-named former directory are kept (with
 the restorability warning), and pruning them takes a directory-level
 `push --delete`.
 
-If the local sub-path no longer exists (and is not excluded), the push fails
-unless `--delete` is present — the guard that keeps a typo from silently
-erasing a backup — and the deletion is confirmed as ONE question for the
-whole subtree. Confirmed, s3bak deletes the exact data key and keys below
-`<sub>/` (without touching a similarly prefixed sibling) and removes that
-subtree from the manifest.
+If the local sub-path no longer exists (and the backup under it is not
+entirely excluded), the push fails unless `--delete` is present — the guard
+that keeps a typo from silently erasing a backup — and the deletion is
+confirmed as ONE question for the whole subtree. Confirmed, s3bak deletes the
+exact data key and keys below `<sub>/` (without touching a similarly prefixed
+sibling) and removes that subtree from the manifest.
 
 ### Deleting backups (`--delete`, `--yes`)
 

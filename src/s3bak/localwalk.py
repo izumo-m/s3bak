@@ -17,9 +17,9 @@ entry enumeration. ``ManifestWalker`` only customizes the exclusion
 - **excludes as a per-entry filter**: every emitted entry is judged alone
   against the entry's ``Excludes`` (aws-cli semantics - the walked pages are
   filtered, so dropping a directory's own record does not hide its
-  non-excluded children). Skipping a descent outright happens only for the
-  provable ``dir/*`` shape, as an optimization that cannot change what the
-  filter decides;
+  non-excluded children). Skipping a descent outright happens only where
+  the patterns provably exclude the whole subtree, as an optimization that
+  cannot change what the filter decides;
 - **directories in-stream**: each directory's record is yielded between the
   sibling files that sort before it and its own children, which is what keeps
   the whole stream in manifest order.
@@ -65,9 +65,10 @@ class ManifestWalker(LocalFileGenerator):
     entry root (``""`` for an entry walk, ``"{sub}/"`` for a sub-path walk).
     The filter runs over the emitted pages (``list_file_pages``), so every
     entry is judged alone - an excluded directory loses its own record but
-    not its visible children. ``finalize_children`` skips a descent only for
-    the provable ``dir/*`` shape (``Excludes.prunes_subtree``), where
-    pruning cannot change what the filter decides.
+    not its visible children. ``finalize_children`` skips a descent only
+    where the patterns provably exclude the whole subtree
+    (``Excludes.prunes_subtree``), so pruning cannot change what the filter
+    decides.
 
     The walker also tracks scan completeness: a warning that hides real tree
     content (an unopenable directory, a path that vanished mid-walk) sets
@@ -116,17 +117,19 @@ class ManifestWalker(LocalFileGenerator):
         )
 
     def finalize_children(self, children: list[WalkChild]) -> list[WalkChild]:
-        # The provable prune (docs/excludes.md): a relative ``dir/*``
-        # pattern covers the directory key and every key beneath it, so the
-        # walk may skip the whole descent. No other child is dropped here -
-        # dropping a directory in this hook would also hide its children,
-        # which the per-entry semantics forbid; they are judged one by one
-        # in list_file_pages instead.
+        # The provable prune (docs/excludes.md): where the patterns exclude
+        # the directory key and every key beneath it - and no later include
+        # can take any of them back - the walk may skip the whole descent.
+        # No other child is dropped here - dropping a directory in this hook
+        # would also hide its children, which the per-entry semantics
+        # forbid; they are judged one by one in list_file_pages instead.
+        # ``info.key`` is the absolute path (trailing ``/`` on a directory),
+        # the anchor absolute includes are judged against.
         kept: list[WalkChild] = []
         for child in children:
             assert child.info.compare_key is not None  # stamped by scan_children
             if child.info.kind == FileKind.DIRECTORY and self._excludes.prunes_subtree(
-                self._key_prefix + child.info.compare_key
+                self._key_prefix + child.info.compare_key, child.info.key
             ):
                 continue
             kept.append(child)

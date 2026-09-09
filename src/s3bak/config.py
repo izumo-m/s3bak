@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from s3bak.console import console, expand_home
+from s3bak.excludes import check_patterns
 from s3bak.manifest import MANIFEST_SUFFIX
 from s3bak.store import Boto3S3Store
 
@@ -332,6 +333,8 @@ def load_config(*, create_store: bool = True) -> Config:
             console.die(
                 f"entries[{name!r}].excludes must be a list of NUL-free strings in {config_path}"
             )
+        if excludes is not None and (problem := check_patterns(excludes)) is not None:
+            console.die(f"entries[{name!r}].excludes {problem} in {config_path}")
         for hook in ("pre_hook", "post_hook"):
             hook_value = entry_cfg.get(hook)
             if hook_value is not None and (

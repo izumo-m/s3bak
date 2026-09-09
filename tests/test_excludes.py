@@ -14,7 +14,7 @@ import shutil
 
 import pytest
 
-from s3bak.excludes import Excludes
+from s3bak.excludes import Excludes, check_patterns
 
 # --- the predicate ---------------------------------------------------------
 
@@ -542,3 +542,266 @@ def test_verify_checksum_skips_residue_content(ws):
     assert "content differs" not in res.err
     assert "0 error(s)" in res.out
     assert "under excludes remain in the backup" in res.err
+
+
+# --- includes: a "!" pattern takes a path back ------------------------------
+
+
+def test_a_bang_pattern_takes_a_path_back():
+    # The aws-cli idiom --exclude "*" --include "*.md".
+    ex = Excludes(["*", "!*.md"])
+    assert not ex.excluded("notes.md")
+    assert not ex.excluded("docs/deep/notes.md")
+    assert ex.excluded("notes.txt")
+    assert ex.excluded("docs/")  # a directory key ends in "/", not ".md"
+
+
+def test_the_last_matching_pattern_decides():
+    ex = Excludes(["*", "!.config/*", ".config/Code/Cache/*", "!.config/Code/Cache/keep"])
+    assert ex.excluded("Downloads/big.iso")
+    assert not ex.excluded(".config/")
+    assert not ex.excluded(".config/nvim/init.lua")
+    assert ex.excluded(".config/Code/Cache/")
+    assert ex.excluded(".config/Code/Cache/blob")
+    assert not ex.excluded(".config/Code/Cache/keep")
+
+
+def test_an_include_before_the_exclude_is_overridden():
+    # Order is aws-cli's: a later exclude wins over an earlier include, so
+    # the same two patterns mean different things in the two orders.
+    assert not Excludes(["cache/*", "!cache/keep/*"]).excluded("cache/keep/k.txt")
+    assert Excludes(["!cache/keep/*", "cache/*"]).excluded("cache/keep/k.txt")
+
+
+def test_includes_do_not_propagate_to_ancestors():
+    # Every path is judged alone in both directions: taking back docs/*.md
+    # takes back no directory key. "!*/" is the idiom that records them.
+    ex = Excludes(["*", "!docs/*.md"])
+    assert not ex.excluded("docs/a.md")
+    assert ex.excluded("docs/")
+    with_dirs = Excludes(["*", "!*/", "!docs/*.md"])
+    assert not with_dirs.excluded("docs/")
+    assert not with_dirs.excluded("other/")
+    assert with_dirs.excluded("other/x.txt")
+
+
+def test_absolute_include_matches_the_absolute_local_path():
+    ex = Excludes(["*", "!/home/you/data/keep.txt"])
+    assert not ex.excluded("keep.txt", "/home/you/data/keep.txt")
+    assert ex.excluded("keep.txt", "/elsewhere/data/keep.txt")
+    assert ex.excluded("keep.txt", None)  # inert without an anchor
+
+
+def test_a_literal_leading_bang_is_spelled_as_a_character_class():
+    ex = Excludes([r"[\!]important"])
+    assert ex.excluded("!important")
+    assert not ex.excluded("important")
+
+
+def test_prune_needs_no_later_include_under_the_directory():
+    ex = Excludes(["*", "!.config/nvim/*", "!.bashrc"])
+    assert ex.prunes_subtree("Downloads/")
+    assert ex.prunes_subtree(".config/Code/")
+    assert not ex.prunes_subtree(".config/")
+    assert not ex.prunes_subtree(".config/nvim/")
+    assert not ex.prunes_subtree(".config/nvim/lua/")
+    assert ex.prunes_subtree(".bashrc/")  # a literal file include reaches no directory
+
+
+def test_prune_is_blocked_by_an_include_that_might_reach_the_subtree():
+    assert not Excludes(["cache/*", "!*.keep"]).prunes_subtree("cache/")
+    carved = Excludes(["cache/*", "!cache/keep/*"])
+    assert not carved.prunes_subtree("cache/")
+    assert carved.prunes_subtree("cache/other/")
+
+
+def test_prune_follows_the_last_covering_pattern():
+    ex = Excludes(["*", "!docs/*", "docs/tmp/*"])
+    assert not ex.prunes_subtree("docs/")
+    assert ex.prunes_subtree("docs/tmp/")
+    assert ex.prunes_subtree("src/")
+    # An include the covering exclude overrides does not block the prune.
+    assert Excludes(["!cache/keep/*", "cache/*"]).prunes_subtree("cache/")
+
+
+def test_prune_judges_an_absolute_include_by_the_directory_path():
+    ex = Excludes(["*", "!/home/you/data/keep/*"])
+    assert not ex.prunes_subtree("keep/", "/home/you/data/keep/")
+    assert ex.prunes_subtree("other/", "/home/you/data/other/")
+    assert not ex.prunes_subtree("other/")  # no anchor to judge by: no proof
+
+
+def test_check_patterns_rejects_a_bare_bang_and_a_leading_include():
+    assert check_patterns([]) is None
+    assert check_patterns(["*", "!*.md"]) is None
+    assert "bare '!'" in (check_patterns(["*", "!"]) or "")
+    assert "empty pattern" in (check_patterns(["*", ""]) or "")
+    assert "must not start with an include" in (check_patterns(["!*.md", "*"]) or "")
+
+
+def test_push_include_takes_back_files_under_a_catch_all_exclude(ws):
+    # Only the .md files are backed up. Directory keys match no include, so
+    # no directory is recorded - a pull creates them as plain directories.
+    ws.write("data/notes.md", "n")
+    ws.write("data/docs/deep/a.md", "a")
+    ws.write("data/docs/b.txt", "b")
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["*", "!*.md"]}})
+
+    ws.run("push", "data", expect_rc=0)
+
+    keys = ws.keys()
+    assert "data/notes.md" in keys and "data/docs/deep/a.md" in keys
+    assert "data/docs/b.txt" not in keys
+    assert set(_manifest_paths(ws)) == {".", "./notes.md", "./docs/deep/a.md"}
+
+
+def test_push_bang_slash_idiom_records_the_directories(ws):
+    ws.write("data/docs/a.md", "a")
+    ws.write("data/docs/b.txt", "b")
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["*", "!*/", "!*.md"]}})
+
+    ws.run("push", "data", expect_rc=0)
+
+    assert set(_manifest_paths(ws)) == {".", "./docs", "./docs/a.md"}
+
+
+def test_push_include_carves_a_subtree_back_out_of_an_exclude(ws):
+    ws.write("data/cache/junk.bin", "j")
+    ws.write("data/cache/keep/k.txt", "k")
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["cache/*", "!cache/keep/*"]}})
+
+    ws.run("push", "data", expect_rc=0)
+
+    keys = ws.keys()
+    assert "data/cache/keep/k.txt" in keys
+    assert "data/cache/junk.bin" not in keys
+    paths = _manifest_paths(ws)
+    assert "./cache/keep" in paths and "./cache" not in paths
+
+
+def test_subpath_push_of_a_dir_with_an_included_descendant_pushes_it(ws):
+    # The directory's own key is excluded, but the walk beneath it is not
+    # empty: naming it pushes what the includes take back.
+    ws.write("data/.config/nvim/init.lua", "i")
+    ws.write("data/.config/Code/Cache/blob", "b")
+    ws.write("data/Downloads/big.iso", "x")
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["*", "!.config/nvim/*"]}})
+
+    ws.run("push", "data/.config", expect_rc=0)
+
+    keys = ws.keys()
+    assert "data/.config/nvim/init.lua" in keys
+    assert "data/.config/Code/Cache/blob" not in keys
+    assert "data/Downloads/big.iso" not in keys
+    paths = _manifest_paths(ws)
+    assert "./.config/nvim/init.lua" in paths and "./.config/nvim" in paths
+    assert "./.config" not in paths
+
+
+def test_pull_restores_only_what_the_includes_take_back(ws):
+    ws.write("data/keep.md", "k")
+    ws.write("data/skip.txt", "s")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["*", "!*.md"]}})
+    out = ws.root / "out"
+    ws.run("pull", "data", "-o", str(out), expect_rc=0)
+
+    assert (out / "keep.md").read_text() == "k"
+    assert not (out / "skip.txt").exists()
+
+
+def test_verify_counts_the_records_the_includes_do_not_take_back(ws):
+    ws.write("data/keep.md", "k")
+    ws.write("data/skip.txt", "s")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["*", "!*.md"]}})
+    res = ws.run("verify", "data", expect_rc=0)
+
+    assert "1 recorded path(s) under excludes remain in the backup" in res.err
+
+
+def test_prune_treats_a_literal_include_as_reaching_its_own_key_only():
+    ex = Excludes(["*", "!.config/", "!.bashrc"])
+    assert not ex.prunes_subtree(".config/")  # the include IS the directory
+    assert ex.prunes_subtree(".config/sub/")  # ...and reaches nothing beneath it
+    assert ex.prunes_subtree(".bashrc.d/")
+    assert Excludes(["*", "!.config"]).prunes_subtree(".config/")  # a file of that name
+
+
+def test_prune_joins_an_absolute_include_like_the_engine_does(monkeypatch):
+    # Windows, simulated: every function involved, in s3bak and in the
+    # engine, is a pure string function over ``os.sep`` / ``os.path``, so
+    # both modules are pointed at ntpath. A UNC pattern with a wildcard in
+    # its server part has no drive of its own that ntpath.join could keep
+    # for the literal head alone: judging the head by itself would borrow
+    # the directory's drive and compare a string no key starts with,
+    # pruning a directory the include reaches. Joining the whole pattern,
+    # as the engine does, keeps the proof honest - and lends the directory's
+    # drive to a driveless absolute pattern the same way the engine does.
+    import ntpath
+    from types import SimpleNamespace
+
+    from boto3_s3 import globsieve
+
+    from s3bak import excludes as excludes_mod
+
+    windows = SimpleNamespace(sep="\\", path=ntpath)
+    monkeypatch.setattr(excludes_mod, "os", windows)
+    monkeypatch.setattr(globsieve, "os", windows)
+
+    ex = Excludes(["*", "!//ser*ver/share/data/x/*"])
+    assert not ex.excluded("x/d", "//server/share/data/x/d")
+    assert not ex.prunes_subtree("x/", "//server/share/data/x/")
+
+    driveless = Excludes(["*", "!/data/x/*"])
+    assert not driveless.excluded("x/d", "C:/data/x/d")
+    assert not driveless.prunes_subtree("x/", "C:/data/x/")
+    assert driveless.prunes_subtree("y/", "C:/data/y/")
+
+
+def test_subpath_push_of_an_absent_dir_the_config_takes_back_is_missing(ws):
+    # Absent locally, the named path is judged by what the backup records
+    # under it: x/ and x/a.md are taken back, so this is a missing path -
+    # the guard against a silent no-op stays - not an ignored one.
+    ws.write("data/x/a.md", "a")
+    ws.write("data/skip.txt", "s")
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["*", "!x/*"]}})
+    ws.run("push", "data", expect_rc=0)
+    shutil.rmtree(ws.root / "data" / "x")
+
+    res = ws.run("push", "data/x", expect_rc=1)
+
+    assert "local path does not exist" in res.err
+    assert "data/x/a.md" in ws.keys()
+
+
+def test_subpath_push_of_an_absent_unrecorded_name_under_a_catch_all_is_ignored(ws):
+    # Nothing recorded and nothing local: no kind to judge by, so the name
+    # counts as excluded when either spelling is - and under "*" both are.
+    ws.write("data/x/a.md", "a")
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["*", "!x/*"]}})
+    ws.run("push", "data", expect_rc=0)
+
+    res = ws.run("push", "data/nope", expect_rc=0)
+
+    assert res.out.strip() == "" and res.err.strip() == ""
+
+
+def test_subpath_push_of_an_absent_dir_with_only_excluded_records_is_ignored(ws):
+    # Residue from before the exclude was added: every record under the name
+    # is excluded, so exclusion wins over "missing" (push --delete retires it).
+    ws.write("data/cache/c.txt", "c")
+    ws.write("data/keep.txt", "k")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["cache/*"]}})
+    shutil.rmtree(ws.root / "data" / "cache")
+
+    res = ws.run("push", "data/cache", expect_rc=0)
+
+    assert res.out.strip() == "" and res.err.strip() == ""
+    assert "data/cache/c.txt" in ws.keys()
