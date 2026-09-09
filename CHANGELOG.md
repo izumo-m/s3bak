@@ -9,6 +9,8 @@ a fix only (Fixed).
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-10
+
 ### Added
 
 - `!` patterns in an entry's `excludes` take matching paths back, the way
