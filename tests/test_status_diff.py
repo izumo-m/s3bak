@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import signal
 import subprocess
 
@@ -108,6 +109,21 @@ def test_status_of_a_named_excluded_file_previews_its_push(ws):
     ws.run("push", "--delete", "--yes", str(log), expect_rc=0)
     assert "data/a.log" not in ws.keys()
     assert ws.run("status", str(ws.root / "data" / "gone.log"), expect_rc=0).out == ""
+
+
+def test_status_previews_the_upload_after_a_single_file_entry_is_renamed(ws):
+    # The record names the old basename, so a push uploads the file afresh
+    # whatever its stat; status says so instead of comparing the old record.
+    old = ws.write("old.txt", "same")
+    ws.config({"solo": {"path": str(old)}})
+    ws.run("push", "solo", expect_rc=0)
+    new = ws.root / "new.txt"
+    shutil.copy2(old, new)
+    ws.config({"solo": {"path": str(new)}})
+
+    assert ws.run("status", "solo", expect_rc=0).out == f"A {new}\n"
+    assert "upload:" in ws.run("push", "solo", expect_rc=0).out
+    assert ws.run("status", "solo", expect_rc=0).out == ""
 
 
 def test_status_missing_subpath_errors(ws):

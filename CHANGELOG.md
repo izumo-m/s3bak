@@ -51,6 +51,10 @@ a fix only (Fixed).
   recorded size. It used the size of the first file the manifest records,
   so a small file could take the multipart path, or a large one the
   single-request path, and its line named the wrong one.
+- `status` of a single-file entry whose configured file name changed since
+  the last push now reports the file as `A`, since the push uploads it
+  afresh; it used to compare the file against the old name's record and
+  report nothing.
 
 ## [0.9.0] - 2026-09-10
 

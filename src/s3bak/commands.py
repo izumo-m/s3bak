@@ -2108,6 +2108,13 @@ def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
                 except OSError as e:
                     console.warn(f"warning: cannot access {target}: {e}")
                     continue
+                if sub is None and entry_obj.path != os.path.basename(outpath):
+                    # The record names the basename the entry was configured
+                    # with before: a push records this file afresh and
+                    # uploads it whatever its stat (_single_file_record).
+                    if os.path.lexists(target):
+                        console.out(f"A {target}\n")
+                    continue
                 diff = compare_to_local(entry_obj, target, window_ns=window_ns, use_color=use_color)
                 if diff.status == "D" and not opts.delete:
                     # Only in the backup: a plain push touches nothing at its
