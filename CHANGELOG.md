@@ -9,14 +9,6 @@ a fix only (Fixed).
 
 ## [Unreleased]
 
-### Changed
-
-- `push` and `pull` accept `--mtime-window` together with `--checksum`. The
-  tolerance still decides what `--checksum` leaves to modification times —
-  whether a content-equal file is re-recorded or has its modification time
-  set back, and under `-u` which side is the newer one — so refusing the
-  override there kept the command line from setting it.
-
 ### Fixed
 
 - A plain `pull` of a single-file entry, or of a file named as a sub-path,
@@ -66,6 +58,12 @@ a fix only (Fixed).
   the last push now reports the file as `A`, since the push uploads it
   afresh; it used to compare the file against the old name's record and
   report nothing.
+- `push` and `pull` no longer refuse `--mtime-window` together with
+  `--checksum`. The refusal assumed a content comparison ignores the
+  tolerance, but the tolerance still decides what `--checksum` leaves to
+  modification times — whether a content-equal file is re-recorded or has
+  its modification time set back, and under `-u` which side is the newer
+  one — so the command line could not set it where it mattered.
 
 ## [0.9.0] - 2026-09-10
 
