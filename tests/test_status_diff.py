@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import signal
 import subprocess
 
@@ -89,6 +90,63 @@ def test_status_excluded_paths_are_invisible_to_plain_status(ws):
     lines = res.out.splitlines()
     assert not any("new.log" in line for line in lines)
     assert any(line.startswith("D") and "old.log" in line for line in lines)
+
+
+def test_status_of_a_named_excluded_file_previews_its_push(ws):
+    # Naming an excluded path does not override the exclude: a plain push
+    # ignores it, so plain status says nothing; push --delete retires its
+    # backup, so status --delete shows it D.
+    ws.write("data/keep.txt", "k")
+    log = ws.write("data/a.log", "o")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["*.log"]}})
+    log.write_text("grown since the push")
+
+    assert ws.run("status", str(log), expect_rc=0).out == ""
+    assert ws.run("push", "--dry-run", str(log), expect_rc=0).out == ""
+    assert ws.run("status", "--delete", str(log), expect_rc=0).out == f"D {log}\n"
+    ws.run("push", "--delete", "--yes", str(log), expect_rc=0)
+    assert "data/a.log" not in ws.keys()
+    assert ws.run("status", str(ws.root / "data" / "gone.log"), expect_rc=0).out == ""
+
+
+def test_status_of_a_named_path_judges_excludes_by_its_local_kind(ws):
+    # As push does: a present path by what it is now, so an excluded file
+    # name that became a directory with content is not ignored, and an
+    # unrecorded name the excludes do not hide is not "ignored" either.
+    x = ws.write("data/x", "file")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    x.unlink()
+    ws.write("data/x/y", "inside")
+    ws.write("data/build", "artifact")
+    ws.write("data/keep/k.txt", "kept")
+
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["x"]}})
+    assert ws.run("status", str(x), expect_rc=0).out != ""
+    assert "upload:" in ws.run("push", "--dry-run", str(x), expect_rc=0).out
+
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["build/*"]}})
+    assert "not found on S3" in ws.run("status", str(ws.root / "data" / "build"), expect_rc=1).err
+
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["*", "!keep/*"]}})
+    assert "not found on S3" in ws.run("status", str(ws.root / "data" / "keep"), expect_rc=1).err
+
+
+def test_status_previews_the_upload_after_a_single_file_entry_is_renamed(ws):
+    # The record names the old basename, so a push uploads the file afresh
+    # whatever its stat; status says so instead of comparing the old record.
+    old = ws.write("old.txt", "same")
+    ws.config({"solo": {"path": str(old)}})
+    ws.run("push", "solo", expect_rc=0)
+    new = ws.root / "new.txt"
+    shutil.copy2(old, new)
+    ws.config({"solo": {"path": str(new)}})
+
+    assert ws.run("status", "solo", expect_rc=0).out == f"A {new}\n"
+    assert "upload:" in ws.run("push", "solo", expect_rc=0).out
+    assert ws.run("status", "solo", expect_rc=0).out == ""
 
 
 def test_status_missing_subpath_errors(ws):

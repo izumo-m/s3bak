@@ -211,7 +211,6 @@ rehearsal.
 | What you asked for | Why it stops |
 | --- | --- |
 | `--yes` without `--delete` | `--yes` answers deletion confirmations; there are none to answer |
-| `--checksum` with `--mtime-window` (except on `verify`) | a content comparison never looks at modification times |
 | `--mtime-window` without `--checksum` on `verify` | there, the window only classifies content mismatches |
 | `pull --all -o <path>` | one destination cannot hold every entry |
 | `pull a b -o <path>` | likewise for several named targets, a group of several among them |

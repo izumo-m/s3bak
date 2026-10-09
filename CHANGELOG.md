@@ -9,6 +9,64 @@ a fix only (Fixed).
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-10-09
+
+### Fixed
+
+- A plain `pull` of a single-file entry, or of a file named as a sub-path,
+  no longer downloads the file when only its permission bits differ from the
+  record. Its size and modification time match, so it sets the recorded bits
+  back and downloads nothing, as a directory pull always did. Under
+  `--checksum` it now compares content too: equal content has only its
+  metadata applied, where it used to be downloaded every time.
+- `pull -u --checksum` of a single-file entry or a file sub-path no longer
+  stops with a permission error when the local file cannot be read: content
+  that cannot be read counts as differing, so a newer record restores the
+  file and a same-time copy is reported as a conflict.
+- A directory `pull` no longer writes a restored file into a FIFO, a device,
+  or the special file a symlink points at, where the backup records a
+  regular file. Such a path is removed first and the file restored in its
+  place; before, a FIFO stalled the pull until something read from it, and a
+  symlink to a device sent the content outside the tree and failed every
+  later pull. Under `-u` such a path is ordered by its modification time like
+  a symlink: a newer one is kept.
+- A directory `pull` now skips a record whose object is gone even when a
+  local file sits at its path, as the manual describes: it warns and leaves
+  the file's content, permission bits and modification time alone. Before,
+  it stamped the record's permission bits and modification time onto that
+  file without a word, hiding a diverged copy from every later comparison.
+  `pull -u` skips such a record the same way, and `--dry-run` warns too.
+- `push -u --delete` of a single-file entry no longer rewrites the entry's
+  record from the local file when it deletes stray objects under the entry
+  while keeping a newer record or reporting a conflict. The record kept
+  describing an object the push never uploaded, so `verify` found it
+  mismatched. Deleting strays still runs `post_hook`.
+- `status` of a path named on the command line now honours the entry's
+  `excludes`, judging the path the way `push` does: one the excludes hide
+  reports nothing (under `--delete`, the `D` that `push --delete` would
+  retire), where it used to report the changes a push ignores, and such a
+  name the backup does not record is ignored instead of reported as not
+  found.
+- `pull --dry-run` of a single-file entry or a file sub-path whose object is
+  gone now warns about the stale record where the real pull does, when the
+  local file's size and modification time match its record (the pull then
+  checks the object before judging the file), instead of announcing a
+  download that would find nothing.
+- `pull` of a file sub-path picks its transfer path from that file's own
+  recorded size. It used the size of the first file the manifest records,
+  so a small file could take the multipart path, or a large one the
+  single-request path, and its line named the wrong one.
+- `status` of a single-file entry whose configured file name changed since
+  the last push now reports the file as `A`, since the push uploads it
+  afresh; it used to compare the file against the old name's record and
+  report nothing.
+- `push` and `pull` no longer refuse `--mtime-window` together with
+  `--checksum`. The refusal assumed a content comparison ignores the
+  tolerance, but the tolerance still decides what `--checksum` leaves to
+  modification times — whether a content-equal file is re-recorded or has
+  its modification time set back, and under `-u` which side is the newer
+  one — so the command line could not set it where it mattered.
+
 ## [0.9.0] - 2026-09-10
 
 ### Added

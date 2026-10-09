@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import shutil
 import stat
+import sys
 
 import pytest
 
@@ -222,6 +223,47 @@ def test_push_update_single_file_entry(ws):
     _rewrite(f, "v2 and more", None)
     res = ws.run("push", "-u", "one.conf", expect_rc=0)
     assert f"{CONFLICT}same mtime, size differs" in res.err
+    assert _object_body(ws, "one.conf") == "v2"
+
+
+@pytest.mark.parametrize("mtime", [OLD, None], ids=["newer-record", "tie"])
+def test_push_update_delete_keeps_the_record_while_retiring_strays(ws, mtime):
+    # Deleting a stray under entry/ is work (post_hook fires), but no reason
+    # to rewrite the one record from a local file the push did not upload.
+    marker = ws.root / "post-ran"
+    hook = ws.write("touch.py", "import pathlib, sys\npathlib.Path(sys.argv[1]).touch()\n")
+    f = ws.write("one.conf", "v1")
+    ws.config({"one.conf": {"path": str(f), "post_hook": [sys.executable, str(hook), str(marker)]}})
+    ws.run("push", "one.conf", expect_rc=0)
+    marker.unlink()
+    body = _manifest_body(ws, "one.conf")
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/one.conf/stray", Body=b"x")
+    _rewrite(f, "an edit of another size", mtime)
+
+    res = ws.run("push", "-u", "--delete", "--yes", "one.conf", expect_rc=0)
+
+    assert "one.conf/stray" not in ws.keys()
+    assert "upload:" not in res.out
+    assert _manifest_body(ws, "one.conf") == body
+    assert marker.exists()
+
+
+def test_push_update_checksum_takes_the_mtime_window_override(ws):
+    # Under -u --checksum the window still orders the two sides, so the
+    # command-line override applies there as anywhere.
+    f = ws.write("one.conf", "v1")
+    ws.config({"one.conf": {"path": str(f)}})
+    ws.run("push", "one.conf", expect_rc=0)
+    newer = _mtime_ns(f) + 5_000_000_000
+    f.write_text("v2")
+    os.utime(f, ns=(newer, newer))
+
+    res = ws.run("push", "-u", "--checksum", "--mtime-window", "10", "one.conf", expect_rc=0)
+    assert f"{CONFLICT}same mtime, content differs" in res.err
+    assert "upload:" not in res.out
+
+    res = ws.run("push", "-u", "--checksum", "one.conf", expect_rc=0)
+    assert "upload:" in res.out
     assert _object_body(ws, "one.conf") == "v2"
 
 
@@ -887,6 +929,22 @@ def test_push_update_single_file_entry_drifted_object_beats_a_newer_local_file(w
     assert f"{CONFLICT}stored object does not match the record" in res.err
     assert "upload:" not in res.out
     assert _object_body(ws, "one.conf") == "written around s3bak"
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs an unreadable file")
+def test_pull_update_checksum_single_file_entry_unreadable_older_copy_is_restored(ws):
+    # Unreadable content cannot be judged equal: a newer record downloads
+    # over the older copy rather than failing the content check.
+    f = ws.write("one.conf", "v1")
+    ws.config({"one.conf": {"path": str(f)}})
+    ws.run("push", "one.conf", expect_rc=0)
+    os.utime(f, (OLD, OLD))
+    os.chmod(f, 0o200)
+
+    res = ws.run("pull", "-u", "--checksum", "one.conf", expect_rc=0)
+
+    assert "download:" in res.out
+    assert f.read_text() == "v1"
 
 
 def test_pull_update_single_file_entry_drifted_object_is_a_conflict(ws):

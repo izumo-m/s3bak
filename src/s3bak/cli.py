@@ -900,17 +900,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if opt_yes and not opt_delete:
         console.die("--yes requires --delete (it answers deletion confirmations)")
-    # push/pull --checksum replaces the size+mtime check entirely, so a window is
-    # meaningless there. verify --checksum is the opposite: the window feeds the
-    # stat classification of content mismatches, and is useless without it.
-    if subcmd == "verify":
-        if opt_mtime_window is not None and not opt_checksum:
-            console.die(
-                "--mtime-window requires --checksum with verify (it classifies content mismatches)"
-            )
-    elif opt_checksum and opt_mtime_window is not None:
+    # verify uses the window only to classify the content mismatches
+    # --checksum finds, so without it the window is useless. push/pull
+    # --checksum still uses it for what it leaves to mtimes: re-recording or
+    # re-stamping a content-equal file, and -u's newer-side ordering.
+    if subcmd == "verify" and opt_mtime_window is not None and not opt_checksum:
         console.die(
-            "--mtime-window cannot be combined with --checksum (content comparison ignores it)"
+            "--mtime-window requires --checksum with verify (it classifies content mismatches)"
         )
 
     if opt_outpath == "":

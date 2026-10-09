@@ -7,6 +7,8 @@ from __future__ import annotations
 import os
 import stat
 
+import pytest
+
 
 def _mtime_ns(p) -> int:
     return os.lstat(p).st_mtime_ns
@@ -125,13 +127,122 @@ def test_pull_checksum_dryrun_clean_tree_prints_nothing(ws):
     assert res.out.strip() == ""
 
 
-def test_single_file_pull_repairs_mode(ws):
+def test_single_file_pull_repairs_mode_without_download(ws):
     f = ws.write("solo.txt", "content")
     ws.config({"solo": {"path": str(f)}})
     ws.run("push", "solo", expect_rc=0)
     recorded_mode = _mode(f)
+    inode = os.lstat(f).st_ino
 
     os.chmod(f, 0o600 if recorded_mode != 0o600 else 0o640)
-    ws.run("pull", "solo", expect_rc=0)
+    res = ws.run("pull", "solo", expect_rc=0)
 
+    assert "download:" not in res.out  # size+mtime match: metadata-only repair
+    assert os.lstat(f).st_ino == inode  # not replaced by a fresh download
     assert _mode(f) == recorded_mode
+    assert "solo.txt" in res.out
+    assert ws.run("pull", "solo", expect_rc=0).out.strip() == ""
+
+
+def test_file_subpath_pull_repairs_mode_without_download(ws):
+    a = ws.write("data/a.txt", "alpha")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    recorded_mode = _mode(a)
+
+    os.chmod(a, 0o600 if recorded_mode != 0o600 else 0o640)
+    res = ws.run("pull", "data/a.txt", expect_rc=0)
+
+    assert "download:" not in res.out
+    assert _mode(a) == recorded_mode
+    assert "a.txt" in res.out
+
+
+def test_single_file_pull_dry_run_previews_a_mode_only_repair(ws):
+    f = ws.write("solo.txt", "content")
+    ws.config({"solo": {"path": str(f)}})
+    ws.run("push", "solo", expect_rc=0)
+    drifted = 0o600 if _mode(f) != 0o600 else 0o640
+    os.chmod(f, drifted)
+
+    res = ws.run("pull", "--dry-run", "solo", expect_rc=0)
+
+    assert "download:" not in res.out
+    assert "would apply manifest metadata" in res.out
+    assert _mode(f) == drifted  # a rehearsal changes nothing
+
+
+def test_single_file_pull_checksum_repairs_metadata_without_download(ws):
+    # Equal content under --checksum: an mtime or mode drift moves no data.
+    f = ws.write("solo.txt", "content")
+    ws.config({"solo": {"path": str(f)}})
+    ws.run("push", "solo", expect_rc=0)
+    recorded_mode = _mode(f)
+    recorded_mtime = _mtime_ns(f)
+
+    os.chmod(f, 0o600 if recorded_mode != 0o600 else 0o640)
+    os.utime(f, (2_000_000_000, 2_000_000_000))
+    res = ws.run("pull", "--checksum", "solo", expect_rc=0)
+
+    assert "download:" not in res.out
+    assert (_mode(f), _mtime_ns(f)) == (recorded_mode, recorded_mtime)
+
+
+def test_single_file_pull_checksum_dryrun_settled_file_prints_nothing(ws):
+    # The single-file shape of the directory test above: equal content and a
+    # settled record plan no transfer and no metadata apply.
+    f = ws.write("solo.txt", "content")
+    ws.write("data/a.txt", "alpha")
+    ws.config({"solo": {"path": str(f)}, "data": {"path": str(ws.root / "data")}})
+    ws.run("push", "solo", "data", expect_rc=0)
+
+    assert ws.run("pull", "--checksum", "solo", expect_rc=0).out.strip() == ""
+    res = ws.run("pull", "--checksum", "--dry-run", "solo", "data/a.txt", expect_rc=0)
+    assert res.out.strip() == ""
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs an unreadable file")
+def test_single_file_pull_checksum_restores_an_unreadable_file(ws):
+    # Content that cannot be read cannot be judged equal: the pull restores
+    # it, as a directory pull does for a file its listing could not read.
+    f = ws.write("solo.txt", "content")
+    ws.config({"solo": {"path": str(f)}})
+    ws.run("push", "solo", expect_rc=0)
+    recorded_mode = _mode(f)
+    os.chmod(f, 0o200)
+
+    res = ws.run("pull", "--checksum", "solo", expect_rc=0)
+
+    assert "download:" in res.out
+    assert _mode(f) == recorded_mode
+    assert f.read_text() == "content"
+
+
+def test_single_file_pull_checksum_downloads_a_same_stat_content_change(ws):
+    f = ws.write("solo.txt", "content")
+    ws.config({"solo": {"path": str(f)}})
+    ws.run("push", "solo", expect_rc=0)
+    recorded = os.lstat(f)
+
+    f.write_text("CONTENT")  # the size+mtime blind spot
+    os.utime(f, ns=(recorded.st_atime_ns, recorded.st_mtime_ns))
+    res = ws.run("pull", "--checksum", "solo", expect_rc=0)
+
+    assert "download:" in res.out
+    assert f.read_text() == "content"
+
+
+def test_single_file_pull_downloads_a_size_drifted_object_under_a_mode_drift(ws):
+    # The stat matches its record, but the stored object does not: the
+    # probe is the evidence a directory sync takes from its listing, and the
+    # restore then reports the mismatch as it does for any drifted object.
+    f = ws.write("solo.txt", "content")
+    ws.config({"solo": {"path": str(f)}})
+    ws.run("push", "solo", expect_rc=0)
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/solo", Body=b"written around s3bak")
+    os.chmod(f, 0o600 if _mode(f) != 0o600 else 0o640)
+
+    res = ws.run("pull", "solo", expect_rc=1)
+
+    assert "download:" in res.out
+    assert "the stored object does not match the record" in res.err

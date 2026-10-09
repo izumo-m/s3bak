@@ -622,12 +622,16 @@ class Boto3S3Store:
         *,
         compare: PairFilter | None = None,
         create: bool | FileFilter = True,
+        orphan: FileFilter | None = None,
         dryrun: bool = False,
         verbose: bool = False,
     ) -> TransferResult:
         """``create`` is the create-lane value: True downloads every S3-only
         key (the default); a callable vetoes per key - pull's exclusion, which
-        must not download an excluded path (docs/excludes.md)."""
+        must not download an excluded path (docs/excludes.md). ``orphan``
+        arms the delete lane with an observer that is handed every local
+        file with no object at its key and deletes what it returns True for -
+        pull's returns False for all of them (syncops._PullFilter.orphan)."""
         from boto3_s3 import LocalStorage
 
         src = self._s3_loc(rel_prefix, is_dir=True)
@@ -644,6 +648,7 @@ class Boto3S3Store:
                 create_filter=create,
                 dryrun=dryrun,
                 update_filter=compare,
+                delete_filter=orphan if orphan is not None else False,
                 on_result=cb,
                 # force_glacier_transfer: the gate that would otherwise WARN-skip
                 # a GLACIER / DEEP_ARCHIVE source checks info.head["Restore"], but

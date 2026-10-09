@@ -32,7 +32,9 @@ What gets compared depends on what the record says the path is:
 | special file | modification time, permission bits |
 
 Permission bits are compared but never move data. A `chmod` alone makes the
-next push rewrite the manifest record and upload nothing.
+next push rewrite the manifest record and upload nothing. The next pull sets
+the recorded bits back and downloads nothing, whether it restores a whole
+entry, a single-file entry, or one file named on the command line.
 
 Here is a tree with a few unrelated changes — a longer file, a new file, and
 a `chmod`. Each `M` line names the properties that differed, and the sign on
@@ -201,6 +203,12 @@ reconstructs each local file's S3 ETag and copies the pair when that does not
 match the stored object's. So a same-size, same-mtime content change **is**
 transferred, and a modification time that drifted on its own is **not**.
 
+The tolerance still applies under `--checksum` to what is left to
+modification times: whether a push re-records a content-equal file whose
+modification time moved, whether a pull sets such a file's modification time
+back, and under `-u` which side is the newer one. `--mtime-window` overrides
+it there as anywhere else.
+
 It reads and hashes every candidate file, which is why it is not the default.
 On an entry of any size that is the difference between a push that reads
 nothing and a push that reads everything. It also depends on the ETag being a
@@ -342,7 +350,9 @@ name is excluded in either spelling, as a file or as a directory — the push
 is the same silent exit 0. Otherwise a missing sub-path is an error, unless
 `--delete` says to retire its backup. A `pull` of a name the backup does not
 record follows the same rule: excluded in either spelling, it is ignored;
-otherwise it is the `not found on S3` error.
+otherwise it is the `not found on S3` error. `status` previews the push for
+a named path, judging it the same way: a path the excludes hide reports
+nothing, or under `--delete` the `D` that `push --delete` would retire.
 
 ### Taking paths back
 

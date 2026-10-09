@@ -26,6 +26,7 @@ from s3bak.compare import (
     SYMLINK_MTIME_SUPPORTED,
     compare_to_stat,
     dir_at_file_record,
+    no_object_record,
     ordered_side,
     tie_conflict,
     warn_conflict,
@@ -616,13 +617,15 @@ def _apply_record(
     repeats no warning its first pass already gave (a stale record, a -u
     conflict).
 
-    Under -u (``update``) the sync's spooled ``decision`` for this key comes
-    first: a kept key (``K``) is left alone in full, a downloaded key
-    (``D``) is settled to its record like any other. A key the sync did not
-    decide - it judged the pair a match, or the record has no object at all
-    (a symlink, a special file, stale residue) - is ordered by the record's
-    mtime here: a newer local side is left alone, a tie with a difference
-    is a conflict, and only a newer record is applied.
+    The sync's spooled ``decision`` for this key comes first. A stale
+    record (``G``: a local file with no object at its key) is warned about
+    and skipped in full, on any pull. Under -u (``update``) a kept key
+    (``K``) is left alone in full, a downloaded key (``D``) is settled to
+    its record like any other, and a key the sync did not decide - it
+    judged the pair a match, or the record has no object at all (a symlink,
+    a special file, stale residue the listing could not see) - is ordered
+    by the record's mtime here: a newer local side is left alone, a tie
+    with a difference is a conflict, and only a newer record is applied.
 
     Directory records are only structurally fixed here
     (conflicting-type removal, ``makedirs``); their mode/mtime is settled by
@@ -637,10 +640,11 @@ def _apply_record(
     symlink whose own recorded target does not exist locally yet is deferred
     the same way - see the placement branch below.
 
-    ``prep_modes`` (Windows, -u) maps absolute paths to the modes the
-    writable prep found: the rule judges a file by that mode, and a file it
-    then leaves alone gets it back - the apply is what re-chmods prepped
-    files, and a kept file is one it would otherwise never reach."""
+    ``prep_modes`` (Windows) maps absolute paths to the modes the writable
+    prep found: the -u rule judges a file by that mode, and a file the apply
+    then leaves alone - kept, or stale - gets it back: the apply is what
+    re-chmods prepped files, and such a file is one it would otherwise never
+    reach."""
     local_mode: int | None = None
     if update and prep_modes and decision != manifest.PULL_DOWNLOADED:
         local_mode = prep_modes.get(os.path.abspath(target))
@@ -653,8 +657,26 @@ def _apply_record(
                 pass  # a mode the record never asked for; nothing to report
         return _ApplyOutcome(0)
 
+    def stale() -> _ApplyOutcome:
+        # A local file at a record with no object behind it: skipped in full
+        # like the record below with nothing local - its metadata included,
+        # since stamping it onto content the pull never restored would hide
+        # a diverged copy from every later size+mtime comparison. A Windows
+        # prep is undone here, as for any file the apply leaves to itself.
+        if report:
+            console.warn(no_object_record(target))
+        prepped = prep_modes.get(os.path.abspath(target)) if prep_modes else None
+        if prepped is not None:
+            try:
+                os.chmod(target, prepped)
+            except OSError:
+                pass  # a mode the record never asked for; nothing to report
+        return _ApplyOutcome(0)
+
     if update and decision == manifest.PULL_KEPT:
         return kept()
+    if decision == manifest.PULL_GONE:
+        return stale()  # the sync's delete lane found no object at its key
     if m_entry.sym_target is not None:
         if compare_to_stat(m_entry, st, local_sym, window_ns=window_ns).is_match:
             return _ApplyOutcome(0)
@@ -716,6 +738,21 @@ def _apply_record(
 
     if compare_to_stat(m_entry, st, local_sym, window_ns=window_ns, local_mode=local_mode).is_match:
         return kept()
+    if (
+        is_dir_entry
+        and decision is None
+        and m_entry.is_file
+        and st is not None
+        and stat_mod.S_ISREG(st.st_mode)
+        and not os.access(target, os.R_OK)
+    ):
+        # The sync's local listing skips a file it cannot read, so its delete
+        # lane never saw this one to spool a G; where an object exists, the
+        # create lane downloads over such a file and spools the D
+        # (syncops.RestoreFilter / UpdateFilter.create). One still
+        # unreadable here with no decision therefore has no object behind
+        # its record.
+        return stale()
     dir_at_file = st is not None and m_entry.is_file and stat_mod.S_ISDIR(st.st_mode)
     if (
         update
@@ -754,10 +791,7 @@ def _apply_record(
             # pull --delete re-settle, which already warned on its first
             # pass over the same records.
             if report:
-                console.warn(
-                    f"warning: no data object behind this record - skipped"
-                    f" (a push retires the stale record): {target}"
-                )
+                console.warn(no_object_record(target))
             return _ApplyOutcome(0)
         # A special file is never created by pull (storage.md#restore-fidelity):
         # a missing one is a hard error, not residue.
@@ -813,11 +847,13 @@ def apply_manifest(
     ``window_ns`` is a match and stays as it is. ``report`` False (the pull
     --delete re-settle) repeats no warning the first pass already gave.
 
-    ``update`` is pull -u (docs/sync.md, "the newer side wins"): the sync's
-    spooled per-key decisions (``decisions``, an ``UpdateFilter`` spool in
-    stream order, merge-joined here through a one-record cursor) say which
-    files it downloaded, which it kept, and which directories it had to
-    create for them; every other record is ordered by its own mtime here. A
+    ``decisions`` is the directory sync's spool of per-key decisions (see
+    ``syncops._PullFilter``), in stream order and merge-joined here through
+    a one-record cursor: on any pull it names the stale records, skipped in
+    full. ``update`` is pull -u (docs/sync.md, "the newer side wins"), whose
+    spool also says which files the sync downloaded, which it kept, and
+    which directories it had to create for them; every other record is
+    ordered by its own mtime here. A
     directory the pull wrote into or created - a spooled download or
     directory key, a makedirs of this apply's own, a placed symlink - is
     marked dirtied on the frame stack and settled to its record like today;
@@ -825,8 +861,9 @@ def apply_manifest(
     one. ``settle_all_dirs``
     treats every directory as dirtied (the --delete re-settle, whose
     removals dirtied an untracked set of them). ``prep_modes`` is the
-    Windows writable prep's record of the modes it changed, for the rule to
-    judge by and for kept files to get back (see ``_apply_record``).
+    Windows writable prep's record of the modes it changed, for the -u rule
+    to judge by and for the files the apply leaves alone to get back (see
+    ``_apply_record``).
 
     A directory entry consumes one merge-join of the manifest against a fresh
     local walk. The walk filters ``excludes`` and serves purely as a stat
@@ -861,7 +898,7 @@ def apply_manifest(
     dir_stack: list[_DirFrame] = []
     post_symlink_dirs: list[tuple[str, ManifestEntry]] = []
     errors = 0
-    decided = _DecisionCursor(decisions if update else None)
+    decided = _DecisionCursor(decisions)
     # A manifest is downloaded from S3 and may be corrupt or hostile. Only a
     # directory entry joins record-controlled paths onto outpath, so only it can
     # escape (a single-file entry always writes at outpath). Reject any record
@@ -1041,12 +1078,12 @@ def apply_manifest(
 
 
 class _DecisionCursor:
-    """A one-record lookahead over pull -u's decision spool (see
-    ``syncops.UpdateFilter``): ``(marker, compare_key)`` JSON lines in the
+    """A one-record lookahead over a directory pull's decision spool (see
+    ``syncops._PullFilter``): ``(marker, compare_key)`` JSON lines in the
     sync's ascending compare-key order, which is the apply merge-join's own
     order, so each key is asked about at most once and the cursor only ever
-    moves forward. ``None`` is the no-spool case (not a -u pull, or a
-    single-file apply) and answers nothing."""
+    moves forward. ``None`` is the no-spool case (a single-file apply, or a
+    pull that ran no sync) and answers nothing."""
 
     def __init__(self, path: str | None):
         self._lines = open(path, encoding="utf-8") if path is not None else None
