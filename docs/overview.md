@@ -121,10 +121,13 @@ PATCH.
 1. On `develop`, commit `chore(release): bump version to X.Y.Z`. It turns
    `[Unreleased]` in CHANGELOG.md into the `## [X.Y.Z] - YYYY-MM-DD` heading
    and raises `version` in `pyproject.toml`.
-2. Merge `develop` into `main`.
+2. Merge `develop` into `main` with a merge commit (`--no-ff`).
 3. Create the annotated tag `vX.Y.Z` on the merge result.
-4. Push `main`, `develop` and the tag.
-5. Run `scripts/gh-release.sh vX.Y.Z`. It creates the GitHub Release, using
+4. Fast-forward `develop` to `main`, so that `develop` descends from `main`
+   and a release that was never merged shows up as `develop` not containing
+   `main`.
+5. Push `main`, `develop` and the tag.
+6. Run `scripts/gh-release.sh vX.Y.Z`. It creates the GitHub Release, using
    that version's CHANGELOG section as the release notes. It skips a tag
    that already has a Release, and `--dry-run` prints the notes without
    creating anything.
