@@ -232,6 +232,18 @@ def dir_at_file_record(path: str) -> str:
     )
 
 
+def no_object_record(path: str) -> str:
+    """The warning for a regular-file record with no data object behind it,
+    which a pull skips in full (docs/sync.md, the pull pipeline). One text
+    for its reporters: the metadata apply, the single-file lane (which names
+    the object, having no tree to place it in), and the sync's delete-lane
+    observer on a dry run, which runs no apply."""
+    return (
+        "warning: no data object behind this record - skipped"
+        f" (a push retires the stale record): {path}"
+    )
+
+
 def ordered_side(entry: ManifestEntry, st: os.stat_result, window_ns: int) -> Side:
     """``newer_side`` for a whole record: which side of a pair the -u rule
     favours. A local symlink on a platform that cannot set link mtimes

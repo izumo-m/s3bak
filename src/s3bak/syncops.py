@@ -31,6 +31,7 @@ from s3bak.compare import (
     SYMLINK_MTIME_SUPPORTED,
     dir_at_file_record,
     mode_differs,
+    no_object_record,
     ordered_side,
     tie_conflict,
     warn_conflict,
@@ -104,7 +105,92 @@ def download_manifest(cfg: Config, entry: str, dest: str, verbose: bool = False)
     return found
 
 
-class RestoreFilter(manifest.ManifestFilter):
+PULL_DOWNLOADED = manifest.PULL_DOWNLOADED
+PULL_KEPT = manifest.PULL_KEPT
+PULL_GONE = manifest.PULL_GONE
+
+
+def _clear_special_target(local_path: str) -> bool:
+    """Make a create-lane download's path safe to land on; False when it is
+    not, and the download must not run.
+
+    s3transfer writes a download straight into a destination it finds to be
+    a special file - following a symlink to stat it - instead of landing it
+    through its temp file and rename: into a FIFO, which blocks the pull
+    until a reader appears, or into a device a symlink points at, outside
+    the restore tree. The record says a regular file belongs here, and the
+    rename would have replaced either one, so it is removed first. One that
+    cannot be removed is left to the metadata apply, which reports a
+    recorded file the pull could not restore."""
+    try:
+        st = os.stat(local_path)
+    except OSError:
+        return True  # nothing there, or a dangling symlink: the rename replaces it
+    if stat_mod.S_ISREG(st.st_mode) or stat_mod.S_ISDIR(st.st_mode):
+        return True
+    try:
+        os.unlink(local_path)
+    except OSError:
+        return False
+    return True
+
+
+class _PullFilter(manifest.ManifestFilter):
+    """What both pull filters share: the ``ManifestFilter`` cursor, a spool
+    of per-key decisions for the metadata apply (``manifest.PULL_*``, one
+    JSON line per key in the sync's compare-key order), and the observed
+    delete lane.
+
+    Pull never deletes through the sync (``--delete`` prunes extras itself),
+    but the delete lane is armed with ``orphan``, which deletes nothing: it
+    is the only place a local file whose key has no object is seen. Under a
+    regular-file record that is a record whose object is gone, and the pull
+    skips it in full - metadata included, since stamping the record's mode
+    and mtime onto content it never restored would hide a diverged copy
+    from every later size+mtime comparison. The apply cannot tell such a
+    file from a downloaded one by itself, so the key is spooled ``G``; a
+    dry run, which runs no apply, warns here instead. The spool is a temp
+    file the caller owns (created before the sync, unlinked after the
+    apply); ``close()`` flushes it along with the manifest handle."""
+
+    def __init__(
+        self,
+        records: Iterator[tuple[str, ManifestEntry]],
+        *,
+        window_ns: int,
+        spool_path: str,
+        outpath: str,
+        dryrun: bool,
+    ):
+        super().__init__(records, window_ns=window_ns)
+        self._spool = open(spool_path, "w", encoding="utf-8")
+        self._outpath = outpath
+        self._dryrun = dryrun
+
+    def close(self) -> None:
+        super().close()
+        self._spool.close()
+
+    def _decide(self, marker: str, compare_key: str) -> None:
+        # A key can contain a newline, so a line needs an encoding.
+        self._spool.write(json.dumps([marker, compare_key]) + "\n")
+
+    def orphan(self, info: FileInfo) -> bool:
+        """The delete lane (``S3.sync``'s ``delete_filter``), observed only:
+        always False."""
+        key = info.compare_key
+        assert key is not None  # the sync stamps every listed entry
+        m = self._lookup(key)
+        if m is not None and m.is_file:
+            self._decide(PULL_GONE, key)
+            if self._dryrun:
+                console.warn(
+                    no_object_record(os.path.join(self._outpath, key.replace("/", os.sep)))
+                )
+        return False
+
+
+class RestoreFilter(_PullFilter):
     """The plain pull's lanes: ``ManifestFilter``'s size+mtime judgment for
     the update lane, plus a create lane that never downloads onto a local
     directory.
@@ -144,13 +230,14 @@ class RestoreFilter(manifest.ManifestFilter):
         records: Iterator[tuple[str, ManifestEntry]],
         *,
         window_ns: int,
+        spool_path: str,
         outpath: str,
         dryrun: bool,
         check_local: bool = True,
     ):
-        super().__init__(records, window_ns=window_ns)
-        self._outpath = outpath
-        self._dryrun = dryrun
+        super().__init__(
+            records, window_ns=window_ns, spool_path=spool_path, outpath=outpath, dryrun=dryrun
+        )
         self._check_local = check_local
         #: Regular-file records a local directory blocked. A dry run fails
         #: on them (exit 1) the way the real run's apply does.
@@ -168,7 +255,9 @@ class RestoreFilter(manifest.ManifestFilter):
         except OSError:
             return True  # nothing local (or unreadable: the transfer reports it)
         if not stat_mod.S_ISDIR(st.st_mode):
-            return True  # a file or symlink: the download replaces it
+            # A file or symlink: the download replaces it - once a special
+            # file, or a symlink to one, is out of its way.
+            return self._dryrun or _clear_special_target(local_path)
         m = self._lookup(key)
         if m is None:
             console.warn(
@@ -182,11 +271,7 @@ class RestoreFilter(manifest.ManifestFilter):
         return False
 
 
-PULL_DOWNLOADED = manifest.PULL_DOWNLOADED
-PULL_KEPT = manifest.PULL_KEPT
-
-
-class UpdateFilter(manifest.ManifestFilter):
+class UpdateFilter(_PullFilter):
     """pull -u's lanes (docs/sync.md, "the newer side wins"): the
     ``ManifestFilter`` judgment with the record's mtime ordering the two
     sides, for both the update lane (a local regular file x its object) and
@@ -223,12 +308,13 @@ class UpdateFilter(manifest.ManifestFilter):
         spool_path: str,
         outpath: str,
         verbose: bool,
+        dryrun: bool,
         content: PairFilter | None = None,
         prep_modes: dict[str, int] | None = None,
     ):
-        super().__init__(records, window_ns=window_ns)
-        self._spool = open(spool_path, "w", encoding="utf-8")
-        self._outpath = outpath
+        super().__init__(
+            records, window_ns=window_ns, spool_path=spool_path, outpath=outpath, dryrun=dryrun
+        )
         self._verbose = verbose
         self._content = content
         # A Windows pull adds the write bit to every read-only local file
@@ -240,16 +326,8 @@ class UpdateFilter(manifest.ManifestFilter):
         # walk per directory answers every download inside it.
         self._walked_parent: str | None = None
 
-    def close(self) -> None:
-        super().close()
-        self._spool.close()
-
     def _local_mode(self, local_path: str) -> int | None:
         return self._prep_modes.get(os.path.abspath(local_path))
-
-    def _decide(self, marker: str, compare_key: str) -> None:
-        # A key can contain a newline, so a line needs an encoding.
-        self._spool.write(json.dumps([marker, compare_key]) + "\n")
 
     @staticmethod
     def _dir_key(compare_key: str) -> str:
@@ -294,6 +372,15 @@ class UpdateFilter(manifest.ManifestFilter):
                 self._decide(PULL_DOWNLOADED, dir_key)
         self._decide(PULL_DOWNLOADED, compare_key)
         return True
+
+    def _download_over(self, compare_key: str, local_path: str) -> bool:
+        """``_download`` onto a local path the listing could not pair: a
+        special file (or a symlink to one) is cleared first. One that cannot
+        be is not downloaded and not spooled, so the apply meets an
+        undecided record of another kind and reports it."""
+        if not self._dryrun and not _clear_special_target(local_path):
+            return False
+        return self._download(compare_key)
 
     def _keep_newer(self, compare_key: str, local_path: str) -> bool:
         self._decide(PULL_KEPT, compare_key)
@@ -358,12 +445,13 @@ class UpdateFilter(manifest.ManifestFilter):
 
     def create(self, info: FileInfo) -> bool:
         """The create lane: an object the destination listing paired with
-        nothing. Nothing local downloads; a local symlink or directory where
-        a file is recorded is the type change the rule orders by the local
-        side's own mtime (a tie where link mtimes cannot be compared). A
-        newer local side is kept either way; a newer record replaces a
-        symlink but never a directory (``RestoreFilter``), which is then the
-        conflict."""
+        nothing. Nothing local downloads, and so does a regular file the
+        listing could not read; a local symlink, special file or directory
+        where a file is recorded is the type change the rule orders by the
+        local side's own mtime (a tie where link mtimes cannot be compared).
+        A newer local side is kept either way; a newer record replaces a
+        symlink or special file but never a directory (``RestoreFilter``),
+        which is then the conflict."""
         key = info.compare_key
         assert key is not None  # the sync stamps every listed entry
         m = self._lookup(key)
@@ -380,16 +468,15 @@ class UpdateFilter(manifest.ManifestFilter):
             return self._conflict(CONFLICT_UNRECORDED, key, local_path)
         if not m.is_file:
             return False
-        is_dir = stat_mod.S_ISDIR(st.st_mode)
-        if not is_dir and not stat_mod.S_ISLNK(st.st_mode):
+        if stat_mod.S_ISREG(st.st_mode):
             return self._download(key)
         side = ordered_side(m, st, self.window_ns)
         if side == "local":
             return self._keep_newer(key, local_path)
         if side == "record":
-            if is_dir:
+            if stat_mod.S_ISDIR(st.st_mode):
                 return self._conflict(CONFLICT_DIR_AT_FILE, key, local_path)
-            return self._download(key)
+            return self._download_over(key, local_path)
         return self._conflict(tie_conflict(m, st, None) or CONFLICT_TYPE, key, local_path)
 
 
@@ -1153,6 +1240,7 @@ def download_from_s3(
     sub: str | None = None,
     compare: PairFilter | None = None,
     create: bool | FileFilter = True,
+    orphan: FileFilter | None = None,
     size: int | None = None,
     dryrun: bool = False,
 ) -> tuple[int, bool]:
@@ -1175,7 +1263,13 @@ def download_from_s3(
                 probe = parent
         try:
             result = cfg.store.sync_down(
-                rel, outpath, compare=compare, create=create, dryrun=dryrun, verbose=verbose
+                rel,
+                outpath,
+                compare=compare,
+                create=create,
+                orphan=orphan,
+                dryrun=dryrun,
+                verbose=verbose,
             )
         finally:
             for path in created:  # leaf-first, so each rmdir empties its parent
@@ -1211,10 +1305,7 @@ def download_from_s3(
         # full. Whatever is local stays untouched: applying the record's
         # metadata over content that was never restored would report a
         # restore that did not happen.
-        console.warn(
-            f"warning: no data object behind this record - skipped"
-            f" (a push retires the stale record): {cfg.prefix}/{rel}"
-        )
+        console.warn(no_object_record(f"{cfg.prefix}/{rel}"))
         return 0, False
     # Reported after the fact, like the sync's own lines: a line printed up
     # front would announce a download the stale-record branch above never made.

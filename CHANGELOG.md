@@ -21,6 +21,19 @@ a fix only (Fixed).
   stops with a permission error when the local file cannot be read: content
   that cannot be read counts as differing, so a newer record restores the
   file and a same-time copy is reported as a conflict.
+- A directory `pull` no longer writes a restored file into a FIFO, a device,
+  or the special file a symlink points at, where the backup records a
+  regular file. Such a path is removed first and the file restored in its
+  place; before, a FIFO stalled the pull until something read from it, and a
+  symlink to a device sent the content outside the tree and failed every
+  later pull. Under `-u` such a path is ordered by its modification time like
+  a symlink: a newer one is kept.
+- A directory `pull` now skips a record whose object is gone even when a
+  local file sits at its path, as the manual describes: it warns and leaves
+  the file's content, permission bits and modification time alone. Before,
+  it stamped the record's permission bits and modification time onto that
+  file without a word, hiding a diverged copy from every later comparison.
+  `pull -u` skips such a record the same way, and `--dry-run` warns too.
 
 ## [0.9.0] - 2026-09-10
 

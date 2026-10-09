@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import threading
 
 import pytest
 
@@ -465,6 +466,94 @@ def test_single_file_pull_replaces_symlink_destination(ws):
     assert victim.read_text() == "do-not-touch"  # link target untouched
 
 
+def _release_fifo_writer_later(fifo) -> threading.Timer:
+    """A watchdog for the FIFO tests: a download written into a FIFO blocks
+    until a reader opens it, so open one (and drain it) after a while - a
+    regression then fails its assertions instead of hanging the suite."""
+
+    def release() -> None:
+        try:
+            fd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError:
+            return
+        try:
+            while True:
+                try:
+                    if not os.read(fd, 65536):
+                        break
+                except BlockingIOError:
+                    break
+        finally:
+            os.close(fd)
+
+    timer = threading.Timer(10, release)
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
+@pytest.mark.skipif(not os.path.exists("/dev/null") or os.name == "nt", reason="needs /dev/null")
+def test_pull_replaces_a_symlink_to_a_device_at_a_file_record(ws):
+    # A download is never written through a symlink into the special file it
+    # points at (outside the tree): the link is replaced by the file.
+    ws.write("data/a.txt", "alpha")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    link = ws.root / "data" / "a.txt"
+    link.unlink()
+    os.symlink("/dev/null", link)
+
+    ws.run("pull", "data", expect_rc=0)
+
+    assert not link.is_symlink()
+    assert link.read_text() == "alpha"
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no mkfifo on this platform")
+def test_pull_replaces_a_fifo_at_a_file_record(ws):
+    ws.write("data/a.txt", "alpha")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    fifo = ws.root / "data" / "a.txt"
+    fifo.unlink()
+    os.mkfifo(fifo)
+    watchdog = _release_fifo_writer_later(fifo)
+
+    try:
+        ws.run("pull", "data", expect_rc=0)
+    finally:
+        watchdog.cancel()
+
+    assert fifo.is_file()
+    assert fifo.read_text() == "alpha"
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no mkfifo on this platform")
+def test_pull_update_orders_a_fifo_at_a_file_record(ws):
+    # Under -u a special file at a file record is the type change the rule
+    # orders: a newer one is kept, an older one replaced.
+    ws.write("data/a.txt", "alpha")
+    ws.write("data/b.txt", "beta")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    newer, older = ws.root / "data" / "a.txt", ws.root / "data" / "b.txt"
+    for fifo, mtime in ((newer, 2_000_000_000), (older, 1_600_000_000)):
+        fifo.unlink()
+        os.mkfifo(fifo)
+        os.utime(fifo, (mtime, mtime))
+    watchdogs = [_release_fifo_writer_later(newer), _release_fifo_writer_later(older)]
+
+    try:
+        res = ws.run("pull", "-u", "data", expect_rc=0)
+    finally:
+        for watchdog in watchdogs:
+            watchdog.cancel()
+
+    assert "a.txt" not in res.out
+    assert not newer.is_file()  # still the FIFO
+    assert older.read_text() == "beta"
+
+
 def test_push_with_unreadable_file_warns_and_exits_2(ws, monkeypatch):
     # A skipped (unreadable) file is a WARNED outcome: the readable files still
     # upload and the manifest still updates, but the run exits 2 so an incomplete
@@ -681,6 +770,71 @@ def test_single_file_pull_leaves_a_diverged_local_copy_untouched(ws):
     assert target.read_text() == "xyz"
     after = os.lstat(target)
     assert (after.st_mode, after.st_mtime_ns) == (before.st_mode, before.st_mtime_ns)
+
+
+def test_dir_pull_leaves_a_diverged_local_copy_of_a_stale_record_untouched(ws):
+    # The directory shape of the single-file test above: the sync's delete
+    # lane sees the local file with no object at its key, and the record is
+    # skipped in full - a diverged copy keeps its content, mode and mtime.
+    a = ws.write("data/a.txt", "alpha")
+    ws.write("data/b.txt", "beta")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.s3.delete_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/a.txt")
+
+    a.write_text("ALPHA")  # same size, different content
+    os.chmod(a, 0o600 if os.lstat(a).st_mode & 0o777 != 0o600 else 0o640)
+    os.utime(a, (2_000_000_000, 2_000_000_000))
+    before = os.lstat(a)
+    res = ws.run("pull", "data", expect_rc=0)
+
+    assert f"a push retires the stale record): {a}" in res.err
+    assert "a.txt" not in res.out
+    after = os.lstat(a)
+    assert (after.st_mode, after.st_mtime_ns) == (before.st_mode, before.st_mtime_ns)
+    assert a.read_text() == "ALPHA"
+
+
+def test_dir_pull_dry_run_warns_about_a_stale_record_it_meets(ws):
+    a = ws.write("data/a.txt", "alpha")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.s3.delete_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/a.txt")
+    os.utime(a, (2_000_000_000, 2_000_000_000))
+
+    res = ws.run("pull", "--dry-run", "data", expect_rc=0)
+
+    assert f"a push retires the stale record): {a}" in res.err
+
+
+def test_dir_pull_update_skips_a_stale_record_under_a_newer_record(ws):
+    # -u takes the same skip: a record with no object restores nothing, so
+    # its newer mtime is not stamped onto the older local copy either.
+    a = ws.write("data/a.txt", "alpha")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.s3.delete_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/a.txt")
+    os.utime(a, (1_600_000_000, 1_600_000_000))
+
+    res = ws.run("pull", "-u", "data", expect_rc=0)
+
+    assert f"a push retires the stale record): {a}" in res.err
+    assert os.lstat(a).st_mtime_ns == 1_600_000_000 * 1_000_000_000
+
+
+def test_dir_pull_says_nothing_about_an_excluded_stale_record(ws):
+    a = ws.write("data/a.log", "alpha")
+    ws.write("data/b.txt", "beta")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["*.log"]}})
+    ws.s3.delete_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/a.log")
+    os.utime(a, (2_000_000_000, 2_000_000_000))
+    os.utime(ws.root / "data" / "b.txt", (2_000_000_000, 2_000_000_000))  # some work
+
+    for args in (("pull", "--dry-run", "data"), ("pull", "data")):
+        res = ws.run(*args, expect_rc=0)
+        assert "stale record" not in res.err
 
 
 def test_subpath_file_pull_warns_when_object_is_gone(ws):

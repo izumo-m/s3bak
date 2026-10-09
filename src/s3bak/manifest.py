@@ -669,14 +669,18 @@ def merge_join(
 # ManifestFilter (the pull compare)
 # =============================================================================
 
-# pull -u's spooled decisions (syncops.UpdateFilter writes them, the metadata
-# apply in restore.py reads them): one JSON ``[marker, compare_key]`` line per
-# decided key, in the sync's ascending compare-key order.
+# pull's spooled decisions (syncops.RestoreFilter / UpdateFilter write them,
+# the metadata apply in restore.py reads them): one JSON
+# ``[marker, compare_key]`` line per decided key, in the sync's ascending
+# compare-key order. ``D`` and ``K`` are -u's alone.
 # ``D`` on a file key means the sync downloads it, on a directory key that the
 # sync has to create that level for a download below; either dirties the
 # directory the write lands in.
 PULL_DOWNLOADED = "D"
 PULL_KEPT = "K"  # the key is left exactly as it is, metadata included
+# A local file under a regular-file record with no object at its key (the
+# delete lane's observation): the record is stale, skipped in full.
+PULL_GONE = "G"
 
 
 class ManifestFilter:

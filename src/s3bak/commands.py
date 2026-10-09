@@ -1108,13 +1108,15 @@ def _pull_exclude_lanes(
     outpath: str,
     compare: PairFilter,
     create_inner: FileFilter,
-) -> tuple[FileFilter, PairFilter]:
+    orphan_inner: FileFilter,
+) -> tuple[FileFilter, PairFilter, FileFilter]:
     """Veto excluded keys in pull's download lanes (docs/excludes.md): a
     create-lane key under an excluded path is never downloaded, and an
     excluded both-sides pair is left untouched without consulting the
     stat/content compare (whose streaming cursor self-heals over keys it is
-    not asked about; ``create_inner``, the filter's own create-lane decision,
-    shares that cursor and is skipped the same way). Keys are re-anchored at
+    not asked about; ``create_inner`` and ``orphan_inner``, the filter's own
+    create- and delete-lane observers, share that cursor and are skipped the
+    same way - an excluded record is never reported). Keys are re-anchored at
     the entry root, where the patterns are defined; anchored (absolute)
     patterns match the restore destination's absolute path - aws-cli's
     join-onto-root semantics."""
@@ -1135,7 +1137,13 @@ def _pull_exclude_lanes(
             return False
         return compare(pair)
 
-    return create, update
+    def orphan(info: FileInfo) -> bool:
+        assert info.compare_key is not None  # the sync stamps every listed entry
+        if excluded_key(info.compare_key):
+            return False
+        return orphan_inner(info)
+
+    return create, update, orphan
 
 
 def _manifest_restore_conflict(manifest_path: str, sub: str | None) -> str | None:
@@ -1308,7 +1316,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
         # ordinary part of the repair) - so the outer finally's restore below
         # is skipped there and only fires on a path that never got that far.
         prep_repaired = False
-        update_spool: str | None = None  # -u's per-key decisions, sync -> apply
+        decision_spool: str | None = None  # a directory sync's per-key decisions, sync -> apply
         restore_filter: RestoreFilter | None = None  # a plain directory pull's lanes
         root_conflict = False  # the restore root is of another kind than its record
         if has_data and os.path.lexists(outpath):
@@ -1366,11 +1374,11 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             prep_modes: dict[str, int] | None = None
             if IS_WINDOWS and not opts.dryrun and stage_dir is None:
                 prep = windows_collect_writable_prep(outpath, is_dir, manifest_path, sub)
-                if use_update:
-                    # -u judges a file's permission bits and then leaves kept
-                    # files to themselves - which the apply never re-chmods -
-                    # so both get the modes from before the prep.
-                    prep_modes = {os.path.abspath(path): mode for path, mode in prep}
+                # -u judges a file's permission bits and then leaves kept
+                # files to themselves, and any pull leaves a stale record's
+                # file to itself - which the apply never re-chmods - so both
+                # get the modes from before the prep.
+                prep_modes = {os.path.abspath(path): mode for path, mode in prep}
 
             # An "apply" verdict counts the single file's content equal
             # (size+mtime, or its ETag under --checksum): nothing to download,
@@ -1392,30 +1400,35 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 # single-file transfer has no lanes.
                 compare: PairFilter | None = None
                 create: bool | FileFilter = True
+                orphan: FileFilter | None = None
                 lanes: manifest.ManifestFilter | None = None  # holds the temp manifest open
                 if is_dir:
                     assert cfg.store is not None
                     records = manifest.iter_compare_records(manifest_path, sub=sub)
+                    spool_fd, decision_spool = tempfile.mkstemp(suffix=".decisions")
+                    os.close(spool_fd)
                     dir_compare: PairFilter
                     dir_create: FileFilter
+                    dir_orphan: FileFilter
                     if use_update:
-                        spool_fd, update_spool = tempfile.mkstemp(suffix=".decisions")
-                        os.close(spool_fd)
                         update_filter = UpdateFilter(
                             records,
                             window_ns=window_ns,
-                            spool_path=update_spool,
+                            spool_path=decision_spool,
                             outpath=outpath,
                             verbose=opts.verbose,
+                            dryrun=opts.dryrun,
                             content=cfg.store.content_compare() if opts.checksum else None,
                             prep_modes=prep_modes,
                         )
                         lanes = dir_compare = update_filter
                         dir_create = update_filter.create
+                        dir_orphan = update_filter.orphan
                     else:
                         restore_filter = RestoreFilter(
                             records,
                             window_ns=window_ns,
+                            spool_path=decision_spool,
                             outpath=outpath,
                             dryrun=opts.dryrun,
                             # Only an existing tree of the recorded kind can
@@ -1430,14 +1443,15 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                             cfg.store.content_compare() if opts.checksum else restore_filter
                         )
                         dir_create = restore_filter.create
+                        dir_orphan = restore_filter.orphan
                     if excludes:
                         # Anchored at OUTPATH, the final destination - on a staged
                         # pull the sync writes into the stage, but absolute
                         # patterns are defined against where the tree ends up.
-                        dir_create, dir_compare = _pull_exclude_lanes(
-                            ex, sub, outpath, dir_compare, dir_create
+                        dir_create, dir_compare, dir_orphan = _pull_exclude_lanes(
+                            ex, sub, outpath, dir_compare, dir_create, dir_orphan
                         )
-                    compare, create = dir_compare, dir_create
+                    compare, create, orphan = dir_compare, dir_create, dir_orphan
                 file_size = None if is_dir else _single_file_size(manifest_path)
                 try:
                     rc, changed = download_from_s3(
@@ -1449,6 +1463,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                         sub=sub,
                         compare=compare,
                         create=create,
+                        orphan=orphan,
                         size=file_size,
                         dryrun=opts.dryrun,
                     )
@@ -1539,7 +1554,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                     window_ns=window_ns,
                     excludes=excludes,
                     update=apply_update,
-                    decisions=update_spool,
+                    decisions=decision_spool,
                     prep_modes=prep_modes,
                 )
                 if st == 0:
@@ -1571,7 +1586,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                         entry=entry,
                         window_ns=window_ns,
                         update=use_update,
-                        decisions=update_spool,
+                        decisions=decision_spool,
                     )
 
             # Any non-zero exit after a staged swap - the metadata apply OR the
@@ -1613,8 +1628,8 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             # never double up with another restore.
             if IS_WINDOWS and not prep_repaired:
                 windows_restore_modes(prep)
-            if update_spool is not None:
-                os.unlink(update_spool)
+            if decision_spool is not None:
+                os.unlink(decision_spool)
             if stage_dir is not None:
                 # Preserve the stage ONLY while it actually holds the stranded old
                 # root (the swap did not cleanly retire or roll it back); on

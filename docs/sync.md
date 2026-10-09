@@ -19,8 +19,10 @@ and where each is wired differs by direction.
 
 **Pull** takes boto3-s3's three lane filters: `ManifestFilter` (or the
 `--checksum` comparison) as the `update_filter` that judges the both-sides
-pairs, the default `create_filter` copying every S3-only key, and no delete
-lane at all (pull prunes local extras itself, see below).
+pairs, the default `create_filter` copying every S3-only key, and a
+`delete_filter` that only observes — it deletes nothing (pull prunes local
+extras itself, see below), but it is the one place a local file with no
+object at its key is seen, which under a file record is a stale record.
 
 **Push** takes the single `pair_filter` instead, which replaces all three: its
 journal emitter (`PushJournal`) sees every pair whatever its shape — new local
@@ -118,10 +120,11 @@ nothing the destination listing could see: nothing local, or a symlink or
 directory, which the listing omits) — one cursor serves both lanes, since
 boto3-s3 decides them serially in one ascending stream, as in the plain
 pull's `RestoreFilter`. A local symlink or directory at a file record's key
-is the type change the rule orders by the local side's own mtime: newer, it
-is kept; a newer record replaces a symlink but never a directory, which is
-then the conflict — and the apply applies the same rule to a directory at a
-file record whose object is gone, a key no lane ever sees. Its decisions are
+is the type change the rule orders by the local side's own mtime (a special
+file too): newer, it is kept; a newer record replaces a symlink or special
+file but never a directory, which is then the conflict — and the apply
+applies the same rule to a directory at a file record whose object is gone,
+a key no lane ever sees. Its decisions are
 spooled for the metadata apply (see the pull pipeline): the apply cannot
 otherwise tell a downloaded file, stamped with the object's upload time and
 therefore "newer", from a genuinely newer local edit. A staged pull (a
@@ -474,12 +477,18 @@ rehearsal must fail or warn exactly where the real command would. With
    come from one streaming filter over the manifest: `ManifestFilter`'s
    size+mtime check for the both-sides pairs (the content comparison under
    `--checksum`), and the create lane for every S3-only key — which is also
-   where a local symlink or directory at an object's key lands, since the
-   destination listing omits both. The create lane never downloads onto a
-   local directory (`syncops.RestoreFilter`): a download commits through an
-   `os.replace` that replaces a file or symlink atomically but can never
-   replace a directory, so the transfer would fetch the bytes only to fail
-   on the rename. The record decides what the directory means. A
+   where a local symlink, special file or directory at an object's key
+   lands, since the destination listing omits all three. A download commits
+   through an `os.replace` that replaces a file or symlink atomically — but
+   s3transfer writes straight into a destination it finds to be a special
+   file, following a symlink to stat it: into a FIFO that blocks until a
+   reader appears, or a device outside the restore tree. So the create lane
+   removes a special file, or a symlink to one, before its download
+   (`syncops._clear_special_target`; one it cannot remove is not downloaded,
+   and the apply reports the record). It never downloads onto a local
+   directory (`syncops.RestoreFilter`): the `os.replace` can never replace
+   one, so the transfer would fetch the bytes only to fail on the rename.
+   The record decides what the directory means. A
    regular-file record there is a type conflict: the directory is never
    replaced (it may hold data the backup does not), so the record cannot be
    restored at that path — the metadata apply reports it (exit 1) on a real
@@ -527,9 +536,10 @@ rehearsal must fail or warn exactly where the real command would. With
    Under `-u` the apply merge-joins the sync's decision spool through a
    one-record cursor (the spool is in the sync's compare-key order, which is
    the join's own): a kept key is skipped in full, a downloaded key is
-   settled to its record whatever its stamped mtime says, and every other
-   record — a match the sync judged, a symlink or special file it never saw,
-   a file record whose object is gone — is ordered by its own mtime here: a
+   settled to its record whatever its stamped mtime says, a stale record is
+   skipped in full as on any pull (below), and every other record — a match
+   the sync judged, a symlink or special file it never saw — is ordered by
+   its own mtime here: a
    newer local side is left alone, a tie with a mode difference is a
    conflict, only a newer record is applied. A directory frame is marked
    dirtied when a spooled download or an apply mutation (a created
@@ -578,7 +588,11 @@ rehearsal must fail or warn exactly where the real command would. With
    left exactly as it is, its metadata included: applying the record's
    mode/mtime over content the pull never restored would report a restore that
    did not happen, and hide a diverged local copy from every later size+mtime
-   comparison.
+   comparison. With nothing local the apply sees that for itself; a local
+   file at the path the apply cannot tell from a downloaded one, so the
+   sync's observing delete lane spools its key (`G`, beside `-u`'s `D` and
+   `K`) for the apply to skip — and warns there itself on a dry run, which
+   runs no apply.
 
 What a pull can reproduce is bounded by what the backup records — see
 [storage.md](storage.md#restore-fidelity).
