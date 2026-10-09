@@ -126,6 +126,7 @@ up as a `main` that `develop` does not contain.
 
 Each release also gets a GitHub Release whose notes are that version's
 CHANGELOG section. Tags up to v0.9.0 have none and are not backfilled.
+The steps are in [release.md](release.md).
 
 ## Documentation
 
