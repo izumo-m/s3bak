@@ -116,23 +116,16 @@ content of `[Unreleased]`: Added / Changed / Removed entries mark a spec
 change (MINOR); Fixed-only content — restoring documented behavior — marks a
 PATCH.
 
-### Release procedure
+A release is cut by a `chore(release): bump version to X.Y.Z` commit on
+`develop` that turns `[Unreleased]` into the new version heading and raises
+`version` in `pyproject.toml`. `main` carries released versions only: it
+moves by merging `develop` at a release, and the annotated tag `vX.Y.Z` sits
+on that merge. After the release `develop` is fast-forwarded to `main`, so
+`develop` always contains `main`, and a release that was never merged shows
+up as a `main` that `develop` does not contain.
 
-1. On `develop`, commit `chore(release): bump version to X.Y.Z`. It turns
-   `[Unreleased]` in CHANGELOG.md into the `## [X.Y.Z] - YYYY-MM-DD` heading
-   and raises `version` in `pyproject.toml`.
-2. Merge `develop` into `main` with a merge commit (`--no-ff`).
-3. Create the annotated tag `vX.Y.Z` on the merge result.
-4. Fast-forward `develop` to `main`, so that `develop` descends from `main`
-   and a release that was never merged shows up as `develop` not containing
-   `main`.
-5. Push `main`, `develop` and the tag.
-6. Run `scripts/gh-release.sh vX.Y.Z`. It creates the GitHub Release, using
-   that version's CHANGELOG section as the release notes. It skips a tag
-   that already has a Release, and `--dry-run` prints the notes without
-   creating anything.
-
-Tags up to v0.9.0 have no GitHub Release and are not backfilled.
+Each release also gets a GitHub Release whose notes are that version's
+CHANGELOG section. Tags up to v0.9.0 have none and are not backfilled.
 
 ## Documentation
 
