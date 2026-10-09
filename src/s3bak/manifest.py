@@ -672,10 +672,11 @@ def merge_join(
 # pull's spooled decisions (syncops.RestoreFilter / UpdateFilter write them,
 # the metadata apply in restore.py reads them): one JSON
 # ``[marker, compare_key]`` line per decided key, in the sync's ascending
-# compare-key order. ``D`` and ``K`` are -u's alone.
-# ``D`` on a file key means the sync downloads it, on a directory key that the
-# sync has to create that level for a download below; either dirties the
-# directory the write lands in.
+# compare-key order. ``K`` and a directory's ``D`` are -u's alone.
+# ``D`` on a file key means the sync downloads it (a plain pull spools only
+# the create lane's downloads over a local path), on a directory key that the
+# sync has to create that level for a download below; under -u either dirties
+# the directory the write lands in.
 PULL_DOWNLOADED = "D"
 PULL_KEPT = "K"  # the key is left exactly as it is, metadata included
 # A local file under a regular-file record with no object at its key (the

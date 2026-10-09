@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import threading
 
 import pytest
@@ -529,6 +530,53 @@ def test_pull_replaces_a_fifo_at_a_file_record(ws):
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no mkfifo on this platform")
+def test_pull_keeps_a_recorded_fifo_over_a_stale_object(ws):
+    # A file replaced by a FIFO and pushed leaves the old object behind
+    # (only push --delete retires it): the record says FIFO, so the pull
+    # leaves the FIFO alone instead of restoring the stale object over it.
+    ws.write("data/a.txt", "alpha")
+    b = ws.write("data/b.txt", "beta")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    fifo = ws.root / "data" / "a.txt"
+    fifo.unlink()
+    os.mkfifo(fifo)
+    ws.run("push", "data", expect_rc=0)
+    assert "data/a.txt" in ws.keys()
+    os.utime(b, (2_000_000_000, 2_000_000_000))  # gives the pull real work
+    watchdog = _release_fifo_writer_later(fifo)
+
+    try:
+        dry = ws.run("pull", "--dry-run", "data", expect_rc=0)
+        res = ws.run("pull", "data", expect_rc=0)
+    finally:
+        watchdog.cancel()
+
+    assert "a.txt" not in dry.out
+    assert "a.txt" not in res.out
+    assert stat.S_ISFIFO(os.lstat(fifo).st_mode)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no mkfifo on this platform")
+def test_pull_leaves_an_unrecorded_fifo_under_a_stray_object(ws):
+    ws.write("data/b.txt", "beta")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    fifo = ws.root / "data" / "a.txt"
+    os.mkfifo(fifo)
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/a.txt", Body=b"stray")
+    watchdog = _release_fifo_writer_later(fifo)
+
+    try:
+        res = ws.run("pull", "data", expect_rc=0)
+    finally:
+        watchdog.cancel()
+
+    assert "a special file sits at its path and no file is recorded there" in res.err
+    assert stat.S_ISFIFO(os.lstat(fifo).st_mode)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no mkfifo on this platform")
 def test_pull_update_orders_a_fifo_at_a_file_record(ws):
     # Under -u a special file at a file record is the type change the rule
     # orders: a newer one is kept, an older one replaced.
@@ -813,6 +861,47 @@ def test_dir_pull_leaves_a_diverged_local_copy_of_a_stale_record_untouched(ws):
     after = os.lstat(a)
     assert (after.st_mode, after.st_mtime_ns) == (before.st_mode, before.st_mtime_ns)
     assert a.read_text() == "ALPHA"
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs an unreadable file")
+def test_dir_pull_leaves_an_unreadable_copy_of_a_stale_record_untouched(ws):
+    # The sync's listing skips an unreadable file, so its delete lane never
+    # sees it; the apply still knows no download landed there.
+    a = ws.write("data/a.txt", "alpha")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.s3.delete_object(Bucket=ws.bucket, Key=f"{ws.prefix}/data/a.txt")
+    a.write_text("ALPHA")
+    os.utime(a, (2_000_000_000, 2_000_000_000))
+    os.chmod(a, 0)
+    try:
+        before = os.lstat(a)
+        res = ws.run("pull", "data", expect_rc=0)
+        after = os.lstat(a)
+    finally:
+        os.chmod(a, 0o644)
+
+    assert f"a push retires the stale record): {a}" in res.err
+    assert (after.st_mode, after.st_mtime_ns) == (before.st_mode, before.st_mtime_ns)
+    assert a.read_text() == "ALPHA"
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs an unreadable file")
+@pytest.mark.parametrize("update", [False, True], ids=["plain", "update"])
+def test_dir_pull_restores_over_an_unreadable_file(ws, update):
+    a = ws.write("data/a.txt", "alpha")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    recorded_mode = os.lstat(a).st_mode
+    a.write_text("ALPHA")
+    os.utime(a, (1_600_000_000, 1_600_000_000))  # older: -u restores it too
+    os.chmod(a, 0)
+
+    res = ws.run("pull", *(("-u",) if update else ()), "data", expect_rc=0)
+
+    assert "stale record" not in res.err
+    assert os.lstat(a).st_mode == recorded_mode
+    assert a.read_text() == "alpha"
 
 
 def test_dir_pull_dry_run_warns_about_a_stale_record_it_meets(ws):

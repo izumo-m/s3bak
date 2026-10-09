@@ -657,15 +657,12 @@ def _apply_record(
                 pass  # a mode the record never asked for; nothing to report
         return _ApplyOutcome(0)
 
-    if update and decision == manifest.PULL_KEPT:
-        return kept()
-    if decision == manifest.PULL_GONE:
-        # A local file the sync's delete lane found with no object at its
-        # key: the record is stale, and skipped in full like the one below
-        # with nothing local - its metadata included, since stamping it onto
-        # content the pull never restored would hide a diverged copy from
-        # every later size+mtime comparison. A Windows prep is undone here,
-        # as for any file the apply leaves to itself.
+    def stale() -> _ApplyOutcome:
+        # A local file at a record with no object behind it: skipped in full
+        # like the record below with nothing local - its metadata included,
+        # since stamping it onto content the pull never restored would hide
+        # a diverged copy from every later size+mtime comparison. A Windows
+        # prep is undone here, as for any file the apply leaves to itself.
         if report:
             console.warn(no_object_record(target))
         prepped = prep_modes.get(os.path.abspath(target)) if prep_modes else None
@@ -675,6 +672,11 @@ def _apply_record(
             except OSError:
                 pass  # a mode the record never asked for; nothing to report
         return _ApplyOutcome(0)
+
+    if update and decision == manifest.PULL_KEPT:
+        return kept()
+    if decision == manifest.PULL_GONE:
+        return stale()  # the sync's delete lane found no object at its key
     if m_entry.sym_target is not None:
         if compare_to_stat(m_entry, st, local_sym, window_ns=window_ns).is_match:
             return _ApplyOutcome(0)
@@ -736,6 +738,21 @@ def _apply_record(
 
     if compare_to_stat(m_entry, st, local_sym, window_ns=window_ns, local_mode=local_mode).is_match:
         return kept()
+    if (
+        is_dir_entry
+        and decision is None
+        and m_entry.is_file
+        and st is not None
+        and stat_mod.S_ISREG(st.st_mode)
+        and not os.access(target, os.R_OK)
+    ):
+        # The sync's local listing skips a file it cannot read, so its delete
+        # lane never saw this one to spool a G; where an object exists, the
+        # create lane downloads over such a file and spools the D
+        # (syncops.RestoreFilter / UpdateFilter.create). One still
+        # unreadable here with no decision therefore has no object behind
+        # its record.
+        return stale()
     dir_at_file = st is not None and m_entry.is_file and stat_mod.S_ISDIR(st.st_mode)
     if (
         update

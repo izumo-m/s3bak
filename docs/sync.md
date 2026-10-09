@@ -485,9 +485,14 @@ rehearsal must fail or warn exactly where the real command would. With
    s3transfer writes straight into a destination it finds to be a special
    file, following a symlink to stat it: into a FIFO that blocks until a
    reader appears, or a device outside the restore tree. So the create lane
-   removes a special file, or a symlink to one, before its download
-   (`syncops._clear_special_target`; one it cannot remove is not downloaded,
-   and the apply reports the record). It never downloads onto a local
+   removes a special file, or a symlink to one, before a regular-file
+   record's download (`syncops._clear_special_target`; one it cannot remove
+   is not downloaded, and the apply reports the record), and with no record
+   at the key it leaves such a path alone, warning that the object is
+   residue it cannot place (exit 2). A symlink or special-file record at the
+   key — an object a push left behind when the path changed kind — is left
+   to the apply, which restores the record, whatever is local. It never
+   downloads onto a local
    directory (`syncops.RestoreFilter`): the `os.replace` can never replace
    one, so the transfer would fetch the bytes only to fail on the rename.
    The record decides what the directory means. A
@@ -498,8 +503,7 @@ rehearsal must fail or warn exactly where the real command would. With
    at the key means the object is residue the pull cannot place — unrecorded,
    or shadowing a directory record (verify's type conflict; a directory
    record's key carries a trailing slash, so the object's key finds no
-   record) — warned about (exit 2). A symlink or special-file record at the
-   key is left to the apply, which restores the record. The check is
+   record) — warned about (exit 2). The check is
    skipped where nothing can be in the way: a staged pull (a conflicting
    restore root, below) writes into an empty stage — and its dry run runs
    against the uncorrected root, which must not be judged either — and a
@@ -594,7 +598,10 @@ rehearsal must fail or warn exactly where the real command would. With
    file at the path the apply cannot tell from a downloaded one, so the
    sync's observing delete lane spools its key (`G`, beside `-u`'s `D` and
    `K`) for the apply to skip — and warns there itself on a dry run, which
-   runs no apply.
+   runs no apply. A file the sync's listing cannot read never reaches that
+   lane; where an object exists, the create lane downloads over it and
+   spools a `D` (a plain pull too), so an unreadable file the apply meets
+   with no decision is a stale record's, skipped the same way.
 
 What a pull can reproduce is bounded by what the backup records — see
 [storage.md](storage.md#restore-fidelity).

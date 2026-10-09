@@ -110,23 +110,28 @@ PULL_KEPT = manifest.PULL_KEPT
 PULL_GONE = manifest.PULL_GONE
 
 
-def _clear_special_target(local_path: str) -> bool:
-    """Make a create-lane download's path safe to land on; False when it is
-    not, and the download must not run.
-
-    s3transfer writes a download straight into a destination it finds to be
-    a special file - following a symlink to stat it - instead of landing it
-    through its temp file and rename: into a FIFO, which blocks the pull
+def _special_target(local_path: str) -> bool:
+    """Whether a download landing at ``local_path`` would be written into a
+    special file. s3transfer writes a download straight into a destination
+    it finds to be one - following a symlink to stat it - instead of landing
+    it through its temp file and rename: into a FIFO, which blocks the pull
     until a reader appears, or into a device a symlink points at, outside
-    the restore tree. The record says a regular file belongs here, and the
-    rename would have replaced either one, so it is removed first. One that
-    cannot be removed is left to the metadata apply, which reports a
-    recorded file the pull could not restore."""
+    the restore tree."""
     try:
         st = os.stat(local_path)
     except OSError:
-        return True  # nothing there, or a dangling symlink: the rename replaces it
-    if stat_mod.S_ISREG(st.st_mode) or stat_mod.S_ISDIR(st.st_mode):
+        return False  # nothing there, or a dangling symlink: the rename replaces it
+    return not (stat_mod.S_ISREG(st.st_mode) or stat_mod.S_ISDIR(st.st_mode))
+
+
+def _clear_special_target(local_path: str) -> bool:
+    """Make a create-lane download's path safe to land on where the record
+    says a regular file belongs; False when it is not, and the download must
+    not run. A special file there (``_special_target``) is removed first, as
+    the rename would have replaced it; one that cannot be removed is left to
+    the metadata apply, which reports a recorded file the pull could not
+    restore."""
+    if not _special_target(local_path):
         return True
     try:
         os.unlink(local_path)
@@ -254,11 +259,30 @@ class RestoreFilter(_PullFilter):
             st = os.lstat(local_path)
         except OSError:
             return True  # nothing local (or unreadable: the transfer reports it)
-        if not stat_mod.S_ISDIR(st.st_mode):
-            # A file or symlink: the download replaces it - once a special
-            # file, or a symlink to one, is out of its way.
-            return self._dryrun or _clear_special_target(local_path)
         m = self._lookup(key)
+        if not stat_mod.S_ISDIR(st.st_mode):
+            if m is not None and not m.is_file:
+                # A symlink or special-file record shadowed by an object at
+                # its key: the record is what pull restores, and the apply
+                # does that.
+                return False
+            if m is None and _special_target(local_path):
+                # Pull never replaces a special file the backup does not
+                # describe, and the transfer would write into it.
+                console.warn(
+                    "warning: stale object not restored - a special file sits at its path"
+                    f" and no file is recorded there (push --delete retires it): {local_path}"
+                )
+                return False
+            # A file or symlink: the download replaces it - once a special
+            # file, or a symlink to one, is out of a recorded file's way. The
+            # download is spooled: a regular file the listing could not read
+            # lands here, and the apply tells it from a stale record's by this
+            # decision alone.
+            if self._dryrun or _clear_special_target(local_path):
+                self._decide(PULL_DOWNLOADED, key)
+                return True
+            return False
         if m is None:
             console.warn(
                 "warning: stale object not restored - a directory sits at its path"
