@@ -290,7 +290,6 @@ def test_mtime_window_flag_requires_value(cfg_ws):
 @pytest.mark.parametrize(
     "args",
     [
-        ("push", "--checksum", "--mtime-window", "0", "data"),
         ("push", "--yes", "data"),
         ("pull", "--yes", "data"),
     ],

@@ -9,6 +9,14 @@ a fix only (Fixed).
 
 ## [Unreleased]
 
+### Changed
+
+- `push` and `pull` accept `--mtime-window` together with `--checksum`. The
+  tolerance still decides what `--checksum` leaves to modification times —
+  whether a content-equal file is re-recorded or has its modification time
+  set back, and under `-u` which side is the newer one — so refusing the
+  override there kept the command line from setting it.
+
 ### Fixed
 
 - A plain `pull` of a single-file entry, or of a file named as a sub-path,

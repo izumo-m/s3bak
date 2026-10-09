@@ -248,6 +248,25 @@ def test_push_update_delete_keeps_the_record_while_retiring_strays(ws, mtime):
     assert marker.exists()
 
 
+def test_push_update_checksum_takes_the_mtime_window_override(ws):
+    # Under -u --checksum the window still orders the two sides, so the
+    # command-line override applies there as anywhere.
+    f = ws.write("one.conf", "v1")
+    ws.config({"one.conf": {"path": str(f)}})
+    ws.run("push", "one.conf", expect_rc=0)
+    newer = _mtime_ns(f) + 5_000_000_000
+    f.write_text("v2")
+    os.utime(f, ns=(newer, newer))
+
+    res = ws.run("push", "-u", "--checksum", "--mtime-window", "10", "one.conf", expect_rc=0)
+    assert f"{CONFLICT}same mtime, content differs" in res.err
+    assert "upload:" not in res.out
+
+    res = ws.run("push", "-u", "--checksum", "one.conf", expect_rc=0)
+    assert "upload:" in res.out
+    assert _object_body(ws, "one.conf") == "v2"
+
+
 # --- pull -u -----------------------------------------------------------------
 
 

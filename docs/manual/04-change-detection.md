@@ -203,6 +203,12 @@ reconstructs each local file's S3 ETag and copies the pair when that does not
 match the stored object's. So a same-size, same-mtime content change **is**
 transferred, and a modification time that drifted on its own is **not**.
 
+The tolerance still applies under `--checksum` to what is left to
+modification times: whether a push re-records a content-equal file whose
+modification time moved, whether a pull sets such a file's modification time
+back, and under `-u` which side is the newer one. `--mtime-window` overrides
+it there as anywhere else.
+
 It reads and hashes every candidate file, which is why it is not the default.
 On an entry of any size that is the difference between a push that reads
 nothing and a push that reads everything. It also depends on the ETag being a
