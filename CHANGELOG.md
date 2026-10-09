@@ -3,9 +3,7 @@
 All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-This project follows [Semantic Versioning](https://semver.org/). While below
-1.0.0, MINOR marks a spec change (Added / Changed / Removed) and PATCH marks
-a fix only (Fixed).
+This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
