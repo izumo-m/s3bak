@@ -772,6 +772,26 @@ def test_single_file_pull_leaves_a_diverged_local_copy_untouched(ws):
     assert (after.st_mode, after.st_mtime_ns) == (before.st_mode, before.st_mtime_ns)
 
 
+@pytest.mark.parametrize("update", [False, True], ids=["plain", "update"])
+def test_single_file_pull_dry_run_warns_where_its_probe_finds_no_object(ws, update):
+    # With the stat matching, the pull probes the object before judging the
+    # file equal; a dry run makes the same probe and warns as the real run
+    # does, instead of announcing a download that would find nothing.
+    target = ws.write("solo.conf", "cfg")
+    ws.config({"solo.conf": {"path": str(target)}})
+    ws.run("push", "solo.conf", expect_rc=0)
+    ws.s3.delete_object(Bucket=ws.bucket, Key=f"{ws.prefix}/solo.conf")
+    drifted = 0o600 if os.lstat(target).st_mode & 0o777 != 0o600 else 0o640
+    os.chmod(target, drifted)
+    flags = ("-u",) if update else ()
+
+    for dry in (("--dry-run",), ()):
+        res = ws.run("pull", *flags, *dry, "solo.conf", expect_rc=0)
+        assert "download:" not in res.out
+        assert "a push retires the stale record" in res.err
+        assert os.lstat(target).st_mode & 0o777 == drifted
+
+
 def test_dir_pull_leaves_a_diverged_local_copy_of_a_stale_record_untouched(ws):
     # The directory shape of the single-file test above: the sync's delete
     # lane sees the local file with no object at its key, and the record is

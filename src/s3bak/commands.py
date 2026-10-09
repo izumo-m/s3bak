@@ -33,6 +33,7 @@ from s3bak.compare import (
     compare_to_stat,
     format_diff_block,
     mode_differs,
+    no_object_record,
     ordered_side,
     tie_conflict,
     warn_conflict,
@@ -1373,6 +1374,14 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 )
                 if single_verdict == "keep":
                     return 0
+                if single_verdict == "missing":
+                    # The probe found no object behind the record: stale, and
+                    # skipped in full - no transfer, no metadata - exactly as
+                    # the download lane skips it when its GetObject finds
+                    # nothing. A dry run made the same probe and warns alike.
+                    rel = f"{entry}/{sub}" if sub else entry
+                    console.warn(no_object_record(f"{cfg.prefix}/{rel}"))
+                    return 0
 
             prep_modes: dict[str, int] | None = None
             if IS_WINDOWS and not opts.dryrun and stage_dir is None:
@@ -1680,7 +1689,9 @@ def _single_file_pull_verdict(
     the no-op gate (so something differs; --checksum skips the gate):
     ``"download"`` to transfer the object, ``"apply"`` when the content is
     taken as equal and only the metadata is behind, ``"keep"`` (-u only) to
-    leave the local file alone in full. The root's kind already agrees (a
+    leave the local file alone in full, ``"missing"`` when the probe found
+    no object behind the record (stale: skipped in full, warned by the
+    caller). The root's kind already agrees (a
     conflicting root is replaced whole, staged on a real run, without
     asking here).
 
@@ -1713,12 +1724,12 @@ def _single_file_pull_verdict(
         # The stat alone decides: no probe, as the sync lane spends none.
         return "download"
     # The stored object is probed before anything is judged equal, as the
-    # directory lane's listing is: a missing one downloads (the lane reports
-    # it), and under -u one that no longer matches its record is a conflict
-    # whichever side is newer.
+    # directory lane's listing is: a missing one makes the record stale, and
+    # under -u one that no longer matches its record is a conflict whichever
+    # side is newer.
     head = cfg.store.head_object(f"{entry}/{sub}" if sub else entry, verbose=opts.verbose)
     if head is None:
-        return "download"  # the lane reports the missing object
+        return "missing"
     if not opts.update:
         if opts.checksum:
             return "download" if _local_content_differs(cfg, outpath, head) else "apply"

@@ -44,6 +44,9 @@ a fix only (Fixed).
   (under `--delete`, the `D` that `push --delete` would retire), where it
   used to report the changes a push ignores. An excluded name the backup
   does not record is ignored instead of reported as not found.
+- `pull --dry-run` of a single-file entry or a file sub-path whose object is
+  gone now warns about the stale record where the real pull does, instead
+  of announcing a download that would find nothing.
 
 ## [0.9.0] - 2026-09-10
 

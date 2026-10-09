@@ -469,10 +469,12 @@ rehearsal must fail or warn exactly where the real command would. With
    entry or file sub-path has no lanes, so `cmd_pull` takes the lane's
    verdict itself: download iff the size+mtime check fails — the local stat
    differs from the record, or a HeadObject (probed only once the stat
-   matches) finds the object missing or size-drifted, the evidence the
-   sync lane takes from its listing. `--checksum` uses the ETag comparison
-   instead, and a local file it cannot read counts as differing. A
-   mode-only drift therefore downloads nothing; step 4 applies it. Excluded paths are
+   matches) finds the object size-drifted, the evidence the sync lane takes
+   from its listing. `--checksum` uses the ETag comparison instead, and a
+   local file it cannot read counts as differing. A mode-only drift
+   therefore downloads nothing; step 4 applies it. An object the probe
+   finds missing makes the record stale: warned and skipped in full, by a
+   dry run too, which made the same probe. Excluded paths are
    not downloaded ([excludes.md](excludes.md)). A directory sync's two lanes
    come from one streaming filter over the manifest: `ManifestFilter`'s
    size+mtime check for the both-sides pairs (the content comparison under
