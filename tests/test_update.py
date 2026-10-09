@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import shutil
 import stat
+import sys
 
 import pytest
 
@@ -223,6 +224,28 @@ def test_push_update_single_file_entry(ws):
     res = ws.run("push", "-u", "one.conf", expect_rc=0)
     assert f"{CONFLICT}same mtime, size differs" in res.err
     assert _object_body(ws, "one.conf") == "v2"
+
+
+@pytest.mark.parametrize("mtime", [OLD, None], ids=["newer-record", "tie"])
+def test_push_update_delete_keeps_the_record_while_retiring_strays(ws, mtime):
+    # Deleting a stray under entry/ is work (post_hook fires), but no reason
+    # to rewrite the one record from a local file the push did not upload.
+    marker = ws.root / "post-ran"
+    hook = ws.write("touch.py", "import pathlib, sys\npathlib.Path(sys.argv[1]).touch()\n")
+    f = ws.write("one.conf", "v1")
+    ws.config({"one.conf": {"path": str(f), "post_hook": [sys.executable, str(hook), str(marker)]}})
+    ws.run("push", "one.conf", expect_rc=0)
+    marker.unlink()
+    body = _manifest_body(ws, "one.conf")
+    ws.s3.put_object(Bucket=ws.bucket, Key=f"{ws.prefix}/one.conf/stray", Body=b"x")
+    _rewrite(f, "an edit of another size", mtime)
+
+    res = ws.run("push", "-u", "--delete", "--yes", "one.conf", expect_rc=0)
+
+    assert "one.conf/stray" not in ws.keys()
+    assert "upload:" not in res.out
+    assert _manifest_body(ws, "one.conf") == body
+    assert marker.exists()
 
 
 # --- pull -u -----------------------------------------------------------------

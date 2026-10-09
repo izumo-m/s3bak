@@ -999,27 +999,30 @@ def cmd_push(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                         return result.returncode
                     results = result.results
                 refresh_manifest = results > 0
+            strays_deleted = False
             if opts.delete:
                 # A single-file entry has no sync listing, so its --delete lane
                 # is this explicit sweep of entry/ (see _delete_file_entry_strays).
                 st, stray_count = _delete_file_entry_strays(cfg, entry, opts)
-                if stray_count:
-                    # Deletions are work: refresh the manifest (a no-op rewrite
-                    # of the single record) so post_hook fires, as a directory
-                    # delete-only push would.
-                    refresh_manifest = True
                 if st != 0:
                     return st
+                strays_deleted = stray_count > 0
 
-        # Single-file refresh: after an upload, a mode drift, or a stray
-        # deletion (a no-op rewrite of the one record, so post_hook fires as
-        # a directory delete-only push would). An mtime drift inside the
-        # window does not refresh an existing manifest (the window is a
-        # rounding tolerance).
-        if refresh_manifest:
-            st = upload_manifest(cfg, entry, target, opts)
-            if st != 0:
-                return st
+            # Single-file refresh: after an upload or a mode drift. An mtime
+            # drift inside the window does not refresh an existing manifest
+            # (the window is a rounding tolerance), and the compare decides
+            # alone: under -u a newer or conflicting record must keep
+            # describing its object, so nothing else may rewrite it from
+            # the local stat.
+            if refresh_manifest:
+                st = upload_manifest(cfg, entry, target, opts)
+                if st != 0:
+                    return st
+            elif strays_deleted:
+                # Deletions are work: post_hook fires, as after a directory
+                # delete-only push - with no manifest change to publish, since
+                # the strays had no records.
+                return _run_hook("post_hook", entry_cfg.get("post_hook"), opts)
 
         return 0
     except DeletionAbortedError:

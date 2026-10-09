@@ -34,6 +34,11 @@ a fix only (Fixed).
   it stamped the record's permission bits and modification time onto that
   file without a word, hiding a diverged copy from every later comparison.
   `pull -u` skips such a record the same way, and `--dry-run` warns too.
+- `push -u --delete` of a single-file entry no longer rewrites the entry's
+  record from the local file when it deletes stray objects under the entry
+  while keeping a newer record or reporting a conflict. The record kept
+  describing an object the push never uploaded, so `verify` found it
+  mismatched. Deleting strays still runs `post_hook`.
 
 ## [0.9.0] - 2026-09-10
 
