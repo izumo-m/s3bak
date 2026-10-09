@@ -39,14 +39,17 @@ a fix only (Fixed).
   while keeping a newer record or reporting a conflict. The record kept
   describing an object the push never uploaded, so `verify` found it
   mismatched. Deleting strays still runs `post_hook`.
-- `status` of a file or symlink named on the command line now honours the
-  entry's `excludes`, as `push` does: an excluded path reports nothing
-  (under `--delete`, the `D` that `push --delete` would retire), where it
-  used to report the changes a push ignores. An excluded name the backup
-  does not record is ignored instead of reported as not found.
+- `status` of a path named on the command line now honours the entry's
+  `excludes`, judging the path the way `push` does: one the excludes hide
+  reports nothing (under `--delete`, the `D` that `push --delete` would
+  retire), where it used to report the changes a push ignores, and such a
+  name the backup does not record is ignored instead of reported as not
+  found.
 - `pull --dry-run` of a single-file entry or a file sub-path whose object is
-  gone now warns about the stale record where the real pull does, instead
-  of announcing a download that would find nothing.
+  gone now warns about the stale record where the real pull does, when the
+  local file's size and modification time match its record (the pull then
+  checks the object before judging the file), instead of announcing a
+  download that would find nothing.
 - `pull` of a file sub-path picks its transfer path from that file's own
   recorded size. It used the size of the first file the manifest records,
   so a small file could take the multipart path, or a large one the

@@ -435,6 +435,37 @@ def _backup_invisible(ex: Excludes, manifest_path: str | None, sub: str, anchor:
     return ex.excluded(sub, anchor) or ex.excluded(f"{sub}/", anchor + "/")
 
 
+def _named_sub_invisible(
+    ex: Excludes,
+    excludes: list[str],
+    manifest_path: str | None,
+    local_sub: str,
+    sub: str,
+    sub_st: os.stat_result | None,
+) -> bool:
+    """Whether the entry's excludes hide everything a push of the named
+    ``sub`` would see (docs/excludes.md): naming an excluded path does not
+    override the exclude. A present target is judged by its actual kind - a
+    directory counts as invisible only when the filtered walk yields NOTHING
+    (its own record included), so a partially excluded directory still
+    pushes normally. "Nothing visible" must be PROVEN: a walk gap (an
+    unreadable directory, a path racing away) means the tree may hold
+    visible content the walk could not see. An absent target has no local
+    kind to consult, so what the backup records under the name is judged
+    instead (_backup_invisible). One judgment for push and the status that
+    previews it."""
+    sub_anchor = os.path.abspath(local_sub).replace(os.sep, "/")
+    if sub_st is not None and stat_mod.S_ISDIR(sub_st.st_mode):
+        gaps: list[str] = []
+        walk = localwalk.walk_tree(
+            local_sub, excludes, root_rel=f"./{sub}", rel_prefix=f"./{sub}/", warn=gaps.append
+        )
+        return next(iter(walk), None) is None and not gaps
+    if sub_st is not None:
+        return ex.excluded(sub, sub_anchor)
+    return _backup_invisible(ex, manifest_path, sub, sub_anchor)
+
+
 def _push_sub(
     cfg: Config,
     entry: str,
@@ -491,31 +522,12 @@ def _push_sub(
             console.err(f"cannot access sub path: {local_sub}: {e}")
             return 1
 
-        # The named target under the entry's excludes (docs/excludes.md):
-        # naming an excluded path does not override the exclude. A present
-        # target is judged by its actual kind - a directory counts as
-        # invisible only when the filtered walk yields NOTHING (its own
-        # record included), so a partially excluded directory still pushes
-        # normally below. An absent target has no local kind to consult, so
-        # what the backup records under the name is judged instead
-        # (_backup_invisible), and exclusion wins over "missing".
+        # The named target under the entry's excludes: exclusion wins over
+        # "missing". A walk gap falls through to the normal branches, whose
+        # completeness gate then refuses deletions - the same fail-closed
+        # rule as everywhere else.
         ex = Excludes(excludes)
-        sub_anchor = os.path.abspath(local_sub).replace(os.sep, "/")
-        if sub_st is not None and stat_mod.S_ISDIR(sub_st.st_mode):
-            # "Nothing visible" must be PROVEN: a walk gap (an unreadable
-            # directory, a path racing away) means the tree may hold visible
-            # content the walk could not see, so the push falls through to
-            # the normal branches, whose completeness gate then refuses
-            # deletions - the same fail-closed rule as everywhere else.
-            gaps: list[str] = []
-            walk = localwalk.walk_tree(
-                local_sub, excludes, root_rel=f"./{sub}", rel_prefix=f"./{sub}/", warn=gaps.append
-            )
-            nothing_visible = next(iter(walk), None) is None and not gaps
-        elif sub_st is not None:
-            nothing_visible = ex.excluded(sub, sub_anchor)
-        else:
-            nothing_visible = _backup_invisible(ex, old_manifest, sub, sub_anchor)
+        nothing_visible = _named_sub_invisible(ex, excludes, old_manifest, local_sub, sub, sub_st)
 
         if sub_st is None or nothing_visible:
             if not opts.delete:
@@ -2048,15 +2060,28 @@ def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
         # still map each record to its own child path (is_dir=False would fold
         # every record onto outpath and print duplicate/wrong lines).
         excludes: list[str] = entry_cfg.get("excludes", [])
-        ex = Excludes(excludes)
-        sub_anchor = os.path.abspath(outpath).replace(os.sep, "/")
+        # A named sub previews its push, which ignores it when the excludes
+        # hide everything it would see - judged exactly as the push judges
+        # it. A path that cannot be stat'd is not proven invisible: it falls
+        # through to the compare, which warns.
+        sub_invisible = False
         if sub is not None:
+            sub_st: os.stat_result | None = None
+            reachable = True
+            try:
+                sub_st = os.lstat(outpath)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                reachable = False
+            if reachable:
+                sub_invisible = _named_sub_invisible(
+                    Excludes(excludes), excludes, manifest_path, outpath, sub, sub_st
+                )
             sub_kind = _sub_kind_from_manifest(manifest_path, sub)
             if sub_kind == "missing":
-                # Exclusion wins over "missing", as for push and pull: with
-                # no record there is no kind to consult, so either spelling
-                # matching means the config ignores the name.
-                if ex.excluded(sub, sub_anchor) or ex.excluded(f"{sub}/", sub_anchor + "/"):
+                # Exclusion wins over "missing", as for push and pull.
+                if sub_invisible:
                     return 0
                 console.err(f"not found on S3: {entry}/{sub}")
                 return 1
@@ -2085,10 +2110,10 @@ def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
                 console.warn(
                     f"warning: {entry}/{sub}: reached through a symlinked parent; not compared"
                 )
-            # A named file/symlink sub under the excludes is ignored by a
+            # A named file/symlink sub the excludes hide is ignored by a
             # plain push and retired by push --delete (docs/excludes.md):
             # the same view the directory walk gives an excluded record.
-            excluded_sub = sub is not None and ex.excluded(sub, sub_anchor)
+            excluded_sub = sub_invisible
             for entry_obj in manifest.iter_manifest(manifest_path):
                 res = manifest_target(entry_obj, outpath, is_dir, sub)
                 if res is None:

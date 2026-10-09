@@ -111,6 +111,29 @@ def test_status_of_a_named_excluded_file_previews_its_push(ws):
     assert ws.run("status", str(ws.root / "data" / "gone.log"), expect_rc=0).out == ""
 
 
+def test_status_of_a_named_path_judges_excludes_by_its_local_kind(ws):
+    # As push does: a present path by what it is now, so an excluded file
+    # name that became a directory with content is not ignored, and an
+    # unrecorded name the excludes do not hide is not "ignored" either.
+    x = ws.write("data/x", "file")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    x.unlink()
+    ws.write("data/x/y", "inside")
+    ws.write("data/build", "artifact")
+    ws.write("data/keep/k.txt", "kept")
+
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["x"]}})
+    assert ws.run("status", str(x), expect_rc=0).out != ""
+    assert "upload:" in ws.run("push", "--dry-run", str(x), expect_rc=0).out
+
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["build/*"]}})
+    assert "not found on S3" in ws.run("status", str(ws.root / "data" / "build"), expect_rc=1).err
+
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["*", "!keep/*"]}})
+    assert "not found on S3" in ws.run("status", str(ws.root / "data" / "keep"), expect_rc=1).err
+
+
 def test_status_previews_the_upload_after_a_single_file_entry_is_renamed(ws):
     # The record names the old basename, so a push uploads the file afresh
     # whatever its stat; status says so instead of comparing the old record.
