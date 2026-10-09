@@ -7,6 +7,8 @@ from __future__ import annotations
 import os
 import stat
 
+import pytest
+
 
 def _mtime_ns(p) -> int:
     return os.lstat(p).st_mtime_ns
@@ -184,6 +186,36 @@ def test_single_file_pull_checksum_repairs_metadata_without_download(ws):
 
     assert "download:" not in res.out
     assert (_mode(f), _mtime_ns(f)) == (recorded_mode, recorded_mtime)
+
+
+def test_single_file_pull_checksum_dryrun_settled_file_prints_nothing(ws):
+    # The single-file shape of the directory test above: equal content and a
+    # settled record plan no transfer and no metadata apply.
+    f = ws.write("solo.txt", "content")
+    ws.write("data/a.txt", "alpha")
+    ws.config({"solo": {"path": str(f)}, "data": {"path": str(ws.root / "data")}})
+    ws.run("push", "solo", "data", expect_rc=0)
+
+    assert ws.run("pull", "--checksum", "solo", expect_rc=0).out.strip() == ""
+    res = ws.run("pull", "--checksum", "--dry-run", "solo", "data/a.txt", expect_rc=0)
+    assert res.out.strip() == ""
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs an unreadable file")
+def test_single_file_pull_checksum_restores_an_unreadable_file(ws):
+    # Content that cannot be read cannot be judged equal: the pull restores
+    # it, as a directory pull does for a file its listing could not read.
+    f = ws.write("solo.txt", "content")
+    ws.config({"solo": {"path": str(f)}})
+    ws.run("push", "solo", expect_rc=0)
+    recorded_mode = _mode(f)
+    os.chmod(f, 0o200)
+
+    res = ws.run("pull", "--checksum", "solo", expect_rc=0)
+
+    assert "download:" in res.out
+    assert _mode(f) == recorded_mode
+    assert f.read_text() == "content"
 
 
 def test_single_file_pull_checksum_downloads_a_same_stat_content_change(ws):

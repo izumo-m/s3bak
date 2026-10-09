@@ -889,6 +889,22 @@ def test_push_update_single_file_entry_drifted_object_beats_a_newer_local_file(w
     assert _object_body(ws, "one.conf") == "written around s3bak"
 
 
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs an unreadable file")
+def test_pull_update_checksum_single_file_entry_unreadable_older_copy_is_restored(ws):
+    # Unreadable content cannot be judged equal: a newer record downloads
+    # over the older copy rather than failing the content check.
+    f = ws.write("one.conf", "v1")
+    ws.config({"one.conf": {"path": str(f)}})
+    ws.run("push", "one.conf", expect_rc=0)
+    os.utime(f, (OLD, OLD))
+    os.chmod(f, 0o200)
+
+    res = ws.run("pull", "-u", "--checksum", "one.conf", expect_rc=0)
+
+    assert "download:" in res.out
+    assert f.read_text() == "v1"
+
+
 def test_pull_update_single_file_entry_drifted_object_is_a_conflict(ws):
     f = ws.write("one.conf", "v1")
     ws.config({"one.conf": {"path": str(f)}})

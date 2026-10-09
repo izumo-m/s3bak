@@ -17,6 +17,10 @@ a fix only (Fixed).
   back and downloads nothing, as a directory pull always did. Under
   `--checksum` it now compares content too: equal content has only its
   metadata applied, where it used to be downloaded every time.
+- `pull -u --checksum` of a single-file entry or a file sub-path no longer
+  stops with a permission error when the local file cannot be read: content
+  that cannot be read counts as differing, so a newer record restores the
+  file and a same-time copy is reported as a conflict.
 
 ## [0.9.0] - 2026-09-10
 

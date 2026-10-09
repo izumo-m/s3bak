@@ -1372,14 +1372,13 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                     # so both get the modes from before the prep.
                     prep_modes = {os.path.abspath(path): mode for path, mode in prep}
 
+            # An "apply" verdict counts the single file's content equal
+            # (size+mtime, or its ETag under --checksum): nothing to download,
+            # and whether the metadata apply below has work the gate
+            # (manifest_matches) already says - `changed` stays False, so a
+            # --checksum dry run of a settled file prints nothing.
             changed = False
-            if has_data and single_verdict == "apply":
-                # The single file's content counts as equal (size+mtime, or
-                # its ETag under --checksum) and only its mode or mtime is
-                # behind: nothing to download, but the metadata apply below
-                # has work.
-                changed = True
-            elif has_data:
+            if has_data and single_verdict != "apply":
                 # The compare only matters for the dir sync; a single file
                 # reaches here only on its verdict's "download". Its size
                 # (from the manifest) routes a large file through multipart.
@@ -1704,9 +1703,7 @@ def _single_file_pull_verdict(
         return "download"  # the lane reports the missing object
     if not opts.update:
         if opts.checksum:
-            if cfg.store.etag_checker()(outpath, head.size, head.etag):
-                return "download"
-            return "apply"
+            return "download" if _local_content_differs(cfg, outpath, head) else "apply"
         # The listing's size is free evidence in the sync lane; the probe's is here.
         return "download" if head.size != record.size else "apply"
     if head.size != record.size:
@@ -1719,7 +1716,7 @@ def _single_file_pull_verdict(
         return "keep"
     differs: str | None = None
     if opts.checksum:
-        if cfg.store.etag_checker()(outpath, head.size, head.etag):
+        if _local_content_differs(cfg, outpath, head):
             differs = CONFLICT_CONTENT
         elif side == "record":
             return "apply"
@@ -1731,6 +1728,24 @@ def _single_file_pull_verdict(
     if reason is not None:
         warn_conflict(reason, outpath)
     return "keep"
+
+
+def _local_content_differs(cfg: Config, local_path: str, head: ObjectMeta) -> bool:
+    """pull --checksum's content check of one local file against its probed
+    object. Hashing reads the local file, so a vanished one raises OSError
+    and an unreadable one a Boto3S3Error (AccessDeniedError) from the
+    reconstruct open: "could not check", which leans to differing as every
+    indeterminate comparison does. A plain pull then downloads, as the
+    directory sync does for a file its local listing could not read; under
+    -u a newer record downloads and a tie is a conflict, which keeps the
+    local file."""
+    assert cfg.store is not None
+    from boto3_s3 import Boto3S3Error
+
+    try:
+        return cfg.store.etag_checker()(local_path, head.size, head.etag)
+    except (OSError, Boto3S3Error):
+        return True
 
 
 def _single_file_size(manifest_path: str) -> int | None:
