@@ -119,6 +119,11 @@ commit on `develop` that turns `[Unreleased]` into the new version heading
 and raises `version` in `pyproject.toml`, followed by a merge to `main` and
 an annotated tag `vX.Y.Z`.
 
+Once the tag is pushed, `scripts/gh-release.sh vX.Y.Z` creates the GitHub
+Release, using that version's CHANGELOG section as the release notes. It
+skips a tag that already has a Release, and `--dry-run` prints the notes
+without creating anything.
+
 ## Documentation
 
 The user manual in [manual/](manual/README.md) is the authoritative
