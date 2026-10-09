@@ -91,6 +91,25 @@ def test_status_excluded_paths_are_invisible_to_plain_status(ws):
     assert any(line.startswith("D") and "old.log" in line for line in lines)
 
 
+def test_status_of_a_named_excluded_file_previews_its_push(ws):
+    # Naming an excluded path does not override the exclude: a plain push
+    # ignores it, so plain status says nothing; push --delete retires its
+    # backup, so status --delete shows it D.
+    ws.write("data/keep.txt", "k")
+    log = ws.write("data/a.log", "o")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["*.log"]}})
+    log.write_text("grown since the push")
+
+    assert ws.run("status", str(log), expect_rc=0).out == ""
+    assert ws.run("push", "--dry-run", str(log), expect_rc=0).out == ""
+    assert ws.run("status", "--delete", str(log), expect_rc=0).out == f"D {log}\n"
+    ws.run("push", "--delete", "--yes", str(log), expect_rc=0)
+    assert "data/a.log" not in ws.keys()
+    assert ws.run("status", str(ws.root / "data" / "gone.log"), expect_rc=0).out == ""
+
+
 def test_status_missing_subpath_errors(ws):
     ws.write("data/a.txt", "x")
     ws.config({"data": {"path": str(ws.root / "data")}})

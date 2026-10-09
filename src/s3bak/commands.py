@@ -2033,15 +2033,22 @@ def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
         # local filesystem: a directory entry whose local tree was deleted must
         # still map each record to its own child path (is_dir=False would fold
         # every record onto outpath and print duplicate/wrong lines).
+        excludes: list[str] = entry_cfg.get("excludes", [])
+        ex = Excludes(excludes)
+        sub_anchor = os.path.abspath(outpath).replace(os.sep, "/")
         if sub is not None:
             sub_kind = _sub_kind_from_manifest(manifest_path, sub)
             if sub_kind == "missing":
+                # Exclusion wins over "missing", as for push and pull: with
+                # no record there is no kind to consult, so either spelling
+                # matching means the config ignores the name.
+                if ex.excluded(sub, sub_anchor) or ex.excluded(f"{sub}/", sub_anchor + "/"):
+                    return 0
                 console.err(f"not found on S3: {entry}/{sub}")
                 return 1
             is_dir = sub_kind == "dir"
         else:
             is_dir = _entry_kind_from_manifest(manifest_path) == "dir"
-        excludes: list[str] = entry_cfg.get("excludes", [])
         use_color = _resolve_use_color(opts.color)
         window_ns = cfg.window_ns_for(entry)
 
@@ -2064,12 +2071,16 @@ def cmd_status(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> i
                 console.warn(
                     f"warning: {entry}/{sub}: reached through a symlinked parent; not compared"
                 )
+            # A named file/symlink sub under the excludes is ignored by a
+            # plain push and retired by push --delete (docs/excludes.md):
+            # the same view the directory walk gives an excluded record.
+            excluded_sub = sub is not None and ex.excluded(sub, sub_anchor)
             for entry_obj in manifest.iter_manifest(manifest_path):
                 res = manifest_target(entry_obj, outpath, is_dir, sub)
                 if res is None:
                     continue
                 target, _rel = res
-                if through_symlink:
+                if through_symlink or excluded_sub:
                     if opts.delete:
                         console.out(f"D {target}\n")
                     continue

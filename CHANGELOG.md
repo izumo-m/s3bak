@@ -39,6 +39,11 @@ a fix only (Fixed).
   while keeping a newer record or reporting a conflict. The record kept
   describing an object the push never uploaded, so `verify` found it
   mismatched. Deleting strays still runs `post_hook`.
+- `status` of a file or symlink named on the command line now honours the
+  entry's `excludes`, as `push` does: an excluded path reports nothing
+  (under `--delete`, the `D` that `push --delete` would retire), where it
+  used to report the changes a push ignores. An excluded name the backup
+  does not record is ignored instead of reported as not found.
 
 ## [0.9.0] - 2026-09-10
 

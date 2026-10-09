@@ -344,7 +344,10 @@ name is excluded in either spelling, as a file or as a directory — the push
 is the same silent exit 0. Otherwise a missing sub-path is an error, unless
 `--delete` says to retire its backup. A `pull` of a name the backup does not
 record follows the same rule: excluded in either spelling, it is ignored;
-otherwise it is the `not found on S3` error.
+otherwise it is the `not found on S3` error. `status` previews the push for
+a named path too: an excluded file or symlink reports nothing, or the `D`
+that `push --delete` would retire under `--delete`, and an excluded name
+the backup does not record is ignored rather than an error.
 
 ### Taking paths back
 
