@@ -9,6 +9,8 @@ a fix only (Fixed).
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-10-09
+
 ### Fixed
 
 - A plain `pull` of a single-file entry, or of a file named as a sub-path,
