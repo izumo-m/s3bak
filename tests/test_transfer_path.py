@@ -453,6 +453,22 @@ def test_single_file_pull_reports_the_cp_lane_for_a_large_object(ws, monkeypatch
     assert "(boto3-s3 cp)" in res.out
 
 
+def test_file_subpath_pull_routes_by_its_own_record_size(ws, monkeypatch):
+    # The lane is picked from the named file's record, not from whichever
+    # file record the manifest lists first.
+    monkeypatch.setattr(cli.Boto3S3Store, "_multipart", lambda self, size: size >= 4)
+    ws.write("data/a.txt", "a large object")
+    b = ws.write("data/b.txt", "b")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    b.write_text("bb")
+
+    res = ws.run("pull", "data/b.txt", expect_rc=0)
+
+    assert "(boto3-s3 get_file)" in res.out
+    assert b.read_text() == "b"
+
+
 def test_single_file_pull_dry_run_names_the_same_lane(ws):
     f = _single_file_ws(ws)
     before = f.read_text()

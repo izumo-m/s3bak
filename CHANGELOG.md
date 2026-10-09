@@ -47,6 +47,10 @@ a fix only (Fixed).
 - `pull --dry-run` of a single-file entry or a file sub-path whose object is
   gone now warns about the stale record where the real pull does, instead
   of announcing a download that would find nothing.
+- `pull` of a file sub-path picks its transfer path from that file's own
+  recorded size. It used the size of the first file the manifest records,
+  so a small file could take the multipart path, or a large one the
+  single-request path, and its line named the wrong one.
 
 ## [0.9.0] - 2026-09-10
 

@@ -1464,7 +1464,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                             ex, sub, outpath, dir_compare, dir_create, dir_orphan
                         )
                     compare, create, orphan = dir_compare, dir_create, dir_orphan
-                file_size = None if is_dir else _single_file_size(manifest_path)
+                file_size = None if is_dir else _single_file_size(manifest_path, sub)
                 try:
                     rc, changed = download_from_s3(
                         cfg,
@@ -1777,10 +1777,13 @@ def _local_content_differs(cfg: Config, local_path: str, head: ObjectMeta) -> bo
         return True
 
 
-def _single_file_size(manifest_path: str) -> int | None:
-    """Size of a single-file entry's sole data record (for the download size
-    gate), or None if the manifest has no regular-file record."""
+def _single_file_size(manifest_path: str, sub: str | None = None) -> int | None:
+    """Size of the regular-file record a single-object download restores
+    (for the download size gate): a single-file entry's sole data record, or
+    a file sub-path's own record. None if there is no such record."""
     for m in manifest.iter_manifest(manifest_path):
+        if sub is not None and m.path != f"./{sub}":
+            continue
         if m.is_file and m.sym_target is None:
             return m.size
     return None
