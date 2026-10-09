@@ -1353,10 +1353,10 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             # stage: a dry run stages nothing, and must preview the same run.
             # A single-file entry has no sync lanes to decide in; its one
             # verdict is taken here, before the Windows writable prep below
-            # changes the very mode it judges.
+            # changes the very mode -u judges.
             use_update = opts.update and not root_conflict
             single_verdict = "download"
-            if use_update and has_data and not is_dir:
+            if has_data and not is_dir and not root_conflict:
                 single_verdict = _single_file_pull_verdict(
                     cfg, entry, manifest_path, outpath, sub, window_ns, opts
                 )
@@ -1374,14 +1374,15 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
 
             changed = False
             if has_data and single_verdict == "apply":
-                # --checksum found the single file's content equal and only
-                # its recorded mtime or mode newer: nothing to download, but
-                # the metadata apply below has work.
+                # The single file's content counts as equal (size+mtime, or
+                # its ETag under --checksum) and only its mode or mtime is
+                # behind: nothing to download, but the metadata apply below
+                # has work.
                 changed = True
             elif has_data:
-                # The compare only matters for the dir sync; a single-file transfer
-                # always happens (we only reach it on a manifest mismatch). Its
-                # size (from the manifest) routes a large file through multipart.
+                # The compare only matters for the dir sync; a single file
+                # reaches here only on its verdict's "download". Its size
+                # (from the manifest) routes a large file through multipart.
                 dest = os.path.join(stage_dir, "new") if stage_dir is not None else outpath
                 # A directory sync's lanes: the update lane judges the
                 # both-sides pairs, the create lane every S3-only key. Both
@@ -1657,16 +1658,28 @@ def _single_file_pull_verdict(
     window_ns: int,
     opts: Opts,
 ) -> str:
-    """pull -u's one verdict for a single-file entry or a file sub-path,
-    reached only past the no-op gate (so something differs), the single-file
-    shape of ``UpdateFilter``'s rule: ``"download"`` when the record is the
-    newer side or nothing is local; ``"keep"`` for a newer local file (a
-    skip line under -v) and for a conflict, warned - a tie with a size
+    """pull's one verdict for a single-file entry or a file sub-path, the
+    single-file shape of the directory sync's update lane, reached only past
+    the no-op gate (so something differs; --checksum skips the gate):
+    ``"download"`` to transfer the object, ``"apply"`` when the content is
+    taken as equal and only the metadata is behind, ``"keep"`` (-u only) to
+    leave the local file alone in full. The root's kind already agrees (a
+    conflicting root is replaced whole, staged on a real run, without
+    asking here).
+
+    A plain pull is ``ManifestFilter``'s rule: download unless the local
+    stat passes the size+mtime check against the record and the stored
+    object is at the recorded size - so a mode-only drift is ``"apply"``,
+    never a download (docs/sync.md). Under --checksum the stored object's
+    ETag decides instead, and an mtime or mode drift on equal content is
+    ``"apply"`` too.
+
+    Under -u it is ``UpdateFilter``'s rule: ``"download"`` when the record
+    is the newer side or nothing is local; ``"keep"`` for a newer local file
+    (a skip line under -v) and for a conflict, warned - a tie with a size
     (content under --checksum) or mode difference, or a stored object that
     no longer matches its record; ``"apply"`` when --checksum finds the
-    content equal under a newer record, so only the metadata is behind. The
-    root's kind already agrees (a conflicting root bypasses -u and is
-    replaced whole, staged on a real run)."""
+    content equal under a newer record."""
     assert cfg.store is not None
     record: ManifestEntry | None = None
     for m in manifest.iter_manifest(manifest_path):
@@ -1679,12 +1692,23 @@ def _single_file_pull_verdict(
         st = os.lstat(outpath)
     except OSError:
         return "download"
-    # The stored object is probed before the two sides are ordered, as the
-    # directory lane's listing is: one that no longer matches its record is
-    # a conflict whichever side is newer.
+    if not opts.update and not opts.checksum and not record.matches_stat(st, window_ns):
+        # The stat alone decides: no probe, as the sync lane spends none.
+        return "download"
+    # The stored object is probed before anything is judged equal, as the
+    # directory lane's listing is: a missing one downloads (the lane reports
+    # it), and under -u one that no longer matches its record is a conflict
+    # whichever side is newer.
     head = cfg.store.head_object(f"{entry}/{sub}" if sub else entry, verbose=opts.verbose)
     if head is None:
         return "download"  # the lane reports the missing object
+    if not opts.update:
+        if opts.checksum:
+            if cfg.store.etag_checker()(outpath, head.size, head.etag):
+                return "download"
+            return "apply"
+        # The listing's size is free evidence in the sync lane; the probe's is here.
+        return "download" if head.size != record.size else "apply"
     if head.size != record.size:
         warn_conflict(CONFLICT_OBJECT, outpath)
         return "keep"

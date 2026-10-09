@@ -1187,11 +1187,11 @@ def download_from_s3(
             return result.returncode, False
         return 0, result.results > 0
 
-    # Single file: a transfer always happens (we only reach here on a manifest
-    # mismatch), so a successful download counts as changed - which keeps the
-    # dry-run stand-in line ("would apply manifest metadata") printed for it.
-    # `size` (from the manifest record) routes a
-    # large file through multipart download; a small one is a direct GetObject.
+    # Single file: a transfer always happens (cmd_pull calls here only on its
+    # verdict's "download"), so a successful download counts as changed -
+    # which keeps the dry-run stand-in line ("would apply manifest metadata")
+    # printed for it. `size` (from the manifest record) routes a large file
+    # through multipart download; a small one is a direct GetObject.
     # The lane is named on the transfer line: a directory sync's lines come
     # from boto3-s3, which reports its own transfers, but nothing else would
     # say how this one object travelled.

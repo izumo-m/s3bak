@@ -9,6 +9,15 @@ a fix only (Fixed).
 
 ## [Unreleased]
 
+### Fixed
+
+- A plain `pull` of a single-file entry, or of a file named as a sub-path,
+  no longer downloads the file when only its permission bits differ from the
+  record. Its size and modification time match, so it sets the recorded bits
+  back and downloads nothing, as a directory pull always did. Under
+  `--checksum` it now compares content too: equal content has only its
+  metadata applied, where it used to be downloaded every time.
+
 ## [0.9.0] - 2026-09-10
 
 ### Added

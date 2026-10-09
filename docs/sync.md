@@ -143,10 +143,11 @@ other. A named file sub-path push stays unconditional.
 (`compare_to_local` / `compare_to_stat`), so `status` never disagrees with what
 a push or pull would actually do. The window is resolved per entry: the CLI
 override beats a per-entry `mtime_window`, which beats the top-level one.
-`status` additionally reports mode changes for the metadata view — the sync
-never transfers over a mode change; a push refreshes just the manifest instead
-(step 3 of the push pipeline, below), through the same mode predicate `status`
-uses.
+`status` additionally reports mode changes for the metadata view — neither
+direction transfers data over a mode change, a single file included: a push
+refreshes just the manifest instead (step 3 of the push pipeline, below), and
+a pull just re-applies the recorded mode (step 4 of the pull pipeline), both
+through the same mode predicate `status` uses.
 
 For a directory entry, `status` is one streaming merge-join
 (`manifest.merge_join`) of the manifest against a fresh local walk, both in
@@ -461,7 +462,14 @@ rehearsal must fail or warn exactly where the real command would. With
    is the very stat check whose blind spot `--checksum` exists to cover.
 3. **Download** (a symlink sub-path, having no data object, skips this
    step): `sync_down` for a directory, a single-request `get_file` for a file
-   (multipart via `S3.cp` if the recorded size is large). Excluded paths are
+   (multipart via `S3.cp` if the recorded size is large). A single-file
+   entry or file sub-path has no lanes, so `cmd_pull` takes the lane's
+   verdict itself: download iff the size+mtime check fails — the local stat
+   differs from the record, or a HeadObject (probed only once the stat
+   matches) finds the object missing or size-drifted, the evidence the
+   sync lane takes from its listing. `--checksum` uses the ETag comparison
+   instead. A mode-only drift therefore downloads nothing; step 4 applies
+   it. Excluded paths are
    not downloaded ([excludes.md](excludes.md)). A directory sync's two lanes
    come from one streaming filter over the manifest: `ManifestFilter`'s
    size+mtime check for the both-sides pairs (the content comparison under
@@ -487,8 +495,8 @@ rehearsal must fail or warn exactly where the real command would. With
    destination that does not exist yet holds nothing. Under `-u` the lanes
    are `UpdateFilter`'s, and each decision is spooled to a temp file in
    stream order — `D` for a download, `K` for a key kept as it is — for
-   step 4; a single-file entry has no lanes, so `cmd_pull` takes its one
-   verdict before the transfer. A restore root of
+   step 4; a single file's `-u` verdict is taken before the transfer, like
+   its plain one. A restore root of
    the wrong type (a directory where a file entry restores, a file or symlink
    where a tree does) is never destroyed up front: the download lands in a
    unique stage directory beside it first, and the root is swapped in two

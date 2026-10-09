@@ -32,7 +32,9 @@ What gets compared depends on what the record says the path is:
 | special file | modification time, permission bits |
 
 Permission bits are compared but never move data. A `chmod` alone makes the
-next push rewrite the manifest record and upload nothing.
+next push rewrite the manifest record and upload nothing, and the next pull
+set the recorded bits back and download nothing — a single-file entry and a
+file named on the command line included.
 
 Here is a tree with a few unrelated changes — a longer file, a new file, and
 a `chmod`. Each `M` line names the properties that differed, and the sign on
