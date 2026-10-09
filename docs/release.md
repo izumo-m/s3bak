@@ -19,5 +19,4 @@ Steps 2 to 6 write to the public repository; confirm before running them.
 6. Create the GitHub Release: `scripts/gh-release.sh vX.Y.Z`. The notes are
    that version's CHANGELOG section, read from the tag. A tag that already
    has a Release is skipped, and `--dry-run` prints the notes without
-   creating anything. Tags up to v0.9.0 have no Release and are not
-   backfilled.
+   creating anything.
