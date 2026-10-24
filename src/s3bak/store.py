@@ -623,10 +623,13 @@ class Boto3S3Store:
         compare: PairFilter | None = None,
         create: bool | FileFilter = True,
         orphan: FileFilter | None = None,
+        walker: LocalFileGenerator | None = None,
         dryrun: bool = False,
         verbose: bool = False,
     ) -> TransferResult:
-        """``create`` is the create-lane value: True downloads every S3-only
+        """``walker`` walks the local destination (localwalk.PullDestWalker,
+        which keeps excluded paths' walk warnings quiet; None is the default
+        walk). ``create`` is the create-lane value: True downloads every S3-only
         key (the default); a callable vetoes per key - pull's exclusion, which
         must not download an excluded path (docs/excludes.md). ``orphan``
         arms the delete lane with an observer that is handed every local
@@ -638,7 +641,7 @@ class Boto3S3Store:
         # follow_symlinks moved onto the Storage in 0.5: the local dest is walked
         # to find existing / orphan files, and a symlink there stays a symlink
         # (never descended into), matching the push side.
-        dest = LocalStorage(dest_dir, follow_symlinks=False)
+        dest = LocalStorage(dest_dir, walker=walker, follow_symlinks=False)
         return self._transfer(
             verbose,
             f"sync {src} {dest_dir}/",

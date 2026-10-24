@@ -161,6 +161,66 @@ class ManifestWalker(LocalFileGenerator):
                 yield kept
 
 
+class PullDestWalker(LocalFileGenerator):
+    """Pull's destination-side walk: the transfer view, quiet about excluded
+    paths.
+
+    The sync walks the destination in the normal (transfer) view, whose
+    vetting warn-skips special files and unreadable entries while it scans,
+    before any lane filter can judge the key. Pull's exclusion lives in its
+    lanes (``commands._pull_exclude_lanes``), so a socket under an excluded
+    path - ``~/.ssh/agent/*`` - would still be warned about on every pull.
+    This walker judges each entry against the excludes as it is classified
+    and drops the warnings of an excluded one; what the walk keeps or skips
+    is unchanged, so the lanes see the same stream as before. ``sub``
+    re-anchors keys at the entry root, and ``anchor`` is the restore
+    destination the absolute patterns match against (a staged pull walks
+    the stage, but the patterns are defined against where the tree ends up).
+    """
+
+    def __init__(self, excludes: Excludes, sub: str | None, anchor: str) -> None:
+        self._excludes = excludes
+        self._key_prefix = f"{sub}/" if sub else ""
+        self._anchor = os.path.abspath(anchor)
+        self._root = ""
+
+    def list_file_pages(
+        self, root: str, options: LocalScanOptions
+    ) -> Iterator[list[LocalFileInfo]]:
+        # ``root`` is absolute with a trailing separator, and every entry's
+        # ``full`` path is joined beneath it.
+        self._root = root
+        yield from super().list_file_pages(root, options)
+
+    def classify_child(
+        self,
+        entry: os.DirEntry[str],
+        full: str,
+        dir_fd: int | None,
+        *,
+        options: LocalScanOptions,
+        notify: Callable[[str], None],
+    ) -> WalkChild | None:
+        if self._excluded(entry, full):
+            notify = _drop_warning
+        return super().classify_child(entry, full, dir_fd, options=options, notify=notify)
+
+    def _excluded(self, entry: os.DirEntry[str], full: str) -> bool:
+        rel = full[len(self._root) :]
+        try:
+            is_dir = entry.is_dir(follow_symlinks=False)
+        except OSError:
+            is_dir = False
+        slash = "/" if is_dir else ""
+        key = self._key_prefix + rel.replace(os.sep, "/") + slash
+        anchor = os.path.join(self._anchor, rel).replace(os.sep, "/") + slash
+        return self._excludes.excluded(key, anchor)
+
+
+def _drop_warning(body: str) -> None:
+    pass
+
+
 def sync_walker(excludes: list[str], sub: str | None = None) -> ManifestWalker:
     """The push sync's local-side walk: the manifest walk's exclusion over
     the complete view (``store.sync_up`` enumerates every entry into the

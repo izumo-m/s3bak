@@ -7,6 +7,11 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `pull` no longer warns about sockets, FIFOs, devices, or unreadable files
+  under excluded paths (for example `~/.ssh/agent/*`).
+
 ## [0.9.1] - 2026-10-09
 
 ### Fixed

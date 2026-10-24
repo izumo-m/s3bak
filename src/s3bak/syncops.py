@@ -41,7 +41,7 @@ from s3bak.console import console
 from s3bak.manifest import ManifestEntry
 
 if TYPE_CHECKING:
-    from boto3_s3 import FileFilter, FileInfo, MergedPair, PairFilter
+    from boto3_s3 import FileFilter, FileInfo, LocalFileGenerator, MergedPair, PairFilter
 
 
 def _walk_warning(body: str) -> None:
@@ -1265,6 +1265,7 @@ def download_from_s3(
     compare: PairFilter | None = None,
     create: bool | FileFilter = True,
     orphan: FileFilter | None = None,
+    walker: LocalFileGenerator | None = None,
     size: int | None = None,
     dryrun: bool = False,
 ) -> tuple[int, bool]:
@@ -1292,6 +1293,7 @@ def download_from_s3(
                 compare=compare,
                 create=create,
                 orphan=orphan,
+                walker=walker,
                 dryrun=dryrun,
                 verbose=verbose,
             )

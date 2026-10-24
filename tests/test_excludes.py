@@ -378,6 +378,48 @@ def test_pull_update_lane_vetoes_an_excluded_pair(ws):
     assert c.read_text() == "locally newer, different size"
 
 
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no mkfifo on this platform")
+def test_pull_does_not_warn_about_an_excluded_special_file(ws):
+    # The destination walk vets special files while it scans, before the
+    # lanes judge the key; an excluded one must still pass in silence - a
+    # top-level one and one under an excluded directory alike.
+    ws.write("data/keep.txt", "k")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["cm-*", "agent/*"]}})
+    os.mkfifo(ws.root / "data" / "cm-sock")
+    (ws.root / "data" / "agent").mkdir()
+    os.mkfifo(ws.root / "data" / "agent" / "s.sock")
+    os.mkfifo(ws.root / "data" / "visible-fifo")
+    (ws.root / "data" / "keep.txt").unlink()  # a visible difference
+
+    res = ws.run("pull", "data", expect_rc=0)
+
+    assert (ws.root / "data" / "keep.txt").read_text() == "k"
+    assert "cm-sock" not in res.err
+    assert "s.sock" not in res.err
+    # A special file the excludes do not cover is still reported.
+    assert "Skipping file" in res.err and "visible-fifo" in res.err
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no mkfifo on this platform")
+def test_subpath_pull_judges_special_files_at_the_entry_root(ws):
+    # A sub pull walks the sub, but the patterns stay entry-rooted.
+    ws.write("data/sub/keep.txt", "k")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["sub/cm-*"]}})
+    os.mkfifo(ws.root / "data" / "sub" / "cm-sock")
+    (ws.root / "data" / "sub" / "keep.txt").unlink()
+
+    res = ws.run("pull", str(ws.root / "data" / "sub"), expect_rc=0)
+
+    assert (ws.root / "data" / "sub" / "keep.txt").read_text() == "k"
+    assert "cm-sock" not in res.err
+
+
 def test_push_delete_dry_run_of_a_named_excluded_path_previews(ws, answers):
     ws.write("data/keep.txt", "k")
     ws.write("data/uv/uv-receipt.json", "r")
