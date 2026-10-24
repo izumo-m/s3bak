@@ -170,9 +170,10 @@ class PullDestWalker(LocalFileGenerator):
     before any lane filter can judge the key. Pull's exclusion lives in its
     lanes (``commands._pull_exclude_lanes``), so a socket under an excluded
     path - ``~/.ssh/agent/*`` - would still be warned about on every pull.
-    This walker judges each entry against the excludes as it is classified
-    and drops the warnings of an excluded one; what the walk keeps or skips
-    is unchanged, so the lanes see the same stream as before. ``sub``
+    This walker drops the warnings of an excluded entry, judging the
+    excludes only when the vetting actually warns, so the common entry pays
+    nothing; what the walk keeps or skips is unchanged, so the lanes see the
+    same stream as before. ``sub``
     re-anchors keys at the entry root, and ``anchor`` is the restore
     destination the absolute patterns match against (a staged pull walks
     the stage, but the patterns are defined against where the tree ends up).
@@ -201,9 +202,21 @@ class PullDestWalker(LocalFileGenerator):
         options: LocalScanOptions,
         notify: Callable[[str], None],
     ) -> WalkChild | None:
-        if self._excluded(entry, full):
-            notify = _drop_warning
-        return super().classify_child(entry, full, dir_fd, options=options, notify=notify)
+        return super().classify_child(
+            entry, full, dir_fd, options=options, notify=self._unless_excluded(entry, full, notify)
+        )
+
+    def _unless_excluded(
+        self, entry: os.DirEntry[str], full: str, notify: Callable[[str], None]
+    ) -> Callable[[str], None]:
+        """Wrap a walk ``notify`` so a warning reaches it only when the entry
+        is not excluded."""
+
+        def wrapped(body: str) -> None:
+            if not self._excluded(entry, full):
+                notify(body)
+
+        return wrapped
 
     def _excluded(self, entry: os.DirEntry[str], full: str) -> bool:
         rel = full[len(self._root) :]
@@ -215,10 +228,6 @@ class PullDestWalker(LocalFileGenerator):
         key = self._key_prefix + rel.replace(os.sep, "/") + slash
         anchor = os.path.join(self._anchor, rel).replace(os.sep, "/") + slash
         return self._excludes.excluded(key, anchor)
-
-
-def _drop_warning(body: str) -> None:
-    pass
 
 
 def sync_walker(excludes: list[str], sub: str | None = None) -> ManifestWalker:
