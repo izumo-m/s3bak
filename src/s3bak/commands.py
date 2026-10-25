@@ -1425,6 +1425,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 compare: PairFilter | None = None
                 create: bool | FileFilter = True
                 orphan: FileFilter | None = None
+                walker: localwalk.PullDestWalker | None = None
                 lanes: manifest.ManifestFilter | None = None  # holds the temp manifest open
                 if is_dir:
                     assert cfg.store is not None
@@ -1475,6 +1476,10 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                         dir_create, dir_compare, dir_orphan = _pull_exclude_lanes(
                             ex, sub, outpath, dir_compare, dir_create, dir_orphan
                         )
+                        # The destination walk warns about special files as it
+                        # scans, before these lanes see a key; keep it quiet
+                        # about the excluded ones.
+                        walker = localwalk.PullDestWalker(ex, sub, outpath)
                     compare, create, orphan = dir_compare, dir_create, dir_orphan
                 file_size = None if is_dir else _single_file_size(manifest_path, sub)
                 try:
@@ -1488,6 +1493,7 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                         compare=compare,
                         create=create,
                         orphan=orphan,
+                        walker=walker,
                         size=file_size,
                         dryrun=opts.dryrun,
                     )

@@ -101,35 +101,9 @@ their most common source (see [storage.md](storage.md)).
 
 ## Versioning
 
-s3bak follows [Semantic Versioning](https://semver.org/). While the version
-is below 1.0.0, MAJOR stays at 0: a release containing a spec change bumps
-MINOR, and a fixes-only release bumps PATCH.
-
-Notable changes are tracked in [CHANGELOG.md](../CHANGELOG.md), in
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. The commit
-that makes a notable change also adds it to the `[Unreleased]` section.
-Internal-only changes (refactor, performance, tests, documentation) add no
-entry and do not by themselves warrant a release.
-
-Whether a release bumps MINOR or PATCH is decided at release time from the
-content of `[Unreleased]`: Added / Changed / Removed entries mark a spec
-change (MINOR); Fixed-only content — restoring documented behavior — marks a
-PATCH.
-
-### Release procedure
-
-1. On `develop`, commit `chore(release): bump version to X.Y.Z`. It turns
-   `[Unreleased]` in CHANGELOG.md into the `## [X.Y.Z] - YYYY-MM-DD` heading
-   and raises `version` in `pyproject.toml`.
-2. Merge `develop` into `main`.
-3. Create the annotated tag `vX.Y.Z` on the merge result.
-4. Push `main`, `develop` and the tag.
-5. Run `scripts/gh-release.sh vX.Y.Z`. It creates the GitHub Release, using
-   that version's CHANGELOG section as the release notes. It skips a tag
-   that already has a Release, and `--dry-run` prints the notes without
-   creating anything.
-
-Tags up to v0.9.0 have no GitHub Release and are not backfilled.
+s3bak follows [Semantic Versioning](https://semver.org/). Notable changes are
+tracked in [CHANGELOG.md](../CHANGELOG.md); how a release is cut is in
+[release.md](release.md).
 
 ## Documentation
 

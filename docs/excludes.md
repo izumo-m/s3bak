@@ -136,6 +136,9 @@ plain "invisible" rule, these are the seams worth stating:
   excluded local path as an extra. A restored file whose parent directory is
   excluded — and hence unrecorded — gets that directory created as a plain
   container: default permissions, no recorded metadata, unmanaged by s3bak.
+  The destination walk's warnings about entries it cannot transfer (a socket,
+  a FIFO, an unreadable file) are dropped for excluded paths; what it skips
+  is unchanged.
 - **verify** keeps its listing checks exclude-blind, since residue pairs are
   internally consistent and pass them, and adds the residue count as a
   separate warning. The `--checksum` content comparison skips residue records:
