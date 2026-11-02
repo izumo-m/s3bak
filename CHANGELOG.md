@@ -17,6 +17,11 @@ This project follows [Semantic Versioning](https://semver.org/).
   never been pushed has nothing to pull, so push it once before its first
   exchange.
 
+### Fixed
+
+- The error for `--delete` on a command that does not take it now names
+  `status` among the commands that do.
+
 ## [0.9.2] - 2026-10-25
 
 ### Fixed

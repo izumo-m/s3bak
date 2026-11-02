@@ -776,10 +776,15 @@ def _validate_command_options(command: str, used_options: Sequence[str]) -> None
     for option in used_options:
         if option in allowed:
             continue
-        applicable_commands = [
-            name for name, spec in _COMMAND_SPECS.items() if option in spec.options
-        ]
+        # Matched by the flag, not the spec key: one flag can carry a spec per
+        # command family (--delete is "delete" on push/pull, "status_delete"
+        # on status, for its own help wording).
         label = _OPTION_SPECS[option].error_label
+        applicable_commands = [
+            name
+            for name, spec in _COMMAND_SPECS.items()
+            if any(_OPTION_SPECS[key].error_label == label for key in spec.options)
+        ]
         console.die(f"{label} only applies to {_join_command_names(applicable_commands)}")
 
 

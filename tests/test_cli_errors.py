@@ -267,7 +267,8 @@ def test_ls_remote_rejects_checksum(cfg_ws):
 def test_show_rejects_delete(cfg_ws):
     res = cfg_ws.run("show", "--delete", "data")
     assert res.rc == 1
-    assert "only applies to" in res.err
+    # status takes --delete under its own spec key, and is still named.
+    assert "--delete only applies to push, pull, exchange, and status" in res.err
 
 
 def test_mtime_window_flag_rejects_non_number(cfg_ws):
