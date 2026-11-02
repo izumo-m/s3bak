@@ -155,17 +155,20 @@ replaces its `prog2` with the older backup.
 `-u` (`--update`) makes both commands take only the newer side of each
 path, judged by its modification time against the one the manifest recorded
 ([Command reference](05-command-reference.md)). Run both directions on each
-machine, in either order:
+machine; [`exchange`](05-command-reference.md#exchange) does exactly that, a
+pull and then a push:
 
 ```sh
-s3bak pull -u bin; s3bak push -u bin
+s3bak exchange -u bin
 ```
 
-`;` rather than `&&`: a conflict makes the first command exit 2, and the
-second should still run. On the laptop, the pull brings down the desktop's
-newer files and the push sends up the laptop's; the same two commands on the
-desktop finish the exchange, and a third round on either machine is silent.
-Per path, the newest edit wins, whichever machine made it.
+On the laptop, the pull brings down the desktop's newer files and the push
+sends up the laptop's; the same command on the desktop finishes the
+exchange, and a third round on either machine is silent. Per path, the newest
+edit wins, whichever machine made it. A conflict does not stop the push: it
+is a warning (exit 2), and the push judges that path by its own `-u` rule. An
+error in the pull does stop it. The first exchange needs a backup to pull
+from, so the machine that creates the entry pushes it once on its own.
 
 What the rule does, path by path:
 
@@ -192,7 +195,7 @@ warning: conflict - same mtime, size differs; skipped (touch the copy to keep): 
 ```
 
 Resolve it by making the copy that should win the newer one — `touch` it on
-that machine and run the two commands again — or by naming the path in a
+that machine and run `exchange -u` again — or by naming the path in a
 plain command, which mirrors it: `s3bak push bin/prog1` sends this machine's
 copy up, `s3bak pull bin/prog1` brings the backup's down.
 
@@ -211,8 +214,8 @@ copy up, `s3bak pull bin/prog1` brings the backup's down.
   them synchronized; WSL2 in particular can fall behind the host after a
   sleep, and an edit made on a slow clock loses to an older one.
 - **A mirror push still mirrors.** A plain `push` from a machine that has not
-  pulled sends its older copies over the newer ones. A later `pull -u;
-  push -u` on the other machine sets that right, and bucket versioning keeps
+  pulled sends its older copies over the newer ones. A later `exchange -u`
+  on the other machine sets that right, and bucket versioning keeps
   the overwritten objects, but the window is real: keep shared entries out
   of a scheduled mirror push. A [group](05-command-reference.md#groups) of
   the shared entries under `-u` and another of the rest under a plain push

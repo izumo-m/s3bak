@@ -2088,7 +2088,8 @@ def test_subpath_delete_keeps_kind_changed_record_at_sub_itself(ws):
     res = ws.run("push", "--delete", "--yes", "data/a/b", expect_rc=0)
     assert "data/a/b" in ws.keys()  # the out-of-listing object survives
     body = _manifest_body(ws, "data")
-    assert '{"path":"./a/b","mode":"100644"' in body  # its record too
+    # Its regular-file record too; the permission bits follow the umask.
+    assert '{"path":"./a/b","mode":"100' in body
     assert "./a/b/inner.txt" in body
     assert "non-directory ./a/b" in res.err  # the surviving pair is warned
 

@@ -216,8 +216,8 @@ groups = {
 ```
 
 `s3bak push nightly` then means `s3bak push bin .ssh vault`. A group name is
-accepted wherever a command takes entry names — `push`, `pull`, `status`,
-`verify` and `hook` — and is replaced by the entries it stands for before the
+accepted wherever a command takes entry names — `push`, `pull`, `exchange`,
+`status`, `verify` and `hook` — and is replaced by the entries it stands for before the
 command does anything, so nothing further along ever sees the name. It never
 reaches S3 either: the backup is laid out by entry, and a group is only a way
 of naming several of them at once. `--all` is untouched by all of this; it

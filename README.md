@@ -82,6 +82,7 @@ Usage: s3bak <command> [options] [args]
 Commands:
   push        Back up entries or sub-paths to S3
   pull        Restore entries or sub-paths from S3
+  exchange    Pull, then push, the same entries
   show        Print a backed-up file
   status      Compare local files with the backup
   verify      Verify backup integrity on S3
@@ -111,7 +112,7 @@ s3bak pull bin -o /tmp/out    # restore the bin entry to /tmp/out
 s3bak pull bin --delete --dry-run  # preview a mirror restore
 s3bak push --all --delete --yes    # unattended mirror (e.g. cron)
 s3bak push bin/subdir         # entry-rooted syntax; independent of CWD
-s3bak pull -u bin; s3bak push -u bin  # exchange newer files with another machine
+s3bak exchange -u bin         # exchange newer files with another machine
 s3bak verify --all            # check manifests against stored objects
 s3bak verify --all --checksum # also compare local content to S3 ETags
 s3bak ls-remote               # list entries stored on S3

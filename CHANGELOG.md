@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [0.10.0] - 2026-11-02
+
+### Added
+
+- `exchange` pulls the given entries and then pushes them, with the same
+  options: `s3bak exchange -u bin` replaces `s3bak pull -u bin; s3bak push -u
+  bin` for sharing an entry between machines. The push still runs when the
+  pull only warned (a conflict, a record whose object is gone), and does not
+  run, for any target, when the pull failed or was aborted. An entry that has
+  never been pushed has nothing to pull, so push it once before its first
+  exchange.
+
+### Fixed
+
+- The error for `--delete` on a command that does not take it now names
+  `status` among the commands that do.
+
 ## [0.9.2] - 2026-10-25
 
 ### Fixed
