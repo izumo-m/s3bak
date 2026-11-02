@@ -18,7 +18,7 @@ The implementation is split across sibling modules:
     compare   manifest-vs-local diff and status/diff presentation
     restore   pull-side filesystem operations (apply metadata, prune extras)
     syncops   the manifest <-> S3 bridge and download orchestration
-    commands  one cmd_* per subcommand
+    commands  one cmd_* per subcommand (exchange runs cmd_pull, then cmd_push)
 """
 
 from __future__ import annotations
@@ -327,6 +327,41 @@ _COMMAND_SPECS = {
             "s3bak pull bin -o /tmp/restore",
             "s3bak pull bin --delete --dry-run",
             "s3bak pull -u bin",
+        ),
+    ),
+    "exchange": _CommandSpec(
+        overview="Pull, then push, the same entries",
+        summary="Pull the given entries or sub-paths from S3, then push them back.",
+        usage=(
+            "s3bak exchange [options] <entry|path>...",
+            "s3bak exchange [options] --all",
+        ),
+        arguments=(("<entry|path>...", "Entries, groups, or paths to pull and then push"),),
+        options=(
+            "all",
+            "dry_run",
+            "delete",
+            "yes",
+            "checksum",
+            "update",
+            "mtime_window",
+            "verbose",
+            "help",
+        ),
+        sections=(
+            (
+                "Order",
+                (
+                    "Every target is pulled first, then every target is pushed, each",
+                    "with the options given. A pull that only warned still pushes;",
+                    "a pull error, a q at a prompt, or Ctrl-C stops before the push.",
+                ),
+            ),
+            *_DELETE_CONFIRMATION,
+        ),
+        examples=(
+            "s3bak exchange -u bin",
+            "s3bak exchange -u --all --dry-run",
         ),
     ),
     "show": _CommandSpec(
@@ -957,6 +992,28 @@ def main(argv: list[str] | None = None) -> int:
         return _run_resolved_entries(
             cmd_pull, cfg, resolved, opts, serial=_interactive_delete(opts)
         )
+
+    elif subcmd == "exchange":
+        # `pull ... && push ...`, except that a warnings-only pull still
+        # pushes (docs/cli.md, "exchange"). Both commands' argument checks run
+        # before the pull, so nothing is restored for a push that cannot start.
+        if opt_all:
+            resolved = [(entry, None) for entry in sorted(cfg.entries.keys())]
+        else:
+            resolved = resolve_entry_files(cfg, positional, "exchange")
+        _validate_distinct_entries(resolved, "exchange")
+        _validate_pull_destinations(cfg, resolved)
+        serial = _interactive_delete(opts)
+        # cmd_pull reports a warning through the console's counter, never
+        # through its return value, so a non-zero status here is a failure:
+        # an error, or a q at a --delete prompt.
+        rc = _run_resolved_entries(cmd_pull, cfg, resolved, opts, serial=serial)
+        if rc != 0 or is_aborted():
+            # Say so: a push that silently did not happen would read like a
+            # push that found nothing to send.
+            console.err("the pull did not finish, so nothing was pushed")
+            return rc or 1
+        return _run_resolved_entries(cmd_push, cfg, resolved, opts, serial=serial)
 
     elif subcmd == "status":
         if opt_all:

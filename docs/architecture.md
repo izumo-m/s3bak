@@ -62,7 +62,8 @@ are foundational modules used from several layers.
   emitter (`PushJournal`, the single-scan compare and keep/drop policy of
   [journal.md](journal.md)), and builds pull's comparison strategy.
 - **commands** implements one `cmd_*` function per subcommand and composes the
-  lower layers into complete operations.
+  lower layers into complete operations. `exchange` has no function of its
+  own: cli runs `cmd_pull` and then `cmd_push`.
 - **cli** parses and validates arguments, resolves entries and paths, dispatches
   commands, coordinates entry-level concurrency, and maps outcomes to process
   exit codes.

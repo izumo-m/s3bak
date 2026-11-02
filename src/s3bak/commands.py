@@ -1,5 +1,6 @@
 # Requires Python 3.10+
-"""The command layer: one ``cmd_*`` per subcommand plus their private helpers.
+"""The command layer: one ``cmd_*`` per subcommand plus their private helpers
+(``exchange`` has none of its own: the CLI runs ``cmd_pull``, then ``cmd_push``).
 
 Orchestrates the lower layers - store (S3), syncops (manifest<->S3),
 restore (local filesystem), compare (status/diff) - into the push / pull /

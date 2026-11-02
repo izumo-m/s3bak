@@ -79,6 +79,33 @@ is taken before the configuration is read, since it needs nothing from it. The
 single argument it does take is expanded like any other, so it may be a group,
 provided that group stands for exactly one entry.
 
+## Pull, then push (`exchange`)
+
+`exchange` composes the two commands rather than adding a third sync model:
+every target is pulled, then every target is pushed, through the same
+`cmd_pull` and `cmd_push` with the same options. It accepts exactly the
+options both commands accept, so each option keeps the one meaning it has on
+either side. Resolution, the duplicate-entry check, and the pull destination
+check run once, before the pull, so an argument error stops the run before
+the pull restores anything; what `cmd_push` itself refuses (a failing
+`pre_hook`, a sub-path of the wrong kind) is met only after the pull.
+
+The push runs unless the pull failed: it is `pull && push` with a
+warnings-only pull counted as success. Every pull warning means the pull left
+that path as it was, and a pull never writes the manifest, so the push that
+follows a warning does exactly what a push run on its own would do — and some
+warnings are what that push settles (a stale record is retired by a push,
+never by a pull). Stopping on a warning would make an exchange that keeps
+meeting the same stale record never reach its push. A pull failure is the
+opposite: the pull did not do what it was asked, and without `-u` a push
+over a half-restored tree would send its unrestored local copies over the
+backup's. The rule does not try to tell that case from a harmless one (an
+entry with nothing on S3 yet): one failing target stops the push of every
+target, and the run says that nothing was pushed rather than letting a
+skipped push read like one that found nothing to send. A `q` at a
+`--delete` prompt aborts the whole command, and Ctrl-C raises out of the
+pull, so neither reaches the push.
+
 ## Explicit input handling
 
 Unknown options, invalid combinations, and options that do not apply to the

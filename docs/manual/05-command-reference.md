@@ -108,7 +108,7 @@ s3bak: no such entry for path: /etc/hostname
 
 A bare name is also read as a [group](03-configuration.md#groups) — a
 configured set of entry names — everywhere a command takes more than one
-entry: `push`, `pull`, `status`, `verify` and `hook`. The group is replaced by
+entry: `push`, `pull`, `exchange`, `status`, `verify` and `hook`. The group is replaced by
 its entries in place, so `s3bak push nightly` is `s3bak push` of each of them,
 and the group name goes no further than that.
 
@@ -150,7 +150,7 @@ order, whichever entry happened to finish first.
 
 | Command | Arguments |
 | --- | --- |
-| `push`, `pull`, `status`, `verify` | one or more entries, groups or paths, or `--all` |
+| `push`, `pull`, `exchange`, `status`, `verify` | one or more entries, groups or paths, or `--all` |
 | `hook` | `pre` or `post`, then one or more entries or groups, or `--all` |
 | `diff`, `show` | exactly one entry or path, never a group |
 | `ls-remote` | none, or one entry or path, never a group |
@@ -165,11 +165,11 @@ Naming several targets is allowed, but not every combination is coherent:
 
 | Rejected | Message |
 | --- | --- |
-| one entry named twice with different targets in one `push` or `pull` — the entry itself beside a sub-path of it, or two different sub-paths | `duplicate entry in push: demo (parallel push of the same entry is not supported)` |
+| one entry named twice with different targets in one `push`, `pull` or `exchange` — the entry itself beside a sub-path of it, or two different sub-paths | `duplicate entry in push: demo (parallel push of the same entry is not supported)` |
 | the same pairing in `status` or `verify` | `conflicting sub paths for entry demo` |
-| a `pull` whose targets restore into the same tree | `pull restore destinations overlap: demo (/home/you/demo) and lib (/home/you/demo/lib)` |
+| a `pull` or `exchange` whose targets restore into the same tree | `pull restore destinations overlap: demo (/home/you/demo) and lib (/home/you/demo/lib)` |
 
-The last one applies to `pull --all` as well, so a configuration with a nested
+The last one applies to `pull --all` and `exchange --all` as well, so a configuration with a nested
 entry is caught the first time you try to restore everything, rather than
 halfway through.
 
@@ -180,14 +180,14 @@ is what makes a group and one of its own members harmless side by side.
 
 | Option | Commands | What it does |
 | --- | --- | --- |
-| `--all` | `push`, `pull`, `status`, `verify`, `hook` | apply to every configured entry |
-| `--dry-run` | `push`, `pull`, `hook` | report what would happen and change nothing |
-| `--delete` | `push`, `pull` | remove what the source no longer has, after confirmation |
+| `--all` | `push`, `pull`, `exchange`, `status`, `verify`, `hook` | apply to every configured entry |
+| `--dry-run` | `push`, `pull`, `exchange`, `hook` | report what would happen and change nothing |
+| `--delete` | `push`, `pull`, `exchange` | remove what the source no longer has, after confirmation |
 | `--delete` | `status` | list what `push --delete` would offer, removing nothing |
-| `--yes` | `push`, `pull` | answer yes to every deletion confirmation |
-| `--checksum` | `push`, `pull`, `verify` | compare content instead of size and modification time |
-| `-u`, `--update` | `push`, `pull` | transfer only where the source is the newer side; a tie with a difference is a conflict |
-| `--mtime-window <seconds>` | `push`, `pull`, `status`, `verify` | override the configured tolerance for this run |
+| `--yes` | `push`, `pull`, `exchange` | answer yes to every deletion confirmation |
+| `--checksum` | `push`, `pull`, `exchange`, `verify` | compare content instead of size and modification time |
+| `-u`, `--update` | `push`, `pull`, `exchange` | transfer only where the source is the newer side; a tie with a difference is a conflict |
+| `--mtime-window <seconds>` | `push`, `pull`, `exchange`, `status`, `verify` | override the configured tolerance for this run |
 | `-o`, `--output <path>` | `pull` | restore one target to this exact path |
 | `-v`, `--verbose` | all but `list` | show the requests and the details behind each line |
 | `--color[=WHEN]` | `status`, `diff` | `auto` (the default), `always`, or `never`; bare `--color` means `always` |
@@ -199,7 +199,7 @@ ignored, and the message names the commands that do accept it:
 
 ```console
 $ s3bak status --checksum demo
-s3bak: --checksum only applies to push, pull, and verify
+s3bak: --checksum only applies to push, pull, exchange, and verify
 ```
 
 That strictness matters most for `--dry-run`. A command that accepted it and
@@ -483,6 +483,74 @@ the object instead of the local path, since there is no tree to place it in.
 [Recovery and troubleshooting](08-recovery-troubleshooting.md) covers what
 leaves such a record behind, and `pull --delete` is in
 [Deleting safely](06-deleting-safely.md).
+
+## `exchange`
+
+```
+s3bak exchange [options] <entry|path>...
+s3bak exchange [options] --all
+```
+
+A `pull` followed by a `push` of the same targets, with the same options.
+`s3bak exchange -u bin` is `s3bak pull -u bin` and then `s3bak push -u bin`,
+and it is the routine
+[Sharing an entry between machines](07-operating.md#sharing-an-entry-between-machines)
+is built on:
+
+```console
+$ s3bak exchange -u bin
+download: s3://my-bucket/backup/bin/prog2 to /home/you/bin/prog2
+755 /home/you/bin/prog2
+755 /home/you/bin
+upload: /home/you/bin/prog1 to s3://my-bucket/backup/bin/prog1
+Updating s3://my-bucket/backup/bin-manifest.jsonl
+```
+
+Every target is pulled first, and only then is every target pushed. The
+arguments are resolved and checked once, before the pull starts, so a
+mistyped or conflicting target stops the run before anything is restored.
+What the push refuses on its own account happens after the pull has run —
+including a failing `pre_hook`, which therefore runs after the pull rather
+than before anything else. It accepts only the options both commands take:
+`-o` is refused, since a push has no destination to match it.
+
+Whether the push runs depends on how the pull ended:
+
+| The pull | The push |
+| --- | --- |
+| succeeded | runs |
+| succeeded with warnings — a conflict, a record whose object is gone | runs: a warning means the pull left that path alone, and a stale record is what the push retires |
+| failed — an error, or `q` at a `--delete` prompt | does not run, for any target: the pull's targets are one request, and what it left behind is not what it was asked to make |
+| was interrupted with `Ctrl-C` | does not run |
+
+When the push does not run, the run says so last:
+`s3bak: the pull did not finish, so nothing was pushed`. One case is worth
+knowing in advance: an entry that has never been pushed has nothing to pull,
+so its pull fails (`entry not found on S3`) and so does the exchange — push
+it once on its own first, and exchange it from then on. The same goes for a
+sub-path that exists only locally.
+
+The exit status is the [usual one](#exit-codes) taken over both halves: the
+pull's failure if it failed, otherwise the push's, and 2 when nothing failed
+but either half warned.
+
+What the options mean depends on the pair, not on `exchange`:
+
+- **Without `-u`** the pull is a mirror restore, so the backup wins every
+  path it has, and the push then sends up only what the backup did not have.
+- **`--dry-run`** rehearses both halves, but a rehearsed pull changes
+  nothing, so the push rehearses against the tree as it is now, not as the
+  pull would leave it. Its list can therefore differ from what the real run
+  does: without `-u` it shows local copies the pull would have replaced,
+  under `--delete` it can offer to remove from S3 what the pull would have
+  restored, and a target that only the pull would create — the first
+  exchange of an entry on a new machine — makes the push rehearsal fail with
+  `target does not exist`. To preview each half faithfully, rehearse the
+  pull, run it, then rehearse the push.
+- **`--delete`** asks the pull to remove local items the backup does not
+  have — among them files created here and not pushed yet — before the push
+  could send them. Answer `n` for those, or leave `--delete` out of an
+  exchange; [Deleting safely](06-deleting-safely.md) has the prompts.
 
 ## `status`
 
