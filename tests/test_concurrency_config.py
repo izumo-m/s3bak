@@ -52,6 +52,34 @@ def test_defaults_fall_through_to_the_library_concurrency(ws):
     assert store.compare_pool_size() == 10  # unset -> boto3's default
 
 
+def test_the_profiles_s3_section_fills_what_s3bak_leaves_unset(ws):
+    # As aws s3 reads it: max_concurrent_requests stands in for an unset
+    # max_concurrency, and sizes the pool and verify's hashing with it; the
+    # other [s3] settings reach the transfers too. The engine stays classic.
+    with open(os.environ["AWS_CONFIG_FILE"], "a") as f:
+        f.write(
+            "s3 =\n"
+            "    max_concurrent_requests = 30\n"
+            "    multipart_threshold = 64MB\n"
+            "    preferred_transfer_client = crt\n"
+        )
+    ws.write("data/a.txt", "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+
+    store = _store(ws)
+    assert store._transfer_config.max_request_concurrency == 30
+    assert store._transfer_config.multipart_threshold == 64 * 1024 * 1024
+    assert store._transfer_config.preferred_transfer_client == "classic"
+    assert store._s3._transfer_config is store._transfer_config
+    assert store._client.meta.config.max_pool_connections == 30 + 4
+    assert store.compare_pool_size() == 30
+
+    ws.config({"data": {"path": str(ws.root / "data")}}, max_concurrency=6)
+    store = _store(ws)
+    assert store._transfer_config.max_request_concurrency == 6  # s3bak's own wins
+    assert store.compare_pool_size() == 6
+
+
 def test_client_built_once_and_reused(ws):
     # boto3 client construction is not thread-safe, so the store builds one
     # client up front and every S3-side location reuses it. Guard against a
@@ -445,9 +473,6 @@ def test_client_config_leaves_room_for_the_listing_and_delete_workers(ws):
     # total_max_attempts is the whole ceiling, the first request included -
     # botocore reads a `max_attempts` here as retries and adds one.
     assert store._client.meta.config.retries == {"mode": "standard", "total_max_attempts": 5}
-    # Ctrl-C is process-fatal for a CLI, which is what lets a scan teardown
-    # abandon its page worker instead of waiting out a stuck listing request.
-    assert store._s3.reusable_after_interrupt is False
 
 
 def test_client_pool_follows_max_concurrency(ws):
@@ -467,4 +492,3 @@ def test_a_cloned_store_carries_the_same_connection_settings(ws):
 
     clone = _store(ws).clone()
     assert clone._client_config.max_pool_connections == 6 + 4
-    assert clone._s3.reusable_after_interrupt is False

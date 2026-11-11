@@ -390,11 +390,14 @@ so a leading include takes nothing back — the same trap as a lone
 with a literal `!` is written as a character class, `[\!]name`; taking such
 a name back is `!!name`, which reads as it works.
 
-A `!` pattern also shapes what s3bak reads from disk. With `*` first, every
-local walk — a push, `status`, `pull --delete` — descends only into
-directories a later `!` pattern could reach, so a `HOME` entry that takes
-back `.config/nvim/*` never opens `Downloads`. A pattern that can reach
-anywhere, `!*.md` or the `!*/` idiom, gives that up: the whole tree is read.
+Excludes also shape what s3bak reads from disk. Every local walk — a push,
+`status`, a pull — leaves out an excluded file without looking at it, and
+does not open a directory whose whole contents a pattern ending in `*`
+excludes: `*/node_modules/*` keeps every `node_modules` unread, and nothing
+in it is warned about. With `*` first, a walk descends only into directories
+a later `!` pattern could reach, so a `HOME` entry that takes back
+`.config/nvim/*` never opens `Downloads`. A pattern that can reach anywhere,
+`!*.md` or the `!*/` idiom, gives that up: the whole tree is read.
 
 ### What excluded means
 

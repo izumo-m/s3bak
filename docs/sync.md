@@ -212,7 +212,8 @@ instead of announcing a download that never happened.
   default; `entry_concurrency` replaces that default (not a further cap on
   top of it) when set. This includes explicit target lists and `--all`. For
   push and pull, each entry's own `cp` / `sync` then spawns s3transfer's
-  transfer threads (`max_concurrency`, ~10 by default) - so the default of 4
+  transfer threads (`max_concurrency`, else the profile's
+  `s3.max_concurrent_requests`, else 10) - so the default of 4
   concurrent entries already means around 40 transfers in flight, enough to
   saturate typical bandwidth; the cap also bounds how many clients and
   threads are built up front for entries that have not started yet. The

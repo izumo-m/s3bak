@@ -3184,7 +3184,7 @@ def verify_top_level(cfg: Config, opts: Opts) -> None:
         if name.endswith(manifest.MANIFEST_SUFFIX) or name in cfg.entries or name in manifests:
             continue
         console.warn(f"warning: top-level object outside any configured entry: {cfg.prefix}/{name}")
-    for name in sorted(set(prefixes)):
+    for name in sorted(prefixes):
         if name in cfg.entries or name in manifests:
             continue
         console.warn(

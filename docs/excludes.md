@@ -44,8 +44,10 @@ hands a path to the engine.
   matched against the path's absolute local form — the entry tree for a push,
   the restore destination for a pull. It never matches an S3-side key, which
   carries no anchor.
-- On Windows, `\` in a pattern folds to `/` and a drive-relative `C:foo`
-  anchors to the root as `foo`, exactly as `globsieve` documents.
+- On Windows, matching folds `/` and `\` into one separator and ignores
+  case, and a drive-relative `C:foo` anchors to the root as `foo` when the
+  path is on drive `C:`, exactly as `globsieve` documents (aws-cli's own
+  `fnmatch` on that host).
 - A pattern prefixed with `!` is an include (aws-cli's `--include`). The
   engine is last-match-wins over the list in config order: an unmatched key
   is included, and the last pattern that matches a key decides. A list with
@@ -90,25 +92,25 @@ Consequences the implementation must preserve:
 - **The entry root is never matched.** In aws terms the operation root has no
   key, and filters apply beneath it. A single-file entry's file *is* the entry
   root, so excludes never apply to it.
-- **Pruning is an optimization only.** Skipping the descent into a directory
-  is permitted only where the pattern list provably excludes the directory
-  and everything below it; it must never change what the rules above decide.
-  The proof is shape-based. A relative `P*` pattern (`dir/*`, or the
-  catch-all `*`) matches exactly the keys that start with `P`, so the last
-  such pattern covering the directory's key decides its whole subtree: the
-  subtree is pruned iff that pattern is an exclude and no later include
-  could match beneath the directory. "Could match" is judged by the
-  include's literal head, the text before its first wildcard — a key it
-  matches starts with that head, so it reaches under the directory only if
-  one of the two is a prefix of the other, and a wildcard-free include, which
-  matches its head alone, only if the head lies under the directory. An
-  absolute include is first joined onto the directory's absolute path
-  exactly as the engine joins it onto every key beneath (on Windows the join
-  lends the directory's drive to a driveless pattern), and the joined
-  pattern's head is judged against that path the same way. This is what
-  keeps a `$HOME` entry that takes back `.config/nvim/*` from walking
-  `Downloads`; an include that can reach anywhere (`!*.md`, `!*/`) blocks
-  every prune, and the whole tree is walked.
+- **Pruning is an optimization only.** A walk may drop an entry before
+  looking at it only where the rules provably exclude it whatever the
+  filesystem says, and skip a directory only where they provably exclude it
+  and everything below it; neither may change what the rules above decide.
+  Both are decided from the entry's name and the type its directory scan
+  reports, before the stat: a file or symlink (never descended, since
+  symlinks are not followed) by its own key, a directory by the engine's
+  `GlobFilter.excludes_below`. That proof is shape-based: the latest exclude
+  ending in `*` that matches the directory's key matches every key that
+  extends it, so the subtree is excluded unless a later include could match
+  beneath it, judged by whether the include's literal head (the text before
+  its first wildcard) and the directory's path are prefix-related. s3bak
+  delegates the proof rather than deriving its own, so that it folds names
+  exactly as the matching does — on Windows, separators and case. This is
+  what keeps a `$HOME` entry that takes back `.config/nvim/*` from walking
+  `Downloads`, and `*/node_modules/*` from reading any `node_modules`; an
+  include that can reach anywhere (`!*.md`, `!*/`) blocks every prune, and
+  the whole tree is walked. A dropped entry is never stat'ed, so it draws no
+  warning and leaves no gap that would make `push --delete` refuse.
 
 ## Where the filter sits
 
@@ -136,9 +138,11 @@ plain "invisible" rule, these are the seams worth stating:
   excluded local path as an extra. A restored file whose parent directory is
   excluded — and hence unrecorded — gets that directory created as a plain
   container: default permissions, no recorded metadata, unmanaged by s3bak.
-  The destination walk's warnings about entries it cannot transfer (a socket,
-  a FIFO, an unreadable file) are dropped for excluded paths; what it skips
-  is unchanged.
+  The destination walk drops excluded entries before vetting them, as the
+  push walk does, so it neither reads an excluded subtree nor warns about an
+  excluded entry it cannot transfer (a socket, a FIFO, an unreadable file);
+  the lanes, which veto every excluded key, decide exactly as they would
+  without it.
 - **verify** keeps its listing checks exclude-blind, since residue pairs are
   internally consistent and pass them, and adds the residue count as a
   separate warning. The `--checksum` content comparison skips residue records:

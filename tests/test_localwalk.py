@@ -171,7 +171,6 @@ def test_walk_tree_anchored_pattern_judges_root_and_child_alike(tmp_path):
 def test_prune_never_changes_what_the_filter_decides(tmp_path, monkeypatch):
     # The dir/* descent skip is an optimization only: with it disabled, the
     # walk must yield exactly the same rels.
-    from s3bak.excludes import Excludes
 
     (tmp_path / "keep.txt").write_text("k")
     (tmp_path / "cache" / "sub").mkdir(parents=True)
@@ -182,9 +181,65 @@ def test_prune_never_changes_what_the_filter_decides(tmp_path, monkeypatch):
     patterns = ["cache/*", "*.log", "logs/"]
 
     pruned = [rel for rel, _st, _sym in localwalk.walk_tree(str(tmp_path), patterns)]
-    monkeypatch.setattr(Excludes, "prunes_subtree", lambda self, key, full_path=None: False)
+    monkeypatch.setattr(localwalk._ExcludingWalker, "_name_excluded", lambda *_args: False)
     unpruned = [rel for rel, _st, _sym in localwalk.walk_tree(str(tmp_path), patterns)]
     assert pruned == unpruned == [".", "./keep.txt"]
+
+
+def test_walk_never_stats_what_the_excludes_rule_out_by_name(tmp_path, monkeypatch):
+    # An excluded file, an excluded symlink and a directory everything under
+    # which is excluded are dropped before the walk's one stat per entry;
+    # what the excludes keep, and an excluded directory something below is
+    # taken back from, are still stat'ed.
+    from boto3_s3 import LocalFileGenerator
+
+    (tmp_path / "keep.txt").write_text("k")
+    (tmp_path / "x.log").write_text("x")
+    os.symlink("elsewhere", tmp_path / "lnk.log")
+    (tmp_path / "web" / "node_modules" / "pkg").mkdir(parents=True)
+    (tmp_path / "web" / "node_modules" / "pkg" / "i.js").write_text("i")
+    (tmp_path / "web" / "app.js").write_text("a")
+    statted: list[str] = []
+    real = LocalFileGenerator.entry_stat_result
+
+    def spy(self, entry):
+        statted.append(entry.name)
+        return real(self, entry)
+
+    monkeypatch.setattr(LocalFileGenerator, "entry_stat_result", spy)
+    rels = [
+        rel
+        for rel, _st, _sym in localwalk.walk_tree(
+            str(tmp_path), ["*.log", "*/node_modules/*", "web/"]
+        )
+    ]
+
+    assert rels == [".", "./keep.txt", "./web/app.js"]
+    assert sorted(statted) == ["app.js", "keep.txt", "web"]
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs an unreadable directory")
+def test_walk_reports_no_gap_inside_a_skipped_subtree(tmp_path):
+    # A gap nothing could record or delete is not one: an unreadable
+    # directory under a skipped subtree is never opened, and the walk stays
+    # complete - so push --delete has no reason to refuse.
+    (tmp_path / "web" / "node_modules" / "locked").mkdir(parents=True)
+    os.chmod(tmp_path / "web" / "node_modules" / "locked", 0)
+    walker = localwalk.sync_walker(["*/node_modules/*"])
+    warns: list[str] = []
+    try:
+        from boto3_s3 import LocalStorage
+
+        storage = LocalStorage(
+            str(tmp_path), walker=walker, follow_symlinks=False, enumerate_all_entries=True
+        )
+        keys = [info.compare_key for info in storage.walk_local(on_warning=warns.append)]
+    finally:
+        os.chmod(tmp_path / "web" / "node_modules" / "locked", 0o755)
+
+    assert keys == ["", "web/"]
+    assert warns == []
+    assert not walker.scan_incomplete
 
 
 def test_walk_tree_keeps_symlink_at_a_dir_patterns_name(tmp_path):
@@ -220,7 +275,6 @@ def test_walk_tree_warns_when_symlink_races_away(tmp_path, monkeypatch):
 def test_prune_never_changes_what_includes_decide(tmp_path, monkeypatch):
     # With "*" first, the walk descends only where a later "!" pattern could
     # reach - still an optimization only: disabled, the same rels come out.
-    from s3bak.excludes import Excludes
 
     (tmp_path / ".config" / "nvim").mkdir(parents=True)
     (tmp_path / ".config" / "nvim" / "init.lua").write_text("i")
@@ -232,7 +286,7 @@ def test_prune_never_changes_what_includes_decide(tmp_path, monkeypatch):
     patterns = ["*", "!.bashrc", "!.config/nvim/*"]
 
     pruned = [rel for rel, _st, _sym in localwalk.walk_tree(str(tmp_path), patterns)]
-    monkeypatch.setattr(Excludes, "prunes_subtree", lambda self, key, full_path=None: False)
+    monkeypatch.setattr(localwalk._ExcludingWalker, "_name_excluded", lambda *_args: False)
     unpruned = [rel for rel, _st, _sym in localwalk.walk_tree(str(tmp_path), patterns)]
     assert pruned == unpruned == [".", "./.bashrc", "./.config/nvim", "./.config/nvim/init.lua"]
 
@@ -263,7 +317,7 @@ def test_walk_tree_skips_the_descent_into_a_provably_excluded_directory(tmp_path
 
 
 def test_prune_judges_an_absolute_include_by_the_walked_directory(tmp_path, monkeypatch):
-    # End to end: the walker hands prunes_subtree the directory's absolute
+    # End to end: the walker hands excludes_below the directory's absolute
     # path in the shape the engine matches against ("/"-separated, trailing
     # "/"), so an absolute include prunes what it cannot reach and only that.
     from s3bak.excludes import Excludes
@@ -275,20 +329,20 @@ def test_prune_judges_an_absolute_include_by_the_walked_directory(tmp_path, monk
     root = str(tmp_path).replace(os.sep, "/")
     patterns = ["*", f"!{root}/keep/*"]
     seen: list[tuple[str, str | None, bool]] = []
-    real = Excludes.prunes_subtree
+    real = Excludes.excludes_below
 
     def spy(self, key, full_path=None):
         verdict = real(self, key, full_path)
         seen.append((key, full_path, verdict))
         return verdict
 
-    monkeypatch.setattr(Excludes, "prunes_subtree", spy)
+    monkeypatch.setattr(Excludes, "excludes_below", spy)
     pruned = [rel for rel, _st, _sym in localwalk.walk_tree(str(tmp_path), patterns)]
     assert pruned == [".", "./keep", "./keep/k.txt"]
     assert ("other/", f"{root}/other/", True) in seen
     assert ("keep/", f"{root}/keep/", False) in seen
 
-    monkeypatch.setattr(Excludes, "prunes_subtree", lambda self, key, full_path=None: False)
+    monkeypatch.setattr(localwalk._ExcludingWalker, "_name_excluded", lambda *_args: False)
     unpruned = [rel for rel, _st, _sym in localwalk.walk_tree(str(tmp_path), patterns)]
     assert pruned == unpruned
 
@@ -304,7 +358,7 @@ def test_prune_on_a_sub_walk_judges_entry_rooted_keys(tmp_path, monkeypatch):
     (tmp_path / "sub" / "y" / "b.txt").write_text("b")
     patterns = ["*", "!sub/x/*"]
     seen: dict[str, bool] = {}
-    real = Excludes.prunes_subtree
+    real = Excludes.excludes_below
 
     def spy(self, key, full_path=None):
         seen[key] = real(self, key, full_path)
@@ -318,10 +372,10 @@ def test_prune_on_a_sub_walk_judges_entry_rooted_keys(tmp_path, monkeypatch):
             )
         ]
 
-    monkeypatch.setattr(Excludes, "prunes_subtree", spy)
+    monkeypatch.setattr(Excludes, "excludes_below", spy)
     pruned = walk()
     assert pruned == ["./sub/x", "./sub/x/a.txt"]
     assert seen == {"sub/x/": False, "sub/y/": True}
 
-    monkeypatch.setattr(Excludes, "prunes_subtree", lambda self, key, full_path=None: False)
+    monkeypatch.setattr(localwalk._ExcludingWalker, "_name_excluded", lambda *_args: False)
     assert walk() == pruned

@@ -77,20 +77,22 @@ def test_absolute_pattern_matches_the_absolute_local_path():
     assert not ex.excluded("secret.txt", None)
 
 
-def test_prunes_subtree_only_for_the_provable_dir_star_shape():
+def test_excludes_below_only_under_an_exclude_ending_in_star():
     ex = Excludes(["cache/*", "*.log", "raw"])
-    assert ex.prunes_subtree("cache/")
-    assert ex.prunes_subtree("cache/sub/")
-    assert not ex.prunes_subtree("cachet/")  # prefix must end at the /
-    assert not ex.prunes_subtree("logs/")  # *.log cannot prove a subtree
-    wild = Excludes(["ca*he/*"])
-    assert not wild.prunes_subtree("cache/")  # wildcard dir part: no proof
+    assert ex.excludes_below("cache/")
+    assert ex.excludes_below("cache/sub/")
+    assert not ex.excludes_below("cachet/")  # prefix must end at the /
+    assert not ex.excludes_below("logs/")  # *.log cannot prove a subtree
+    # A trailing "*" covers whatever extends a path it matches, so a
+    # wildcard before it proves the subtree too.
+    assert Excludes(["*/node_modules/*"]).excludes_below("web/node_modules/")
+    assert not Excludes(["*/node_modules/*"]).excludes_below("node_modules/")
 
 
 def test_empty_pattern_list_excludes_nothing():
     ex = Excludes([])
     assert not ex.excluded("anything")
-    assert not ex.prunes_subtree("any/")
+    assert not ex.excludes_below("any/")
 
 
 # --- what a push makes of it ------------------------------------------------
@@ -308,6 +310,33 @@ def test_pull_delete_keeps_an_excluded_local_extra(ws):
     ws.run("pull", "--delete", "--yes", "data", "-o", str(out), expect_rc=0)
 
     assert extra.read_text() == "local only"
+
+
+def test_pull_delete_does_not_read_an_excluded_local_subtree(ws, monkeypatch):
+    # Every walk a pull runs over the destination skips a directory
+    # everything under which is excluded: nothing in it is stat'ed.
+    from boto3_s3 import LocalFileGenerator
+
+    ws.write("data/keep.txt", "k")
+    ws.write("data/web/app.js", "a")
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["*/node_modules/*"]}})
+    ws.run("push", "data", expect_rc=0)
+    ws.write("data/web/node_modules/pkg/i.js", "i")
+    (ws.root / "data" / "keep.txt").unlink()  # a visible difference
+    statted: list[str] = []
+    real = LocalFileGenerator.entry_stat_result
+
+    def spy(self, entry):
+        statted.append(entry.path)
+        return real(self, entry)
+
+    monkeypatch.setattr(LocalFileGenerator, "entry_stat_result", spy)
+    ws.run("pull", "--delete", "--yes", "data", expect_rc=0)
+
+    assert (ws.root / "data" / "keep.txt").read_text() == "k"
+    assert (ws.root / "data" / "web" / "node_modules" / "pkg" / "i.js").read_text() == "i"
+    assert any(path.endswith("app.js") for path in statted)
+    assert not [path for path in statted if "node_modules" in path]
 
 
 def test_pull_of_named_excluded_file_is_ignored(ws):
@@ -642,35 +671,38 @@ def test_a_literal_leading_bang_is_spelled_as_a_character_class():
 
 def test_prune_needs_no_later_include_under_the_directory():
     ex = Excludes(["*", "!.config/nvim/*", "!.bashrc"])
-    assert ex.prunes_subtree("Downloads/")
-    assert ex.prunes_subtree(".config/Code/")
-    assert not ex.prunes_subtree(".config/")
-    assert not ex.prunes_subtree(".config/nvim/")
-    assert not ex.prunes_subtree(".config/nvim/lua/")
-    assert ex.prunes_subtree(".bashrc/")  # a literal file include reaches no directory
+    assert ex.excludes_below("Downloads/")
+    assert ex.excludes_below(".config/Code/")
+    assert not ex.excludes_below(".config/")
+    assert not ex.excludes_below(".config/nvim/")
+    assert not ex.excludes_below(".config/nvim/lua/")
+    # Conservative: an include whose literal head is a prefix of the path
+    # may reach it, even when it has no wildcard to reach with.
+    assert not ex.excludes_below(".bashrc.d/")
 
 
 def test_prune_is_blocked_by_an_include_that_might_reach_the_subtree():
-    assert not Excludes(["cache/*", "!*.keep"]).prunes_subtree("cache/")
+    assert not Excludes(["cache/*", "!*.keep"]).excludes_below("cache/")
     carved = Excludes(["cache/*", "!cache/keep/*"])
-    assert not carved.prunes_subtree("cache/")
-    assert carved.prunes_subtree("cache/other/")
+    assert not carved.excludes_below("cache/")
+    assert carved.excludes_below("cache/other/")
 
 
 def test_prune_follows_the_last_covering_pattern():
     ex = Excludes(["*", "!docs/*", "docs/tmp/*"])
-    assert not ex.prunes_subtree("docs/")
-    assert ex.prunes_subtree("docs/tmp/")
-    assert ex.prunes_subtree("src/")
+    assert not ex.excludes_below("docs/")
+    assert ex.excludes_below("docs/tmp/")
+    assert ex.excludes_below("src/")
     # An include the covering exclude overrides does not block the prune.
-    assert Excludes(["!cache/keep/*", "cache/*"]).prunes_subtree("cache/")
+    assert Excludes(["!cache/keep/*", "cache/*"]).excludes_below("cache/")
 
 
 def test_prune_judges_an_absolute_include_by_the_directory_path():
     ex = Excludes(["*", "!/home/you/data/keep/*"])
-    assert not ex.prunes_subtree("keep/", "/home/you/data/keep/")
-    assert ex.prunes_subtree("other/", "/home/you/data/other/")
-    assert not ex.prunes_subtree("other/")  # no anchor to judge by: no proof
+    assert not ex.excludes_below("keep/", "/home/you/data/keep/")
+    assert ex.excludes_below("other/", "/home/you/data/other/")
+    # Without an anchor, absolute patterns are inert, as they are in excluded.
+    assert ex.excludes_below("other/")
 
 
 def test_check_patterns_rejects_a_bare_bang_and_a_leading_include():
@@ -766,43 +798,17 @@ def test_verify_counts_the_records_the_includes_do_not_take_back(ws):
     assert "1 recorded path(s) under excludes remain in the backup" in res.err
 
 
-def test_prune_treats_a_literal_include_as_reaching_its_own_key_only():
-    ex = Excludes(["*", "!.config/", "!.bashrc"])
-    assert not ex.prunes_subtree(".config/")  # the include IS the directory
-    assert ex.prunes_subtree(".config/sub/")  # ...and reaches nothing beneath it
-    assert ex.prunes_subtree(".bashrc.d/")
-    assert Excludes(["*", "!.config"]).prunes_subtree(".config/")  # a file of that name
-
-
-def test_prune_joins_an_absolute_include_like_the_engine_does(monkeypatch):
-    # Windows, simulated: every function involved, in s3bak and in the
-    # engine, is a pure string function over ``os.sep`` / ``os.path``, so
-    # both modules are pointed at ntpath. A UNC pattern with a wildcard in
-    # its server part has no drive of its own that ntpath.join could keep
-    # for the literal head alone: judging the head by itself would borrow
-    # the directory's drive and compare a string no key starts with,
-    # pruning a directory the include reaches. Joining the whole pattern,
-    # as the engine does, keeps the proof honest - and lends the directory's
-    # drive to a driveless absolute pattern the same way the engine does.
-    import ntpath
-    from types import SimpleNamespace
-
+def test_excludes_below_folds_names_as_the_matching_does(monkeypatch):
+    # Windows, simulated (globsieve reads _WINDOWS when a filter is
+    # compiled): matching ignores case there, so "!docs/*" takes "Docs/"
+    # back, and the skip must not drop what the matching keeps.
     from boto3_s3 import globsieve
 
-    from s3bak import excludes as excludes_mod
-
-    windows = SimpleNamespace(sep="\\", path=ntpath)
-    monkeypatch.setattr(excludes_mod, "os", windows)
-    monkeypatch.setattr(globsieve, "os", windows)
-
-    ex = Excludes(["*", "!//ser*ver/share/data/x/*"])
-    assert not ex.excluded("x/d", "//server/share/data/x/d")
-    assert not ex.prunes_subtree("x/", "//server/share/data/x/")
-
-    driveless = Excludes(["*", "!/data/x/*"])
-    assert not driveless.excluded("x/d", "C:/data/x/d")
-    assert not driveless.prunes_subtree("x/", "C:/data/x/")
-    assert driveless.prunes_subtree("y/", "C:/data/y/")
+    monkeypatch.setattr(globsieve, "_WINDOWS", True)
+    ex = Excludes(["*", "!docs/*"])
+    assert not ex.excluded("Docs/a.md", "C:/data/Docs/a.md")
+    assert not ex.excludes_below("Docs/", "C:/data/Docs/")
+    assert ex.excludes_below("src/", "C:/data/src/")
 
 
 def test_subpath_push_of_an_absent_dir_the_config_takes_back_is_missing(ws):

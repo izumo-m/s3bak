@@ -17,9 +17,9 @@ Two cases behave very differently:
   for the operator to resolve.
 
 A *second* `Ctrl-C` moves a run from the first case to the second on purpose.
-The first one unwinds normally, but that unwind joins s3transfer's transfer
-threads, so a request stuck in a socket read can hold it for a full request
-timeout ([cli.md](cli.md#exit-codes)); the second leaves through `os._exit`,
+The first one unwinds normally, but the interpreter's exit waits for the S3
+requests still out, so a request stuck in a socket read can hold it for a full
+request timeout ([cli.md](cli.md#exit-codes)); the second leaves through `os._exit`,
 which runs no `finally` and is a hard kill in every way that matters here.
 The fail-old rule below is what makes that safe to offer: the state it leaves
 is still an arbitrary subset of completed work described by the previous

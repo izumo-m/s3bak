@@ -1133,14 +1133,14 @@ def _sdk_errors() -> tuple[type[BaseException], ...]:
 # --- Ctrl-C ------------------------------------------------------------------
 #
 # The first interrupt asks for an orderly stop. It surfaces as the
-# KeyboardInterrupt every layer below recognizes: boto3-s3 abandons a scan's
-# page worker rather than waiting out one more listing (Boto3S3Store builds its
-# S3 with reusable_after_interrupt=False), run_entries lets the entries already
+# KeyboardInterrupt every layer below recognizes: boto3-s3 hands it back at
+# once, leaving the requests already out to finish behind it (that S3 is never
+# used again: the process is ending), run_entries lets the entries already
 # running finish, and run() maps it to exit 130.
 #
-# That orderly stop is not always quick. s3transfer joins its transfer threads
-# on the way out, so a request stuck in a socket read holds the exit until it
-# times out - up to a read timeout per attempt (store._client_config). The
+# That orderly stop is not always quick. The interpreter's exit waits for the
+# requests still out, so a request stuck in a socket read holds the exit until
+# it times out - up to a read timeout per attempt (store._client_config). The
 # second interrupt is the escape hatch: it gives up on the orderly stop and
 # leaves at once. What that leaves behind is what any hard kill leaves - S3
 # changes with no manifest describing them - and the next plain push of the

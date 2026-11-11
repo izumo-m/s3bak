@@ -813,9 +813,9 @@ def _apply_record(
     if m_entry.is_file and m_entry.size is not None and st.st_size != m_entry.size:
         # After the data sync a regular file must have its recorded size: the
         # ManifestFilter re-downloads any pair whose size drifted, so a surviving
-        # mismatch means the S3 object itself does not match the record (an
-        # out-of-band overwrite, a truncated object, or one that was missing so
-        # a stale local file was left in place). Applying metadata would report
+        # mismatch means the S3 object itself does not match the record (one
+        # overwritten out of band, or one that was missing so a stale local
+        # file was left in place). Applying metadata would report
         # success on wrong content, so fail instead - restore fidelity is the
         # point of the backup.
         console.err(

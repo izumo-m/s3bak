@@ -89,7 +89,7 @@ At the top level of the file:
 | `prefix` | non-empty string | *required* | the bucket and optional path everything is stored under; must start with `s3://` and name a bucket, and a trailing slash is accepted and ignored |
 | `entries` | non-empty dict | *required* | what to back up, keyed by entry name; a name must be a non-empty, control-character-free single path component that does not end in `-manifest.jsonl` |
 | `groups` | dict | no groups | named sets of entries, keyed by group name; each value is a non-empty list of entry or group names, and a group name follows the entry-name rules except the `-manifest.jsonl` one and may not be an entry's name |
-| `max_concurrency` | integer >= 1 | 10 | transfers running at once within one entry; also sizes the pool `verify --checksum` hashes with |
+| `max_concurrency` | integer >= 1 | the AWS profile's `s3.max_concurrent_requests`, else 10 | transfers running at once within one entry; also sizes the pool `verify --checksum` hashes with |
 | `entry_concurrency` | integer >= 1 | 4 | entries processed at once by one command |
 | `mtime_window` | number of seconds >= 0 | 0.01 | how far two modification times may differ and still count as equal; `0` demands an exact nanosecond match |
 
@@ -266,9 +266,12 @@ The optional top-level settings default to values that suit most machines, and
 the reason to change one is usually that a particular machine or filesystem
 has forced the question. Beyond what the table says:
 
-- **`max_concurrency`** is not taken from the AWS CLI's `[s3]` settings, so
-  `s3.max_concurrent_requests` in `~/.aws/config` has no effect on s3bak and
-  the value belongs here.
+- **The AWS CLI's `[s3]` settings** in the profile's section of
+  `~/.aws/config` apply to s3bak's transfers as they do to `aws s3`:
+  `max_concurrent_requests`, `multipart_threshold`, `multipart_chunksize`
+  and the rest. `max_concurrency` here, when set, wins over
+  `max_concurrent_requests`. `preferred_transfer_client` is the exception:
+  s3bak always runs the classic engine, whose timeouts and retries it pins.
 - **`entry_concurrency`** multiplies with the setting above: 4 entries each
   transferring 10 objects is 40 requests in flight, which is the number to
   think about on a metered or fragile link.

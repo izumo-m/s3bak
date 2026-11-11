@@ -17,9 +17,10 @@ entry enumeration. ``ManifestWalker`` only customizes the exclusion
 - **excludes as a per-entry filter**: every emitted entry is judged alone
   against the entry's ``Excludes`` (aws-cli semantics - the walked pages are
   filtered, so dropping a directory's own record does not hide its
-  non-excluded children). Skipping a descent outright happens only where
-  the patterns provably exclude the whole subtree, as an optimization that
-  cannot change what the filter decides;
+  non-excluded children). Dropping an entry by its name before its stat,
+  and with it a directory's whole descent, happens only where the patterns
+  provably exclude the entry (and, for a directory, everything below it), as
+  an optimization that cannot change what the filter decides;
 - **directories in-stream**: each directory's record is yielded between the
   sibling files that sort before it and its own children, which is what keeps
   the whole stream in manifest order.
@@ -57,7 +58,70 @@ if TYPE_CHECKING:
 _INVALID_TIMESTAMP_WARNING = "File has an invalid timestamp. Passing epoch time as timestamp."
 
 
-class ManifestWalker(LocalFileGenerator):
+class _ExcludingWalker(LocalFileGenerator):
+    """What both excluding walks share: dropping an entry by its name.
+
+    ``classify_child`` is the walk's one stat per entry. ``_name_excluded``
+    decides ahead of it, from the entry's name and its scanned type alone,
+    that the excludes rule the entry out whatever the stat would say: a file
+    or symlink whose own key is excluded, or a directory under which every
+    key is (``Excludes.excludes_below``). Such an entry is not stat'ed,
+    vetted or warned about, and such a directory is not read - what the walk
+    yields is unchanged, since the entry would have been dropped after its
+    stat, and a directory's every descendant after theirs. With symlinks
+    not followed a link is a leaf keyed without a trailing ``/``, so its
+    name decides it too; a followed one waits for its stat, which says what
+    it leads to.
+
+    ``key_prefix`` re-anchors keys at the entry root (``""`` for an entry
+    walk, ``"{sub}/"`` for a sub-path walk). ``anchor`` is the absolute path
+    the walked root stands for when absolute patterns are judged, ``None``
+    for the walked root itself.
+    """
+
+    def __init__(self, excludes: Excludes, key_prefix: str, anchor: str | None = None) -> None:
+        self._excludes = excludes
+        self._key_prefix = key_prefix
+        self._anchor = anchor
+        self._root = ""
+
+    def list_file_pages(
+        self, root: str, options: LocalScanOptions
+    ) -> Iterator[list[LocalFileInfo]]:
+        # ``root`` is absolute with a trailing separator, and every entry's
+        # ``full`` path is joined beneath it.
+        self._root = root
+        yield from super().list_file_pages(root, options)
+
+    def _keys(self, full: str, is_dir: bool) -> tuple[str, str]:
+        """The entry-rooted key and the absolute anchor of the entry at
+        ``full``, as the walk stamps them (a directory's with a trailing
+        ``/``)."""
+        rel = full[len(self._root) :]
+        slash = "/" if is_dir else ""
+        key = self._key_prefix + rel.replace(os.sep, "/") + slash
+        path = full if self._anchor is None else os.path.join(self._anchor, rel)
+        return key, path.replace(os.sep, "/") + slash
+
+    def _name_excluded(self, entry: os.DirEntry[str], full: str, options: LocalScanOptions) -> bool:
+        if self._excludes.empty:
+            return False
+        try:
+            if entry.is_symlink():
+                if options.follow_symlinks:
+                    return False
+                is_dir = False
+            else:
+                is_dir = entry.is_dir(follow_symlinks=False)
+        except OSError:
+            return False  # left to the stat, which reports what is wrong
+        key, anchor = self._keys(full, is_dir)
+        if is_dir:
+            return self._excludes.excludes_below(key, anchor)
+        return self._excludes.excluded(key, anchor)
+
+
+class ManifestWalker(_ExcludingWalker):
     """Apply an entry's excludes to the walk, per emitted entry.
 
     One instance serves one walk: it carries the compiled ``Excludes`` and
@@ -65,10 +129,10 @@ class ManifestWalker(LocalFileGenerator):
     entry root (``""`` for an entry walk, ``"{sub}/"`` for a sub-path walk).
     The filter runs over the emitted pages (``list_file_pages``), so every
     entry is judged alone - an excluded directory loses its own record but
-    not its visible children. ``finalize_children`` skips a descent only
-    where the patterns provably exclude the whole subtree
-    (``Excludes.prunes_subtree``), so pruning cannot change what the filter
-    decides.
+    not its visible children. Ahead of the stat, ``classify_child`` drops
+    what the excludes rule out by name alone (``_ExcludingWalker``), which
+    is where a directory everything under which is excluded is skipped
+    without being read; neither can change what the filter decides.
 
     The walker also tracks scan completeness: a warning that hides real tree
     content (an unopenable directory, a path that vanished mid-walk) sets
@@ -79,14 +143,15 @@ class ManifestWalker(LocalFileGenerator):
     content-unreadable entries instead of warn-skipping them - so a warning
     IS a gap, with one exception: the invalid-timestamp fallback warns but
     keeps its entry (the record is built from the raw ``st_mtime_ns``, which
-    the fallback does not touch). ``PushJournal`` marks the same flag for
-    the gaps only it can see (an unreadable file it decided to transfer, a
-    symlink racing away before its readlink).
+    the fallback does not touch). An entry dropped by name never warns, so
+    a gap under a skipped subtree - which nothing could record or delete -
+    does not count. ``PushJournal`` marks the same flag for the gaps only it
+    can see (an unreadable file it decided to transfer, a symlink racing
+    away before its readlink).
     """
 
     def __init__(self, excludes: Excludes, key_prefix: str) -> None:
-        self._excludes = excludes
-        self._key_prefix = key_prefix
+        super().__init__(excludes, key_prefix)
         self.scan_incomplete = False
 
     def _completeness_watch(self, notify: Callable[[str], None]) -> Callable[[str], None]:
@@ -112,28 +177,11 @@ class ManifestWalker(LocalFileGenerator):
         options: LocalScanOptions,
         notify: Callable[[str], None],
     ) -> WalkChild | None:
+        if self._name_excluded(entry, full, options):
+            return None
         return super().classify_child(
             entry, full, dir_fd, options=options, notify=self._completeness_watch(notify)
         )
-
-    def finalize_children(self, children: list[WalkChild]) -> list[WalkChild]:
-        # The provable prune (docs/excludes.md): where the patterns exclude
-        # the directory key and every key beneath it - and no later include
-        # can take any of them back - the walk may skip the whole descent.
-        # No other child is dropped here - dropping a directory in this hook
-        # would also hide its children, which the per-entry semantics
-        # forbid; they are judged one by one in list_file_pages instead.
-        # ``info.key`` is the absolute path (trailing ``/`` on a directory),
-        # the anchor absolute includes are judged against.
-        kept: list[WalkChild] = []
-        for child in children:
-            assert child.info.compare_key is not None  # stamped by scan_children
-            if child.info.kind == FileKind.DIRECTORY and self._excludes.prunes_subtree(
-                self._key_prefix + child.info.compare_key, child.info.key
-            ):
-                continue
-            kept.append(child)
-        return self.normalize_sort(kept)
 
     def _keep(self, info: LocalFileInfo) -> bool:
         assert info.compare_key is not None  # stamped by scan_children
@@ -153,45 +201,38 @@ class ManifestWalker(LocalFileGenerator):
         # the sync's pair stream and walk_tree alike consume these pages.
         # Dropping an entry here never affects the traversal itself: an
         # excluded directory's record disappears while its non-excluded
-        # children still emit (only ``finalize_children``'s provable prune
-        # skips a descent).
+        # children still emit. The by-name drop in classify_child has
+        # already removed most excluded entries; this catches the rest - an
+        # excluded directory that is still descended, and an entry whose
+        # stat disagreed with its scanned type.
         for page in super().list_file_pages(root, options):
             kept = [info for info in page if self._keep(info)]
             if kept:
                 yield kept
 
 
-class PullDestWalker(LocalFileGenerator):
-    """Pull's destination-side walk: the transfer view, quiet about excluded
+class PullDestWalker(_ExcludingWalker):
+    """Pull's destination-side walk: the transfer view, without the excluded
     paths.
 
-    The sync walks the destination in the normal (transfer) view, whose
-    vetting warn-skips special files and unreadable entries while it scans,
-    before any lane filter can judge the key. Pull's exclusion lives in its
-    lanes (``commands._pull_exclude_lanes``), so a socket under an excluded
-    path - ``~/.ssh/agent/*`` - would still be warned about on every pull.
-    This walker drops the warnings of an excluded entry, judging the
-    excludes only when the vetting actually warns, so the common entry pays
-    nothing; what the walk keeps or skips is unchanged, so the lanes see the
-    same stream as before. ``sub``
-    re-anchors keys at the entry root, and ``anchor`` is the restore
-    destination the absolute patterns match against (a staged pull walks
-    the stage, but the patterns are defined against where the tree ends up).
+    Pull's exclusion lives in its lanes (``commands._pull_exclude_lanes``),
+    which veto every excluded key whichever side it shows up on, so the
+    destination walk need not show them one. It drops what the excludes rule
+    out by name before the stat (``_ExcludingWalker``) - an excluded file,
+    and a directory everything under which is excluded, which is then not
+    read at all. The lanes decide exactly as before; what changes is that
+    an excluded subtree costs nothing, and that the vetting, which
+    warn-skips special files and unreadable entries while it scans, never
+    sees a socket under ``~/.ssh/agent/*``. A warning about an entry that
+    is excluded but still walked (a directory something below it is taken
+    back from) is dropped as well. ``sub`` re-anchors keys at the entry
+    root, and ``anchor`` is the restore destination the absolute patterns
+    match against (a staged pull walks the stage, but the patterns are
+    defined against where the tree ends up).
     """
 
     def __init__(self, excludes: Excludes, sub: str | None, anchor: str) -> None:
-        self._excludes = excludes
-        self._key_prefix = f"{sub}/" if sub else ""
-        self._anchor = os.path.abspath(anchor)
-        self._root = ""
-
-    def list_file_pages(
-        self, root: str, options: LocalScanOptions
-    ) -> Iterator[list[LocalFileInfo]]:
-        # ``root`` is absolute with a trailing separator, and every entry's
-        # ``full`` path is joined beneath it.
-        self._root = root
-        yield from super().list_file_pages(root, options)
+        super().__init__(excludes, f"{sub}/" if sub else "", os.path.abspath(anchor))
 
     def classify_child(
         self,
@@ -202,6 +243,8 @@ class PullDestWalker(LocalFileGenerator):
         options: LocalScanOptions,
         notify: Callable[[str], None],
     ) -> WalkChild | None:
+        if self._name_excluded(entry, full, options):
+            return None
         return super().classify_child(
             entry, full, dir_fd, options=options, notify=self._unless_excluded(entry, full, notify)
         )
@@ -213,21 +256,14 @@ class PullDestWalker(LocalFileGenerator):
         is not excluded."""
 
         def wrapped(body: str) -> None:
-            if not self._excluded(entry, full):
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+            except OSError:
+                is_dir = False
+            if not self._excludes.excluded(*self._keys(full, is_dir)):
                 notify(body)
 
         return wrapped
-
-    def _excluded(self, entry: os.DirEntry[str], full: str) -> bool:
-        rel = full[len(self._root) :]
-        try:
-            is_dir = entry.is_dir(follow_symlinks=False)
-        except OSError:
-            is_dir = False
-        slash = "/" if is_dir else ""
-        key = self._key_prefix + rel.replace(os.sep, "/") + slash
-        anchor = os.path.join(self._anchor, rel).replace(os.sep, "/") + slash
-        return self._excludes.excluded(key, anchor)
 
 
 def sync_walker(excludes: list[str], sub: str | None = None) -> ManifestWalker:

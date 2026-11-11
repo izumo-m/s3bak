@@ -5,21 +5,13 @@ then-publish paths: the ordinary directory ``push --delete`` sync lane, and
 the explicit sub-path deletion (``push --delete entry/sub``, which goes
 through ``store.delete_objects`` directly via ``delete_subtree``).
 
-A plain local deletion is the positive control. Against it, a per-key
-(attributable) DeleteObjects error must fail the push and leave the manifest
-untouched; and an error that cannot be tied to any requested key
-(unattributable) must fail every key of its batch that the response cannot
-vouch for - leaving the manifest untouched even when the object was in fact
-removed from S3 underneath. Both deletions run through boto3-s3's
-``S3Deleter``, whose fail-closed synthesis is what s3bak's "publish only
-after the deletion landed" rule rests on.
+A plain local deletion is the positive control. Against it, a DeleteObjects
+error for the requested key must fail the push and leave the manifest
+untouched. Both deletions run through boto3-s3's ``S3Deleter``.
 
 Failures are injected by wrapping ``botocore.client.BaseClient._make_api_call``
 so only the ``DeleteObjects`` call is intercepted; every other S3 call (the
-manifest GET/PUT, HeadObject, ListObjectsV2) runs unmodified against moto. The
-sub-path test's wrapper calls through to the real implementation first and
-then substitutes the response, so the underlying delete genuinely happens on
-S3 even while the client-observed response reports an error.
+manifest GET/PUT, HeadObject, ListObjectsV2) runs unmodified against moto.
 """
 
 from __future__ import annotations
@@ -59,7 +51,7 @@ def test_push_delete_removes_key_and_drops_manifest_record(ws):
     assert "keep.txt" in body
 
 
-def test_push_delete_attributable_failure_keeps_stale_manifest(ws, monkeypatch):
+def test_push_delete_failure_keeps_stale_manifest(ws, monkeypatch):
     # The main directory delete lane (an orphan taken by sync_up's pair filter,
     # dispatched through boto3-s3's S3Deleter) reports a DeleteObjects error tied
     # to the requested key: the push must fail, the object must survive, and -
@@ -94,23 +86,10 @@ def test_push_delete_attributable_failure_keeps_stale_manifest(ws, monkeypatch):
     assert _manifest_etag(ws, "data") == before_etag
 
 
-def test_push_delete_subpath_unattributable_failure_keeps_stale_manifest_despite_real_delete(
-    ws, monkeypatch
-):
-    # A second delete-then-publish path, distinct from the ordinary directory
-    # delete lane above: an explicit sub-path deletion (push --delete
-    # entry/gone-sub) goes through delete_subtree -> store.delete_objects
-    # directly (commands.py's _push_sub, the "local_sub_present is False"
-    # branch), gated the same way - drop_subtree_records runs only after
-    # cfg.store.delete_subtree returns 0.
-    #
-    # Here the injected response lets the real DeleteObjects call go through
-    # first (so the object is actually removed from S3) and only then splices
-    # in an unattributable error, to pin the strongest form of the guarantee:
-    # even when S3 truly deleted the object, an unattributable error in the
-    # response still blocks the manifest rewrite that would drop its record.
-    # That is the safe side of the trade - the alternative, a false success,
-    # would orphan the object with no record and no way to notice.
+def test_push_delete_subpath_failure_keeps_stale_manifest(ws, monkeypatch):
+    # The explicit sub-path deletion (push --delete entry/gone-sub) goes
+    # through delete_subtree -> store.delete_objects directly, gated the same
+    # way: drop_subtree_records runs only after delete_subtree returns 0.
     ws.write("data/keep.txt", "keep")
     ws.write("data/removed.txt", "target")
     ws.config({"data": {"path": str(ws.root / "data")}})
@@ -120,13 +99,12 @@ def test_push_delete_subpath_unattributable_failure_keeps_stale_manifest_despite
     assert "removed.txt" in before_body
 
     (ws.root / "data" / "removed.txt").unlink()
+    target_key = f"{ws.prefix}/data/removed.txt"
 
     def fake_call(self: Any, operation_name: str, api_params: Any):
-        result = real_call(self, operation_name, api_params)
         if operation_name == "DeleteObjects":
-            result = dict(result)
-            result["Errors"] = [{"Code": "InternalError", "Message": "boom"}]
-        return result
+            return {"Errors": [{"Key": target_key, "Code": "AccessDenied", "Message": "denied"}]}
+        return real_call(self, operation_name, api_params)
 
     real_call = botocore.client.BaseClient._make_api_call
     monkeypatch.setattr(botocore.client.BaseClient, "_make_api_call", fake_call)
@@ -134,8 +112,7 @@ def test_push_delete_subpath_unattributable_failure_keeps_stale_manifest_despite
     res = ws.run("push", "--delete", "--yes", "data/removed.txt")
 
     assert res.rc != 0
-    assert "cannot be confirmed" in res.err
-    assert "data/removed.txt" in res.err
-    assert "data/removed.txt" not in ws.keys()  # the real delete_objects call did happen
-    assert _manifest_body(ws, "data") == before_body  # the stale record survives
+    assert "removed.txt" in res.err
+    assert "data/removed.txt" in ws.keys()  # the refused delete never reached S3
+    assert _manifest_body(ws, "data") == before_body  # never rewritten
     assert _manifest_etag(ws, "data") == before_etag

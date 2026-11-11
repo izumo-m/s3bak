@@ -5,6 +5,25 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- A local walk no longer looks at what `excludes` leave out: an excluded file
+  is not looked at, and a directory whose whole contents a pattern ending in `*`
+  excludes is not opened. More patterns now keep a directory unread — any
+  such pattern that matches it, such as `*/node_modules/*`, not only
+  `dir/*` — and `pull` now skips them on the destination too. Nothing
+  excluded there is warned about, and an unreadable or vanishing entry there
+  no longer makes `push --delete` refuse to delete.
+- Transfers now follow the AWS profile's `[s3]` settings in `~/.aws/config`
+  as `aws s3` does: `max_concurrent_requests` (when `max_concurrency` is not
+  set), `multipart_threshold`, `multipart_chunksize` and the rest.
+  `preferred_transfer_client` is ignored; s3bak keeps the classic engine.
+- On Windows, `excludes` now match as `aws s3` matches there: ignoring case,
+  with `/` and `\` as one separator. A drive-relative pattern such as
+  `C:cache` anchors to the entry root only for an entry on drive `C:`.
+
 ## [0.10.0] - 2026-11-02
 
 ### Added
