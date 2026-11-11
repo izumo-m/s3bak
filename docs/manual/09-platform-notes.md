@@ -173,9 +173,9 @@ back.
   alike — for the same reason `/` is.
 - **Exclude patterns are written with `/`**, though `\` works too: the two
   are one separator in matching. Matching ignores case, as `aws s3` does on
-  Windows, so `Cache/*` also covers a directory named `cache`. A drive-relative pattern like
-  `C:cache` anchors to the entry root as `cache` when the entry is on drive
-  `C:`.
+  Windows, so `Cache/*` also covers a directory named `cache`. A
+  drive-relative pattern like `C:cache` anchors to the entry root as `cache`
+  when the entry is on drive `C:`.
 - **`s3bak diff` needs a `diff` executable** on `PATH`. Windows has none by
   default; the one shipped with Git for Windows works.
 

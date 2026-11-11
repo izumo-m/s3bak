@@ -366,8 +366,8 @@ def test_pull_delete_keeps_an_extra_dir_holding_excluded_paths(ws, answers):
     assert (ws.root / "data" / "web" / "node_modules" / "pkg" / "i.js").read_text() == "i"
     assert (ws.root / "data" / "web" / "app" / "node_modules" / "m.js").read_text() == "m"
     assert (ws.root / "data" / "site" / "app" / "node_modules" / "n.js").read_text() == "n"
-    asked = [p.split(" delete ", 1)[1].split("?")[0] for p in answers.prompts]
-    root = str(ws.root / "data")
+    asked = [p.split(" delete ", 1)[1].split("?")[0].replace(os.sep, "/") for p in answers.prompts]
+    root = str(ws.root / "data").replace(os.sep, "/")
     assert asked == [f"{root}/old/stale.txt", f"{root}/old", f"{root}/web/app/extra.txt"]
 
 
@@ -393,7 +393,7 @@ def test_pull_does_not_replace_a_dir_holding_excluded_paths_with_a_symlink(ws):
     res = ws.run("pull", "data", expect_rc=1)
 
     assert "type conflict: a directory holding excluded paths" in res.err
-    assert "records a symlink" in res.err and "data/x" in res.err
+    assert "records a symlink" in res.err and str(ws.root / "data" / "x") in res.err
     assert (ws.root / "data" / "x" / "a" / "b" / "cache.secret").read_text() == "excluded content"
     # A directory holding nothing excluded is still replaced, as documented.
     assert os.path.islink(ws.root / "data" / "z")
@@ -461,9 +461,11 @@ def test_holds_excluded_keys_a_junction_as_a_directory_without_entering_it(tmp_p
 
     (tmp_path / "d" / "link").mkdir(parents=True)
     (tmp_path / "d" / "link" / "inside.log").write_text("x")
-    link_ino = os.lstat(tmp_path / "d" / "link").st_ino
+    # Told apart by a marked mtime: a scanned entry's stat carries no inode
+    # number on Windows.
+    os.utime(tmp_path / "d" / "link", (12345, 12345))
     monkeypatch.setattr(restore, "IS_WINDOWS", True)
-    monkeypatch.setattr(restore, "is_junction", lambda st: st.st_ino == link_ino)
+    monkeypatch.setattr(restore, "is_junction", lambda st: int(st.st_mtime) == 12345)
     anchor = str(tmp_path / "d").replace(os.sep, "/") + "/"
     d = str(tmp_path / "d")
     assert restore.holds_excluded(Excludes(["d/link/*"]), d, "d/", anchor, recursive=False)
@@ -660,7 +662,8 @@ def test_holds_excluded_has_no_depth_limit(tmp_path):
     # takes a frame per level fails; built and removed level by level, since
     # os.makedirs, shutil.rmtree and pytest's own temp cleanup recurse.
     depth = 200
-    base = str(tmp_path / "d")
+    # Past Windows' MAX_PATH, so spelled there in the extended-length form.
+    base = ("\\\\?\\" if os.name == "nt" else "") + str(tmp_path / "d")
     deep = base
     limit = sys.getrecursionlimit()
     try:
@@ -670,7 +673,7 @@ def test_holds_excluded_has_no_depth_limit(tmp_path):
             os.mkdir(deep)
         with open(os.path.join(deep, "x.secret"), "w") as f:
             f.write("s")
-        anchor = base.replace(os.sep, "/") + "/"
+        anchor = str(tmp_path / "d").replace(os.sep, "/") + "/"
         ex = Excludes(["*.secret"])
         sys.setrecursionlimit(len(inspect.stack()) + depth // 2)
         try:
