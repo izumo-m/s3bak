@@ -190,9 +190,9 @@ behind that mapping:
   asked ([sync.md](sync.md#deleting-backups---delete---yes)).
 - **`Ctrl-C` has two stages, and both exit 130.** The first SIGINT raises
   `KeyboardInterrupt` — the shape the layers below recognize, so boto3-s3
-  abandons a scan's page worker rather than waiting one more listing out and
-  a multi-entry run lets the entries already in flight finish. That orderly
-  stop still joins s3transfer's transfer threads, so a request stuck in a
+  hands it back at once, leaving the requests already out to finish behind
+  it, and a multi-entry run lets the entries already in flight finish. The
+  interpreter's exit still waits for those requests, so a request stuck in a
   socket read holds the exit until it times out; the second SIGINT is the
   escape hatch and leaves through `os._exit`. Neither writes through the
   console: a handler runs on the main thread, which may already hold the

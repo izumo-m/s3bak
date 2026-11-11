@@ -212,7 +212,8 @@ instead of announcing a download that never happened.
   default; `entry_concurrency` replaces that default (not a further cap on
   top of it) when set. This includes explicit target lists and `--all`. For
   push and pull, each entry's own `cp` / `sync` then spawns s3transfer's
-  transfer threads (`max_concurrency`, ~10 by default) - so the default of 4
+  transfer threads (`max_concurrency`, else the profile's
+  `s3.max_concurrent_requests`, else 10) - so the default of 4
   concurrent entries already means around 40 transfers in flight, enough to
   saturate typical bandwidth; the cap also bounds how many clients and
   threads are built up front for entries that have not started yet. The
@@ -513,7 +514,11 @@ rehearsal must fail or warn exactly where the real command would. With
    step 4; a single file's `-u` verdict is taken before the transfer, like
    its plain one. A restore root of
    the wrong type (a directory where a file entry restores, a file or symlink
-   where a tree does) is never destroyed up front: the download lands in a
+   where a tree does) is never destroyed up front — and a sub-path's root
+   that is a directory holding an excluded path, or one that cannot be read
+   in full, is not replaced at all: the pull reports the type conflict
+   before any transfer
+   ([excludes.md](excludes.md)). Otherwise the download lands in a
    unique stage directory beside it first, and the root is swapped in two
    atomic renames only after the download succeeded — a failed download costs
    nothing local, and the swap keeps the old root recoverable until the new
@@ -581,7 +586,10 @@ rehearsal must fail or warn exactly where the real command would. With
    target and — where the platform can set it without following the link
    (`os.utime(..., follow_symlinks=False)`) — their own recorded mtime, and
    mode/mtime are set on entries whose local type matches the record.
-   Directory and symlink conflicts are recreated from the manifest; a
+   Directory and symlink conflicts are recreated from the manifest, save a
+   local directory holding an excluded path, or one that cannot be read in
+   full, which a symlink record does not replace: a type conflict, reported
+   ([excludes.md](excludes.md)); a
    regular-file conflict is reported: never through a hostile local symlink,
    and never over a local directory, which is not replaced (step 3 refused
    its download for the same reason; a record whose object is gone never
@@ -612,7 +620,8 @@ What a pull can reproduce is bounded by what the backup records — see
 same per-item confirmation as push. Candidates are the local-only lane of the
 same manifest×walk merge-join `status` runs, streamed straight into the
 removal - never materialized as a list. An excluded local path is invisible to
-the extras diff and is never offered ([excludes.md](excludes.md)).
+the extras diff and is never offered, and neither is an extra directory that
+holds one, which stays for what it holds ([excludes.md](excludes.md)).
 
 - **Order.** A leaf extra is judged the moment it arrives; a directory extra is
   pushed as an open frame on an ancestor stack and popped - and only then
@@ -628,7 +637,10 @@ the extras diff and is never offered ([excludes.md](excludes.md)).
   NFC/NFD normalization) may fold onto a path the manifest records under a
   different spelling is excluded from removal, even though it matches no
   record byte-for-byte — it may be the very file the pull just restored under
-  its recorded spelling. The alias set is collected in one preliminary pass
+  its recorded spelling. The filesystem folds every component, so the set
+  holds whole folded paths: a local `docs/a.txt` is the recorded
+  `Docs/a.txt`, while a `docs/extra.txt` no record folds onto is an ordinary
+  extra. The alias set is collected in one preliminary pass
   over the same merge-join, before the removal stream starts, so a leaf and a
   directory extra alike check it the instant each is judged; a hit warns
   (exit 2) instead of removing.
@@ -648,7 +660,12 @@ the extras diff and is never offered ([excludes.md](excludes.md)).
   once form a chain of prefixes — a record can only join while an earlier
   one's range is still ahead, i.e. its name extends that one's by
   characters below `/` (`x`, `x-`, `x-old`) — so their number is bounded by
-  the longest name, never by the tree.
+  the longest name, never by the tree. A directory the filesystem folds onto
+  such a record under another spelling (`lib/` for a recorded file `Lib`)
+  lies outside that byte range, so the same preliminary pass also collects
+  the folded paths of the non-directory records whose spelling resolves to
+  a local directory, and those cover it too — bounded by the conflicts that
+  actually exist.
 - **Ordering against the metadata apply.** The extras pass runs after the
   apply and is skipped when the apply failed — extras diffed against a tree
   that is not in its recorded state are not trustworthy deletion candidates.

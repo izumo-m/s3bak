@@ -347,7 +347,11 @@ path that was a file when it was last pushed has since become a directory —
 often deliberately, with its contents excluded — and the record still says
 file. The pull restores everything else and refuses that one record, since a
 directory is never replaced (the restore root itself is the exception:
-`pull demo/lib` asks for `lib` back, and gets it):
+`pull demo/lib` asks for `lib` back, and gets it — unless the directory holds
+excluded paths, which no pull removes; that is reported as below, with
+`a directory holding excluded paths` — or `a directory that could not be read
+in full`, since then nothing shows it holds none — and a symlink record over
+such a directory is reported the same way):
 
 ```console
 $ s3bak pull demo

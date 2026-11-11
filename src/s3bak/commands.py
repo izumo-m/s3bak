@@ -53,12 +53,15 @@ from s3bak.manifest import ManifestEntry
 from s3bak.restore import (
     _lstat_readlink,
     apply_manifest,
-    fs_alias_key,
+    fs_alias_path,
+    holds_excluded,
     local_keyed,
     manifest_keyed,
     manifest_target,
     prepare_dir_conflicts,
     remove_extras,
+    replacement_conflict,
+    report_symlink_conflicts,
     resolve_pull_destination,
     windows_collect_writable_prep,
     windows_restore_modes,
@@ -1341,6 +1344,16 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 root_conflict = os.path.islink(outpath) or not os.path.isdir(outpath)
             else:
                 root_conflict = not stat_mod.S_ISREG(os.lstat(outpath).st_mode)
+            if root_conflict and sub is not None and stat_mod.S_ISDIR(os.lstat(outpath).st_mode):
+                # Replacing the root whole would remove the excluded paths in
+                # it, which pull never removes (docs/excludes.md). A
+                # single-file entry has no excludes to apply, and a
+                # directory record's conflicting root (a file or a symlink)
+                # holds nothing.
+                conflict = replacement_conflict(ex, outpath, f"{sub}/", "regular file")
+                if conflict is not None:
+                    console.err(conflict)
+                    return 1
             if root_conflict:
                 if opts.dryrun:
                     console.out(f"(dry-run) would replace {outpath} (conflicting type)\n")
@@ -1554,6 +1567,18 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             #    match and stays, like any other within-window drift. The gate also
             #    re-applies the recorded modes over the writable prep on success -
             #    the outer finally below covers every other case.
+            # A single file's -u verdict was taken above, so its apply
+            # settles the download it decided on, like any download; a
+            # symlink or special-file sub-path has no download and takes
+            # the apply's own -u rule - against a local path of its
+            # recorded kind only: it is its own restore root, and a root
+            # of another kind takes the plain apply - a symlink record
+            # replaces it, a special-file record refuses it (pull never
+            # creates one) - as staging replaces a conflicting data root.
+            apply_update = use_update and is_dir
+            if use_update and not has_data:
+                root_st, _root_sym = _lstat_readlink(outpath)
+                apply_update = root_st is not None and _is_kind(root_st, kind)
             if opts.dryrun:
                 # One stand-in line for the metadata apply (mode / mtime /
                 # symlinks), printed only when the real apply could repair
@@ -1562,21 +1587,27 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                     console.out(f"(dry-run) would apply manifest metadata: {outpath}\n")
                 # A directory sitting where a regular file is recorded fails
                 # the real run's apply; the lane reported it here instead (a
-                # dry run applies nothing), so rehearse the failure too.
+                # dry run applies nothing), so rehearse the failure too - and
+                # the apply's other refusal no lane sees, a symlink record
+                # over a directory holding excluded paths.
                 st = 1 if restore_filter is not None and restore_filter.conflicts else 0
+                # A conflicting root is replaced by a fresh stage, where no
+                # local directory stands in a symlink record's way.
+                if (
+                    not manifest_matches
+                    and not root_conflict
+                    and report_symlink_conflicts(
+                        manifest_path,
+                        outpath,
+                        is_dir,
+                        sub,
+                        excludes,
+                        window_ns=window_ns,
+                        update=apply_update,
+                    )
+                ):
+                    st = 1
             else:
-                # A single file's -u verdict was taken above, so its apply
-                # settles the download it decided on, like any download; a
-                # symlink or special-file sub-path has no download and takes
-                # the apply's own -u rule - against a local path of its
-                # recorded kind only: it is its own restore root, and a root
-                # of another kind takes the plain apply - a symlink record
-                # replaces it, a special-file record refuses it (pull never
-                # creates one) - as staging replaces a conflicting data root.
-                apply_update = use_update and is_dir
-                if use_update and not has_data:
-                    root_st, _root_sym = _lstat_readlink(outpath)
-                    apply_update = root_st is not None and _is_kind(root_st, kind)
                 st = apply_manifest(
                     outpath,
                     is_dir,
@@ -1815,9 +1846,9 @@ def _single_file_size(manifest_path: str, sub: str | None = None) -> int | None:
 
 def _collect_extra_aliases(
     manifest_path: str, outpath: str, sub: str | None, excludes: list[str]
-) -> set[tuple[str, str]]:
+) -> tuple[set[str], set[str]]:
     """The alias set ``remove_extras`` checks a candidate against: one
-    ``(parent_rel, fs_alias_key(basename))`` pair per manifest-only record
+    ``fs_alias_path(rel)`` per manifest-only record
     whose recorded spelling a name-folding filesystem (case, NFC/NFD, a
     Win32-trimmed trailing dot/space) could fold onto some local path - the
     W-F3 defense (pushing from POSIX and pulling on Windows or macOS splits
@@ -1836,8 +1867,8 @@ def _collect_extra_aliases(
     it has to be self-contained here, independent of whether or how apply
     ran.
 
-    A manifest-only record only becomes an alias candidate when
-    ``os.path.lexists`` finds something at its OWN recorded spelling - which
+    A manifest-only record only becomes an alias candidate when an
+    ``lstat`` finds something at its OWN recorded spelling - which
     a plain byte-different local walk would never do, but a name-folding
     filesystem's own path resolution does (case-insensitive lookup, NFC/NFD
     equivalence, or the Win32 trailing dot/space trim), the same fold that
@@ -1846,21 +1877,33 @@ def _collect_extra_aliases(
     number of records the filesystem actually folded - the same "bounded by
     actual conflicts" allowance ``apply_manifest``'s deferred-symlink list
     gets (see docs/overview.md). Cost is one extra lstat per manifest-only
-    record, on top of the merge-join this already re-runs."""
-    aliases: set[tuple[str, str]] = set()
+    record, on top of the merge-join this already re-runs.
+
+    Every component is folded, the directories on the way included: the
+    filesystem folds ``Docs/a.txt`` onto a local ``docs/a.txt`` as readily
+    as ``Report.txt`` onto ``report.txt``. The second set returned holds the
+    folded paths of the non-directory records whose spelling resolves to a
+    local directory: ``_delete_extras``' blockers compare spellings exactly,
+    and these cover the directories they miss, ``lib/`` where the record is
+    a file ``Lib``."""
+    aliases: set[str] = set()
+    dir_blockers: set[str] = set()
     for _key, m, loc in manifest.merge_join(
         manifest_keyed(manifest_path, sub), local_keyed(outpath, excludes, sub)
     ):
         if m is None or loc is not None:
             continue
-        rel, _m_entry = m
+        rel, m_entry = m
         if rel == ".":
             continue
-        if os.path.lexists(os.path.join(outpath, rel)):
-            parent = "." if "/" not in rel else rel.rsplit("/", 1)[0]
-            name = rel.rsplit("/", 1)[-1]
-            aliases.add((parent, fs_alias_key(name)))
-    return aliases
+        st, _sym = _lstat_readlink(os.path.join(outpath, rel))
+        if st is None:
+            continue
+        folded = fs_alias_path(rel)
+        aliases.add(folded)
+        if not m_entry.is_dir and stat_mod.S_ISDIR(st.st_mode):
+            dir_blockers.add(folded)
+    return aliases, dir_blockers
 
 
 def _delete_extras(
@@ -1892,7 +1935,7 @@ def _delete_extras(
         if mode is AnswerMode.ASK:
             confirmer = DeleteConfirmer(mode, entry)
 
-    aliases = _collect_extra_aliases(manifest_path, outpath, sub, excludes)
+    aliases, folded_blockers = _collect_extra_aliases(manifest_path, outpath, sub, excludes)
 
     # A local directory left standing where the manifest records a file,
     # symlink, or special file - under -u the kept or conflicting side; a
@@ -1919,7 +1962,15 @@ def _delete_extras(
         blockers[:] = [b for b in blockers if rel < b + "/" or rel.startswith(b + "/")]
 
     def covered(rel: str) -> bool:
-        return any(rel == b or rel.startswith(b + "/") for b in blockers)
+        if any(rel == b or rel.startswith(b + "/") for b in blockers):
+            return True
+        # The same blocker reached under another spelling a name-folding
+        # filesystem resolves to it (collected up front, so its range need
+        # not lie ahead in the stream's byte order).
+        if folded_blockers:
+            folded = fs_alias_path(rel)
+            return any(folded == b or folded.startswith(b + "/") for b in folded_blockers)
+        return False
 
     def items() -> Iterator[tuple[str, str, bool, bool]]:
         # Every LOCAL item flows: the local-only lane (m is None) are the
@@ -1945,7 +1996,24 @@ def _delete_extras(
             extra = m is None and not covered(rel)
             yield rel, os.path.join(outpath, rel), stat_mod.S_ISDIR(st.st_mode), extra
 
-    errors, removed = remove_extras(items(), aliases=aliases, dryrun=opts.dryrun, confirm=confirmer)
+    ex = Excludes(excludes)
+    key_prefix = f"{sub}/" if sub else ""
+
+    def dir_holds_excluded(rel: str, path: str) -> bool:
+        # Re-anchored at the entry root, where the patterns are defined; the
+        # absolute patterns match the restore destination.
+        anchor = os.path.abspath(path).replace(os.sep, "/") + "/"
+        # A directory it cannot read is left to rmdir, which fails on what it
+        # cannot see and reports it.
+        return holds_excluded(ex, path, f"{key_prefix}{rel}/", anchor, recursive=False) is True
+
+    errors, removed = remove_extras(
+        items(),
+        aliases=aliases,
+        dryrun=opts.dryrun,
+        confirm=confirmer,
+        dir_holds_excluded=dir_holds_excluded,
+    )
     return (1 if errors else 0), removed
 
 
@@ -3184,7 +3252,7 @@ def verify_top_level(cfg: Config, opts: Opts) -> None:
         if name.endswith(manifest.MANIFEST_SUFFIX) or name in cfg.entries or name in manifests:
             continue
         console.warn(f"warning: top-level object outside any configured entry: {cfg.prefix}/{name}")
-    for name in sorted(set(prefixes)):
+    for name in sorted(prefixes):
         if name in cfg.entries or name in manifests:
             continue
         console.warn(

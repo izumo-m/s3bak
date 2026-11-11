@@ -134,6 +134,7 @@ def test_failed_direct_download_preserves_existing_destination(ws, monkeypatch):
     ws.write("data/a.txt", "x")
     ws.config({"data": {"path": str(ws.root / "data")}})
     store = _store(ws)
+    ws.s3.put_object(Bucket=ws.bucket, Key=store._api_key("data/a.txt"), Body=b"remote")
     dest = ws.write("existing.txt", "original")
 
     class FailingBody:
@@ -148,7 +149,14 @@ def test_failed_direct_download_preserves_existing_destination(ws, monkeypatch):
         def close(self):
             pass
 
-    monkeypatch.setattr(store._client, "get_object", lambda **_kwargs: {"Body": FailingBody()})
+    real_get_object = store._client.get_object
+
+    def get_object(**kwargs):
+        response = real_get_object(**kwargs)
+        response["Body"].close()
+        return {**response, "Body": FailingBody()}
+
+    monkeypatch.setattr(store._client, "get_object", get_object)
     before = sorted(p.name for p in dest.parent.iterdir())
 
     # boto3-s3 files a broken body as a TransportError; run() reports it and
@@ -203,63 +211,6 @@ def test_delete_objects_reports_only_actually_deleted_keys(ws, monkeypatch, capf
     assert "data/b" in captured.err  # reported as failed
 
 
-def test_delete_objects_fails_batch_on_unattributable_error(ws, monkeypatch, capfd):
-    # A DeleteObjects error whose Key is missing cannot be tied to a requested
-    # key, so we cannot prove any key was deleted: fail the batch instead of
-    # claiming a phantom success (which would orphan the object on S3 while the
-    # manifest record was dropped).
-    ws.config({"data": {"path": str(ws.root / "data")}})
-    store = _store(ws)
-    monkeypatch.setattr(
-        store._client,
-        "delete_objects",
-        lambda **kw: {"Errors": [{"Code": "AccessDenied", "Message": "denied"}]},
-    )
-    capfd.readouterr()
-    res = store.delete_objects(["a/b"])
-    captured = capfd.readouterr()
-    assert res.returncode == 1
-    assert res.results == 0
-    assert "delete:" not in captured.out  # never claim a success we cannot prove
-    assert "a/b" in captured.err
-
-
-def test_delete_objects_fails_batch_on_unknown_key(ws, monkeypatch, capfd):
-    ws.config({"data": {"path": str(ws.root / "data")}})
-    store = _store(ws)
-    monkeypatch.setattr(
-        store._client,
-        "delete_objects",
-        lambda **kw: {"Errors": [{"Key": "totally/other", "Code": "AccessDenied"}]},
-    )
-    capfd.readouterr()
-    res = store.delete_objects(["a/b"])
-    captured = capfd.readouterr()
-    assert res.returncode == 1
-    assert res.results == 0
-    assert "delete:" not in captured.out
-
-
-def test_delete_objects_reports_only_attributable_failures(ws, monkeypatch, capfd):
-    # An ordinary per-key error keyed to a requested object still lets the other
-    # keys report as deleted (unchanged behaviour).
-    ws.config({"data": {"path": str(ws.root / "data")}})
-    store = _store(ws)
-    api_b = store._api_key("b")
-    monkeypatch.setattr(
-        store._client,
-        "delete_objects",
-        lambda **kw: {"Errors": [{"Key": api_b, "Code": "AccessDenied"}]},
-    )
-    capfd.readouterr()
-    res = store.delete_objects(["a", "b", "c"])
-    captured = capfd.readouterr()
-    assert res.returncode == 1
-    assert res.results == 2
-    assert "/a" in captured.out and "/c" in captured.out
-    assert "/b:" in captured.err
-
-
 def test_transfer_lines_print_as_each_item_completes(ws, monkeypatch):
     # F1: a sync's result lines print from on_result as each item finishes,
     # not accumulated and flushed once as a single write after the whole sync
@@ -287,27 +238,6 @@ def test_transfer_lines_print_as_each_item_completes(ws, monkeypatch):
     # line - never one call joining every line after the sync finished.
     assert len(upload_calls) == 5
     assert all(c.count("\n") == 1 for c in upload_calls)
-
-
-def test_iter_objects_rejects_unordered_listing(ws, monkeypatch):
-    from boto3_s3 import Boto3S3Error
-
-    ws.config({"data": {"path": str(ws.root / "data")}})
-    store = _store(ws)
-    prefix = store._api_key("data") + "/"
-
-    class FakePaginator:
-        def paginate(self, **kw):
-            yield {
-                "Contents": [
-                    {"Key": prefix + "b", "Size": 1},
-                    {"Key": prefix + "a", "Size": 1},  # regresses below "b"
-                ]
-            }
-
-    monkeypatch.setattr(store._client, "get_paginator", lambda name: FakePaginator())
-    with pytest.raises(Boto3S3Error, match="ascending key order"):
-        list(store.iter_objects("data"))
 
 
 def test_get_object_forces_glacier_transfer_on_large_downloads(ws, monkeypatch):

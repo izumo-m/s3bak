@@ -6,7 +6,7 @@ drives cp / sync / ls, and every S3-side location is handed to the library as
 an ``S3Storage`` bound to one shared boto3 client (see ``_s3_loc``), which is
 also what the single-key head / get / put and the batched delete are
 addressed through. That client is used directly only by ``iter_objects``,
-whose paginated listing carries the ordering check verify's merge-join needs.
+the paginated listing verify merge-joins against the manifest.
 The orchestrator and the client are built up front, client construction not
 being thread-safe.
 """
@@ -126,7 +126,7 @@ class ObjectMeta:
 
     key: str
     size: int = 0
-    etag: str | None = None  # dequoted S3 ETag
+    etag: str | None = None  # the S3 ETag, quoted or not
     storage_class: str | None = None  # None = STANDARD (S3 omits it on head)
 
 
@@ -183,30 +183,30 @@ class Boto3S3Store:
         # under a single transfer are the library's business).
         from boto3_s3 import S3, TransferConfig, session
 
-        # One TransferConfig always, set max_concurrency or not: it is the
-        # default for every cp / sync, and _multipart reads multipart_threshold
-        # back off it. A None argument is dropped rather
-        # than forwarded, so an unset max_concurrency still lands on the
-        # library's own default (boto3's 10 - ~/.aws/config is never read for
-        # it). Handing S3 a None instead would take its separate no-config
-        # branch, which need not resolve to these same values.
-        self._transfer_config = TransferConfig(max_concurrency=max_concurrency)
-        # Sized off the resolved transfer concurrency, not the argument: an
-        # unset max_concurrency still has to size the pool the library's own
-        # default will fill (see _client_config).
-        self._client_config = _client_config(self._transfer_config.max_request_concurrency)
         # boto3_s3.session is a boto3.Session whose clients parse response
         # timestamps at C speed - the listings that drive sync and verify are
         # severalfold faster on large trees.
+        profile_session = session(profile_name=profile)
+        # The transfer config every cp / sync runs with, resolved once here as
+        # the library would resolve it per run: what s3bak sets wins, and every
+        # other setting comes from the profile's [s3] section in ~/.aws/config,
+        # then aws s3's defaults - so an unset max_concurrency is
+        # s3.max_concurrent_requests, else 10. Resolved up front because the
+        # client's pool is sized off the concurrency and _multipart reads
+        # multipart_threshold back off it; a resolved config passes through the
+        # runs unchanged, so they use exactly these values. The engine is
+        # pinned to classic: the CRT engine does not run on this client's
+        # pinned timeouts and retry policy (_client_config), so an [s3]
+        # preferred_transfer_client must not switch to it.
+        requested = TransferConfig(
+            max_concurrency=max_concurrency, preferred_transfer_client="classic"
+        )
+        self._transfer_config = S3(session=profile_session).resolve_transfer_config(requested)
+        self._client_config = _client_config(self._transfer_config.max_request_concurrency)
         self._s3 = S3(
-            session=session(profile_name=profile),
+            session=profile_session,
             config=self._client_config,
             transfer_config=self._transfer_config,
-            # Ctrl-C is process-fatal here (cli.run raises one KeyboardInterrupt
-            # and hard-exits on a second), which is the posture that lets a scan
-            # teardown abandon its page worker instead of waiting out a listing
-            # request that may be stuck for a full timeout.
-            reusable_after_interrupt=False,
         )
         self._client = self._s3.client()
 
@@ -262,9 +262,9 @@ class Boto3S3Store:
         return EtagComparison(self._s3)
 
     def compare_pool_size(self) -> int:
-        """Worker count for verify's local hashing pool: the transfer
-        `max_concurrency`, else boto3's default of 10."""
-        return self.max_concurrency or 10
+        """Worker count for verify's local hashing pool: the transfers'
+        resolved concurrency (see __init__)."""
+        return self._transfer_config.max_request_concurrency
 
     def _api_key(self, rel_key: str) -> str:
         return f"{self.path_prefix}/{rel_key}" if self.path_prefix else rel_key
@@ -394,8 +394,7 @@ class Boto3S3Store:
         result), so it costs no S3 call. One shared EtagComparison
         (thread-safe by contract) serves every call; part_size comes from the
         same profile the uploads use, so multipart ETags reconstruct to a
-        matching value. A missing ETag reports "differs" - verification must
-        fail loudly rather than silently pass."""
+        matching value."""
         from boto3_s3.etagcompare import EtagComparison
 
         comparison = EtagComparison(self._s3)
@@ -408,8 +407,8 @@ class Boto3S3Store:
     def needs_upload(self, rel_key: str, local_path: str, *, verbose: bool = False) -> bool:
         """True when local_path should be (re)uploaded to rel_key, by content.
 
-        The single-object counterpart of `--checksum`: no stored object (or no
-        ETag) means upload; otherwise the shared ETag check (etag_checker) so
+        The single-object counterpart of `--checksum`: no stored object means
+        upload; otherwise the shared ETag check (etag_checker) so
         the decision matches a dir entry's `--checksum` sync - an unchanged
         file is skipped, a same-size/same-mtime content change is not. The
         default (non-checksum) single-file decision is the manifest size+mtime
@@ -432,27 +431,12 @@ class Boto3S3Store:
         if verbose:
             console.diag(f"+ (boto3) list objects s3://{self.bucket}/{prefix}\n")
         paginator = self._client.get_paginator("list_objects_v2")
-        prev_key: str | None = None
         for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
             for item in page.get("Contents", []):
-                key = item.get("Key", "")
-                # The merge-join against the manifest relies on strict ascending
-                # key order, which standard S3 and MinIO guarantee (UTF-8 byte
-                # order). A bucket that does not - an S3 Express directory bucket,
-                # or a broken S3-compatible endpoint - would silently make verify
-                # report phantom missing/unrecorded objects, so fail loudly.
-                if prev_key is not None and key <= prev_key:
-                    from boto3_s3 import Boto3S3Error
-
-                    raise Boto3S3Error(
-                        f"S3 listing under {prefix} is not in ascending key order "
-                        f"({prev_key!r} then {key!r}); s3bak needs an order-preserving bucket"
-                    )
-                prev_key = key
                 yield ObjectMeta(
-                    key=key[len(prefix) :],
-                    size=int(item.get("Size", 0)),
-                    etag=str(item.get("ETag") or "").strip('"') or None,
+                    key=item.get("Key", "")[len(prefix) :],
+                    size=item.get("Size", 0),
+                    etag=item.get("ETag"),
                     storage_class=item.get("StorageClass"),
                 )
 
@@ -546,9 +530,7 @@ class Boto3S3Store:
 
         A non-zero result is what stops the caller from publishing a manifest
         that has already dropped the records (docs/recovery.md), so it must
-        cover every key the response cannot vouch for: the deleter fails a key
-        whose batch carried an error naming no submitted key, rather than
-        inferring its success from the key's absence among the errors.
+        cover every key the deleter reports as failed.
 
         Not to be called from inside a console prompt session: a dispatch
         waits for the previous batch (the deleter's backpressure point) while

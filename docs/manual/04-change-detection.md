@@ -390,11 +390,14 @@ so a leading include takes nothing back — the same trap as a lone
 with a literal `!` is written as a character class, `[\!]name`; taking such
 a name back is `!!name`, which reads as it works.
 
-A `!` pattern also shapes what s3bak reads from disk. With `*` first, every
-local walk — a push, `status`, `pull --delete` — descends only into
-directories a later `!` pattern could reach, so a `HOME` entry that takes
-back `.config/nvim/*` never opens `Downloads`. A pattern that can reach
-anywhere, `!*.md` or the `!*/` idiom, gives that up: the whole tree is read.
+Excludes also shape what s3bak reads from disk. Every local walk — a push,
+`status`, a pull — leaves out an excluded file without looking at it, and
+does not open a directory whose whole contents a pattern ending in `*`
+excludes: `*/node_modules/*` keeps every `node_modules` unread, and nothing
+in it is warned about. With `*` first, a walk descends only into directories
+a later `!` pattern could reach, so a `HOME` entry that takes back
+`.config/nvim/*` never opens `Downloads`. A pattern that can reach anywhere,
+`!*.md` or the `!*/` idiom, gives that up: the whole tree is read.
 
 ### What excluded means
 
@@ -410,6 +413,13 @@ One visible consequence: an excluded directory is never recorded, so when a
 pull restores a file inside one, the directory is created as a plain
 directory — default permissions, nothing applied afterwards. s3bak does not
 manage it.
+
+The same protection reaches the directories an excluded path sits in, since
+removing a directory would remove it too: a pull never removes a directory
+that holds one. `pull --delete` leaves such a directory in place without
+asking, even when the backup does not record it. Where the backup records a
+symlink — or, for a path you name, a file — in place of such a directory, the
+pull reports a type conflict (exit 1) rather than replacing it.
 
 ### The backup keeps what it already holds
 

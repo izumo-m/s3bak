@@ -17,6 +17,7 @@ Steps 2 to 6 write to the public repository; confirm before running them.
 4. On `develop`, fast-forward to `main`: `git merge --ff-only main`.
 5. Push: `git push origin main develop vX.Y.Z`.
 6. Create the GitHub Release: `scripts/gh-release.sh vX.Y.Z`. The notes are
-   that version's CHANGELOG section, read from the tag. A tag that already
-   has a Release is skipped, and `--dry-run` prints the notes without
-   creating anything.
+   that version's CHANGELOG section, read from the tag; preview them first
+   with `scripts/gh-release.sh --dry-run vX.Y.Z`. Every tag is checked
+   before anything is created, a tag that already has a Release is skipped,
+   and `--help` lists the options.

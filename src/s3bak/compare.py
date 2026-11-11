@@ -232,6 +232,30 @@ def dir_at_file_record(path: str) -> str:
     )
 
 
+def dir_holding_excluded(path: str, recorded: str) -> str:
+    """The pull's report for a local directory it would replace whole - under
+    a symlink record, or as a named path's restore root of the wrong type -
+    that holds an excluded path. Replacing it would remove that path, which
+    pull never removes (docs/excludes.md), so the record cannot be restored
+    at ``path``; ``recorded`` names what the backup records there."""
+    return (
+        f"type conflict: a directory holding excluded paths sits where the backup"
+        f" records a {recorded} (push --delete retires the stale record; move the"
+        f" directory away to restore the {recorded}): {path}"
+    )
+
+
+def dir_unreadable(path: str, recorded: str) -> str:
+    """The pull's report for a local directory it would replace whole that it
+    could not read in full: nothing shows it holds no excluded path, and the
+    replacement moves the directory away, unread parts included."""
+    return (
+        f"type conflict: a directory that could not be read in full sits where the"
+        f" backup records a {recorded} (it may hold excluded paths; make it readable,"
+        f" or move the directory away to restore the {recorded}): {path}"
+    )
+
+
 def no_object_record(path: str) -> str:
     """The warning for a regular-file record with no data object behind it,
     which a pull skips in full (docs/sync.md, the pull pipeline). One text

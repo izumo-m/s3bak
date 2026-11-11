@@ -171,9 +171,11 @@ back.
   and `s3bak push demo/lib` mean the same thing.
 - **A path root is refused** as an entry path — `C:\` and `\\server\share`
   alike — for the same reason `/` is.
-- **Exclude patterns are written with `/`**, though `\` works too: a backslash
-  in a pattern folds to `/` before matching. A drive-relative pattern like
-  `C:cache` anchors to the entry root as `cache` rather than to a drive.
+- **Exclude patterns are written with `/`**, though `\` works too: the two
+  are one separator in matching. Matching ignores case, as `aws s3` does on
+  Windows, so `Cache/*` also covers a directory named `cache`. A
+  drive-relative pattern like `C:cache` anchors to the entry root as `cache`
+  when the entry is on drive `C:`.
 - **`s3bak diff` needs a `diff` executable** on `PATH`. Windows has none by
   default; the one shipped with Git for Windows works.
 
@@ -324,10 +326,15 @@ s3 =
 ```
 
 s3bak's own development runs against a local MinIO this way, so the path is
-well travelled. What the service has to provide is the ordinary object API:
-`ListObjectsV2` with prefixes and delimiters, `GetObject`, `PutObject`,
-`HeadObject`, `DeleteObject` and batched `DeleteObjects`, and multipart upload
-for files above the multipart threshold.
+well travelled. What the service has to provide is the ordinary object API,
+answering as S3 does: `ListObjectsV2` with prefixes and delimiters and keys
+listed in UTF-8 byte order, `GetObject`, `PutObject`, `HeadObject`,
+`DeleteObject` and batched `DeleteObjects`, and multipart upload for files
+above the multipart threshold. s3bak does not check that a service answers
+this way; one that does not can make a backup go wrong without saying so.
+An S3 Express directory bucket does not list in key order, so s3bak does not
+support one: pushing a directory entry to one is refused, and `verify` cannot
+check one.
 
 Two things are worth checking before trusting a backup to one:
 

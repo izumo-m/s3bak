@@ -32,6 +32,13 @@ s3bak aims to support S3-compatible services broadly. When a service lacks an
 S3 capability required by s3bak, an appropriate compatibility approach is
 evaluated separately.
 
+s3bak relies on the service answering as S3's API defines, as boto3-s3 does.
+What a response outside that definition leads to — a missing element, a
+value the API does not define, a listing out of key order — is not
+specified, and no code checks for such a response or works around it. A
+failure only a modified or broken server could produce is not guarded
+against.
+
 ### Performance and scalability
 
 Everything that processes a tree streams. The manifest, the local walk, and

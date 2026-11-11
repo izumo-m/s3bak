@@ -446,7 +446,9 @@ the pull cannot place: warned about (exit 2) and skipped. The restore root
 is the exception: naming the path itself — `pull demo/lib`, wherever `-o`
 sends it — asks for that one thing back, and a root of the wrong type is
 replaced whole once its download has landed, as any restore root of the
-wrong type is.
+wrong type is — unless it is a directory holding excluded paths, or one
+that cannot be read in full, which is the same type conflict, reported
+before anything is downloaded.
 
 `-u` (`--update`) restores only the files whose record is newer than the
 local copy, and leaves a newer local file alone in full — content,
