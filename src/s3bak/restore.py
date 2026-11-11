@@ -26,6 +26,8 @@ from s3bak.compare import (
     SYMLINK_MTIME_SUPPORTED,
     compare_to_stat,
     dir_at_file_record,
+    dir_holding_excluded,
+    dir_unreadable,
     no_object_record,
     ordered_side,
     tie_conflict,
@@ -610,6 +612,7 @@ def _apply_record(
     update: bool = False,
     decision: str | None = None,
     prep_modes: dict[str, int] | None = None,
+    ex: Excludes | None = None,
 ) -> _ApplyOutcome:
     """Repair one manifest record against its local lstat; a record whose
     local state already matches (the shared ``compare_to_stat`` predicate) is
@@ -694,6 +697,18 @@ def _apply_record(
                     warn_conflict(reason, target)
                 return kept()
         if st is not None and stat_mod.S_ISDIR(st.st_mode):
+            conflict = symlink_conflict(ex, m_entry, target) if ex is not None else None
+            if conflict is not None:
+                # Placing the link would remove the directory and everything
+                # in it, the excluded paths included, which pull never
+                # removes (docs/excludes.md): a conflict, reported like a
+                # regular-file record over a local directory. Judged here,
+                # not at the deferred placement: nothing the pull writes
+                # lands under a symlink record, and a refused placement
+                # must not leave its parent flagged for a re-settle.
+                if report:
+                    console.err(conflict)
+                return _ApplyOutcome(1)
             deferred_symlinks.append((target, m_entry))
             return _ApplyOutcome(0, defer_symlink=True)
         if IS_WINDOWS and not os.path.exists(_resolve_symlink_target(target, m_entry.sym_target)):
@@ -987,6 +1002,7 @@ def apply_manifest(
                     update=update,
                     decision=decision,
                     prep_modes=prep_modes,
+                    ex=ex,
                 )
                 errors += outcome.errors
                 if (
@@ -1048,6 +1064,7 @@ def apply_manifest(
                     report=report,
                     update=update,
                     prep_modes=prep_modes,
+                    ex=ex,
                 )
                 errors += outcome.errors
     finally:
@@ -1114,9 +1131,146 @@ class _DecisionCursor:
         self._head = None
 
 
+def symlink_conflict(ex: Excludes, m_entry: ManifestEntry, target: str) -> str | None:
+    """``replacement_conflict`` for placing the symlink record ``m_entry``
+    over the local directory at ``target``, keyed as the record's path with
+    a trailing ``/``, at the entry root."""
+    return replacement_conflict(ex, target, m_entry.path.removeprefix("./") + "/", "symlink")
+
+
+def report_symlink_conflicts(
+    manifest_path: str,
+    outpath: str,
+    is_dir: bool,
+    sub: str | None,
+    excludes: list[str],
+    *,
+    window_ns: int,
+    update: bool,
+) -> int:
+    """A dry run's rehearsal of the apply's refusal to place a symlink record
+    over a local directory that holds an excluded path - the one conflict
+    the apply finds that no transfer lane reports, and a dry run applies
+    nothing. Judged as ``_apply_record`` judges it: the record not excluded,
+    a real directory at its path, and under -u (``update``) only where the
+    record is the newer side. Reports each like the apply and returns how
+    many."""
+    ex = Excludes(excludes)
+    if ex.empty:
+        return 0
+    root_real = canonical_restore_path(outpath)
+    conflicts = 0
+    for m_entry in manifest.iter_manifest(manifest_path):
+        if m_entry.sym_target is None:
+            continue
+        res = manifest_target(m_entry, outpath, is_dir, sub)
+        if res is None:
+            continue
+        target, rel = res
+        if rel != "." and canonical_restore_path(target) != os.path.normcase(
+            os.path.normpath(os.path.join(root_real, rel))
+        ):
+            # Reached through a symlink or junction, inside the tree or out:
+            # the real run replaces one at a recorded directory before the
+            # sync, and refuses the rest as escaping the restore root -
+            # neither meets this conflict.
+            continue
+        key = m_entry.path.removeprefix("./")
+        if key and ex.excluded(key, os.path.abspath(target).replace(os.sep, "/")):
+            continue  # pull never touches an excluded path
+        st, _sym = _lstat_readlink(target)
+        if st is None or not stat_mod.S_ISDIR(st.st_mode):
+            continue
+        if update and ordered_side(m_entry, st, window_ns) != "record":
+            continue  # kept as the newer side, or a conflict the apply warns about
+        conflict = symlink_conflict(ex, m_entry, target)
+        if conflict is not None:
+            console.err(conflict)
+            conflicts += 1
+    return conflicts
+
+
 # =============================================================================
 # remove_extras
 # =============================================================================
+
+
+def holds_excluded(
+    ex: Excludes, path: str, key: str, anchor: str, *, recursive: bool
+) -> bool | None:
+    """Whether the local directory at ``path`` holds an excluded path: is one
+    itself, or has one among its direct entries - or, with ``recursive``,
+    anywhere below it. ``None`` when a directory it had to look into could
+    not be read and nothing it did read was excluded: nothing shows the
+    directory holds none.
+
+    Removing a directory removes everything under it, so pull never removes
+    one that holds an excluded path (docs/excludes.md): the per-path rule
+    reaches the directory through what it holds. ``key`` is the directory's
+    entry-rooted key and ``anchor`` its absolute ``/``-separated path, both
+    ending in ``/`` - the spellings ``Excludes.excluded`` takes for a
+    directory. Entries are judged by name and scanned type alone, with no
+    stat: a symlink is a leaf, never followed, and a Windows junction is
+    keyed as the directory the walk takes it for. ``recursive`` asks what
+    removing the directory whole would take, so it does not look behind a
+    junction - removing one only unlinks it - the directory's own included.
+
+    The search is a loop over pending directories, never recursion, so no
+    depth is too deep for it; what is pending is the subdirectory names of
+    the directories on the current path."""
+    if ex.empty:
+        return False
+    if ex.excluded(key, anchor):
+        return True
+    if recursive and IS_WINDOWS:
+        try:
+            if is_junction(os.lstat(path)):
+                return False
+        except OSError:
+            return None
+    pending = [(path, key, anchor)]
+    unreadable = False
+    while pending:
+        dir_path, dir_key, dir_anchor = pending.pop()
+        try:
+            with os.scandir(dir_path) as entries:
+                for entry in entries:
+                    try:
+                        is_dir = entry.is_dir(follow_symlinks=False)
+                        descend = is_dir and not (
+                            IS_WINDOWS and is_junction(entry.stat(follow_symlinks=False))
+                        )
+                    except OSError:
+                        # Its kind cannot be told, so neither can whether
+                        # it holds anything.
+                        is_dir = descend = False
+                        unreadable = True
+                    slash = "/" if is_dir else ""
+                    child_key = dir_key + entry.name + slash
+                    child_anchor = dir_anchor + entry.name + slash
+                    if ex.excluded(child_key, child_anchor):
+                        return True
+                    if recursive and descend:
+                        pending.append((entry.path, child_key, child_anchor))
+        except OSError:
+            unreadable = True
+    return None if unreadable else False
+
+
+def replacement_conflict(ex: Excludes, path: str, key: str, recorded: str) -> str | None:
+    """The type conflict that refuses replacing the local directory at
+    ``path`` (entry-rooted ``key``, trailing ``/``) whole with the
+    ``recorded`` kind, or ``None`` when it may go: one holding an excluded
+    path, or one that could not be read in full - a replacement moves the
+    directory away before removing it, so what it could not read would not
+    survive in place either."""
+    anchor = os.path.abspath(path).replace(os.sep, "/") + "/"
+    held = holds_excluded(ex, path, key, anchor, recursive=True)
+    if held is None:
+        return dir_unreadable(path, recorded)
+    if held:
+        return dir_holding_excluded(path, recorded)
+    return None
 
 
 @dataclass
@@ -1136,6 +1290,7 @@ def remove_extras(
     aliases: set[tuple[str, str]],
     dryrun: bool = False,
     confirm: DeleteConfirmer | None = None,
+    dir_holds_excluded: Callable[[str, str], bool] | None = None,
 ) -> tuple[int, int]:
     """Remove local extras (pull ``--delete``): an ascending ``(rel, path,
     is_dir, is_extra)`` stream - every LOCAL item of the status/--delete
@@ -1157,9 +1312,16 @@ def remove_extras(
     directories currently open, not by the number of extras. Confirmation and
     output order is therefore subtree by subtree - children before their own
     directory - in the same ascending order as everything else, not one
-    global deepest-first pass. A removal failure (e.g. a non-empty directory
-    that lost a child to an exclude) is reported so a requested mirror
-    restore cannot return success while extras remain.
+    global deepest-first pass. ``dir_holds_excluded(rel, path)`` tells whether
+    an extra directory holds an excluded path among its direct entries; such
+    a directory is kept like a kept item, silently and before any question,
+    since the excluded path it holds is not the pull's to remove and the
+    directory cannot go without it (docs/excludes.md). Its direct entries
+    suffice: an extra directory below that holds one deeper was kept the
+    same way when it closed, which keeps every directory open above it.
+    Anything else that keeps a directory non-empty - an entry the walk could
+    not see - makes its ``rmdir`` fail, and that failure is reported so a
+    requested mirror restore cannot return success while extras remain.
 
     ``aliases`` is the set of ``(parent_rel, fs_alias_key(basename))`` pairs
     the caller (``commands._delete_extras``) already collected in one
@@ -1229,6 +1391,9 @@ def remove_extras(
                 f" a recorded path): {path}"
             )
             keep_open_ancestors()
+            return
+        if is_dir_entry and dir_holds_excluded is not None and dir_holds_excluded(rel, path):
+            keep_open_ancestors()  # it stays for what it holds, and so do they
             return
         if dryrun:
             console.out(f"(dry-run) delete: {path}\n")

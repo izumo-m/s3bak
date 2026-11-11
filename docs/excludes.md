@@ -92,6 +92,28 @@ Consequences the implementation must preserve:
 - **The entry root is never matched.** In aws terms the operation root has no
   key, and filters apply beneath it. A single-file entry's file *is* the entry
   root, so excludes never apply to it.
+- **Pull never removes a directory that holds an excluded path.** Every path
+  is judged alone, but removing a directory removes everything under it, so
+  the rule reaches the directory through what it holds: wherever pull would
+  remove a local directory, it first looks for an excluded path there — the
+  directory's own key included — by name and scanned type, without a stat.
+  `pull --delete` keeps an extra directory that holds one, silently and
+  unasked, as it keeps the extra directories above a kept item; the
+  directory's direct entries are enough, since an extra directory below
+  that holds one was kept the same way when it closed. A directory pull
+  would replace whole — under a symlink record, or as a sub-path pull's
+  restore root of the wrong type — is searched to the bottom, and holding
+  one is a type conflict, reported (exit 1) like a regular-file record over
+  a local directory — by a dry run too, which rehearses that refusal. A
+  replacement moves the directory away before removing it, so one that
+  cannot be read in full is refused the same way, under its own wording:
+  nothing shows it holds no excluded path. `pull --delete` only calls
+  `rmdir`, which fails on what it cannot see and reports it, so there an
+  unreadable directory is left to that. A Windows junction is keyed as the
+  directory the walk takes it for, but a replacement does not look behind
+  one: removing it only unlinks it. What such a directory holds that is
+  neither excluded nor recorded is not covered: a replacement still takes
+  it.
 - **Pruning is an optimization only.** A walk may drop an entry before
   looking at it only where the rules provably exclude it whatever the
   filesystem says, and skip a directory only where they provably exclude it
@@ -134,8 +156,9 @@ plain "invisible" rule, these are the seams worth stating:
   either spelling (as a file or as a directory). The record-by-record rule is
   what keeps `["*", "!x/*"]` from silencing a `push entry/x` whose backup is
   the one thing the config keeps.
-- **pull** skips excluded records entirely, and `pull --delete` never sees an
-  excluded local path as an extra. A restored file whose parent directory is
+- **pull** skips excluded records entirely, `pull --delete` never sees an
+  excluded local path as an extra, and no pull removes a directory that holds
+  one (above). A restored file whose parent directory is
   excluded — and hence unrecorded — gets that directory created as a plain
   container: default permissions, no recorded metadata, unmanaged by s3bak.
   The destination walk drops excluded entries before vetting them, as the

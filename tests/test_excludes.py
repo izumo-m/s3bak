@@ -339,6 +339,355 @@ def test_pull_delete_does_not_read_an_excluded_local_subtree(ws, monkeypatch):
     assert not [path for path in statted if "node_modules" in path]
 
 
+def test_pull_delete_keeps_an_extra_dir_holding_excluded_paths(ws, answers):
+    # Removing a directory removes what it holds, so an extra directory
+    # holding an excluded path stays - silently and unasked, and so does
+    # every extra directory above it - while an extra directory without one
+    # is removed as before. The dry run previews exactly that.
+    ws.write("data/keep.txt", "k")
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["*/node_modules/*"]}})
+    ws.run("push", "data", expect_rc=0)
+    ws.write("data/web/node_modules/pkg/i.js", "i")
+    ws.write("data/web/app/node_modules/m.js", "m")
+    ws.write("data/web/app/extra.txt", "x")
+    ws.write("data/site/app/node_modules/n.js", "n")  # site holds one only below
+    ws.write("data/old/stale.txt", "s")
+
+    dry = ws.run("pull", "--delete", "--dry-run", "data", expect_rc=0)
+    assert "old" in dry.out and "extra.txt" in dry.out
+    assert "data/web\n" not in dry.out and "data/web/app\n" not in dry.out
+
+    answers.feed("y", "y", "y")
+    res = ws.run("pull", "--delete", "data", expect_rc=0)
+
+    assert "delete failed" not in res.err
+    assert not (ws.root / "data" / "old").exists()
+    assert not (ws.root / "data" / "web" / "app" / "extra.txt").exists()
+    assert (ws.root / "data" / "web" / "node_modules" / "pkg" / "i.js").read_text() == "i"
+    assert (ws.root / "data" / "web" / "app" / "node_modules" / "m.js").read_text() == "m"
+    assert (ws.root / "data" / "site" / "app" / "node_modules" / "n.js").read_text() == "n"
+    asked = [p.split(" delete ", 1)[1].split("?")[0] for p in answers.prompts]
+    root = str(ws.root / "data")
+    assert asked == [f"{root}/old/stale.txt", f"{root}/old", f"{root}/web/app/extra.txt"]
+
+
+def test_pull_does_not_replace_a_dir_holding_excluded_paths_with_a_symlink(ws):
+    # A symlink record over a local directory replaces the directory whole -
+    # unless it holds an excluded path, which pull never removes: then it is
+    # a conflict, reported like a regular-file record over a directory.
+    ws.write("data/keep.txt", "k")
+    os.symlink("keep.txt", ws.root / "data" / "x")
+    ws.write("data/y/plain.txt", "p")
+    os.symlink("keep.txt", ws.root / "data" / "z")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    os.remove(ws.root / "data" / "x")
+    ws.write("data/x/a/b/cache.secret", "excluded content")  # found only by looking below
+    os.remove(ws.root / "data" / "z")
+    ws.write("data/z/notes.txt", "unrecorded, not excluded")
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["*.secret"]}})
+
+    dry = ws.run("pull", "--dry-run", "data", expect_rc=1)
+    assert "type conflict: a directory holding excluded paths" in dry.err
+    assert "data/z" not in dry.err
+    res = ws.run("pull", "data", expect_rc=1)
+
+    assert "type conflict: a directory holding excluded paths" in res.err
+    assert "records a symlink" in res.err and "data/x" in res.err
+    assert (ws.root / "data" / "x" / "a" / "b" / "cache.secret").read_text() == "excluded content"
+    # A directory holding nothing excluded is still replaced, as documented.
+    assert os.path.islink(ws.root / "data" / "z")
+
+
+def test_subpath_pull_does_not_replace_a_dir_holding_excluded_paths(ws):
+    # The named path is the restore root, replaced whole when it is of the
+    # wrong type - but not when it holds an excluded path. The dry run says
+    # the same before anything moves.
+    ws.write("data/keep.txt", "k")
+    ws.write("data/x", "recorded file")
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["*.log"]}})
+    ws.run("push", "data", expect_rc=0)
+    os.remove(ws.root / "data" / "x")
+    ws.write("data/x/a/b/run.log", "excluded content")  # found only by looking below
+    x = ws.root / "data" / "x"
+
+    dry = ws.run("pull", "--dry-run", str(x), expect_rc=1)
+    assert "type conflict: a directory holding excluded paths" in dry.err
+    res = ws.run("pull", str(x), expect_rc=1)
+
+    assert "records a regular file" in res.err
+    assert (x / "a" / "b" / "run.log").read_text() == "excluded content"
+    assert not [p for p in os.listdir(ws.root / "data") if ".s3bak-stage-" in p]
+
+
+def test_holds_excluded_looks_below_only_when_recursive(tmp_path):
+    from s3bak.restore import holds_excluded
+
+    (tmp_path / "d" / "sub" / "node_modules").mkdir(parents=True)
+    (tmp_path / "d" / "plain.txt").write_text("p")
+    ex = Excludes(["*/node_modules/*"])
+    anchor = str(tmp_path / "d").replace(os.sep, "/") + "/"
+    d = str(tmp_path / "d")
+    assert holds_excluded(ex, d, "d/", anchor, recursive=False) is False
+    assert holds_excluded(ex, d, "d/", anchor, recursive=True)
+    # The directory itself counts.
+    assert holds_excluded(Excludes(["d/"]), d, "d/", anchor, recursive=False)
+    assert holds_excluded(Excludes([]), d, "d/", anchor, recursive=True) is False
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs an unreadable directory")
+def test_holds_excluded_cannot_clear_an_unreadable_dir(tmp_path):
+    from s3bak.restore import holds_excluded
+
+    (tmp_path / "d" / "locked").mkdir(parents=True)
+    os.chmod(tmp_path / "d" / "locked", 0)
+    ex = Excludes(["*.log"])
+    anchor = str(tmp_path / "d").replace(os.sep, "/") + "/"
+    # Nothing shows it holds none: neither True nor False.
+    try:
+        assert holds_excluded(ex, str(tmp_path / "d"), "d/", anchor, recursive=True) is None
+        locked = str(tmp_path / "d" / "locked")
+        assert holds_excluded(ex, locked, "d/locked/", anchor + "locked/", recursive=False) is None
+    finally:
+        os.chmod(tmp_path / "d" / "locked", 0o755)
+
+
+def test_holds_excluded_keys_a_junction_as_a_directory_without_entering_it(tmp_path, monkeypatch):
+    # Windows, simulated (only d/link is a junction): the walk keys a
+    # junction as a directory ("link/"), so an exclude written for its path
+    # ("d/link/*") must see it; and removing d only unlinks it, so a
+    # replacement does not look behind it.
+    from s3bak import restore
+
+    (tmp_path / "d" / "link").mkdir(parents=True)
+    (tmp_path / "d" / "link" / "inside.log").write_text("x")
+    link_ino = os.lstat(tmp_path / "d" / "link").st_ino
+    monkeypatch.setattr(restore, "IS_WINDOWS", True)
+    monkeypatch.setattr(restore, "is_junction", lambda st: st.st_ino == link_ino)
+    anchor = str(tmp_path / "d").replace(os.sep, "/") + "/"
+    d = str(tmp_path / "d")
+    assert restore.holds_excluded(Excludes(["d/link/*"]), d, "d/", anchor, recursive=False)
+    assert restore.holds_excluded(Excludes(["*.log"]), d, "d/", anchor, recursive=True) is False
+    # Without the junction, the same search finds it.
+    monkeypatch.setattr(restore, "is_junction", lambda st: False)
+    assert restore.holds_excluded(Excludes(["*.log"]), d, "d/", anchor, recursive=True) is True
+
+
+def test_remove_extras_still_warns_about_an_aliased_dir_holding_excluded_paths(tmp_path, capfd):
+    # The name-folding check comes first: a directory that may be the
+    # recorded one under another spelling is warned about whatever it holds.
+    from s3bak import restore
+
+    d = tmp_path / "a" / "Docs"
+    d.mkdir(parents=True)
+    items = [("a/Docs", str(d), True, True)]
+    aliases = {("a", restore.fs_alias_key("docs"))}
+    errors, removed = restore.remove_extras(
+        iter(items), aliases=aliases, dir_holds_excluded=lambda rel, path: True
+    )
+
+    assert (errors, removed) == (0, 0)
+    assert "not removed" in capfd.readouterr().err
+
+
+def test_pull_u_refused_symlink_leaves_its_parents_newer_mtime(ws):
+    # Under -u a refused placement must not flag its parent for the
+    # post-placement re-settle: a parent the pull did not touch keeps a
+    # newer local modification time.
+    ws.write("data/keep.txt", "k")
+    ws.write("data/sub/inner.txt", "i")
+    os.symlink("../keep.txt", ws.root / "data" / "sub" / "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    x = ws.root / "data" / "sub" / "x"
+    os.remove(x)
+    ws.write("data/sub/x/cache.secret", "excluded content")
+    os.utime(x, (1, 1))  # older than the symlink record: the record wins under -u
+    sub = ws.root / "data" / "sub"
+    newer = os.stat(sub).st_mtime_ns + 3600 * 10**9
+    os.utime(sub, ns=(newer, newer))
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["*.secret"]}})
+
+    dry = ws.run("pull", "-u", "--dry-run", "data", expect_rc=1)
+    assert "type conflict: a directory holding excluded paths" in dry.err
+    res = ws.run("pull", "-u", "data", expect_rc=1)
+
+    assert "type conflict: a directory holding excluded paths" in res.err
+    assert (x / "cache.secret").read_text() == "excluded content"
+    assert os.stat(sub).st_mtime_ns == newer
+
+
+def _symlink_over_dir_workspace(ws, excludes):
+    """A pushed entry whose ./x is a symlink, with a local directory at x now
+    holding x/cache.secret."""
+    ws.write("data/keep.txt", "k")
+    os.symlink("keep.txt", ws.root / "data" / "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    os.remove(ws.root / "data" / "x")
+    ws.write("data/x/cache.secret", "excluded content")
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": excludes}})
+    return ws.root / "data" / "x"
+
+
+def test_pull_u_keeps_a_newer_dir_holding_excluded_paths_without_a_conflict(ws):
+    # Under -u a directory newer than the symlink record is kept as the
+    # newer side: no placement, so no conflict - the dry run agrees.
+    x = _symlink_over_dir_workspace(ws, ["*.secret"])
+    later = os.stat(x).st_mtime_ns + 3600 * 10**9
+    os.utime(x, ns=(later, later))
+
+    dry = ws.run("pull", "-u", "--dry-run", "data", expect_rc=0)
+    res = ws.run("pull", "-u", "data", expect_rc=0)
+
+    assert "type conflict" not in dry.err + res.err
+    assert (x / "cache.secret").read_text() == "excluded content"
+
+
+def test_pull_skips_an_excluded_symlink_record_over_a_dir(ws):
+    # An excluded record is not the pull's: no placement, no conflict.
+    x = _symlink_over_dir_workspace(ws, ["x", "*.secret"])
+
+    dry = ws.run("pull", "--dry-run", "data", expect_rc=0)
+    res = ws.run("pull", "data", expect_rc=0)
+
+    assert "type conflict" not in dry.err + res.err
+    assert (x / "cache.secret").read_text() == "excluded content"
+
+
+def test_subpath_pull_of_a_symlink_record_over_a_dir_holding_excluded_paths(ws):
+    # A symlink sub-path has no download; the apply places it and refuses
+    # the directory the same way, and the dry run says so first.
+    x = _symlink_over_dir_workspace(ws, ["*.secret"])
+
+    dry = ws.run("pull", "--dry-run", str(x), expect_rc=1)
+    res = ws.run("pull", str(x), expect_rc=1)
+
+    assert "type conflict: a directory holding excluded paths" in dry.err
+    assert "type conflict: a directory holding excluded paths" in res.err
+    assert (x / "cache.secret").read_text() == "excluded content"
+
+
+def test_pull_dry_run_finds_no_conflict_behind_a_replaced_root(ws):
+    # The restore root is a symlink, which a real pull replaces by a fresh
+    # stage: no local directory is in the symlink record's way there, so
+    # the dry run, which still sees through the old root, must not report
+    # one either.
+    ws.write("data/keep.txt", "k")
+    os.symlink("keep.txt", ws.root / "data" / "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    os.rename(ws.root / "data", ws.root / "elsewhere")
+    os.remove(ws.root / "elsewhere" / "x")
+    ws.write("elsewhere/x/cache.secret", "excluded content")
+    os.symlink("elsewhere", ws.root / "data")
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["*.secret"]}})
+
+    dry = ws.run("pull", "--dry-run", "data", expect_rc=0)
+    res = ws.run("pull", "data", expect_rc=0)
+
+    assert "type conflict" not in dry.err + res.err
+    assert (ws.root / "elsewhere" / "x" / "cache.secret").read_text() == "excluded content"
+
+
+def test_pull_dry_run_finds_no_conflict_through_a_symlinked_recorded_dir(ws):
+    # A symlink at a recorded directory is replaced by a real directory
+    # before the sync, so the symlink record under it meets no directory in
+    # the real run; the dry run must not look through the link either.
+    ws.write("data/keep.txt", "k")
+    ws.write("data/a/plain.txt", "p")
+    os.symlink("../keep.txt", ws.root / "data" / "a" / "x")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    shutil.rmtree(ws.root / "data" / "a")
+    ws.write("outside/x/cache.secret", "excluded content")
+    os.symlink(str(ws.root / "outside"), ws.root / "data" / "a")
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["*.secret"]}})
+
+    dry = ws.run("pull", "--dry-run", "data", expect_rc=0)
+
+    assert "type conflict" not in dry.err
+
+
+def test_pull_dry_run_finds_no_conflict_through_an_in_tree_symlinked_recorded_dir(ws):
+    # The same with the link pointing inside the tree: what it leads to is a
+    # recorded path of its own, but the record under the link meets no
+    # directory in the real run, which replaces the link first.
+    ws.write("data/keep.txt", "k")
+    ws.write("data/a/plain.txt", "p")
+    os.symlink("../keep.txt", ws.root / "data" / "a" / "x")
+    ws.write("data/c/x/inner.txt", "i")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    shutil.rmtree(ws.root / "data" / "a")
+    os.symlink("c", ws.root / "data" / "a")
+    ws.write("data/c/x/cache.secret", "excluded content")
+    ws.config({"data": {"path": str(ws.root / "data"), "excludes": ["*.secret"]}})
+
+    dry = ws.run("pull", "--dry-run", "data", expect_rc=0)
+    res = ws.run("pull", "data", expect_rc=0)
+
+    assert "type conflict" not in dry.err + res.err
+    assert (ws.root / "data" / "c" / "x" / "cache.secret").read_text() == "excluded content"
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs an unreadable directory")
+def test_pull_does_not_replace_a_dir_it_cannot_read_in_full(ws):
+    # A replacement moves the directory away before removing it, so a part
+    # it cannot read would leave its place unseen: refused, in its own words.
+    x = _symlink_over_dir_workspace(ws, ["*.secret"])
+    os.remove(x / "cache.secret")
+    (x / "locked").mkdir()
+    os.chmod(x / "locked", 0)
+    try:
+        dry = ws.run("pull", "--dry-run", "data", expect_rc=1)
+        res = ws.run("pull", "data", expect_rc=1)
+    finally:
+        os.chmod(x / "locked", 0o755)
+
+    assert "type conflict: a directory that could not be read in full" in dry.err
+    assert "type conflict: a directory that could not be read in full" in res.err
+    assert (x / "locked").is_dir()
+
+
+def test_holds_excluded_has_no_depth_limit(tmp_path):
+    import inspect
+    import sys
+
+    from s3bak.restore import holds_excluded
+
+    # Deeper than the recursion limit is set to below, so a search that
+    # takes a frame per level fails; built and removed level by level, since
+    # os.makedirs, shutil.rmtree and pytest's own temp cleanup recurse.
+    depth = 200
+    base = str(tmp_path / "d")
+    deep = base
+    limit = sys.getrecursionlimit()
+    try:
+        os.mkdir(deep)
+        for _ in range(depth):
+            deep = os.path.join(deep, "a")
+            os.mkdir(deep)
+        with open(os.path.join(deep, "x.secret"), "w") as f:
+            f.write("s")
+        anchor = base.replace(os.sep, "/") + "/"
+        ex = Excludes(["*.secret"])
+        sys.setrecursionlimit(len(inspect.stack()) + depth // 2)
+        try:
+            assert holds_excluded(ex, base, "d/", anchor, recursive=True) is True
+        finally:
+            sys.setrecursionlimit(limit)
+    finally:
+        secret = os.path.join(deep, "x.secret")
+        if os.path.exists(secret):
+            os.remove(secret)
+        while os.path.isdir(deep):
+            os.rmdir(deep)
+            if deep == base:
+                break
+            deep = os.path.dirname(deep)
+
+
 def test_pull_of_named_excluded_file_is_ignored(ws):
     # Naming an excluded path on pull is the same silence as push: no
     # download, nothing created, exit 0.

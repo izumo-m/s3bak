@@ -414,6 +414,13 @@ pull restores a file inside one, the directory is created as a plain
 directory — default permissions, nothing applied afterwards. s3bak does not
 manage it.
 
+The same protection reaches the directories an excluded path sits in, since
+removing a directory would remove it too: a pull never removes a directory
+that holds one. `pull --delete` leaves such a directory in place without
+asking, even when the backup does not record it. Where the backup records a
+symlink — or, for a path you name, a file — in place of such a directory, the
+pull reports a type conflict (exit 1) rather than replacing it.
+
 ### The backup keeps what it already holds
 
 Excludes decide what s3bak touches from now on; they have no opinion about

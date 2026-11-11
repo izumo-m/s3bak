@@ -24,6 +24,18 @@ This project follows [Semantic Versioning](https://semver.org/).
   with `/` and `\` as one separator. A drive-relative pattern such as
   `C:cache` anchors to the entry root only for an entry on drive `C:`.
 
+### Fixed
+
+- `pull --delete` no longer fails with "Directory not empty" on a local-only
+  directory that holds excluded paths: the directory is kept without asking,
+  and `--dry-run` no longer lists it.
+- A pull no longer deletes excluded files by replacing the local directory
+  that holds them: where the backup records a symlink — or, for a path you
+  name, a file — in place of such a directory, the pull leaves it as it is
+  and reports a type conflict (exit 1). A directory there that cannot be read
+  in full is refused the same way, instead of being replaced with its
+  unreadable part left behind beside it as `<name>.s3bak-old-*`.
+
 ## [0.10.0] - 2026-11-02
 
 ### Added

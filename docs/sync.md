@@ -514,7 +514,11 @@ rehearsal must fail or warn exactly where the real command would. With
    step 4; a single file's `-u` verdict is taken before the transfer, like
    its plain one. A restore root of
    the wrong type (a directory where a file entry restores, a file or symlink
-   where a tree does) is never destroyed up front: the download lands in a
+   where a tree does) is never destroyed up front — and a sub-path's root
+   that is a directory holding an excluded path, or one that cannot be read
+   in full, is not replaced at all: the pull reports the type conflict
+   before any transfer
+   ([excludes.md](excludes.md)). Otherwise the download lands in a
    unique stage directory beside it first, and the root is swapped in two
    atomic renames only after the download succeeded — a failed download costs
    nothing local, and the swap keeps the old root recoverable until the new
@@ -582,7 +586,10 @@ rehearsal must fail or warn exactly where the real command would. With
    target and — where the platform can set it without following the link
    (`os.utime(..., follow_symlinks=False)`) — their own recorded mtime, and
    mode/mtime are set on entries whose local type matches the record.
-   Directory and symlink conflicts are recreated from the manifest; a
+   Directory and symlink conflicts are recreated from the manifest, save a
+   local directory holding an excluded path, or one that cannot be read in
+   full, which a symlink record does not replace: a type conflict, reported
+   ([excludes.md](excludes.md)); a
    regular-file conflict is reported: never through a hostile local symlink,
    and never over a local directory, which is not replaced (step 3 refused
    its download for the same reason; a record whose object is gone never
@@ -613,7 +620,8 @@ What a pull can reproduce is bounded by what the backup records — see
 same per-item confirmation as push. Candidates are the local-only lane of the
 same manifest×walk merge-join `status` runs, streamed straight into the
 removal - never materialized as a list. An excluded local path is invisible to
-the extras diff and is never offered ([excludes.md](excludes.md)).
+the extras diff and is never offered, and neither is an extra directory that
+holds one, which stays for what it holds ([excludes.md](excludes.md)).
 
 - **Order.** A leaf extra is judged the moment it arrives; a directory extra is
   pushed as an open frame on an ancestor stack and popped - and only then

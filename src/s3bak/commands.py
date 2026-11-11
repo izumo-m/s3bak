@@ -54,11 +54,14 @@ from s3bak.restore import (
     _lstat_readlink,
     apply_manifest,
     fs_alias_key,
+    holds_excluded,
     local_keyed,
     manifest_keyed,
     manifest_target,
     prepare_dir_conflicts,
     remove_extras,
+    replacement_conflict,
+    report_symlink_conflicts,
     resolve_pull_destination,
     windows_collect_writable_prep,
     windows_restore_modes,
@@ -1341,6 +1344,16 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                 root_conflict = os.path.islink(outpath) or not os.path.isdir(outpath)
             else:
                 root_conflict = not stat_mod.S_ISREG(os.lstat(outpath).st_mode)
+            if root_conflict and sub is not None and stat_mod.S_ISDIR(os.lstat(outpath).st_mode):
+                # Replacing the root whole would remove the excluded paths in
+                # it, which pull never removes (docs/excludes.md). A
+                # single-file entry has no excludes to apply, and a
+                # directory record's conflicting root (a file or a symlink)
+                # holds nothing.
+                conflict = replacement_conflict(ex, outpath, f"{sub}/", "regular file")
+                if conflict is not None:
+                    console.err(conflict)
+                    return 1
             if root_conflict:
                 if opts.dryrun:
                     console.out(f"(dry-run) would replace {outpath} (conflicting type)\n")
@@ -1554,6 +1567,18 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
             #    match and stays, like any other within-window drift. The gate also
             #    re-applies the recorded modes over the writable prep on success -
             #    the outer finally below covers every other case.
+            # A single file's -u verdict was taken above, so its apply
+            # settles the download it decided on, like any download; a
+            # symlink or special-file sub-path has no download and takes
+            # the apply's own -u rule - against a local path of its
+            # recorded kind only: it is its own restore root, and a root
+            # of another kind takes the plain apply - a symlink record
+            # replaces it, a special-file record refuses it (pull never
+            # creates one) - as staging replaces a conflicting data root.
+            apply_update = use_update and is_dir
+            if use_update and not has_data:
+                root_st, _root_sym = _lstat_readlink(outpath)
+                apply_update = root_st is not None and _is_kind(root_st, kind)
             if opts.dryrun:
                 # One stand-in line for the metadata apply (mode / mtime /
                 # symlinks), printed only when the real apply could repair
@@ -1562,21 +1587,27 @@ def cmd_pull(cfg: Config, entry: str, opts: Opts, sub: str | None = None) -> int
                     console.out(f"(dry-run) would apply manifest metadata: {outpath}\n")
                 # A directory sitting where a regular file is recorded fails
                 # the real run's apply; the lane reported it here instead (a
-                # dry run applies nothing), so rehearse the failure too.
+                # dry run applies nothing), so rehearse the failure too - and
+                # the apply's other refusal no lane sees, a symlink record
+                # over a directory holding excluded paths.
                 st = 1 if restore_filter is not None and restore_filter.conflicts else 0
+                # A conflicting root is replaced by a fresh stage, where no
+                # local directory stands in a symlink record's way.
+                if (
+                    not manifest_matches
+                    and not root_conflict
+                    and report_symlink_conflicts(
+                        manifest_path,
+                        outpath,
+                        is_dir,
+                        sub,
+                        excludes,
+                        window_ns=window_ns,
+                        update=apply_update,
+                    )
+                ):
+                    st = 1
             else:
-                # A single file's -u verdict was taken above, so its apply
-                # settles the download it decided on, like any download; a
-                # symlink or special-file sub-path has no download and takes
-                # the apply's own -u rule - against a local path of its
-                # recorded kind only: it is its own restore root, and a root
-                # of another kind takes the plain apply - a symlink record
-                # replaces it, a special-file record refuses it (pull never
-                # creates one) - as staging replaces a conflicting data root.
-                apply_update = use_update and is_dir
-                if use_update and not has_data:
-                    root_st, _root_sym = _lstat_readlink(outpath)
-                    apply_update = root_st is not None and _is_kind(root_st, kind)
                 st = apply_manifest(
                     outpath,
                     is_dir,
@@ -1945,7 +1976,24 @@ def _delete_extras(
             extra = m is None and not covered(rel)
             yield rel, os.path.join(outpath, rel), stat_mod.S_ISDIR(st.st_mode), extra
 
-    errors, removed = remove_extras(items(), aliases=aliases, dryrun=opts.dryrun, confirm=confirmer)
+    ex = Excludes(excludes)
+    key_prefix = f"{sub}/" if sub else ""
+
+    def dir_holds_excluded(rel: str, path: str) -> bool:
+        # Re-anchored at the entry root, where the patterns are defined; the
+        # absolute patterns match the restore destination.
+        anchor = os.path.abspath(path).replace(os.sep, "/") + "/"
+        # A directory it cannot read is left to rmdir, which fails on what it
+        # cannot see and reports it.
+        return holds_excluded(ex, path, f"{key_prefix}{rel}/", anchor, recursive=False) is True
+
+    errors, removed = remove_extras(
+        items(),
+        aliases=aliases,
+        dryrun=opts.dryrun,
+        confirm=confirmer,
+        dir_holds_excluded=dir_holds_excluded,
+    )
     return (1 if errors else 0), removed
 
 
