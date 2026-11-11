@@ -101,6 +101,14 @@ def fs_alias_key(name: str) -> str:
     return unicodedata.normalize("NFD", name.rstrip(". ")).casefold()
 
 
+def fs_alias_path(rel: str) -> str:
+    """Fold a whole ``/``-separated relative path, every component with
+    ``fs_alias_key``: a name-folding filesystem folds the directories on the
+    way as much as the final name, so ``docs/a.txt`` on disk may be the
+    recorded ``Docs/a.txt``."""
+    return "/".join(fs_alias_key(part) for part in rel.split("/"))
+
+
 def canonical_restore_comparison_path(path: str) -> str:
     """Conservative identity used to reject possibly overlapping restores.
 
@@ -1287,7 +1295,7 @@ class _ExtraFrame:
 def remove_extras(
     items: Iterator[tuple[str, str, bool, bool]],
     *,
-    aliases: set[tuple[str, str]],
+    aliases: set[str],
     dryrun: bool = False,
     confirm: DeleteConfirmer | None = None,
     dir_holds_excluded: Callable[[str, str], bool] | None = None,
@@ -1323,13 +1331,15 @@ def remove_extras(
     not see - makes its ``rmdir`` fail, and that failure is reported so a
     requested mirror restore cannot return success while extras remain.
 
-    ``aliases`` is the set of ``(parent_rel, fs_alias_key(basename))`` pairs
-    the caller (``commands._delete_extras``) already collected in one
+    ``aliases`` is the set of ``fs_alias_path(rel)`` paths - every component
+    folded, the directories on the way included - the caller
+    (``commands._delete_extras``) already collected in one
     preliminary pass over the same merge-join, before this stream even
     starts: every manifest-only record whose recorded spelling a
     name-folding filesystem (case, NFC/NFD, a Win32-trimmed trailing dot or
     space) could fold onto some local path (W-F3 - e.g. manifest
-    ``Report.txt`` / disk ``report.txt``). Because the set is complete up
+    ``Report.txt`` / disk ``report.txt``, or manifest ``Docs/a.txt`` / disk
+    ``docs/a.txt``). Because the set is complete up
     front, a leaf extra (checked on arrival) and a directory extra (checked
     at its own pop) both look themselves up in it the instant they are
     judged - no deferral needed. A hit is NOT removed (it may be the very
@@ -1375,17 +1385,11 @@ def remove_extras(
         for frame in stack:
             frame.kept = True
 
-    def parent_of(rel: str) -> str:
-        return "." if "/" not in rel else rel.rsplit("/", 1)[0]
-
-    def basename_of(rel: str) -> str:
-        return rel.rsplit("/", 1)[-1]
-
     def decide(rel: str, path: str, is_dir_entry: bool) -> None:
         # Shared by a leaf (judged on arrival) and a directory frame's own
         # removal decision (judged at its pop, below) - both look up their
-        # OWN (parent, basename) in the pre-collected alias set the same way.
-        if (parent_of(rel), fs_alias_key(basename_of(rel))) in aliases:
+        # OWN folded path in the pre-collected alias set the same way.
+        if fs_alias_path(rel) in aliases:
             console.warn(
                 f"warning: not removed (a local name the filesystem may fold onto"
                 f" a recorded path): {path}"

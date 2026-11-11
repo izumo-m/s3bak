@@ -483,7 +483,7 @@ def test_remove_extras_still_warns_about_an_aliased_dir_holding_excluded_paths(t
     d = tmp_path / "a" / "Docs"
     d.mkdir(parents=True)
     items = [("a/Docs", str(d), True, True)]
-    aliases = {("a", restore.fs_alias_key("docs"))}
+    aliases = {restore.fs_alias_path("a/docs")}
     errors, removed = restore.remove_extras(
         iter(items), aliases=aliases, dir_holds_excluded=lambda rel, path: True
     )

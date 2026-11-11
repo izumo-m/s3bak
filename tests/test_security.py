@@ -756,7 +756,7 @@ def test_remove_extras_keeps_local_extra_whose_manifest_alias_would_sort_after_i
     report.write_text("restored content")
 
     items = [("a/report", str(report), False, True)]
-    aliases = {("a", restore.fs_alias_key("report."))}
+    aliases = {restore.fs_alias_path("a/report.")}
     errors, removed = restore.remove_extras(iter(items), aliases=aliases)
 
     assert (errors, removed) == (0, 0)
@@ -776,7 +776,7 @@ def test_remove_extras_keeps_local_extra_whose_manifest_alias_would_sort_before_
     b.write_text("restored content")
 
     items = [("a/b.txt", str(b), False, True)]
-    aliases = {("a", restore.fs_alias_key("B.txt"))}
+    aliases = {restore.fs_alias_path("a/B.txt")}
     errors, removed = restore.remove_extras(iter(items), aliases=aliases)
 
     assert (errors, removed) == (0, 0)
@@ -794,7 +794,7 @@ def test_remove_extras_keeps_an_aliased_extra_directory_too(tmp_path, capfd):
     d.mkdir(parents=True)
 
     items = [("a/b", str(d), True, True)]
-    aliases = {("a", restore.fs_alias_key("B"))}
+    aliases = {restore.fs_alias_path("a/B")}
     errors, removed = restore.remove_extras(iter(items), aliases=aliases)
 
     assert (errors, removed) == (0, 0)
@@ -813,12 +813,126 @@ def test_remove_extras_still_removes_an_unaliased_extra_next_to_an_alias_entry(t
     extra.write_text("delete me")
 
     items = [("a/unrelated.txt", str(extra), False, True)]
-    aliases = {("a", restore.fs_alias_key("deleted-elsewhere.txt"))}
+    aliases = {restore.fs_alias_path("a/deleted-elsewhere.txt")}
     errors, removed = restore.remove_extras(iter(items), aliases=aliases)
 
     assert (errors, removed) == (0, 1)
     assert not extra.exists()
     assert "not removed" not in capfd.readouterr().err.lower()
+
+
+def _fold_on_lookup(monkeypatch):
+    """Emulate a case-insensitive filesystem's path lookup where pull
+    --delete asks it whether a recorded spelling exists: a spelling that
+    misses is resolved component by component, case folded."""
+    from s3bak import commands
+
+    real = commands._lstat_readlink
+
+    def lstat_readlink(path):
+        st, sym = real(path)
+        if st is not None:
+            return st, sym
+        parts = os.path.abspath(path).split(os.sep)
+        current = parts[0] + os.sep
+        for part in parts[1:]:
+            try:
+                names = os.listdir(current)
+            except OSError:
+                return None, None
+            match = next((n for n in names if n.casefold() == part.casefold()), None)
+            if match is None:
+                return None, None
+            current = os.path.join(current, match)
+        return real(current)
+
+    monkeypatch.setattr(commands, "_lstat_readlink", lstat_readlink)
+
+
+def _case_insensitive(path) -> bool:
+    probe = path / "CaseProbe"
+    probe.write_text("p")
+    try:
+        return (path / "caseprobe").exists()
+    finally:
+        probe.unlink()
+
+
+def _docs_case_split(ws):
+    """Docs/a.txt and Docs/sub/b.txt recorded; on disk the directory is now
+    spelled docs/, holding one genuine extra beside them."""
+    ws.write("data/keep.txt", "k")
+    ws.write("data/Docs/a.txt", "a")
+    ws.write("data/Docs/sub/b.txt", "b")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    os.rename(ws.root / "data" / "Docs", ws.root / "data" / "docs")
+    ws.write("data/docs/extra.txt", "genuinely local-only")
+    return ws.root / "data" / "docs"
+
+
+def _lib_case_split(ws):
+    """A file Lib recorded; on disk a newer directory lib/ holding unrecorded
+    data stands where it would resolve."""
+    ws.write("data/keep.txt", "k")
+    ws.write("data/Lib", "recorded file")
+    ws.config({"data": {"path": str(ws.root / "data")}})
+    ws.run("push", "data", expect_rc=0)
+    os.remove(ws.root / "data" / "Lib")
+    ws.write("data/lib/mine.txt", "local data")
+    lib = ws.root / "data" / "lib"
+    later = os.stat(lib).st_mtime_ns + 3600 * 10**9
+    os.utime(lib, ns=(later, later))
+    return lib
+
+
+def test_pull_delete_folds_the_directories_on_the_way_to_an_alias(ws, monkeypatch):
+    # The filesystem folds Docs/a.txt onto docs/a.txt as readily as a final
+    # name: neither it nor docs/sub is offered, while a genuine extra in the
+    # same directory still is.
+    docs = _docs_case_split(ws)
+    _fold_on_lookup(monkeypatch)
+
+    res = ws.run("pull", "--delete", "--dry-run", "data")
+
+    slashed = str(docs).replace(os.sep, "/")
+    deletes = [ln.replace(os.sep, "/") for ln in res.out.splitlines() if "delete:" in ln]
+    assert deletes == [f"(dry-run) delete: {slashed}/extra.txt"]
+    assert f"{slashed}/a.txt" in res.err.replace(os.sep, "/") and "not removed" in res.err
+
+
+def test_pull_delete_folds_a_blocking_file_record(ws, monkeypatch):
+    # A directory standing where a file is recorded holds what the manifest
+    # cannot vouch for - spelled differently, as the filesystem folds it, too.
+    _lib_case_split(ws)
+    _fold_on_lookup(monkeypatch)
+
+    res = ws.run("pull", "-u", "--delete", "--dry-run", "data")
+
+    assert "mine.txt" not in res.out
+
+
+def test_pull_delete_keeps_what_it_restored_under_a_folded_directory(ws):
+    # End to end on a real case-insensitive filesystem (Windows, macOS).
+    if not _case_insensitive(ws.root):
+        pytest.skip("needs a case-insensitive filesystem")
+    docs = _docs_case_split(ws)
+
+    ws.run("pull", "--delete", "--yes", "data")
+
+    assert (docs / "a.txt").read_text() == "a"
+    assert (docs / "sub" / "b.txt").read_text() == "b"
+    assert not (docs / "extra.txt").exists()
+
+
+def test_pull_delete_keeps_data_under_a_folded_blocking_directory(ws):
+    if not _case_insensitive(ws.root):
+        pytest.skip("needs a case-insensitive filesystem")
+    lib = _lib_case_split(ws)
+
+    ws.run("pull", "-u", "--delete", "--yes", "data")
+
+    assert (lib / "mine.txt").read_text() == "local data"
 
 
 def test_remove_extras_regression_nested_post_order_still_removes_plain_extras(tmp_path, capfd):
@@ -850,19 +964,16 @@ def test_remove_extras_regression_nested_post_order_still_removes_plain_extras(t
     ]
 
 
-def test_delete_extras_collects_alias_via_a_name_folding_lexists_probe(
-    tmp_path, monkeypatch, capfd
-):
+def test_delete_extras_collects_alias_via_a_name_folding_lstat_probe(tmp_path, monkeypatch, capfd):
     # End-to-end through commands._delete_extras (not restore.remove_extras
     # directly): pins that the alias SET ITSELF ties back to a real
     # name-folding filesystem signal, not a hand-built set. On such a
-    # filesystem, os.path.lexists(the manifest's OWN recorded spelling)
-    # succeeds even though a plain directory listing enumerates the same
-    # file under a different local spelling - the fold happens inside the
-    # OS's own path resolution. Linux has no such filesystem, so the fold is
-    # simulated by monkeypatching os.path.lexists for exactly that spelling;
-    # everything else (the walk, the merge-join, remove_extras) runs for
-    # real.
+    # filesystem, an lstat of the manifest's OWN recorded spelling succeeds
+    # even though a plain directory listing enumerates the same file under
+    # a different local spelling - the fold happens inside the OS's own path
+    # resolution. Linux has no such filesystem, so the fold is simulated
+    # where pull --delete probes (_fold_on_lookup); everything else (the
+    # walk, the merge-join, remove_extras) runs for real.
     from s3bak import commands
     from s3bak.config import Opts
 
@@ -882,13 +993,7 @@ def test_delete_extras_collects_alias_via_a_name_folding_lexists_probe(
         + "\n"
     )
 
-    folded = os.path.join(str(dest), "Report.txt")
-    real_lexists = os.path.lexists
-
-    def fake_lexists(path):
-        return True if path == folded else real_lexists(path)
-
-    monkeypatch.setattr(commands.os.path, "lexists", fake_lexists)
+    _fold_on_lookup(monkeypatch)
 
     status, removed = commands._delete_extras(
         str(manifest_path), str(dest), None, [], opts=Opts(yes=True), entry="data"

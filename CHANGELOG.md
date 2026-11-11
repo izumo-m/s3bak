@@ -35,6 +35,11 @@ This project follows [Semantic Versioning](https://semver.org/).
   and reports a type conflict (exit 1). A directory there that cannot be read
   in full is refused the same way, instead of being replaced with its
   unreadable part left behind beside it as `<name>.s3bak-old-*`.
+- On a filesystem that folds names (case-insensitive Windows and macOS),
+  `pull --delete` no longer deletes the files it has just restored when a
+  directory above them is spelled differently on disk than in the backup
+  (`docs/` for `Docs/`), nor the contents of a local directory standing
+  where the backup records a file under another spelling (`lib/` for `Lib`).
 
 ## [0.10.0] - 2026-11-02
 

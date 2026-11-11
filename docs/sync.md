@@ -637,7 +637,10 @@ holds one, which stays for what it holds ([excludes.md](excludes.md)).
   NFC/NFD normalization) may fold onto a path the manifest records under a
   different spelling is excluded from removal, even though it matches no
   record byte-for-byte — it may be the very file the pull just restored under
-  its recorded spelling. The alias set is collected in one preliminary pass
+  its recorded spelling. The filesystem folds every component, so the set
+  holds whole folded paths: a local `docs/a.txt` is the recorded
+  `Docs/a.txt`, while a `docs/extra.txt` no record folds onto is an ordinary
+  extra. The alias set is collected in one preliminary pass
   over the same merge-join, before the removal stream starts, so a leaf and a
   directory extra alike check it the instant each is judged; a hit warns
   (exit 2) instead of removing.
@@ -657,7 +660,12 @@ holds one, which stays for what it holds ([excludes.md](excludes.md)).
   once form a chain of prefixes — a record can only join while an earlier
   one's range is still ahead, i.e. its name extends that one's by
   characters below `/` (`x`, `x-`, `x-old`) — so their number is bounded by
-  the longest name, never by the tree.
+  the longest name, never by the tree. A directory the filesystem folds onto
+  such a record under another spelling (`lib/` for a recorded file `Lib`)
+  lies outside that byte range, so the same preliminary pass also collects
+  the folded paths of the non-directory records whose spelling resolves to
+  a local directory, and those cover it too — bounded by the conflicts that
+  actually exist.
 - **Ordering against the metadata apply.** The extras pass runs after the
   apply and is skipped when the apply failed — extras diffed against a tree
   that is not in its recorded state are not trustworthy deletion candidates.

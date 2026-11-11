@@ -291,9 +291,10 @@ An excluded local path is invisible to this diff and is never offered, and
 neither is a directory that holds one: it stays for what it holds. Nor is
 a directory left standing where the backup records a file, symlink, or
 special file — under `-u`, the newer or conflicting side — or anything inside
-it: what it holds is not the pull's to remove. Neither
-is a name your filesystem might fold onto a recorded one — a case difference on
-Windows or macOS, a Unicode spelling difference, a trailing dot Windows trims.
+it, whatever its name's case: what it holds is not the pull's to remove.
+Neither is a name your filesystem might fold onto a recorded one — a case
+difference on Windows or macOS, a Unicode spelling difference, a trailing dot
+Windows trims, in the name or in any directory above it.
 Such a name might *be* the file the pull just restored under its recorded
 spelling, so it is reported rather than removed:
 

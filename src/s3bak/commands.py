@@ -53,7 +53,7 @@ from s3bak.manifest import ManifestEntry
 from s3bak.restore import (
     _lstat_readlink,
     apply_manifest,
-    fs_alias_key,
+    fs_alias_path,
     holds_excluded,
     local_keyed,
     manifest_keyed,
@@ -1846,9 +1846,9 @@ def _single_file_size(manifest_path: str, sub: str | None = None) -> int | None:
 
 def _collect_extra_aliases(
     manifest_path: str, outpath: str, sub: str | None, excludes: list[str]
-) -> set[tuple[str, str]]:
+) -> tuple[set[str], set[str]]:
     """The alias set ``remove_extras`` checks a candidate against: one
-    ``(parent_rel, fs_alias_key(basename))`` pair per manifest-only record
+    ``fs_alias_path(rel)`` per manifest-only record
     whose recorded spelling a name-folding filesystem (case, NFC/NFD, a
     Win32-trimmed trailing dot/space) could fold onto some local path - the
     W-F3 defense (pushing from POSIX and pulling on Windows or macOS splits
@@ -1867,8 +1867,8 @@ def _collect_extra_aliases(
     it has to be self-contained here, independent of whether or how apply
     ran.
 
-    A manifest-only record only becomes an alias candidate when
-    ``os.path.lexists`` finds something at its OWN recorded spelling - which
+    A manifest-only record only becomes an alias candidate when an
+    ``lstat`` finds something at its OWN recorded spelling - which
     a plain byte-different local walk would never do, but a name-folding
     filesystem's own path resolution does (case-insensitive lookup, NFC/NFD
     equivalence, or the Win32 trailing dot/space trim), the same fold that
@@ -1877,21 +1877,33 @@ def _collect_extra_aliases(
     number of records the filesystem actually folded - the same "bounded by
     actual conflicts" allowance ``apply_manifest``'s deferred-symlink list
     gets (see docs/overview.md). Cost is one extra lstat per manifest-only
-    record, on top of the merge-join this already re-runs."""
-    aliases: set[tuple[str, str]] = set()
+    record, on top of the merge-join this already re-runs.
+
+    Every component is folded, the directories on the way included: the
+    filesystem folds ``Docs/a.txt`` onto a local ``docs/a.txt`` as readily
+    as ``Report.txt`` onto ``report.txt``. The second set returned holds the
+    folded paths of the non-directory records whose spelling resolves to a
+    local directory: ``_delete_extras``' blockers compare spellings exactly,
+    and these cover the directories they miss, ``lib/`` where the record is
+    a file ``Lib``."""
+    aliases: set[str] = set()
+    dir_blockers: set[str] = set()
     for _key, m, loc in manifest.merge_join(
         manifest_keyed(manifest_path, sub), local_keyed(outpath, excludes, sub)
     ):
         if m is None or loc is not None:
             continue
-        rel, _m_entry = m
+        rel, m_entry = m
         if rel == ".":
             continue
-        if os.path.lexists(os.path.join(outpath, rel)):
-            parent = "." if "/" not in rel else rel.rsplit("/", 1)[0]
-            name = rel.rsplit("/", 1)[-1]
-            aliases.add((parent, fs_alias_key(name)))
-    return aliases
+        st, _sym = _lstat_readlink(os.path.join(outpath, rel))
+        if st is None:
+            continue
+        folded = fs_alias_path(rel)
+        aliases.add(folded)
+        if not m_entry.is_dir and stat_mod.S_ISDIR(st.st_mode):
+            dir_blockers.add(folded)
+    return aliases, dir_blockers
 
 
 def _delete_extras(
@@ -1923,7 +1935,7 @@ def _delete_extras(
         if mode is AnswerMode.ASK:
             confirmer = DeleteConfirmer(mode, entry)
 
-    aliases = _collect_extra_aliases(manifest_path, outpath, sub, excludes)
+    aliases, folded_blockers = _collect_extra_aliases(manifest_path, outpath, sub, excludes)
 
     # A local directory left standing where the manifest records a file,
     # symlink, or special file - under -u the kept or conflicting side; a
@@ -1950,7 +1962,15 @@ def _delete_extras(
         blockers[:] = [b for b in blockers if rel < b + "/" or rel.startswith(b + "/")]
 
     def covered(rel: str) -> bool:
-        return any(rel == b or rel.startswith(b + "/") for b in blockers)
+        if any(rel == b or rel.startswith(b + "/") for b in blockers):
+            return True
+        # The same blocker reached under another spelling a name-folding
+        # filesystem resolves to it (collected up front, so its range need
+        # not lie ahead in the stream's byte order).
+        if folded_blockers:
+            folded = fs_alias_path(rel)
+            return any(folded == b or folded.startswith(b + "/") for b in folded_blockers)
+        return False
 
     def items() -> Iterator[tuple[str, str, bool, bool]]:
         # Every LOCAL item flows: the local-only lane (m is None) are the
